@@ -198,7 +198,7 @@ impl Args {
         config.user_agent_rules.clone_from(&self.ua_rule);
         config.block_template_cache_lifetime = self.block_template_cache_lifetime;
         config.p2p_listen_address = self.listen.unwrap_or(ContextualNetAddress::unspecified());
-        config.externalip = self.externalip.map(|v| v.normalize(config.default_p2p_port()));
+        config.externalip = self.externalip.map(|v| v.normalize(config.default_listen_p2p_port()));
         config.ram_scale = self.ram_scale;
         config.retention_period_days = self.retention_period_days;
 

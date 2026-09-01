@@ -268,6 +268,18 @@ impl NetworkId {
         }
     }
 
+    /// Port the node LISTENS on / ADVERTISES by default — distinct from
+    /// [`default_p2p_port`] (the port ASSUMED for a remote peer given without one:
+    /// DNS-seeded IPs, bare --connect/--addpeer/--externalip). Mainnet listens on
+    /// 16811 to coexist with a Kaspa parent on 16111, while still dialing the seeds
+    /// on 16111; peers learn this node's real 16811 from the handshake.
+    pub fn default_listen_p2p_port(&self) -> u16 {
+        match self.network_type {
+            NetworkType::Mainnet => 16811,
+            _ => self.default_p2p_port(),
+        }
+    }
+
     pub fn iter() -> impl Iterator<Item = Self> {
         static NETWORK_IDS: [NetworkId; 4] = [
             NetworkId::new(NetworkType::Mainnet),

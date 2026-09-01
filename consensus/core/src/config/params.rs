@@ -725,6 +725,10 @@ impl Params {
         self.net.default_p2p_port()
     }
 
+    pub fn default_listen_p2p_port(&self) -> u16 {
+        self.net.default_listen_p2p_port()
+    }
+
     pub fn default_rpc_port(&self) -> u16 {
         self.net.default_rpc_port()
     }
