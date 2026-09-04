@@ -342,6 +342,21 @@ mod e2e {
         }
     }
 
+    /// The Orchard stack is pinned by value, not by semver. A bump that is not
+    /// reflected here is a consensus change made by accident.
+    #[test]
+    fn orchard_stack_is_pinned() {
+        assert_eq!(crate::verify::CIRCUIT_VERSION, orchard::circuit::OrchardCircuitVersion::FixedPostNu6_2);
+        assert_eq!(
+            crate::verify::ORCHARD_CRATE,
+            "zakura-orchard 1.0.1 79f40234883ea702da695f1cbf470a0ba3b9fe0ac51d24af588a058afc383d68"
+        );
+        assert_eq!(
+            crate::verify::HALO2_GADGETS_CRATE,
+            "zakura-halo2-gadgets 1.0.1 c601160505e513507664516f16a38b8e875a31b48155a93964b6e97c1e07d315"
+        );
+    }
+
     #[test]
     fn real_bundle_verifies_and_rejects_tampering() {
         let mut rng = rand::rng();
@@ -490,3 +505,22 @@ pub const BUNDLE_VERSION: orchard::bundle::BundleVersion = orchard::bundle::Bund
 /// a DIFFERENT circuit: changing this constant is a hard fork.
 #[cfg(feature = "circuit")]
 pub const CIRCUIT_VERSION: orchard::circuit::OrchardCircuitVersion = orchard::circuit::OrchardCircuitVersion::FixedPostNu6_2;
+
+/// The Orchard crate this build links, as `name version sha256` read from the
+/// workspace `Cargo.lock` at build time (see `build.rs`). With
+/// [`CIRCUIT_VERSION`] this fixes the verifying key; both are reported by
+/// [`circuit_identity`] so a running node can be checked against a peer.
+pub const ORCHARD_CRATE: &str = env!("ZKAS_ORCHARD_CRATE");
+/// The halo2_gadgets crate this build links (`name version sha256`); the ECC
+/// gadget carrying the June-2026 base-anchoring fix lives here.
+pub const HALO2_GADGETS_CRATE: &str = env!("ZKAS_HALO2_GADGETS_CRATE");
+
+/// One line identifying the shielded circuit this node verifies against.
+/// Intended for the startup log and for `getInfo`-style RPC exposure.
+pub fn circuit_identity() -> String {
+    #[cfg(feature = "circuit")]
+    let version = format!("{CIRCUIT_VERSION:?}");
+    #[cfg(not(feature = "circuit"))]
+    let version = "no-circuit-feature".to_string();
+    format!("circuit={version} orchard=[{ORCHARD_CRATE}] halo2_gadgets=[{HALO2_GADGETS_CRATE}]")
+}
