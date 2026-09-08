@@ -444,61 +444,10 @@ impl NullifierSet for LayeredNullifierSet<'_> {
     }
 }
 
-static ANCHOR_OVERRIDE_MAP: std::sync::OnceLock<std::collections::HashMap<[u8; 32], Hash>> = std::sync::OnceLock::new();
-
-/// Anchor→source-block mappings pinned from an external file, consulted BEFORE the local index.
-///
-/// # Why this is necessary
-///
-/// `anchor_block` maps a shielded tree root to a block, and `persist` writes it last-write-wins.
-/// Sibling blocks can carry a byte-identical root (measured on mainnet: canonical `da8dfb9d` and
-/// orphan `e6f50b47` share size, leaf and all 8 ommers), so the entry a node ends up with depends
-/// on the order it happened to validate them — orphans included. `is_shielded_anchor_final` then
-/// rejects a non-canonical source, so two nodes with identical canonical state legitimately
-/// disagree about whether a spend applied, and therefore about a block's coinbase.
-///
-/// That makes this index consensus-relevant state that is NOT derivable from the canonical chain.
-/// A node syncing from scratch rebuilds it from the blocks it happens to see and cannot reproduce
-/// the entry an orphan won on the live chain. Measured on mainnet: of 39,228 anchors known to both
-/// a live node and a fresh sync, 34 disagreed — every one of them chain=orphan / fresh=canonical,
-/// and one of those 34 wedges every fresh node at DAA 371,851 permanently.
-///
-/// Pinning the chain's own mappings is the repair. It changes no validation rule: the predicate is
-/// untouched, only the index it reads is corrected to what the chain actually used.
-///
-/// The overrides must live OUTSIDE `anchor_block` and take precedence over it. Seeding the store
-/// instead would not work — a syncing node validates the canonical producer of a contested root
-/// before it reaches the block that spends against it, and `persist` would overwrite the seeded
-/// entry with its own value long before it mattered.
-fn anchor_overrides() -> &'static std::collections::HashMap<[u8; 32], Hash> {
-    ANCHOR_OVERRIDE_MAP.get_or_init(Default::default)
-}
-
-/// Load pinned anchor mappings. Call once at startup, before consensus starts.
-///
-/// Accepts the `zkas-anchor-dump` format: `<anchor-hex>\t<block-hash>[\t<flag>]` per line, `#`
-/// comments and blank lines ignored. Returns how many mappings were pinned.
-pub fn load_anchor_overrides(path: &std::path::Path) -> Result<usize, String> {
-    let text = std::fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    let mut map = std::collections::HashMap::new();
-    for (n, line) in text.lines().enumerate() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let mut it = line.split('\t');
-        let (Some(a), Some(b)) = (it.next(), it.next()) else {
-            return Err(format!("{}:{}: expected <anchor>\\t<block>", path.display(), n + 1));
-        };
-        let mut anchor = [0u8; 32];
-        faster_hex::hex_decode(a.as_bytes(), &mut anchor).map_err(|e| format!("{}:{}: bad anchor: {e}", path.display(), n + 1))?;
-        let block: Hash = b.parse().map_err(|_| format!("{}:{}: bad block hash '{b}'", path.display(), n + 1))?;
-        map.insert(anchor, block);
-    }
-    let n = map.len();
-    ANCHOR_OVERRIDE_MAP.set(map).map_err(|_| "anchor overrides already loaded".to_string())?;
-    Ok(n)
-}
+// The external anchor-override mechanism was removed (2026-09): the multi-producer anchor
+// resolution (`anchor_producer_blocks`, active on mainnet) makes the last-write-wins index
+// order-independent, so no external pin is needed; and bulk-pinning a dump was measured to
+// corrupt shielded state (the index is time-dependent). See GitHub issue #11.
 
 /// Why one shielded transaction was kept or dropped.
 ///
@@ -794,11 +743,6 @@ impl ShieldedStateManager {
     /// max_shielded_anchor_age]` (maturity + fail-closed upper bound, audit
     /// F-04/F-05). `None` means the anchor is not a real tree root of any block.
     pub fn anchor_source_block(&self, anchor: &[u8; 32]) -> StoreResult<Option<Hash>> {
-        // A pinned mapping wins over the locally built index. See [`anchor_overrides`] for why
-        // the local index cannot be trusted to agree with the chain.
-        if let Some(pinned) = anchor_overrides().get(anchor) {
-            return Ok(Some(*pinned));
-        }
         self.anchor_block.get(anchor)
     }
 

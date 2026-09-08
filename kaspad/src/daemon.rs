@@ -359,15 +359,6 @@ pub fn create_core_with_runtime(runtime: &Runtime, args: &Args, fd_total_budget:
         );
     }
 
-    // Pinned anchor mappings must be loaded before consensus starts: the map is latched on
-    // first read, and the virtual processor reads it while validating the very first block.
-    if let Some(path) = args.shielded_anchor_overrides.as_ref() {
-        match kaspa_consensus::processes::shielded::load_anchor_overrides(std::path::Path::new(path)) {
-            Ok(n) => info!("Pinned {n} shielded anchor->source mappings from {path}"),
-            Err(e) => panic!("--shielded-anchor-overrides: {e}"),
-        }
-    }
-
     let consensus_db_dir = db_dir.join(CONSENSUS_DB);
     let utxoindex_db_dir = db_dir.join(UTXOINDEX_DB);
     let meta_db_dir = db_dir.join(META_DB);
