@@ -311,7 +311,17 @@ impl NetworkId {
     }
 
     pub fn from_prefixed(prefixed: &str) -> Result<Self, NetworkIdError> {
-        if let Some(stripped) = prefixed.strip_prefix("zkas-").or_else(|| prefixed.strip_prefix("firecash-")) {
+        // A merged-mining PARENT node is real Kaspa; its getBlockDagInfo reports
+        // "kaspa-mainnet". Accept that prefix too so the bridge can read the parent's
+        // DAG info. A NetworkId carries only the type (mainnet/testnet), not chain
+        // identity, and this parser is only reached decoding a remote node's reported
+        // network in the gRPC GetBlockDagInfo response (its sole non-test caller) — so
+        // this does not weaken p2p network isolation.
+        if let Some(stripped) = prefixed
+            .strip_prefix("zkas-")
+            .or_else(|| prefixed.strip_prefix("firecash-"))
+            .or_else(|| prefixed.strip_prefix("kaspa-"))
+        {
             Self::from_str(stripped)
         } else {
             Err(NetworkIdError::InvalidPrefix(prefixed.to_string()))
