@@ -311,7 +311,7 @@ impl NetworkId {
     }
 
     pub fn from_prefixed(prefixed: &str) -> Result<Self, NetworkIdError> {
-        if let Some(stripped) = prefixed.strip_prefix("zkas-").or_else(|| prefixed.strip_prefix("firecash-")) {
+        if let Some(stripped) = prefixed.strip_prefix("zkas-").or_else(|| prefixed.strip_prefix("firecash-")).or_else(|| prefixed.strip_prefix("kaspa-")) {
             Self::from_str(stripped)
         } else {
             Err(NetworkIdError::InvalidPrefix(prefixed.to_string()))
