@@ -1016,7 +1016,13 @@ impl VirtualStateProcessor {
         // committed inline (see below), because validation of new blocks in this same loop reads
         // the nullifier store directly and must observe them.
 
-        let split_point = split_point.expect("chain iterator was expected to reach the reorg split point");
+        let split_point = match split_point {
+            Some(point) => point,
+            None => {
+                log::error!("Reorg split point not found for {from} -> {to}; declining reorg and staying on {from}");
+                return from;
+            }
+        };
         debug!("VIRTUAL PROCESSOR, found split point: {split_point}");
 
         // A variable holding the most recent UTXO-valid block on `chain(to)` (note that it's maintained such
