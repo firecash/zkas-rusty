@@ -3,9 +3,9 @@
 *Destroying ZKAS verifiably — even by an entity nobody trusts — with no way for that entity to
 secretly retain a spend key or to lie about the burn.*
 
-Status: design note. The address construction and the burn **proof** work today with no consensus
-change (they reuse `shielded-core::payment_check`). A *supply-reducing* burn (the turnstile total
-actually dropping) needs the small consensus change in §6.
+Status: design note. The address construction and the OVK-based verification work today with no
+consensus change (the note-binding reuses `shielded-core::payment_check`). A *supply-reducing* burn
+(the turnstile total actually dropping) needs the small consensus change in §6.
 
 ---
 
@@ -16,7 +16,8 @@ we do **not** trust it. Two things must be impossible for that entity:
 
 1. **Retain a spend key.** It must not be able to hand out a "burn address" that is really an address
    it controls, so it could quietly spend the "burned" coins later.
-2. **Lie.** Its claim "I burned V ZKAS" must be independently verifiable, not taken on its word.
+2. **Lie / hide.** Its burns must be independently verifiable, not taken on its word — and it must not
+   be able to *withhold* a burn or quietly divert the funds instead.
 
 Constraints of the substrate:
 
@@ -37,9 +38,11 @@ The scheme has two independent halves:
 1. **A canonical NUMS burn address** — a normal ZKas address whose public key is the output of a
    public hash, so *no private key for it exists* and *anyone can recompute it*. The untrusted entity
    never generates it, so it cannot substitute one it controls.
-2. **A per-transaction burn proof** — a single-note disclosure that binds "output X of tx T paid
-   value V to the canonical burn address" to on-chain data. It is cryptographically unforgeable and
-   reveals *only that one note* — never a viewing key.
+2. **A published OVK on a dedicated burn account** — the entity runs one ZIP-32 account used *only*
+   for burning, and publishes that account's **outgoing viewing key (OVK)**. Because the OVK decrypts
+   every note the account *sends*, anyone can enumerate and verify **all** of the entity's burns,
+   continuously, with no further action from the entity — and can see any attempt to send funds
+   somewhere other than the canonical burn address.
 
 Trust properties this achieves:
 
@@ -47,10 +50,10 @@ Trust properties this achieves:
 |---|---|---|
 | Entity knows a spend key for the burn address | **No** | recovering it = discrete-log on Pallas; back-dooring it = 2nd-preimage on the hash; and the address is protocol-fixed, so the entity has no freedom |
 | Anyone can verify the address is the genuine burn address | **Yes** | it is a deterministic function of a public string |
-| Entity can forge a fake burn proof | **No** | the proof is bound to the on-chain note commitment and value commitment |
+| Entity can forge a fake burn | **No** | every disclosed note is bound to the on-chain note commitment and value commitment |
+| Entity can hide a burn, or divert funds elsewhere from the account | **No** | the published OVK decrypts *every* outgoing note of the account, so both burns and any diversion-send are visible |
 | Coins are gone forever | **Yes (no-fork)** | the note is unspendable by anyone |
 | Recorded/turnstile supply drops | **No-fork: no. Fork: yes** | supply accounting is consensus state (§6) |
-| Entity can be *forced* to burn / to disclose | **No-fork: no** | close by gating the incentive on the proof, or by the consensus burn (§6) |
 
 ---
 
@@ -104,72 +107,69 @@ Why the entity cannot cheat the address:
 
 ---
 
-## 4. Low level — the burn transaction and its proof
+## 4. Low level — the burn transaction and how it is verified via the OVK
 
-**The burn tx** is an ordinary shielded spend: input note(s) → one output note to the canonical burn
-address carrying value `V`, with change back to the burner. On-chain it is indistinguishable from a
-normal payment (recipient encrypted).
+**The burn tx** is an ordinary shielded spend from the entity's dedicated burn account: input note(s)
+→ one output note to the canonical burn address carrying value `V`, with change back to the same
+account. On-chain it is indistinguishable from a normal payment (recipient encrypted).
 
-**The burn proof** is a single-note disclosure that reuses the verifier ZKas already ships,
-`shielded-core::payment_check` (`check_prepared_payment` + `ActionDisclosure`). For the burn output
-action the burner discloses:
+**Verification via the published OVK.** In Orchard, every action carries an `out_ciphertext`
+encrypted under a key derived from the sender's **OVK**, containing the note's `(recipient, value,
+rseed)`. So a verifier who holds the account's OVK can, for every outgoing note that account ever
+produced:
 
-```
-ActionDisclosure {
-    out_recipient : [u8; 43],   // MUST equal the canonical burn address raw bytes
-    out_value     : u64,        // = V
-    out_rseed     : [u8; 32],
-    rcv           : [u8; 32],   // value-commitment trapdoor
-    spend_value   : u64,
-}
-```
+1. Decrypt `out_ciphertext` with the OVK → recover `(recipient, value, rseed)`; `rho` is that action's
+   nullifier, taken from the bundle itself.
+2. Reconstruct `note = Note::from_parts(recipient, value, rho, rseed, V2)` and check
+   `ExtractedNoteCommitment(note) == act.cmx` — the on-chain note commitment. `cmx` is a *binding*
+   commitment, so the recovered plaintext **is** that note; recipient, value and `rho` are pinned.
+3. Check `ValueCommitment::derive(spend_value − value, rcv) == act.cv_net`, pinning the amount.
+4. Check `recipient == CANONICAL_BURN_ADDRESS` (the §3 constant).
 
-Verification (all already implemented in `payment_check.rs`, plus one burn-specific line):
-
-1. `rho` = **that action's nullifier**, read from the bundle itself — not asserted by the prover.
-2. `rseed = RandomSeed::from_bytes(out_rseed, rho)`; `recipient = Address::from_raw_address_bytes(out_recipient)`.
-3. `note = Note::from_parts(recipient, out_value, rho, rseed, V2)`.
-4. **Commitment bind:** `ExtractedNoteCommitment::from(note.commitment()) == act.cmx` (the on-chain
-   note commitment). `cmx` is a *binding* commitment, so a disclosure that recomputes to the on-chain
-   `cmx` **is** that note — the recipient, value and `rho` are pinned; no other plaintext can match.
-5. **Value bind:** `ValueCommitment::derive(spend_value − out_value, rcv) == act.cv_net`, pinning the
-   amounts to the on-chain value commitment.
-6. **Burn check (the added line):** `out_recipient == CANONICAL_BURN_ADDRESS` (the §3 constant).
-
-If all pass, the proof establishes, against on-chain data the entity cannot alter, that **this output
-burned exactly `V` to the canonical unspendable address.** A forged disclosure produces a mismatch at
-step 4 or 5, so the entity cannot lie.
-
-A burn-specific wrapper (e.g. `check_burn(wire, disclosure, height) -> V`) is just
-`check_prepared_payment` with `to = CANONICAL_BURN_ADDRESS` and no `fvk`/change accounting — a thin
-addition, not new cryptography.
+Steps 2–3 are exactly the binding logic already implemented in `shielded-core::payment_check`
+(`check_prepared_payment` / `ActionDisclosure`); the burn verifier is that logic driven from
+OVK-decrypted plaintexts, plus step 4. An output whose recipient is the canonical address and whose
+`cmx`/`cv_net` match the chain is a proven burn of exactly `V`; any output to a *different* recipient
+is a proven diversion. Neither can be faked, because both are bound to on-chain data.
 
 ---
 
-## 5. Should the user share the per-tx proof, or a viewing key?
+## 5. What the entity reveals: the OVK of a dedicated burn account
 
-**The per-transaction (single-note) `ActionDisclosure` — never a viewing key.**
+**Reveal the account's OVK — on an account used only for burning.** This is the disclosure primitive.
 
-- A burn only needs to prove **one** fact: "this specific on-chain output burned `V` to the canonical
-  address." The `ActionDisclosure` above proves exactly that and nothing else.
-- Sharing **OVK / FVK / IVK** would expose **all** of the entity's transactions — every incoming
-  and/or outgoing note, past and future — which is catastrophic over-disclosure and destroys the
-  privacy of everything unrelated to the burn.
-- The burner uses its **OVK locally** to recover its own output's plaintext (that is what OVK is for),
-  but publishes only the recovered per-note fields, **not the OVK itself.**
+- The OVK is the **outgoing** viewing key: it decrypts the `out_ciphertext` of every note *this
+  account sent*, letting anyone recover `(recipient, value, rseed)` for each and run the §4 checks. It
+  reveals **all outgoing notes of that one account** — and nothing else: it does **not** grant spend
+  authority, and it does **not** reveal the account's incoming notes (that is the IVK).
+- **Use a dedicated burn account.** Because the OVK exposes *every* send of the account it belongs to,
+  it must be an account the entity uses *only* to receive-then-burn. On such an account the OVK
+  discloses exactly the burns and nothing sensitive. **Never publish the OVK of a general-purpose
+  account** — that would reveal every unrelated payment the account ever made.
+- **Why the OVK beats a one-off per-tx disclosure here.** With the OVK published once, burns become
+  *continuously and publicly auditable with no action from the entity*, and the entity **cannot
+  withhold**: it can neither hide a burn nor quietly divert funds — any send that is *not* to the
+  canonical burn address is decrypted by every OVK holder and visible as a diversion. A per-tx
+  disclosure only ever proves the burns the entity chooses to reveal; the OVK proves the *whole*
+  outgoing history of the account.
+- **If you also need full in/out reconciliation** ("everything that entered the account was burned,
+  nothing is merely being held"), publish the account's **FVK** instead — that adds visibility of
+  *incoming* notes too, at the cost of revealing them. The OVK alone proves the burns and rules out
+  send-diversions; the FVK additionally rules out silent holds.
 
-So: minimal, sufficient, privacy-preserving, and unforgeable. One burn = one `ActionDisclosure`.
+Summary: **publish the OVK of a dedicated burn account** (or its FVK for full in/out accounting) —
+never a general account's keys, and never the spending key.
 
 ---
 
 ## 6. The residual gap, and the fork that closes it fully
 
-**No-fork residual.** Because recipients are encrypted, a burn is invisible until the entity
-discloses, and no-fork logic cannot *compel* an untrusted entity to burn or to publish the proof. It
-can only make a *false* proof impossible. Close the gap by design: make a valid burn proof a
-**required precondition** of whatever the burn is *for* (a fee credit, a mint, a reward, a listing).
-No valid proof ⇒ no credit ⇒ no incentive to fake or to withhold. The recorded supply still does not
-change — the coins are frozen, not subtracted.
+**No-fork residual.** Publishing the OVK removes the withholding/diversion problem for that account,
+but the burn still does not reduce the *recorded* supply — the coins are frozen (unspendable forever),
+not subtracted from the turnstile total. And the guarantee only extends to the account whose OVK was
+published; you rely on the entity having routed the funds through that account (make routing-through-
+the-burn-account, and publishing its OVK, a required condition of whatever the burn is *for* — a fee
+credit, a mint, a reward — so a non-compliant entity simply gets no credit).
 
 **Fork = fully trustless, supply-reducing.** The primitive already exists: `burn::ExitReceipt`,
 `burn::BurnAccumulator`, and the turnstile invariant `pool = coinbase + pegged_in − fees − burns`,
@@ -181,9 +181,9 @@ gated behind `BRIDGE_ENABLED = false` and today only serves peg-out. A **standal
   turnstile,
 
 makes the node itself enforce the burn: any non-canonical "burn" is rejected, supply visibly drops for
-everyone, and even withholding is impossible — **zero trust in the entity.** This is a small,
-coordinated hardfork (it relaxes tx validity and changes supply accounting, so old nodes would reject
-the new blocks), reusing the accumulator that is already present.
+everyone, and even withholding is impossible — **zero trust in the entity, no OVK needed.** This is a
+small, coordinated hardfork (it relaxes tx validity and changes supply accounting, so old nodes would
+reject the new blocks), reusing the accumulator that is already present.
 
 ---
 
@@ -194,13 +194,15 @@ the new blocks), reusing the accumulator that is already present.
 | Burn address | canonical NUMS, publicly recomputable | same |
 | Spend key exists for it | no (DLP + 2nd-preimage) | no |
 | Entity can substitute its own address | no (recomputable) | no (consensus checks canonical) |
-| Entity can forge a burn proof | no (`payment_check` binding) | no |
+| What the entity reveals | the OVK of a dedicated burn account | nothing (consensus enforces) |
+| Entity can forge a burn | no (`payment_check` binding) | no |
+| Entity can hide a burn / divert funds | no (OVK shows all sends) | no (consensus) |
 | Coins unspendable forever | yes | yes |
 | Recorded supply drops | **no** | **yes** |
-| Entity can withhold / not burn | yes — gate the incentive on the proof | no — consensus enforces |
-| Publicly visible without disclosure | no (shielded) | yes (turnstile total) |
+| Publicly visible without any disclosure | no (needs the OVK) | yes (turnstile total) |
 
 **Bottom line:** a canonical hash-derived burn address (no key can exist, anyone recomputes it) plus a
-per-note `payment_check` disclosure (no forgeable lie) gives a trustless, verifiable burn **today with
-no fork** — the coins are provably gone. Turning that into a *supply-reducing* burn an untrusted entity
-cannot even withhold is the small consensus change in §6, reusing the existing `BurnAccumulator`.
+**published OVK on a dedicated burn account** (every burn, and every diversion, publicly and
+continuously verifiable, unforgeable) gives a trustless, auditable burn **today with no fork** — the
+coins are provably gone and the entity cannot hide or fake. Turning that into a *supply-reducing* burn
+is the small consensus change in §6, reusing the existing `BurnAccumulator`.
