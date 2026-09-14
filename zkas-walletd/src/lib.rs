@@ -8371,6 +8371,7 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
     let app = Router::new()
         .route("/health", get(health))
         .route("/api/status", get(status))
+        .route("/api/checkpoint", post(checkpoint))
         .route("/api/wallet/create", post(wallet_create))
         .route("/api/wallet/import", post(wallet_import))
         .route("/api/wallet/watch", post(wallet_watch))
@@ -8541,23 +8542,21 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
     result
 }
 
-/// Persist every resident wallet's scan progress on the way out.
-///
-/// A wallet checkpoints only every `CHECKPOINT_EVERY` blocks, so at any moment the
-/// difference between its in-memory position and its file is unsaved work. Without this
-/// the process simply died on a signal and that work was lost — for a wallet part-way
-/// through its first scan, that is the progress bar the user was watching resetting
-/// backwards (reported live 2026-08-07: "syncing 80%" to "syncing 44%" across a
-/// restart). No funds were ever at risk and nothing was corrupted; the scan was just
-/// thrown away and redone.
-///
-/// Runs after the loops are aborted, so nothing is mutating a wallet underneath us, and
-/// every lock is taken uncontended. A wallet in an error state is skipped for the same
-/// reason the periodic path skips it: its checkpoint already lags and the reload path
-/// re-derives what it can.
-async fn flush_checkpoints_on_exit(state: &Arc<AppState>) {
-    let started = std::time::Instant::now();
-    let resident: Vec<(String, Wallet)> = { state.wallets.lock().await.iter().map(|(k, v)| (k.clone(), v.clone())).collect() };
+/// Flush the scan checkpoint of the wallet under `only` (or of every resident wallet
+/// when `only` is None) to disk now. Returns (wallets saved, wallets considered,
+/// blocks of progress preserved). Skips wallets in error and wallets whose on-disk
+/// checkpoint already matches memory, so calling it often is cheap.
+async fn flush_checkpoints(state: &Arc<AppState>, only: Option<&str>) -> (usize, usize, usize) {
+    let resident: Vec<(String, Wallet)> = {
+        state
+            .wallets
+            .lock()
+            .await
+            .iter()
+            .filter(|(k, _)| only.map_or(true, |t| t == k.as_str()))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    };
     let total = resident.len();
     let (mut saved, mut blocks) = (0usize, 0usize);
     for (token, w) in resident {
@@ -8584,6 +8583,30 @@ async fn flush_checkpoints_on_exit(state: &Arc<AppState>) {
             blocks += advanced;
         }
     }
+    (saved, total, blocks)
+}
+
+/// `POST /api/checkpoint` — write the caller's wallet checkpoint NOW.
+///
+/// The sync loop checkpoints every `CHECKPOINT_EVERY` blocks and on graceful shutdown.
+/// A phone gives neither guarantee: Android freezes or kills the app process the moment
+/// the screen goes dark, with no shutdown at all, so everything scanned since the last
+/// periodic save was redone on the next open — seen by users as the sync "going back to
+/// 0". The app calls this as it goes to the background, so the checkpoint is as fresh as
+/// that moment. Token-scoped: a hosted daemon flushes only the caller's wallet.
+async fn checkpoint(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Json<serde_json::Value> {
+    let only = token_from(&headers, state.allow_default_token).ok();
+    let (saved, total, blocks) = flush_checkpoints(&state, only.as_deref()).await;
+    if blocks > 0 {
+        log::info!("checkpoint on request: saved {saved}/{total} wallet(s), preserving {blocks} block(s) of scan progress");
+    }
+    Json(serde_json::json!({ "saved": saved, "resident": total, "blocks": blocks }))
+}
+
+/// Persist every resident wallet's scan progress on the way out.
+async fn flush_checkpoints_on_exit(state: &Arc<AppState>) {
+    let started = std::time::Instant::now();
+    let (saved, total, blocks) = flush_checkpoints(state, None).await;
     log::info!(
         "shutdown: flushed {saved}/{total} wallet checkpoint(s) in {:.1?}, preserving {blocks} block(s) of scan progress that a restart would otherwise redo",
         started.elapsed()
