@@ -3880,7 +3880,20 @@ impl AppState {
         // cannot serve that walk (pages fail below its pruning point) and falls
         // through to the full scan exactly as before.
         let older_than_checkpoint = birthday < cp.daa_score;
-        let walk_from = if older_than_checkpoint { guard } else { cp.block_hash };
+        // The walk reads block HEADERS (metadata only, never the scan archive), and a
+        // node — even an archival one that went archival after it had already pruned —
+        // holds headers only back to its pruning point. Walking from genesis therefore
+        // failed on the first page ("cannot find header"). Start from the pruning point
+        // instead: every birthday between it and the finality checkpoint (~1.5 days)
+        // fast-syncs; an older one falls through to the full scan below.
+        let walk_from = if older_than_checkpoint {
+            match self.request_client().await?.get_block_dag_info().await {
+                Ok(info) => info.pruning_point_hash,
+                Err(_) => guard,
+            }
+        } else {
+            cp.block_hash
+        };
         let walked = self.birthday_start(walk_from, birthday).await;
         if older_than_checkpoint && walked.is_none() {
             log::info!(
@@ -3940,12 +3953,22 @@ impl AppState {
         // itself — a note received *in* the birthday block must not be skipped.
         let mut base_below: Option<RpcHash> = None;
         // Bound the walk (a 2000-block page × this cap covers many millions of blocks).
-        for _ in 0..4000 {
-            let page = self.request_client().await?.get_shielded_block_metadata(cursor, WALK_PAGE).await.ok()?;
+        for pages in 0..4000u32 {
+            let page = match self.request_client().await?.get_shielded_block_metadata(cursor, WALK_PAGE).await {
+                Ok(p) => p,
+                Err(e) => {
+                    log::info!("birthday walk stopped after {pages} page(s) at cursor {cursor}: rpc error: {e}");
+                    return None;
+                }
+            };
             if page.reorged {
+                log::info!("birthday walk stopped after {pages} page(s) at cursor {cursor}: node reports the cursor reorged off the selected chain");
                 return None;
             }
-            let Some(last) = page.blocks.last() else { return None };
+            let Some(last) = page.blocks.last() else {
+                log::info!("birthday walk stopped after {pages} page(s) at cursor {cursor}: node returned an empty page");
+                return None;
+            };
             if last.daa_score >= birthday {
                 // Birthday reached within this page. Advance `base_below` to the last block
                 // still strictly below it, then start the tree from that block's frontier.
@@ -4019,13 +4042,18 @@ impl AppState {
                 (start, ts)
             }
         };
+        // Refuse only a scan that cannot succeed: the node holds PARTIAL history (it is
+        // pruned and never backfilled), so notes below its history floor are invisible no
+        // matter how long the scan runs. A complete-history node's genesis scan is slow on
+        // a phone but finishes, and with checkpoints surviving restarts it is the honest
+        // path for a wallet older than the node's fast-sync window — never refuse that.
         if let Some(max) = self.resources.max_full_scan_blocks {
             let tip = self.node_tip.lock().await.0;
             let span = tip.saturating_sub(ts.daa_score);
-            if span > max {
+            if span > max && !ts.history_complete {
                 let msg = format!(
-                    "This node cannot fast-sync this wallet: its earliest fast-sync point is block {}, and the wallet's birthday {birthday} is older — the only alternative is scanning {span} blocks, which this device will not finish. Use an archival node (Settings → Wallet service → node), or restore with a birthday after block {}.",
-                    ts.daa_score, ts.daa_score
+                    "This node holds only partial shielded history (from block {}), so a wallet born at block {birthday} cannot be synced from it — its older notes are not on this node. Connect to a node with complete history (Settings → Wallet service → node).",
+                    ts.history_from_daa_score
                 );
                 log::error!("{msg}");
                 let db = key.empty_db()?;
