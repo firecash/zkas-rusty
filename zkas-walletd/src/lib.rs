@@ -334,6 +334,12 @@ pub struct Config {
 
 #[derive(Clone, Debug)]
 pub struct ResourceLimits {
+    /// Refuse a full scan whose span exceeds this many blocks and surface a clear
+    /// error instead. Unset = never refuse (servers). A phone sets it: when fast-sync
+    /// is impossible (pruned node, birthday older than its checkpoint) the fallback
+    /// is a scan of the ENTIRE chain, which on a phone never finishes and read as
+    /// "syncing from 0" forever — an honest error beats a hopeless progress bar.
+    pub max_full_scan_blocks: Option<u64>,
     pub sync_wallets: usize,
     pub sync_wallet_memory_mb: u64,
     pub load_wallets: usize,
@@ -361,6 +367,7 @@ impl Default for ResourceLimits {
         // than baking a hosted-machine size into the binary.
         let max_resident_wallets = mem_available_mb().map(|mb| (mb / 192).clamp(4, 256) as usize).unwrap_or(32);
         Self {
+            max_full_scan_blocks: None,
             sync_wallets: cores.saturating_sub(1).clamp(1, 8),
             sync_wallet_memory_mb: 512,
             load_wallets: cores.saturating_sub(2).clamp(1, 4),
@@ -950,6 +957,11 @@ const SCAN_HEADER_LEN: usize = 77;
 // whole wallet cohort (a "thundering herd" that pins every core). At ~32B/leaf the
 // checkpoint blob stays small, so frequent writes are cheap.
 const CHECKPOINT_EVERY: usize = 1000;
+/// Also checkpoint whenever this much wall time has passed with ANY progress. The
+/// block-count rule alone let a slow scanner — a phone against a public node — run
+/// for many minutes before its first save, and a process kill in that window (Android
+/// force-stop, no shutdown) threw all of it away.
+const CHECKPOINT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Minimum block lead a twin must have over THIS wallet's own checkpoint before it is
 /// worth cloning instead of scanning the gap. Below this, the argon2 + decrypt cost of
@@ -2010,6 +2022,9 @@ struct WalletEntry {
     /// `scanned` at the last persisted checkpoint — the sync loop rewrites the
     /// checkpoint once enough new blocks accrue past this.
     saved_scanned: usize,
+    /// When the checkpoint was last written (or the entry created) — the time-based
+    /// checkpoint rule in `sync_one_wallet` is measured from here.
+    last_checkpoint_at: std::time::Instant,
     /// `(blue_score, absolute leaf count)` after each ingested chain block,
     /// oldest→newest, capped at [`MATURED_RING`]. `send` picks the newest entry
     /// at least `anchor_depth + slack` blue units below the sink to root a spend
@@ -2192,6 +2207,7 @@ impl WalletEntry {
             updated_unix: 0,
             error: None,
             saved_scanned: scanned,
+            last_checkpoint_at: std::time::Instant::now(),
             boundaries,
             sink_blue,
             reorged_strikes: 0,
@@ -3853,8 +3869,24 @@ impl AppState {
             Ok(Ok(cp)) => cp,
             _ => return None,
         };
-        if birthday < cp.daa_score {
-            log::info!("wallet birthday {birthday} precedes fast-sync checkpoint (daa {}); full scan required", cp.daa_score);
+        // A birthday OLDER than the finality checkpoint used to mean "full scan
+        // required" — and a full scan anchors at GENESIS, i.e. every block the chain
+        // ever had. Any wallet older than the ~12 h finality window hit it, and on a
+        // phone that is hours to days ("syncing from 0"). But an ARCHIVAL node retains
+        // the per-block tree frontier for every selected-chain block back to genesis,
+        // so the same metadata-only walk that finds a birthday AFTER the checkpoint
+        // can find one BEFORE it — starting from genesis: thousands of 2000-block
+        // metadata pages instead of millions of blocks of tree work. A pruned node
+        // cannot serve that walk (pages fail below its pruning point) and falls
+        // through to the full scan exactly as before.
+        let older_than_checkpoint = birthday < cp.daa_score;
+        let walk_from = if older_than_checkpoint { guard } else { cp.block_hash };
+        let walked = self.birthday_start(walk_from, birthday).await;
+        if older_than_checkpoint && walked.is_none() {
+            log::info!(
+                "wallet birthday {birthday} precedes fast-sync checkpoint (daa {}) and this node cannot walk the chain back to it; full scan required",
+                cp.daa_score
+            );
             return None;
         }
         // Default start = the finality checkpoint. But when the wallet's birthday is
@@ -3865,10 +3897,16 @@ impl AppState {
         // (metadata only, no tree work) and start the tree from *that* block's frontier.
         // Sound because a birthday asserts the wallet holds no notes before it. Any failure
         // (RPC hiccup, tip reached early) falls back to the checkpoint start.
-        let (start_hash, start_daa, start_size, start_leaf, start_ommers) = match self.birthday_start(cp.block_hash, birthday).await {
+        let (start_hash, start_daa, start_size, start_leaf, start_ommers) = match walked {
             Some(s) => s,
             None => (cp.block_hash, cp.daa_score, cp.size, cp.leaf, cp.ommers),
         };
+        if older_than_checkpoint {
+            log::info!(
+                "fast-sync from birthday block daa {start_daa} via the archival frontier walk (finality checkpoint daa {}) — no genesis scan",
+                cp.daa_score
+            );
+        }
         if start_daa > cp.daa_score {
             log::info!(
                 "fast-sync from birthday block daa {start_daa} (checkpoint daa {}) — skipped {} blocks of replay",
@@ -3981,6 +4019,21 @@ impl AppState {
                 (start, ts)
             }
         };
+        if let Some(max) = self.resources.max_full_scan_blocks {
+            let tip = self.node_tip.lock().await.0;
+            let span = tip.saturating_sub(ts.daa_score);
+            if span > max {
+                let msg = format!(
+                    "This node cannot fast-sync this wallet: its earliest fast-sync point is block {}, and the wallet's birthday {birthday} is older — the only alternative is scanning {span} blocks, which this device will not finish. Use an archival node (Settings → Wallet service → node), or restore with a birthday after block {}.",
+                    ts.daa_score, ts.daa_score
+                );
+                log::error!("{msg}");
+                let db = key.empty_db()?;
+                let mut e = WalletEntry::from_parts(key, recoverable, db, guard, start, ts.daa_score as usize, VecDeque::new(), 0);
+                e.error = Some(msg);
+                return Some(e);
+            }
+        }
         let fs = FrontierState {
             size: ts.size,
             leaf: (ts.size > 0).then(|| ts.leaf.as_bytes()),
@@ -4103,6 +4156,7 @@ impl AppState {
                     .is_ok()
                 {
                     e.saved_scanned = e.scanned;
+            e.last_checkpoint_at = std::time::Instant::now();
                     e.force_checkpoint = false;
                 }
             }
@@ -4763,7 +4817,8 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
     // witness state (v5) is persisted immediately — a restart seconds later must not throw
     // it away and re-do the ~30–90 s warm.
     let force = e.force_checkpoint;
-    if e.error.is_none() && (advanced >= CHECKPOINT_EVERY || (just_caught_up && advanced > 0) || force) {
+    let overdue = advanced > 0 && e.last_checkpoint_at.elapsed() >= CHECKPOINT_INTERVAL;
+    if e.error.is_none() && (advanced >= CHECKPOINT_EVERY || (just_caught_up && advanced > 0) || force || overdue) {
         if let Err(err) = save_checkpoint(
             &state.wallet_dir,
             &token,
@@ -4778,6 +4833,7 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
             eprintln!("checkpoint write failed for {token}: {err}");
         } else {
             e.saved_scanned = e.scanned;
+            e.last_checkpoint_at = std::time::Instant::now();
             e.force_checkpoint = false;
         }
     }
@@ -4915,6 +4971,7 @@ async fn evict_idle_wallets(state: &Arc<AppState>) {
                 .is_ok()
                 {
                     e.saved_scanned = e.scanned;
+            e.last_checkpoint_at = std::time::Instant::now();
                     e.force_checkpoint = false;
                 }
             }
@@ -8590,6 +8647,7 @@ async fn flush_checkpoints(state: &Arc<AppState>, only: Option<&str>) -> (usize,
         .is_ok()
         {
             e.saved_scanned = e.scanned;
+            e.last_checkpoint_at = std::time::Instant::now();
             saved += 1;
             blocks += advanced;
         }
