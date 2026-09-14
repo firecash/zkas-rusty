@@ -5088,6 +5088,7 @@ dependencies = [
  "tokio",
  "toml",
  "workflow-log",
+ "zakura-orchard",
  "zkas-walletd",
 ]
 
