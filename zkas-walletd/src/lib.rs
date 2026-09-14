@@ -863,7 +863,7 @@ fn save_seed(dir: &str, token: &str, network: &str, seed: &[u8; 32], birthday: u
 /// Persist a **watch-only** wallet: only the full viewing key is written — there is
 /// no seed to protect, so `--wallet-secret` encryption is moot. A compromise of this
 /// file leaks the ability to *see* the wallet, never to spend it.
-fn save_fvk(dir: &str, token: &str, network: &str, fvk: &[u8; 96], birthday: u64) -> std::io::Result<()> {
+fn save_fvk(dir: &str, token: &str, network: &str, fvk: &[u8; 96], birthday: u64, recoverable_history: bool) -> std::io::Result<()> {
     let wf = WalletFile {
         version: 2,
         network: network.to_string(),
@@ -871,8 +871,8 @@ fn save_fvk(dir: &str, token: &str, network: &str, fvk: &[u8; 96], birthday: u64
         encrypted: false,
         birthday,
         fvk_hex: hex(fvk),
-        // Opt-in, same as the seed path above.
-        recoverable_history: false,
+        // Opt-in by default (same as the seed path); a view-key import asks for it on.
+        recoverable_history,
     };
     write_wallet_file(dir, token, &wf)
 }
@@ -5577,6 +5577,13 @@ struct WatchReq {
     /// needs no historical scan; 0 means "may hold funds from any height" → full scan.
     #[serde(default)]
     birthday: u64,
+    /// Record chain history (own sends' recipient/amount/memo via the OVK) from the
+    /// first scan. Unset keeps the wallet's existing setting (a fresh wallet: OFF,
+    /// opt-in). A view-key import sets this: the caller imported a full viewing key
+    /// precisely to SEE the wallet, and the key already lets this daemon decrypt
+    /// everything, so recording rows adds no disclosure.
+    #[serde(default)]
+    recoverable_history: Option<bool>,
 }
 
 /// Register a **watch-only** wallet for this token: the daemon syncs it, shows its
@@ -5610,11 +5617,15 @@ async fn wallet_watch(
     // takes the rescan-from-birthday path below.
     let existing = load_wallet_meta(&state.wallet_dir, &token, state.wallet_secret.as_deref());
     let same_key = matches!(&existing, Some((WalletKey::Fvk(f), _, _)) if *f == fvk);
+    // An explicit request wins; otherwise keep what the wallet already had (OFF for a
+    // brand-new wallet — history stays opt-in unless the caller asks for it).
+    let existing_history = existing.as_ref().map(|(_, _, h)| *h).unwrap_or(false);
+    let history = req.recoverable_history.unwrap_or(existing_history);
     let has_checkpoint = checkpoint_cursor(&state.wallet_dir, &token, &state.genesis).is_some();
     if same_key && has_checkpoint {
         let stored_birthday = existing.as_ref().map(|(_, b, _)| *b).unwrap_or(0);
         let keep_birthday = stored_birthday.min(req.birthday);
-        save_fvk(&state.wallet_dir, &token, &state.network, &fvk, keep_birthday)
+        save_fvk(&state.wallet_dir, &token, &state.network, &fvk, keep_birthday, history)
             .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to write wallet file: {e}")))?;
         // Evict any stale in-RAM entry so the next load resumes from the preserved checkpoint.
         state.wallets.lock().await.remove(&token);
@@ -5632,7 +5643,7 @@ async fn wallet_watch(
     // scanned this exact viewing key, clone its checkpoint — the second device is
     // synced immediately instead of rescanning history the daemon already walked.
     if let Some((donor, keep_birthday)) = state.adopt_twin(&token, &fvk, req.birthday).await {
-        save_fvk(&state.wallet_dir, &token, &state.network, &fvk, keep_birthday)
+        save_fvk(&state.wallet_dir, &token, &state.network, &fvk, keep_birthday, history)
             .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to write wallet file: {e}")))?;
         state.wallets.lock().await.remove(&token);
         if state.get_wallet(&token).await.is_some() {
@@ -5645,13 +5656,13 @@ async fn wallet_watch(
         // The clone failed to load (corrupt donor file, node hiccup) — scan honestly.
         let _ = std::fs::remove_file(scan_path(&state.wallet_dir, &token));
     }
-    save_fvk(&state.wallet_dir, &token, &state.network, &fvk, req.birthday)
+    save_fvk(&state.wallet_dir, &token, &state.network, &fvk, req.birthday, history)
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to write wallet file: {e}")))?;
-    // History starts OFF (opt-in), matching what `save_fvk` just wrote.
-    let entry = match state.fast_sync_entry(key, false, state.genesis, req.birthday).await {
+    // Matches what `save_fvk` just wrote: opt-in unless the caller asked for history.
+    let entry = match state.fast_sync_entry(key, history, state.genesis, req.birthday).await {
         Some(e) => e,
         None => state
-            .full_scan_entry(key, false, state.genesis, req.birthday)
+            .full_scan_entry(key, history, state.genesis, req.birthday)
             .await
             .ok_or_else(|| err(StatusCode::BAD_GATEWAY, "cannot anchor a full scan (node unreachable or too old)"))?,
     };
