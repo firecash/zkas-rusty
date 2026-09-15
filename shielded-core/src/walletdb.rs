@@ -4865,7 +4865,9 @@ mod circuit_tests {
         assert_eq!(a2.history()[1].recipient, sent.recipient);
         assert_eq!(a2.history()[1].memo, sent.memo);
 
-        // A NON-recoverable send (ovk withheld): B pays A back 3_000 (fee 500).
+        // A send whose caller asks for NO recovery (`recoverable = false`): B pays A back
+        // 3_000 (fee 500). The builder ignores the request — outputs are always encrypted
+        // to the sender's own OVK — so B still recovers where it paid.
         let mut b2 = b;
         let inputs = vec![(b2.notes()[0].note.clone(), b2.witness_path(b2.notes()[0].position).unwrap())];
         let payload = crate::wallet::build::build_wallet_payment(
@@ -4879,14 +4881,18 @@ mod circuit_tests {
             false,
             [0u8; 512],
         )
-        .expect("non-recoverable payment builds");
+        .expect("payment builds");
         let wire = ShieldedBundle::from_bytes(&payload).unwrap();
         let meta3 = BlockMeta { coinbase_txid: [0xdd; 32], txids: vec![[0xee; 32]], timestamp_ms: 3_000, daa_score: 30 };
         b2.ingest_block_with_meta(&[], &[&wire], Some(&meta3));
         let sent = b2.history().last().unwrap();
         assert_eq!(sent.kind, HistoryKind::Sent);
         assert_eq!(sent.amount, 3_000, "net-outflow fallback still prices the send right");
-        assert_eq!(sent.recipient, None, "without the OVK not even the sender can recover the recipient");
+        assert_eq!(
+            sent.recipient,
+            Some(address_bytes_from_seed(miner).unwrap()),
+            "outputs are always OVK-encrypted: the sender recovers the recipient even when it asked not to"
+        );
 
         // A later watch-only rescan sees the same transaction through the compact
         // archive. It lacks the full bundle's fee/OVK ciphertext, but it MUST still
