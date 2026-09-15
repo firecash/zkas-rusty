@@ -476,12 +476,20 @@ pub struct GetShieldedTreeStateRequest {
     /// Optional explicit chain block to checkpoint at; `None` = the node's
     /// finality point. Pass the pruning point to anchor a full-history scan.
     pub block_hash: Option<RpcHash>,
+    /// With `block_hash == None`: serve the nearest retained frontier at-or-before the last
+    /// selected-chain block whose DAA score is strictly below this value — the node
+    /// binary-searches its chain index, so a wallet places a birthday anywhere in history
+    /// with one call. A node that predates this field ignores it and answers with the
+    /// finality point; callers detect that by `daa_score >= below_daa_score`.
+    #[serde(default)]
+    pub below_daa_score: Option<u64>,
 }
 
 impl Serializer for GetShieldedTreeStateRequest {
     fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        store!(u16, &2, writer)?;
+        store!(u16, &3, writer)?;
         store!(Option<RpcHash>, &self.block_hash, writer)?;
+        store!(Option<u64>, &self.below_daa_score, writer)?;
         Ok(())
     }
 }
@@ -490,7 +498,8 @@ impl Deserializer for GetShieldedTreeStateRequest {
     fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
         let version = load!(u16, reader)?;
         let block_hash = if version >= 2 { load!(Option<RpcHash>, reader)? } else { None };
-        Ok(Self { block_hash })
+        let below_daa_score = if version >= 3 { load!(Option<u64>, reader)? } else { None };
+        Ok(Self { block_hash, below_daa_score })
     }
 }
 

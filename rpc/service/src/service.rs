@@ -754,9 +754,17 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         // never be reorged (so a wallet can safely base its tree there), and its
         // per-block frontier snapshot is retained. An explicit block (e.g. the
         // pruning point) anchors a full-history scan at correct absolute positions.
-        let requested = match request.block_hash {
-            Some(h) => h,
-            None => session.async_finality_point().await,
+        let requested = match (request.block_hash, request.below_daa_score) {
+            (Some(h), _) => h,
+            // Birthday locator: the last chain block strictly below the DAA that still keeps a
+            // frontier. The consensus side binary-searches the chain index (DAA is monotone
+            // along the selected chain) and walks back to a retained checkpoint, so one call
+            // replaces a metadata walk of thousands of pages from genesis.
+            (None, Some(daa)) => match session.async_get_shielded_frontier_block_below_daa(daa).await? {
+                Some(h) => h,
+                None => return Err(RpcError::General(format!("no chain block with a retained shielded frontier below daa {daa}"))),
+            },
+            (None, None) => session.async_finality_point().await,
         };
         // Per-block frontiers exist for every retained block; below the pruning point only
         // the checkpointed blocks (one per ~1,000) keep one. When the requested block has

@@ -823,7 +823,7 @@ async fn sanity_test() {
                     // transparent-coinbase, so no notes are ever minted and the
                     // frontier is the empty tree.
                     let response =
-                        rpc_client.get_shielded_tree_state_call(None, GetShieldedTreeStateRequest { block_hash: None }).await.unwrap();
+                        rpc_client.get_shielded_tree_state_call(None, GetShieldedTreeStateRequest { block_hash: None, below_daa_score: None }).await.unwrap();
                     assert_eq!(response.size, 0, "transparent-coinbase simnet must have an empty shielded tree");
                 })
             }

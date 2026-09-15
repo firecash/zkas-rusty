@@ -273,6 +273,12 @@ impl ConsensusSessionOwned {
         self.clone().spawn_blocking(move |c| c.get_shielded_chain_range(low, limit)).await
     }
 
+    /// Last chain block strictly below `daa` with a retained shielded frontier (binary search
+    /// over the chain index) — places a wallet birthday anywhere in history in one call.
+    pub async fn async_get_shielded_frontier_block_below_daa(&self, daa: u64) -> ConsensusResult<Option<Hash>> {
+        self.clone().spawn_blocking(move |c| c.get_shielded_frontier_block_below_daa(daa)).await
+    }
+
     /// Serve a peer's shielded-history backfill request (see `get_shielded_history_below`).
     pub async fn async_get_shielded_history_indexed_below(
         &self,

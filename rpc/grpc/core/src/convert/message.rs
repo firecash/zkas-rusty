@@ -221,7 +221,7 @@ from!(item: RpcResult<&kaspa_rpc_core::GetSinkResponse>, protowire::GetSinkRespo
 });
 
 from!(item: &kaspa_rpc_core::GetShieldedTreeStateRequest, protowire::GetShieldedTreeStateRequestMessage, {
-    Self { block_hash: item.block_hash.map(|h| h.to_string()).unwrap_or_default() }
+    Self { block_hash: item.block_hash.map(|h| h.to_string()).unwrap_or_default(), below_daa_score: item.below_daa_score.unwrap_or(0) }
 });
 from!(item: RpcResult<&kaspa_rpc_core::GetShieldedTreeStateResponse>, protowire::GetShieldedTreeStateResponseMessage, {
     Self {
@@ -829,7 +829,10 @@ try_from!(item: &protowire::GetSinkResponseMessage, RpcResult<kaspa_rpc_core::Ge
 });
 
 try_from!(item: &protowire::GetShieldedTreeStateRequestMessage, kaspa_rpc_core::GetShieldedTreeStateRequest, {
-    Self { block_hash: if item.block_hash.is_empty() { None } else { Some(RpcHash::from_str(&item.block_hash)?) } }
+    Self {
+        block_hash: if item.block_hash.is_empty() { None } else { Some(RpcHash::from_str(&item.block_hash)?) },
+        below_daa_score: (item.below_daa_score != 0).then_some(item.below_daa_score),
+    }
 });
 try_from!(item: &protowire::GetShieldedTreeStateResponseMessage, RpcResult<kaspa_rpc_core::GetShieldedTreeStateResponse>, {
     Self {
