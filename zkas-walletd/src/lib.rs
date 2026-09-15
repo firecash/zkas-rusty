@@ -169,6 +169,17 @@ const PASS_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
 /// wallet. One pathological wallet now slows itself down instead of everyone.
 const LAP_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// A wallet still at least this many blocks behind the tip keeps taking chunks within
+/// ONE pass instead of stopping after `PAGES_PER_CHUNK` pages and waiting for the lap's
+/// stragglers. Measured 2026-09-15 on the hosted daemon: the box sat 90% idle while a
+/// restoring wallet crawled at ~140 blocks/s — exactly 4,000 blocks per 30 s lap — because
+/// every lap ran to `LAP_BUDGET` on a few note-heavy wallets and the fast ones idled.
+/// The lock is still dropped between chunks, so status keeps interleaving.
+const CATCHUP_BURST_MIN_BEHIND: u64 = 20_000;
+/// The burst's per-pass time budget: comfortably under `LAP_BUDGET`, so a bursting wallet
+/// is never one of the stragglers a lap detaches.
+const CATCHUP_BURST_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+
 /// How long a lap waits for a free sync slot before moving on to the next wallet.
 ///
 /// Short on purpose: a full budget means other wallets are mid-pass, and waiting on them
@@ -4877,8 +4888,31 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
     // behind rather than idle: "caught up" would be a claim about the chain that this
     // daemon currently cannot see, and the UI would show a partial balance as final.
     let Some(sync_client) = state.sync_client().await else { return SyncOutcome::Behind };
-    e.sync_chunk(&sync_client, &state.page_cache, &state.warm_gate, &state, &token, was_caught_up, state.resources.subtree_free_floor_mb, shared_tree_covers, shared_tree_base)
-        .await;
+    // One chunk per pass for a wallet near the tip; a wallet far behind bursts through
+    // more chunks while the pass budget lasts (see `CATCHUP_BURST_MIN_BEHIND`). The shared
+    // chain tree keeps its single chunk: it holds its lock across a chunk and every other
+    // wallet reads its published reach between passes.
+    let pass_started = std::time::Instant::now();
+    let mut was_caught_up = was_caught_up;
+    loop {
+        e.sync_chunk(&sync_client, &state.page_cache, &state.warm_gate, &state, &token, was_caught_up, state.resources.subtree_free_floor_mb, shared_tree_covers, shared_tree_base)
+            .await;
+        let behind_by = chain_len.saturating_sub(e.scanned as u64);
+        if token == CHAIN_TREE_TOKEN
+            || e.caught_up
+            || e.error.is_some()
+            || behind_by < CATCHUP_BURST_MIN_BEHIND
+            || pass_started.elapsed() >= CATCHUP_BURST_BUDGET
+        {
+            break;
+        }
+        // Let queued status/history calls on this wallet through before the next chunk.
+        drop(e);
+        tokio::task::yield_now().await;
+        e = w.lock().await;
+        e.chain_len = chain_len;
+        was_caught_up = false;
+    }
     // A borrowing wallet's mirror tree is stale by construction; make it current again
     // by taking the shared tree's frontier. `adopt_tip_frontier` REFUSES unless the
     // frontier describes exactly this wallet's leaf count — the frontier at N leaves is
