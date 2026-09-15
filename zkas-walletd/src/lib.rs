@@ -3886,15 +3886,24 @@ impl AppState {
         // failed on the first page ("cannot find header"). Start from the pruning point
         // instead: every birthday between it and the finality checkpoint (~1.5 days)
         // fast-syncs; an older one falls through to the full scan below.
-        let walk_from = if older_than_checkpoint {
-            match self.request_client().await?.get_block_dag_info().await {
-                Ok(info) => info.pruning_point_hash,
-                Err(_) => guard,
+        let walked = if older_than_checkpoint {
+            // Headers survive only back to the pruning point, so try from there first — a
+            // birthday below it fails on the first page, cheaply. Then from genesis: the
+            // archive chain index enumerates from genesis on a complete-history node, and a
+            // node with the archive-record metadata fallback can place the birthday below
+            // the pruning point too (an older node errors on the first page → full scan).
+            let pp = self.request_client().await?.get_block_dag_info().await.ok().map(|i| i.pruning_point_hash);
+            let mut w = None;
+            if let Some(pp) = pp {
+                w = self.birthday_start(pp, birthday).await;
             }
+            if w.is_none() {
+                w = self.birthday_start(guard, birthday).await;
+            }
+            w
         } else {
-            cp.block_hash
+            self.birthday_start(cp.block_hash, birthday).await
         };
-        let walked = self.birthday_start(walk_from, birthday).await;
         if older_than_checkpoint && walked.is_none() {
             log::info!(
                 "wallet birthday {birthday} precedes fast-sync checkpoint (daa {}) and this node cannot walk the chain back to it; full scan required",
@@ -3945,6 +3954,26 @@ impl AppState {
     /// a large finality window is cheap. Returns `None` on any RPC error, a reorg during
     /// the walk, or if the tip is reached before `birthday` — the caller then starts from
     /// the checkpoint as before.
+    /// The tree frontier to start scanning from for `base` (the last chain block strictly
+    /// below the birthday). A retained block answers with its own frontier. Below the pruning
+    /// point only checkpointed blocks keep one, and the node answers a bare request with the
+    /// nearest checkpoint AT OR AFTER the block — which could sit past the birthday and skip
+    /// its notes — so that answer is accepted only if it is `base` itself. Otherwise ask again
+    /// from two walk pages earlier: the node searches at most 2,100 blocks forward from there,
+    /// so its answer is at or before `base`. The wallet scans a few thousand extra blocks
+    /// instead of the whole chain.
+    async fn frontier_at_or_before(&self, base: RpcHash, two_back: Option<RpcHash>) -> Option<(RpcHash, u64, u64, RpcHash, Vec<RpcHash>)> {
+        if let Ok(ts) = self.request_client().await?.get_shielded_tree_state(Some(base)).await {
+            if ts.block_hash == base {
+                return Some((ts.block_hash, ts.daa_score, ts.size, ts.leaf, ts.ommers));
+            }
+        }
+        let earlier = two_back?;
+        let ts = self.request_client().await?.get_shielded_tree_state(Some(earlier)).await.ok()?;
+        log::info!("birthday below the node's retained headers: starting from frontier checkpoint at daa {} (block {})", ts.daa_score, ts.block_hash);
+        Some((ts.block_hash, ts.daa_score, ts.size, ts.leaf, ts.ommers))
+    }
+
     async fn birthday_start(&self, from: RpcHash, birthday: u64) -> Option<(RpcHash, u64, u64, RpcHash, Vec<RpcHash>)> {
         const WALK_PAGE: u64 = 2000; // RPC MAX_LIMIT — few round-trips across the window
         let mut cursor = from;
@@ -3952,6 +3981,12 @@ impl AppState {
         // ITS frontier so that scanning resumes at (and trial-decrypts) the birthday block
         // itself — a note received *in* the birthday block must not be skipped.
         let mut base_below: Option<RpcHash> = None;
+        // First block of the previous page and of the one before it. Below the pruning point
+        // the node serves the nearest frontier checkpoint AT OR AFTER the block it is asked
+        // for, so to get one at-or-before `base` we ask from two full pages back (≥3,999
+        // blocks earlier; the node searches at most 2,100 forward). See frontier_at_or_before.
+        let mut one_back: Option<RpcHash> = None;
+        let mut two_back: Option<RpcHash> = None;
         // Bound the walk (a 2000-block page × this cap covers many millions of blocks).
         for pages in 0..4000u32 {
             let page = match self.request_client().await?.get_shielded_block_metadata(cursor, WALK_PAGE).await {
@@ -3981,10 +4016,11 @@ impl AppState {
                 // No block below birthday anywhere (birthday <= first block past the
                 // checkpoint) → nothing to skip; let the caller start from the checkpoint.
                 let base = base_below?;
-                let ts = self.request_client().await?.get_shielded_tree_state(Some(base)).await.ok()?;
-                return Some((ts.block_hash, ts.daa_score, ts.size, ts.leaf, ts.ommers));
+                return self.frontier_at_or_before(base, two_back).await;
             }
             base_below = Some(last.hash);
+            two_back = one_back;
+            one_back = page.blocks.first().map(|b| b.hash);
             cursor = last.hash;
             // Short page → we walked all the way to the tip without reaching the birthday,
             // which is exactly what a wallet born *now* looks like (its birthday is the
@@ -3994,8 +4030,7 @@ impl AppState {
             // blocks of history it could not possibly appear in.
             if (page.blocks.len() as u64) < WALK_PAGE {
                 let base = base_below?;
-                let ts = self.request_client().await?.get_shielded_tree_state(Some(base)).await.ok()?;
-                return Some((ts.block_hash, ts.daa_score, ts.size, ts.leaf, ts.ommers));
+                return self.frontier_at_or_before(base, two_back).await;
             }
         }
         None
