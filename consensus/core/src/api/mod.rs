@@ -585,6 +585,15 @@ pub trait ConsensusApi: Send + Sync {
         unimplemented!()
     }
 
+    /// The last selected-chain block strictly below `daa` that still has a retained shielded
+    /// tree frontier — found by binary search over the chain index (DAA is non-decreasing
+    /// along the chain), so a wallet can place a birthday anywhere in history with ONE call
+    /// instead of walking thousands of metadata pages. `Ok(None)` = nothing below `daa` in
+    /// the retained index (older than this node's history base), or no frontier within reach.
+    fn get_shielded_frontier_block_below_daa(&self, _daa: u64) -> ConsensusResult<Option<Hash>> {
+        unimplemented!()
+    }
+
     /// Serve a shielded-history backfill request: this node's scan records for the chain blocks
     /// immediately BELOW `anchor` on its own selected chain, newest first, plus whether the walk
     /// reached genesis.

@@ -789,6 +789,56 @@ impl ConsensusApi for Consensus {
         Ok(Some(hashes))
     }
 
+    fn get_shielded_frontier_block_below_daa(&self, daa: u64) -> ConsensusResult<Option<Hash>> {
+        // Below the pruning point one chain block in ~1,000 keeps a frontier checkpoint, so a
+        // bounded backward search from the located block always reaches one; above it every
+        // block has one and the first probe hits.
+        const FRONTIER_SEARCH: u64 = 2100;
+        let _guard = self.pruning_lock.blocking_read();
+        let sc = self.storage.selected_chain_store.read();
+        // Index 0 is the history base (genesis on a complete-history node).
+        let low = 0u64;
+        let Some((tip, _)) = sc.get_tip().optional().unwrap() else { return Ok(None) };
+        let daa_of = |index: u64| -> Option<(Hash, u64)> {
+            let hash = sc.get_by_index(index).optional().unwrap()?;
+            // Header when retained, else the archive record (headers are gone below the
+            // pruning point; the archive keeps hash/blue/daa for every chain block).
+            let daa = match self.headers_store.get_daa_score(hash) {
+                Ok(d) => d,
+                Err(_) => self.virtual_processor.shielded_chain_block_data(hash).ok()?.daa_score,
+            };
+            Some((hash, daa))
+        };
+        // First chain index whose DAA reaches `daa`.
+        let (mut lo, mut hi) = (low, tip + 1);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            match daa_of(mid) {
+                Some((_, d)) if d >= daa => hi = mid,
+                Some(_) => lo = mid + 1,
+                None => return Ok(None),
+            }
+        }
+        if lo == low {
+            // Nothing strictly below `daa` in the index: the caller is older than this node's
+            // history base and must anchor a full scan instead.
+            return Ok(None);
+        }
+        // `lo - 1` is the last block strictly below; walk back to one with a retained frontier.
+        let mut index = lo - 1;
+        for _ in 0..FRONTIER_SEARCH {
+            let Some(hash) = sc.get_by_index(index).optional().unwrap() else { return Ok(None) };
+            if self.virtual_processor.shielded_frontier_at(hash).is_ok() {
+                return Ok(Some(hash));
+            }
+            if index == low {
+                return Ok(None);
+            }
+            index -= 1;
+        }
+        Ok(None)
+    }
+
     fn get_shielded_history_base(&self) -> Hash {
         let _guard = self.pruning_lock.blocking_read();
         let sc = self.storage.selected_chain_store.read();

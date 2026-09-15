@@ -159,7 +159,7 @@ pub trait RpcApi: Sync + Send + AnySync {
     /// error for RPC clients that don't implement it (e.g. wRPC); the gRPC client and
     /// the node service provide it.
     async fn get_shielded_tree_state(&self, block_hash: Option<RpcHash>) -> RpcResult<GetShieldedTreeStateResponse> {
-        self.get_shielded_tree_state_call(None, GetShieldedTreeStateRequest { block_hash }).await
+        self.get_shielded_tree_state_call(None, GetShieldedTreeStateRequest { block_hash, below_daa_score: None }).await
     }
     async fn get_shielded_tree_state_call(
         &self,

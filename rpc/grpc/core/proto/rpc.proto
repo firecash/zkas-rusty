@@ -245,6 +245,9 @@ message GetSinkResponseMessage {
 // tree positions once pruning has moved past genesis.
 message GetShieldedTreeStateRequestMessage {
   string blockHash = 1;                 // optional explicit chain block (hex); empty = finality point
+  uint64 belowDaaScore = 2;             // optional (0 = unset): when blockHash is empty, serve the nearest
+                                        // retained frontier at-or-before the last chain block whose DAA is
+                                        // strictly below this — places a wallet birthday in ONE call
 }
 
 message GetShieldedTreeStateResponseMessage {
