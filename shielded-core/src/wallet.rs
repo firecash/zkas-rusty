@@ -832,11 +832,12 @@ pub mod build {
     /// state, so this holds. Every spend is authorized by the sender's single spend
     /// authority. Builds its own `ProvingKey`; heavy (a real Halo 2 proof whose cost
     /// grows with the number of inputs).
-    /// `recoverable` encrypts each output's details to the sender's own OVK
-    /// (Zcash-standard), so the wallet's chain-derived history can recover the
-    /// recipient/amount/memo of this send after any seed restore. Off = the old
-    /// behaviour: even the sender cannot recover who was paid. `memo` rides in
-    /// the recipient's encrypted note (zeros = no memo).
+    /// Every output's details are encrypted to the sender's own OVK (Zcash-standard),
+    /// so the wallet's chain-derived history — on any device holding the full viewing
+    /// key — can recover the recipient/amount/memo of this send after a restore.
+    /// `recoverable` is retained for API compatibility and no longer switches this off
+    /// (an unrecoverable send helped nobody: not even the sender could see who was
+    /// paid). `memo` rides in the recipient's encrypted note (zeros = no memo).
     #[allow(clippy::too_many_arguments)]
     pub fn build_wallet_payment(
         owner_seed: [u8; 32],
@@ -863,8 +864,8 @@ pub mod build {
     /// the same standard-mass ceiling it already uses for spends.
     ///
     /// Each payee's note is encrypted to that payee alone, so recipients learn nothing
-    /// about each other's amounts; `recoverable` governs only the *sender's* later
-    /// ability to recover the batch through its own OVK. Fails if `payees` is empty, if
+    /// about each other's amounts; the sender's own OVK can always recover the batch
+    /// (`recoverable` is retained for API compatibility only). Fails if `payees` is empty, if
     /// any address is malformed, or if the inputs do not cover `sum(amounts) + fee`.
     #[allow(clippy::too_many_arguments)]
     pub fn build_wallet_payment_multi(
@@ -882,7 +883,15 @@ pub mod build {
         }
         let keys = ShieldedKeys::from_seed(owner_seed).ok_or(BuildError::Empty)?;
         let change_addr = keys.address();
-        let ovk = recoverable.then(|| keys.fvk.to_ovk(Scope::External));
+        // ALWAYS encrypt outputs to the sender's own external OVK (Zcash-standard). Only a
+        // holder of this wallet's full viewing key can read them, so nothing leaks to the
+        // chain — and a view-only copy of the wallet (another device, an auditor, the
+        // owner after a restore) can recover where every send went. Sends built without
+        // it were unrecoverable by ANYONE, forever, which is what a "view key wallet shows
+        // no destination" report turned out to be. `recoverable` is kept for API
+        // compatibility; it no longer changes the encryption.
+        let _ = recoverable;
+        let ovk = Some(keys.fvk.to_ovk(Scope::External));
 
         // Resolve every payee before touching the builder, so a malformed address
         // fails the whole batch rather than emitting a partial one.
@@ -979,7 +988,9 @@ pub mod build {
         memo: [u8; 512],
     ) -> Result<PreparedPayment, BuildError> {
         use group::ff::PrimeField;
-        let ovk = recoverable.then(|| fvk.to_ovk(Scope::External));
+        // Always the sender's own external OVK — see `build_wallet_payment_multi`.
+        let _ = recoverable;
+        let ovk = Some(fvk.to_ovk(Scope::External));
 
         let (first_note, first_path) = inputs.first().ok_or(BuildError::Empty)?;
         let recipient = Option::<Address>::from(Address::from_raw_address_bytes(&recipient_addr)).ok_or(BuildError::Empty)?;

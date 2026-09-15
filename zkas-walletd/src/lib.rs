@@ -1797,6 +1797,35 @@ fn decode_block(b: &kaspa_rpc_core::RpcShieldedChainBlock) -> DecodedBlock {
 
 /// Chunk a node's concatenated compact-action bytes into [`CompactActionRecord`]s.
 /// `None` if the length is not a whole number of 148-byte records.
+/// The full shielded bundle of `txid`, which chain block `chain` ACCEPTED. The tx body lives
+/// in `chain` itself or in one of its mergeset blocks, so fetch those with transactions and
+/// match on the id. `None` when the node no longer holds the block bodies (pruned) or the
+/// tx carries no shielded bundle.
+async fn fetch_bundle_for_tx(client: &GrpcClient, chain: RpcHash, txid: &[u8; 32]) -> Option<ShieldedBundle> {
+    let first = tokio::time::timeout(SYNC_RPC_TIMEOUT, client.get_block(chain, true)).await.ok()?.ok()?;
+    let mut candidates = vec![chain];
+    if let Some(v) = &first.verbose_data {
+        candidates.extend(v.merge_set_blues_hashes.iter().copied());
+        candidates.extend(v.merge_set_reds_hashes.iter().copied());
+    }
+    let find = |b: &kaspa_rpc_core::RpcBlock| -> Option<ShieldedBundle> {
+        b.transactions
+            .iter()
+            .find(|t| t.verbose_data.as_ref().is_some_and(|v| v.transaction_id.as_bytes() == *txid))
+            .and_then(|t| ShieldedBundle::from_bytes(&t.payload).ok())
+    };
+    if let Some(b) = find(&first) {
+        return Some(b);
+    }
+    for h in candidates.into_iter().skip(1) {
+        let Ok(Ok(blk)) = tokio::time::timeout(SYNC_RPC_TIMEOUT, client.get_block(h, true)).await else { continue };
+        if let Some(b) = find(&blk) {
+            return Some(b);
+        }
+    }
+    None
+}
+
 fn decode_compact_actions(bytes: &[u8]) -> Option<Vec<CompactActionRecord>> {
     if bytes.len() % CompactActionRecord::SERIALIZED_LEN != 0 {
         return None;
@@ -2025,6 +2054,11 @@ struct WalletEntry {
     /// When the checkpoint was last written (or the entry created) — the time-based
     /// checkpoint rule in `sync_one_wallet` is measured from here.
     last_checkpoint_at: std::time::Instant,
+    /// How many history rows have been examined for send-detail recovery (see
+    /// `recover_sent_details`). Rows below this index are not re-examined in this
+    /// process — a failed fetch (block body pruned, node without the locator) is retried
+    /// only on the next load, never every pass.
+    history_examined: usize,
     /// `(blue_score, absolute leaf count)` after each ingested chain block,
     /// oldest→newest, capped at [`MATURED_RING`]. `send` picks the newest entry
     /// at least `anchor_depth + slack` blue units below the sink to root a spend
@@ -2208,6 +2242,7 @@ impl WalletEntry {
             error: None,
             saved_scanned: scanned,
             last_checkpoint_at: std::time::Instant::now(),
+            history_examined: 0,
             boundaries,
             sink_blue,
             reorged_strikes: 0,
@@ -2231,6 +2266,57 @@ impl WalletEntry {
             subtree_low_mem_logged: false,
             force_checkpoint: false,
             blind_below: 0,
+        }
+    }
+
+    /// Recover recipient / paid amount / memo / fee for this wallet's own sends whose history
+    /// rows were written from compact scan records (no `out_ciphertext` there). For each
+    /// such row not yet examined: find its chain block — by DAA in the page just ingested,
+    /// else through the node's DAA locator for rows recorded before this daemon could do
+    /// this — fetch that block and its mergeset with transactions, locate the txid, and let
+    /// the wallet decrypt the outputs with its outgoing viewing key. A view-key wallet thus
+    /// sees where its money went, just like the spending wallet does. Bounded per pass;
+    /// a row whose block body is gone (pruned) or whose node lacks the locator stays as it
+    /// was and is retried on the next load only.
+    async fn recover_sent_details(&mut self, client: &GrpcClient, page: &[DecodedBlock]) {
+        const MAX_PER_PASS: usize = 8;
+        let from = self.history_examined.min(self.db.history().len());
+        let pending = self.db.unrecovered_sends(from);
+        self.history_examined = self.db.history().len();
+        if pending.is_empty() {
+            return;
+        }
+        let mut done = 0usize;
+        for (txid, daa) in pending.into_iter().take(MAX_PER_PASS) {
+            // The chain block that accepted the tx: same DAA as the row (rows are dated by
+            // the accepting chain block's metadata).
+            let chain = match page.iter().find(|b| b.daa_score == daa) {
+                Some(b) => Some(b.hash),
+                None => {
+                    // Backfill: rows from before this daemon could recover details. Ask the
+                    // node for the chain block at this DAA (locator: last block strictly
+                    // below daa+1). A node without the locator answers its finality point,
+                    // whose DAA will not match — skipped.
+                    let req = kaspa_rpc_core::GetShieldedTreeStateRequest { block_hash: None, below_daa_score: Some(daa + 1) };
+                    match tokio::time::timeout(SYNC_RPC_TIMEOUT, client.get_shielded_tree_state_call(None, req)).await {
+                        Ok(Ok(ts)) if ts.daa_score == daa => Some(ts.block_hash),
+                        _ => None,
+                    }
+                }
+            };
+            let Some(chain) = chain else { continue };
+            let Some(bundle) = fetch_bundle_for_tx(client, chain, &txid).await else { continue };
+            let recovered = self.db.recover_sent_from_bundle(&txid, &bundle);
+            done += 1;
+            log::info!(
+                "history: own send {} at daa {daa} — {}",
+                hex(&txid[..8]),
+                if recovered { "recipient/amount/memo/fee recovered from the full transaction" } else { "fee recovered; no recipient (sent without this wallet's OVK)" }
+            );
+        }
+        if done > 0 {
+            // Persist what was recovered on the next checkpoint rather than waiting 1000 blocks.
+            self.force_checkpoint = true;
         }
     }
 
@@ -2600,6 +2686,13 @@ impl WalletEntry {
                 (advanced, at_margin)
             });
             self.page_ingest_ns += t_ingest.elapsed().as_nanos();
+            // Own sends ingested from compact records have no recipient/memo/fee yet — fetch
+            // the full transaction for each new Sent row and recover them with the OVK. Rare
+            // per wallet (one fetch per own send), bounded, best-effort; async, so it lives
+            // outside the blocking ingest section above.
+            if advanced && self.recoverable_history && !self.db.is_leaves_only() {
+                self.recover_sent_details(client, &resp.blocks).await;
+            }
             // Publish what this pass has reached so far. Without this the only progress
             // report is the one after the pass ENDS, which for an initial scan means the
             // user watches "opening" for minutes while the daemon is in fact working
@@ -4312,6 +4405,29 @@ impl AppState {
         Some(best.max(disk)).filter(|&v| v > 0)
     }
 
+    /// The node's tree frontier at the cursor of the checkpoint file currently on disk for
+    /// `token` — what `load_checkpoint` binds a restored tree to. `Ok(None)` when there is
+    /// no usable checkpoint file; `Err` when the node could not answer (timeout / RPC
+    /// error), which callers treat as "try again later", never as permission to trust the
+    /// file unverified.
+    async fn frontier_at_checkpoint_cursor(
+        &self,
+        token: &str,
+        genesis: &RpcHash,
+    ) -> Result<Option<kaspa_shielded_core::tree::FrontierState>, String> {
+        let Some(cursor) = checkpoint_cursor(&self.wallet_dir, token, genesis) else { return Ok(None) };
+        let c = self.request_client().await.ok_or_else(|| "no node connection".to_string())?;
+        let ts = tokio::time::timeout(std::time::Duration::from_secs(8), c.get_shielded_tree_state(Some(cursor)))
+            .await
+            .map_err(|_| format!("cursor verification timed out ({cursor})"))?
+            .map_err(|e| e.to_string())?;
+        Ok(Some(kaspa_shielded_core::tree::FrontierState {
+            size: ts.size,
+            leaf: (ts.size > 0).then(|| ts.leaf.as_bytes()),
+            ommers: ts.ommers.iter().map(|o| o.as_bytes()).collect(),
+        }))
+    }
+
     async fn get_wallet(self: &Arc<Self>, token: &str) -> Option<Wallet> {
         // Mark the wallet active so the sync loop keeps it current; idle wallets are
         // parked (see `sync_loop`).
@@ -4452,7 +4568,21 @@ impl AppState {
             _ => match key.fvk_bytes() {
                 Some(fvk) => match self.adopt_twin(token, &fvk, birthday).await {
                     Some((donor, keep_birthday)) => {
-                        match load_checkpoint(&self.wallet_dir, token, key, &genesis, tip.as_ref()) {
+                        // The copied file carries the DONOR's cursor. Verify it against the
+                        // node's frontier at THAT block — not `tip`, fetched above for this
+                        // wallet's own, different cursor. Comparing the donor's tree against
+                        // the wrong block's frontier made every adopted twin look "divergent"
+                        // (its size can never match another block's) and sent BOTH wallets back
+                        // to a birthday rescan on every load — the daily mass-rescan source, and
+                        // the 20,087-iteration loop described below.
+                        let twin_tip = match self.frontier_at_checkpoint_cursor(token, &genesis).await {
+                            Ok(t) => t,
+                            Err(e) => {
+                                log::warn!("wallet {token}: cannot verify the adopted twin checkpoint ({e}); retrying later");
+                                return None;
+                            }
+                        };
+                        match load_checkpoint(&self.wallet_dir, token, key, &genesis, twin_tip.as_ref()) {
                             Some(restored) => {
                                 log::info!(
                                     "wallet {token}: adopted checkpoint from twin token {donor} (birthday {keep_birthday}) instead of rescanning from {birthday}"

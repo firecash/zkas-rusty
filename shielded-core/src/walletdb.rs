@@ -1160,6 +1160,69 @@ impl WalletDb {
         self.push_history(entry);
     }
 
+    /// Sent rows still missing what only the full transaction can tell: recipient, paid
+    /// amount, memo and fee. A row ingested from compact records is stored as a bare net
+    /// outflow (`fee_known == false`); this lists them oldest-first as `(txid, daa)` so the
+    /// daemon can fetch each transaction's full bundle and call
+    /// [`Self::recover_sent_from_bundle`]. Rows already attempted are marked `fee_known`
+    /// whether or not a recipient came out, so a send built without our OVK is never
+    /// re-fetched.
+    pub fn unrecovered_sends(&self, from: usize) -> Vec<([u8; 32], u64)> {
+        self.history
+            .iter()
+            .skip(from)
+            .filter(|h| h.kind == HistoryKind::Sent && h.recipient.is_none() && !h.fee_known)
+            .map(|h| (h.txid, h.daa_score))
+            .collect()
+    }
+
+    /// Fill in a compact-ingested Sent row from the transaction's full bundle: recipient,
+    /// paid amount and memo via our outgoing viewing key (when the send was built with
+    /// it), and the exact fee from the value balance. Same recovery as
+    /// [`Self::record_bundle_history`], applied to a row that already exists. Returns
+    /// whether a recipient was recovered. The row is marked `fee_known` either way.
+    pub fn recover_sent_from_bundle(&mut self, txid: &[u8; 32], bundle: &ShieldedBundle) -> bool {
+        let Some(pos) = self.history.iter().rposition(|h| h.kind == HistoryKind::Sent && &h.txid == txid) else {
+            return false;
+        };
+        let fee = bundle.value_balance.max(0) as u64;
+        let mut recipient = None;
+        let mut memo = Vec::new();
+        let mut recovered_paid = 0u64;
+        for a in &bundle.actions {
+            let Some(action) = reconstruct_action(a) else { continue };
+            let domain = OrchardDomain::for_action(&action);
+            let Some((note, addr, m)) =
+                try_output_recovery_with_ovk(&domain, &self.ovk, &action, action.cv_net(), &a.out_ciphertext)
+            else {
+                continue;
+            };
+            let addr_bytes = addr.to_raw_address_bytes();
+            if addr_bytes == self.my_address {
+                continue; // our own change
+            }
+            recovered_paid = recovered_paid.saturating_add(note.value().inner());
+            if recipient.is_none() {
+                recipient = Some(addr_bytes);
+                memo = trim_memo(&m);
+            }
+        }
+        let h = &mut self.history[pos];
+        let net_out = if h.amount_is_net_outflow { h.amount } else { h.amount.saturating_add(h.fee) };
+        h.fee = fee;
+        h.fee_known = true;
+        h.amount_is_net_outflow = false;
+        if recipient.is_some() {
+            h.amount = recovered_paid;
+            h.recipient = recipient;
+            h.memo = memo;
+            true
+        } else {
+            h.amount = net_out.saturating_sub(fee);
+            false
+        }
+    }
+
     fn push_history(&mut self, entry: HistoryEntry) {
         if self.history.len() >= HISTORY_CAP {
             // Drop the oldest half in one move instead of shifting per push.
