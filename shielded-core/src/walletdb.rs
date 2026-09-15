@@ -687,6 +687,16 @@ impl WalletDb {
         self.my_address
     }
 
+    /// The wallet's diversified address at `index` (0 = [`Self::my_address_bytes`]).
+    /// Every diversified address of a wallet is paid into the SAME notes/balance and is
+    /// found by the same scan: trial decryption uses the incoming viewing key, which does
+    /// not depend on the diversifier, and a received note carries the diversified address
+    /// it was sent to (recorded in its history row). So a service can hand each customer
+    /// their own address and attribute deposits by address — no memo required.
+    pub fn address_bytes_at(&self, index: u32) -> [u8; 43] {
+        self.fvk().address_at(index, Scope::External).to_raw_address_bytes()
+    }
+
     /// Build a wallet that **fast-syncs** from a checkpoint frontier: the tree starts
     /// at the checkpoint's leaf count, and only leaves appended *after* the checkpoint
     /// are scanned and stored — so sync cost is O(blocks since the checkpoint), not

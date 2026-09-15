@@ -171,7 +171,7 @@ curl -X POST -H "X-Wallet-Token: $TOK" http://127.0.0.1:8501/api/wallet/create
 | `POST` | `/api/wallet/create` | New wallet. **Returns the seed once** — store it. |
 | `POST` | `/api/wallet/import` | Import a seed. Accepts a `birthday` (DAA or date) to skip replaying earlier chain. |
 | `POST` | `/api/wallet/watch` | Register **watch-only** from a full viewing key. Cannot spend. |
-| `GET` | `/api/wallet/address` | Shielded `zkas:` receive address. |
+| `GET` | `/api/wallet/address` | Shielded `zkas:` receive address. `?index=N` returns the wallet's N-th **diversified** address — a distinct address paying into the same wallet, found by the same scan (see §6b). |
 | `GET` | `/api/wallet/reveal` | Reveal the seed (gated). |
 | `GET` | `/api/wallet/balance` | Balance + sync status (see §5). |
 | `GET` | `/api/wallet/history` | Chain-derived history. Opt-in — see `settings`. |
@@ -684,31 +684,42 @@ being starved — check whether something keeps a payment permanently in flight.
 
 #### The deposit-attribution problem — read before designing anything
 
-**One wallet has exactly one address.** `/api/wallet/address` returns
-`address_at(0, External)` and always the same string; there is no endpoint that mints a
-fresh per-customer address. So there are two workable designs, and one of them does not
-scale:
+A wallet has one key but **unlimited addresses**. `GET /api/wallet/address?index=N` returns
+the wallet's N-th Orchard *diversified* address (index 0 is the address the endpoint always
+returned). Every diversified address pays into the same wallet and is found by the same
+scan — trial decryption is keyed on the incoming viewing key, which does not depend on the
+diversifier — and each received note carries the diversified address it was paid to, which
+its history row reports as `recipient`. On-chain the addresses are unlinkable: nobody but
+the wallet can tell that two of them belong to the same key.
+
+Three designs, one of which does not scale:
 
 | Design | How | Verdict |
 | --- | --- | --- |
-| **One wallet per customer** | a token per customer, each its own `.scan` file | **Does not scale.** Every wallet syncs independently; 350 loaded wallets already strain a 4-core box. Fine for hundreds, not for hundreds of thousands. |
-| **One deposit wallet + memo** | every customer gets the same address plus a unique memo/payment-id | **Use this.** The XRP/XLM destination-tag pattern. One wallet, one scan. |
+| **One wallet, one diversified address per customer** | `address?index=<customer id>` at signup; attribute deposits by `recipient` in `/api/wallet/history` | **Use this.** The standard exchange model — a per-customer address, nothing for the customer to type. One wallet, one scan. |
+| **One wallet + memo** | every customer gets the same address plus a unique memo/payment-id | Works (the XRP/XLM destination-tag pattern) but customers forget memos and other exchanges do not ask for one. Keep as a fallback for legacy flows. |
+| **One wallet per customer** | a token per customer, each its own `.scan` file | **Does not scale.** Every wallet syncs independently; 350 loaded wallets already strain a 4-core box. |
 
-Memos survive on the receive side and are readable per transaction:
+Per-customer addresses, end to end:
 
 ```bash
-# enable the readable record first — off by default
+# enable the readable record first — off by default; without it no history rows are kept
 curl -X POST -H "X-Wallet-Token: $TOK" -H 'Content-Type: application/json' \
   -d '{"recoverable_history":true}' http://127.0.0.1:8501/api/wallet/settings
 
-curl -s -H "X-Wallet-Token: $TOK" http://127.0.0.1:8501/api/wallet/history \
-  | jq '.[] | select(.kind=="received") | {txid, amount, memo}'
+# at signup: give customer 4711 their own deposit address (store the index with the customer)
+curl -H "X-Wallet-Token: $TOK" "http://127.0.0.1:8501/api/wallet/address?index=4711"
+
+# credit deposits: every received row names the diversified address it was paid to
+curl -s -H "X-Wallet-Token: $TOK" "http://127.0.0.1:8501/api/wallet/history?limit=500" \
+  | jq '.rows[] | select(.kind=="received") | {txid, daaScore, amountZkas, recipient, memo}'
 ```
 
-Memos are up to 512 bytes and are **encrypted to the recipient** — nobody but your wallet
-sees them on-chain. Two caveats: a customer who forgets the memo produces an
-unattributable deposit (have a manual reconciliation path, as XRP exchanges do), and
-`recoverable_history` must be on or no memo is recorded to read back.
+Index is a `u32`; use your internal customer id or a counter and persist the mapping —
+the daemon does not remember which indexes you handed out (deriving is deterministic, so
+nothing is lost either way). Withdrawals need no memo: pay the customer's address like any
+other. Memos, when used, are up to 512 bytes and **encrypted to the recipient**; they are
+recorded only while `recoverable_history` is on.
 
 #### Recommended exchange configuration
 

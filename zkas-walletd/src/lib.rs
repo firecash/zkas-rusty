@@ -5849,17 +5849,36 @@ async fn load_new_wallet(
 #[derive(Serialize)]
 struct AddressResp {
     address: String,
+    /// Diversifier index this address was derived at (0 = the wallet's default address).
+    index: u32,
+}
+
+/// `?index=N` selects the wallet's N-th diversified address. All of them pay into the same
+/// wallet and are found by its one scan (trial decryption is keyed on the incoming viewing
+/// key, not the diversifier); each received history row names the diversified address that
+/// was paid. This is how a custodial service gives every customer a distinct deposit
+/// address and attributes deposits by address instead of by memo. Omitted = 0, the address
+/// this endpoint always returned.
+#[derive(Deserialize, Default)]
+struct AddressQuery {
+    index: Option<u32>,
 }
 
 async fn wallet_address(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    Query(query): Query<AddressQuery>,
 ) -> Result<Json<AddressResp>, (StatusCode, Json<serde_json::Value>)> {
     let token = token_from(&headers, state.allow_default_token)?;
     let w = state.get_wallet(&token).await.ok_or_else(|| err(StatusCode::NOT_FOUND, "no wallet loaded"))?;
     let e = w.lock().await;
-    let address = state.address_of(&e.db);
-    Ok(Json(AddressResp { address }))
+    let index = query.index.unwrap_or(0);
+    let address = if index == 0 {
+        state.address_of(&e.db)
+    } else {
+        String::from(&Address::new(state.prefix, Version::ShieldedOrchard, &e.db.address_bytes_at(index)))
+    };
+    Ok(Json(AddressResp { address, index }))
 }
 
 #[derive(Serialize)]
@@ -5952,7 +5971,7 @@ async fn wallet_watch(
             .await
             .ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "failed to resume wallet from checkpoint"))?;
         log::info!("re-registered watch-only wallet for token {token}: resumed from checkpoint (birthday kept {keep_birthday})");
-        return Ok(Json(AddressResp { address }));
+        return Ok(Json(AddressResp { address, index: 0 }));
     }
 
     // A new or changed key must not resume a DIFFERENT key's checkpoint stream.
@@ -5969,7 +5988,7 @@ async fn wallet_watch(
             log::info!(
                 "registered watch-only wallet for token {token}: adopted checkpoint from twin token {donor} (birthday {keep_birthday})"
             );
-            return Ok(Json(AddressResp { address }));
+            return Ok(Json(AddressResp { address, index: 0 }));
         }
         // The clone failed to load (corrupt donor file, node hiccup) — scan honestly.
         let _ = std::fs::remove_file(scan_path(&state.wallet_dir, &token));
@@ -5987,7 +6006,7 @@ async fn wallet_watch(
     state.wallets.lock().await.insert(token.clone(), Arc::new(Mutex::new(entry)));
     state.index_fvk(&token, &WalletKey::Fvk(fvk)).await;
     log::info!("registered watch-only wallet for token {token} (birthday {})", req.birthday);
-    Ok(Json(AddressResp { address }))
+    Ok(Json(AddressResp { address, index: 0 }))
 }
 
 #[derive(Serialize)]
