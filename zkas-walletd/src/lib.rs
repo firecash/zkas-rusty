@@ -3861,6 +3861,12 @@ impl AppState {
     /// balance ("fully synced but missing coins") because their older notes were
     /// behind the fast-sync base.
     async fn fast_sync_entry(&self, key: WalletKey, recoverable: bool, guard: RpcHash, birthday: u64) -> Option<WalletEntry> {
+        // Page budgets for the metadata walks (2,000 blocks per page, ~0.3 s each). Headers
+        // above the pruning point: generous — the finality window is a few dozen pages.
+        // From genesis through the archive (only a node with the archive fallbacks but no
+        // locator ever gets here): a short budget, because the request blocks meanwhile.
+        const WALK_PAGES_HEADERS: u32 = 4000;
+        const WALK_PAGES_ARCHIVE: u32 = 100;
         // Bound the checkpoint RPC: on a healthy chain it returns immediately, but the
         // node's finality-point walk can be pathologically slow on a degenerate DAG
         // (e.g. difficulty collapsed to the floor). Time it out and fall back to a full
@@ -3892,17 +3898,26 @@ impl AppState {
             // archive chain index enumerates from genesis on a complete-history node, and a
             // node with the archive-record metadata fallback can place the birthday below
             // the pruning point too (an older node errors on the first page → full scan).
-            let pp = self.request_client().await?.get_block_dag_info().await.ok().map(|i| i.pruning_point_hash);
-            let mut w = None;
-            if let Some(pp) = pp {
-                w = self.birthday_start(pp, birthday).await;
+            // ONE call first: the node binary-searches its chain index for the last block
+            // strictly below the birthday and serves the nearest retained frontier at-or-before
+            // it. A node without the locator answers with the finality point instead, which
+            // `frontier_below_daa` rejects, and the walks below take over.
+            let mut w = self.frontier_below_daa(birthday).await;
+            if w.is_none() {
+                let pp = self.request_client().await?.get_block_dag_info().await.ok().map(|i| i.pruning_point_hash);
+                if let Some(pp) = pp {
+                    w = self.birthday_start(pp, birthday, WALK_PAGES_HEADERS).await;
+                }
             }
             if w.is_none() {
-                w = self.birthday_start(guard, birthday).await;
+                // Bounded: a page costs ~0.3 s and the import/open request blocks for the
+                // whole walk, so past this budget a full scan (which runs in the background
+                // and survives restarts) is the better experience than a hung "Opening".
+                w = self.birthday_start(guard, birthday, WALK_PAGES_ARCHIVE).await;
             }
             w
         } else {
-            self.birthday_start(cp.block_hash, birthday).await
+            self.birthday_start(cp.block_hash, birthday, WALK_PAGES_HEADERS).await
         };
         if older_than_checkpoint && walked.is_none() {
             log::info!(
@@ -3974,7 +3989,26 @@ impl AppState {
         Some((ts.block_hash, ts.daa_score, ts.size, ts.leaf, ts.ommers))
     }
 
-    async fn birthday_start(&self, from: RpcHash, birthday: u64) -> Option<(RpcHash, u64, u64, RpcHash, Vec<RpcHash>)> {
+    /// Place `birthday` with the node's DAA locator: one `GetShieldedTreeState` call carrying
+    /// `below_daa_score` returns the nearest retained frontier at-or-before the last chain
+    /// block strictly below the birthday (the node binary-searches its chain index). A node
+    /// that predates the field ignores it and answers with its finality point — which, in the
+    /// only branch that calls this, lies at-or-past the birthday — so the `< birthday` check
+    /// tells the two apart and never lets an overshooting frontier skip the birthday's notes.
+    async fn frontier_below_daa(&self, birthday: u64) -> Option<(RpcHash, u64, u64, RpcHash, Vec<RpcHash>)> {
+        let req = kaspa_rpc_core::GetShieldedTreeStateRequest { block_hash: None, below_daa_score: Some(birthday) };
+        let ts = tokio::time::timeout(std::time::Duration::from_secs(30), self.request_client().await?.get_shielded_tree_state_call(None, req))
+            .await
+            .ok()?
+            .ok()?;
+        if ts.daa_score >= birthday {
+            return None;
+        }
+        log::info!("node placed birthday {birthday} at frontier daa {} (block {}) in one call", ts.daa_score, ts.block_hash);
+        Some((ts.block_hash, ts.daa_score, ts.size, ts.leaf, ts.ommers))
+    }
+
+    async fn birthday_start(&self, from: RpcHash, birthday: u64, max_pages: u32) -> Option<(RpcHash, u64, u64, RpcHash, Vec<RpcHash>)> {
         const WALK_PAGE: u64 = 2000; // RPC MAX_LIMIT — few round-trips across the window
         let mut cursor = from;
         // The last selected-chain block seen with daa < birthday. The tree starts from
@@ -3987,8 +4021,8 @@ impl AppState {
         // blocks earlier; the node searches at most 2,100 forward). See frontier_at_or_before.
         let mut one_back: Option<RpcHash> = None;
         let mut two_back: Option<RpcHash> = None;
-        // Bound the walk (a 2000-block page × this cap covers many millions of blocks).
-        for pages in 0..4000u32 {
+        // Bound the walk: `max_pages` × a 2000-block page.
+        for pages in 0..max_pages {
             let page = match self.request_client().await?.get_shielded_block_metadata(cursor, WALK_PAGE).await {
                 Ok(p) => p,
                 Err(e) => {
