@@ -692,13 +692,12 @@ diversifier — and each received note carries the diversified address it was pa
 its history row reports as `recipient`. On-chain the addresses are unlinkable: nobody but
 the wallet can tell that two of them belong to the same key.
 
-Three designs, one of which does not scale:
+Two designs, one of which does not scale:
 
 | Design | How | Verdict |
 | --- | --- | --- |
-| **One wallet, one diversified address per customer** | `address?index=<customer id>` at signup; attribute deposits by `recipient` in `/api/wallet/history` | **Use this.** The standard exchange model — a per-customer address, nothing for the customer to type. One wallet, one scan. |
-| **One wallet + memo** | every customer gets the same address plus a unique memo/payment-id | Works (the XRP/XLM destination-tag pattern) but customers forget memos and other exchanges do not ask for one. Keep as a fallback for legacy flows. |
-| **One wallet per customer** | a token per customer, each its own `.scan` file | **Does not scale.** Every wallet syncs independently; 350 loaded wallets already strain a 4-core box. |
+| **One wallet, one diversified address per customer** | `address?index=<customer id>` at signup; attribute deposits by `recipient` in `/api/wallet/history` | **Use this.** The standard exchange model — a per-customer address, nothing for the customer to type. One wallet, one scan, one seed. |
+| **One wallet per customer** | a token per customer (`/api/wallet/create`), each its own seed and `.scan` file, swept to a hot wallet | Works, but every customer is a separate scan and a separate seed to back up, and each sweep is a proving job. Fine for hundreds of customers; past that it is the design above with extra cost. |
 
 Per-customer addresses, end to end:
 
@@ -712,14 +711,12 @@ curl -H "X-Wallet-Token: $TOK" "http://127.0.0.1:8501/api/wallet/address?index=4
 
 # credit deposits: every received row names the diversified address it was paid to
 curl -s -H "X-Wallet-Token: $TOK" "http://127.0.0.1:8501/api/wallet/history?limit=500" \
-  | jq '.rows[] | select(.kind=="received") | {txid, daaScore, amountZkas, recipient, memo}'
+  | jq '.rows[] | select(.kind=="received") | {txid, daaScore, amountZkas, recipient}'
 ```
 
 Index is a `u32`; use your internal customer id or a counter and persist the mapping —
 the daemon does not remember which indexes you handed out (deriving is deterministic, so
-nothing is lost either way). Withdrawals need no memo: pay the customer's address like any
-other. Memos, when used, are up to 512 bytes and **encrypted to the recipient**; they are
-recorded only while `recoverable_history` is on.
+nothing is lost either way). Withdrawals: pay the customer's address like any other.
 
 #### Recommended exchange configuration
 
