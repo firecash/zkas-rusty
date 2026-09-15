@@ -754,12 +754,39 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         // never be reorged (so a wallet can safely base its tree there), and its
         // per-block frontier snapshot is retained. An explicit block (e.g. the
         // pruning point) anchors a full-history scan at correct absolute positions.
-        let block_hash = match request.block_hash {
+        let requested = match request.block_hash {
             Some(h) => h,
             None => session.async_finality_point().await,
         };
-        let daa_score = session.async_get_header(block_hash).await?.daa_score;
-        let (size, leaf, ommers) = session.async_get_shielded_tree_frontier(block_hash).await?;
+        // Per-block frontiers exist for every retained block; below the pruning point only
+        // the checkpointed blocks (one per ~1,000) keep one. When the requested block has
+        // none, serve the nearest checkpoint AT OR AFTER it by walking the archive chain
+        // index (it enumerates forward from any archived block). A caller that needs a
+        // frontier at-or-BEFORE a point — a wallet placing a birthday below the pruning
+        // point — asks for a block comfortably earlier than that point (walletd asks two
+        // 2,000-block pages back), so this answer can never overshoot its birthday. The
+        // response names the block actually served; the DAA comes from the header when
+        // retained, else from the archive record.
+        const CHECKPOINT_SEARCH: usize = 2100;
+        let (block_hash, (size, leaf, ommers)) = match session.async_get_shielded_tree_frontier(requested).await {
+            Ok(f) => (requested, f),
+            Err(first_err) => {
+                let mut found = None;
+                if let Some(candidates) = session.async_get_shielded_chain_range(requested, CHECKPOINT_SEARCH).await? {
+                    for h in candidates {
+                        if let Ok(f) = session.async_get_shielded_tree_frontier(h).await {
+                            found = Some((h, f));
+                            break;
+                        }
+                    }
+                }
+                found.ok_or(first_err)?
+            }
+        };
+        let daa_score = match session.async_get_header(block_hash).await {
+            Ok(h) => h.daa_score,
+            Err(_) => session.async_get_shielded_chain_block_data(block_hash).await?.daa_score,
+        };
         let leaf = RpcHash::from_bytes(leaf.unwrap_or_default());
         let ommers = ommers.into_iter().map(RpcHash::from_bytes).collect();
         // How far back this node can actually answer. Published on the call wallets already
@@ -824,17 +851,28 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
                             // discovery. Full archive records can contain large compact
                             // action payloads; birthday walks need only canonical header
                             // metadata.
-                            let header = c.get_header(hash)?;
-                            let blue_score = c.get_ghostdag_data(hash)?.blue_score;
+                            // Prefer the canonical header (cheap, no archive touch). Below the
+                            // pruning point the header and ghostdag data are gone, but the
+                            // archive record — which a full-history scan reads anyway — carries
+                            // the same hash/blue/daa/timestamp, so a birthday walk can continue
+                            // from genesis instead of dying at the first pruned block. Only the
+                            // metadata is sent; the record's action payload stays here.
+                            let (blue_score, daa_score, timestamp) = match (c.get_header(hash), c.get_ghostdag_data(hash)) {
+                                (Ok(header), Ok(gd)) => (gd.blue_score, header.daa_score, header.timestamp),
+                                _ => {
+                                    let d = c.get_shielded_chain_block_data(hash)?;
+                                    (d.blue_score, d.daa_score, d.timestamp)
+                                }
+                            };
                             out.push(RpcShieldedChainBlock {
                                 hash,
                                 blue_score,
-                                daa_score: header.daa_score,
+                                daa_score,
                                 coinbase_txid: RpcHash::default(),
                                 coinbase_outputs: Vec::new(),
                                 accepted_actions: Vec::new(),
                                 accepted_txids: Vec::new(),
-                                timestamp: header.timestamp,
+                                timestamp,
                             });
                             continue;
                         }
