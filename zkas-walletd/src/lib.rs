@@ -153,6 +153,10 @@ const SNAPSHOT_PUBLISH_EVERY: std::time::Duration = std::time::Duration::from_se
 ///
 /// A pass resumes exactly where it stopped, so yielding costs nothing but a lap.
 const PASS_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+/// Lock-free gap the shared chain tree leaves between the pages of one pass, longer
+/// than the 20 ms `try_lock` poll of `chain_tree_paths` so a waiting spend is sure to
+/// find the tree free once per page (see `sync_one_wallet`).
+const CHAIN_TREE_PAGE_GAP: std::time::Duration = std::time::Duration::from_millis(25);
 
 /// Longest the scheduler waits for the slowest wallet before starting the next lap.
 ///
@@ -982,6 +986,11 @@ const SCAN_HEADER_LEN: usize = 77;
 // initial scan doesn't throw away all progress and re-trigger a full rescan of the
 // whole wallet cohort (a "thundering herd" that pins every core). At ~32B/leaf the
 // checkpoint blob stays small, so frequent writes are cheap.
+//
+// Near the tip only. A wallet bursting through a deep catch-up advances several
+// thousand blocks per pass while retaining every leaf since its birthday, so there
+// this rule would rewrite a growing many-MB blob every pass; those wallets save on
+// `CHECKPOINT_INTERVAL` alone (see `sync_one_wallet`).
 const CHECKPOINT_EVERY: usize = 1000;
 /// Also checkpoint whenever this much wall time has passed with ANY progress. The
 /// block-count rule alone let a slow scanner — a phone against a public node — run
@@ -1412,6 +1421,8 @@ const IDLE_SYNC_POLL: std::time::Duration = std::time::Duration::from_secs(1);
 /// How often the dedicated mempool loop looks for unmined payments. This is the floor on
 /// "the receiver's screen changed" — keep it fast; the work behind it is trivial.
 const MEMPOOL_POLL: std::time::Duration = std::time::Duration::from_millis(700);
+/// The mempool loop's cadence while no active wallet is at the tip yet (see there).
+const MEMPOOL_POLL_BEHIND: std::time::Duration = std::time::Duration::from_secs(5);
 // 150→50 ms: with the bounded-parallel loop another scan task overlaps this sleep, so
 // its only job is guaranteeing the HTTP runtime a scheduling gap — 50 ms is plenty.
 const SYNC_WALLET_THROTTLE_MS: u64 = 50;
@@ -1444,6 +1455,24 @@ fn save_checkpoint(
     sink_blue: u64,
     blind_below: u64,
 ) -> std::io::Result<()> {
+    let buf = checkpoint_bytes(genesis, low, scanned, db, boundaries, sink_blue, blind_below);
+    write_checkpoint_bytes(dir, token, &buf)
+}
+
+/// The serialised checkpoint file for [`save_checkpoint`], built from the wallet
+/// state alone. Split from the write so the sync loop can serialise under the wallet
+/// lock and hand the bytes to a blocking thread: the blob copies every retained leaf
+/// (32 B each — tens to hundreds of MB mid-restore), and writing it inline held the
+/// lock AND a runtime worker for the whole `fs::write`.
+fn checkpoint_bytes(
+    genesis: &RpcHash,
+    low: &RpcHash,
+    scanned: u64,
+    db: &WalletDb,
+    boundaries: &VecDeque<(u64, u64)>,
+    sink_blue: u64,
+    blind_below: u64,
+) -> Vec<u8> {
     let db_blob = db.to_checkpoint();
     let mut buf = Vec::with_capacity(SCAN_HEADER_LEN + 8 + db_blob.len() + 4 + boundaries.len() * 16 + 8);
     buf.extend_from_slice(SCAN_MAGIC);
@@ -1460,15 +1489,32 @@ fn save_checkpoint(
     }
     buf.extend_from_slice(&sink_blue.to_le_bytes());
     buf.extend_from_slice(&blind_below.to_le_bytes());
+    buf
+}
+
+/// Write a serialised checkpoint (from [`checkpoint_bytes`]) atomically: tmp + rename.
+///
+/// The tmp name is unique per write. The sync loop now writes OFF the wallet lock,
+/// so it can overlap a write from the lock-holding paths (`/api/checkpoint` on app
+/// pause, the eviction sweep, the twin-clone flush); two writers on one shared
+/// `.tmp` would truncate each other and rename a torn blob into place.
+fn write_checkpoint_bytes(dir: &str, token: &str, buf: &[u8]) -> std::io::Result<()> {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let path = scan_path(dir, token);
-    let tmp = format!("{path}.tmp");
-    std::fs::write(&tmp, &buf)?;
+    let tmp = format!("{path}.{}.tmp", SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    // A unique name is never reused, so a failed write must clean up after itself or a
+    // full disk grows a fresh partial `.tmp` on every retry.
+    std::fs::write(&tmp, buf).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
     }
-    std::fs::rename(&tmp, &path)
+    std::fs::rename(&tmp, &path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
 }
 
 /// The cursor block a wallet's checkpoint resumes from, read from the header alone.
@@ -2132,6 +2178,19 @@ async fn fetch_shielded_page(
         }
     }
     c.order.push_back(key);
+    // Expired pages go NOW, not when `cap` pushes them out. The TTL used to be read
+    // only on lookup, so a dead page stayed resident until `cap` newer ones had been
+    // inserted — and on a single-wallet daemon every page is read exactly once, so a
+    // long restore held `cap` decoded pages (~0.45 MB each) it would never touch again.
+    // `order` is insertion-ordered (a re-insert moves to the back), so the sweep stops
+    // at the first live entry and costs only what it evicts.
+    while let Some(old) = c.order.front().copied() {
+        if c.map.get(&old).is_some_and(|(at, _)| at.elapsed() < c.ttl) {
+            break;
+        }
+        c.order.pop_front();
+        c.map.remove(&old);
+    }
     if c.order.len() > c.cap {
         if let Some(old) = c.order.pop_front() {
             c.map.remove(&old);
@@ -2215,6 +2274,12 @@ struct WalletEntry {
     /// (reorg inside the margin) drops the roll and rebuilds the window once —
     /// the same self-correction the full recompute gave.
     preview_roll: VecDeque<PreviewRollEntry>,
+    /// The LAST page of the previous `sync_chunk` call was a caught-up (16-block) page
+    /// that came back FULL, so the next fetch must be a full page. Inside a chunk the
+    /// local flag carries that over between iterations; this carries it across calls,
+    /// which matters for the shared chain tree (ONE page per call — without it a tree
+    /// that fell a few hundred blocks behind crawled at CAUGHT_UP_PAGE per page).
+    need_full_page: bool,
     /// Mempool previews by bundle key (first action's nullifier): the same
     /// pending bundles sit in the mempool for many 700 ms ticks and were
     /// re-trial-decrypted on every one. Cleared whenever a block is ingested
@@ -2371,6 +2436,7 @@ impl WalletEntry {
             mempool: Preview::default(),
             unsettled_nulls: HashSet::new(),
             preview_roll: VecDeque::new(),
+            need_full_page: false,
             mempool_cache: HashMap::new(),
             last_witness_advance: None,
             witnesses_warm: false,
@@ -2506,7 +2572,8 @@ impl WalletEntry {
         self.mempool = total;
     }
 
-    /// Advance this wallet by up to `PAGES_PER_CHUNK` pages of new **chain**
+    /// Advance this wallet by up to `PAGES_PER_CHUNK` pages (the shared chain tree:
+    /// one page, see below) of new **chain**
     /// blocks, ingesting exactly the shielded effects consensus applied per block
     /// (own coinbase mint + accepted post-retain bundles, consensus order), and
     /// only once a block is `SYNC_TIP_MARGIN` blue units below the sink (the
@@ -2592,8 +2659,16 @@ impl WalletEntry {
             let depth = state.resources.prefetch_depth;
             tokio::spawn(deep_prefetch(state.clone(), client.clone(), self.low, depth));
         }
-        let mut need_full_page = false;
-        for _ in 0..PAGES_PER_CHUNK {
+        let mut need_full_page = self.need_full_page;
+        // The shared chain tree takes ONE page per call: every borrowing wallet's spend
+        // witnesses through it (`chain_tree_paths` spins on its `try_lock` while holding
+        // the sending wallet's own lock), and this method runs entirely under the tree's
+        // lock, so a whole chunk here was a whole chunk of fetch+ingest a spend could
+        // wait — code-recorded ~8 s at ~2 s/page under heavy ingest, and past 20 s the
+        // spend falls to an O(chain) replay. `sync_one_wallet` re-calls per page with
+        // the lock released between pages, for the same page count per pass.
+        let pages = if token == CHAIN_TREE_TOKEN { 1 } else { PAGES_PER_CHUNK };
+        for _ in 0..pages {
             // HARD TIMEOUT. There is ONE sync loop for every wallet, and it advances them
             // sequentially — so an await here that never returns does not stall one wallet,
             // it stalls ALL of them, forever. That was a live outage: a hung page fetch
@@ -2891,6 +2966,8 @@ impl WalletEntry {
             if small_page_full {
                 need_full_page = true;
             }
+            // Only the last page's verdict outlives the call (see the field).
+            self.need_full_page = small_page_full;
             if !advanced || (at_margin && !small_page_full) {
                 self.caught_up = true;
                 break;
@@ -3973,6 +4050,7 @@ fn snap_from_entry(address: String, e: &WalletEntry, daa_score: u64) -> StatusSn
             && (e.caught_up || (e.scanned as u64) + DEFAULT_ANCHOR_DEPTH >= tip)
             && (e.db.tree_is_valid() || e.db.is_borrowing()),
         blocks_behind: tip.saturating_sub(e.scanned as u64),
+        caught_up: e.caught_up,
     }
 }
 
@@ -4042,6 +4120,11 @@ struct StatusSnap {
     /// window are not counted yet, and a spend made from ANOTHER device inside it is
     /// unknown here.
     blocks_behind: u64,
+    /// The sync loop's own verdict (`WalletEntry::caught_up`) as of this snapshot — not
+    /// `synced`, which also folds in tip knowledge and the blind-history guard. Read by
+    /// `mempool_loop` to tell a wallet that is idling at the tip (its lock is free, a
+    /// preview can land) from one mid-scan (its lock is held for whole chunks).
+    caught_up: bool,
 }
 
 /// A non-custodial payment proven and awaiting on-device spend-auth signatures.
@@ -5236,7 +5319,17 @@ async fn mempool_loop(state: Arc<AppState>) {
                 .map(|(k, _)| k.clone())
                 .collect()
         };
-        if !active.is_empty() {
+        // Only worth a fetch for a wallet that is idling at the tip. A wallet mid-scan
+        // holds its lock for whole chunks (or a 20 s burst), so the `try_lock` below
+        // skips it nearly every tick and the mempool — every entry, transaction bodies
+        // included — was fetched and thrown away ~1.4 times a second for the length of
+        // a restore, kept "active" by nothing more than the app's 1 s status poll. A
+        // wallet with no snapshot yet has not finished a pass and counts as behind.
+        let ready = {
+            let snaps = state.snapshots.lock().await;
+            active.iter().filter(|t| snaps.get(*t).is_some_and(|s| s.caught_up)).count()
+        };
+        if ready > 0 {
             // One decode of the mempool, shared by every wallet.
             let bundles: Vec<ShieldedBundle> =
                 match tokio::time::timeout(SYNC_RPC_TIMEOUT, async {
@@ -5276,7 +5369,11 @@ async fn mempool_loop(state: Arc<AppState>) {
                 state.snapshots.lock().await.insert(token, snap);
             }
         }
-        tokio::time::sleep(MEMPOOL_POLL).await;
+        // Sub-second whenever ANY active wallet is at the tip — a restore on one tenant
+        // must not slow every other receiver's preview (the guarantee in the doc above).
+        // With nothing ready there is nothing to fetch for, so only the snapshot check
+        // above runs: ease off until a wallet arrives.
+        tokio::time::sleep(if ready > 0 { MEMPOOL_POLL } else { MEMPOOL_POLL_BEHIND }).await;
     }
 }
 
@@ -5414,7 +5511,7 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
     let was_caught_up = e.caught_up;
     e.caught_up = false;
     // Published, not peeked. A `try_lock` here read 0 nearly always (the shared tree
-    // holds its own lock across a whole chunk) and so disabled borrowing entirely.
+    // holds its own lock across each page it ingests) and so disabled borrowing entirely.
     // The shared tree itself must not borrow from itself, hence the token check.
     let shared_tree_covers =
         if token == CHAIN_TREE_TOKEN { 0 } else { state.chain_tree_size.load(std::sync::atomic::Ordering::Relaxed) };
@@ -5426,16 +5523,26 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
     let Some(sync_client) = state.sync_client().await else { return SyncOutcome::Behind };
     // One chunk per pass for a wallet near the tip; a wallet far behind bursts through
     // more chunks while the pass budget lasts (see `CATCHUP_BURST_MIN_BEHIND`). The shared
-    // chain tree keeps its single chunk: it holds its lock across a chunk and every other
-    // wallet reads its published reach between passes.
+    // chain tree keeps its single chunk's worth of pages per pass, but takes them ONE
+    // per `sync_chunk` call with its lock released in between: a spend on any borrowing
+    // wallet witnesses through this tree (`chain_tree_paths`), so it can now take the
+    // tree after at most one page instead of a whole chunk. That reader polls `try_lock`
+    // every 20 ms and cannot queue, so the gap between pages is held open for one of
+    // its polls (see below) — a bare yield would close it in microseconds. Every other
+    // wallet reads the tree's published reach between passes, never its lock.
     let pass_started = std::time::Instant::now();
     let mut was_caught_up = was_caught_up;
+    let mut chain_tree_pages = 0usize;
     loop {
         e.sync_chunk(&sync_client, &state.page_cache, &state.warm_gate, &state, &token, was_caught_up, state.resources.subtree_free_floor_mb, shared_tree_covers, shared_tree_base)
             .await;
         let behind_by = chain_len.saturating_sub(e.scanned as u64);
-        if token == CHAIN_TREE_TOKEN
-            || e.caught_up
+        if token == CHAIN_TREE_TOKEN {
+            chain_tree_pages += 1;
+            if chain_tree_pages >= PAGES_PER_CHUNK || e.caught_up || e.error.is_some() || pass_started.elapsed() >= PASS_BUDGET {
+                break;
+            }
+        } else if e.caught_up
             || e.error.is_some()
             || behind_by < CATCHUP_BURST_MIN_BEHIND
             || pass_started.elapsed() >= CATCHUP_BURST_BUDGET
@@ -5444,10 +5551,22 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
         }
         // Let queued status/history calls on this wallet through before the next chunk.
         drop(e);
-        tokio::task::yield_now().await;
+        if token == CHAIN_TREE_TOKEN {
+            // Lock released: this sleep blocks nothing, it only guarantees a spinning
+            // `chain_tree_paths` (20 ms poll) one look at the free tree per page.
+            tokio::time::sleep(CHAIN_TREE_PAGE_GAP).await;
+        } else {
+            tokio::task::yield_now().await;
+        }
         e = w.lock().await;
         e.chain_len = chain_len;
-        was_caught_up = false;
+        // A bursting wallet is by definition not at the tip. The chain tree re-loops per
+        // PAGE even when it was: keep its verdict, or any lap longer than CAUGHT_UP_PAGE
+        // blocks (a 30 s lap at 1 BPS) ends the pass "just caught up" — which is a full
+        // checkpoint write of the whole shared stream (475 MB live) per such lap.
+        if token != CHAIN_TREE_TOKEN {
+            was_caught_up = false;
+        }
     }
     // A borrowing wallet's mirror tree is stale by construction; make it current again
     // by taking the shared tree's frontier. `adopt_tip_frontier` REFUSES unless the
@@ -5631,25 +5750,28 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
     // it away and re-do the ~30–90 s warm.
     let force = e.force_checkpoint;
     let overdue = advanced > 0 && e.last_checkpoint_at.elapsed() >= CHECKPOINT_INTERVAL;
-    if e.error.is_none() && (advanced >= CHECKPOINT_EVERY || (just_caught_up && advanced > 0) || force || overdue) {
-        if let Err(err) = save_checkpoint(
-            &state.wallet_dir,
-            &token,
-            &e.genesis,
-            &e.low,
-            e.scanned as u64,
-            &e.db,
-            &e.boundaries,
-            e.sink_blue,
-            e.blind_below,
-        ) {
-            eprintln!("checkpoint write failed for {token}: {err}");
-        } else {
-            e.saved_scanned = e.scanned;
-            e.last_checkpoint_at = std::time::Instant::now();
-            e.force_checkpoint = false;
-        }
-    }
+    // A wallet far enough behind to burst (see `CATCHUP_BURST_MIN_BEHIND`) ingests
+    // several thousand blocks per pass, so the block rule alone would rewrite the
+    // checkpoint on EVERY pass — and a restoring wallet retains every leaf since its
+    // birthday until it is caught up (base compaction runs only then), so each write
+    // is the whole growing stream, ~150 MB by the end of a full-chain restore. Bursting
+    // wallets checkpoint on the time rule only; the block rule keeps its near-tip role.
+    let bursting = chain_len.saturating_sub(e.scanned as u64) >= CATCHUP_BURST_MIN_BEHIND;
+    let due_by_blocks = advanced >= CHECKPOINT_EVERY && !bursting;
+    // Serialised under the lock (the bytes must describe one consistent state), but
+    // WRITTEN off it, on a blocking thread, below: `fs::write` of a many-MB blob on the
+    // async worker stalled every other task and every status/history call on this
+    // wallet for the duration. The flag is consumed here so a force that arrives while
+    // the write is in flight is not lost; a failed write hands it back.
+    let pending_checkpoint = if e.error.is_none() && (due_by_blocks || (just_caught_up && advanced > 0) || force || overdue) {
+        e.force_checkpoint = false;
+        Some((
+            checkpoint_bytes(&e.genesis, &e.low, e.scanned as u64, &e.db, &e.boundaries, e.sink_blue, e.blind_below),
+            e.scanned,
+        ))
+    } else {
+        None
+    };
     // Snapshot the subtree-cache build inputs while we still hold the lock; the fold
     // itself runs without it (see `SubtreeBuildJob`).
     let build_job = if e.wants_cache_build && !e.build_in_flight {
@@ -5663,6 +5785,26 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
     let snap = snap_from_entry(state.address_of(&e.db), &e, chain_len);
     drop(e);
     state.snapshots.lock().await.insert(token.clone(), snap);
+    if let Some((buf, scanned)) = pending_checkpoint {
+        let dir = state.wallet_dir.clone();
+        let who = token.clone();
+        let written = tokio::task::spawn_blocking(move || write_checkpoint_bytes(&dir, &who, &buf)).await;
+        let mut e = w.lock().await;
+        match written {
+            Ok(Ok(())) => {
+                e.saved_scanned = scanned;
+                e.last_checkpoint_at = std::time::Instant::now();
+            }
+            Ok(Err(err)) => {
+                eprintln!("checkpoint write failed for {token}: {err}");
+                e.force_checkpoint |= force;
+            }
+            Err(err) => {
+                eprintln!("checkpoint write task failed for {token}: {err}");
+                e.force_checkpoint |= force;
+            }
+        }
+    }
     if let Some(job) = build_job {
         // DETACHED on purpose. `sync_loop` joins every wallet task before starting the
         // next lap, so awaiting a ~247 s fold here would stall every other wallet for
@@ -7992,61 +8134,6 @@ async fn wallet_prepare(
         PreparingGuard { state: state.clone(), key: req.fvk_hex.clone() }
     };
 
-    let _consolidate_permit = if self_payment {
-        // WAIT for a consolidation slot rather than reject on the first busy instant. A
-        // merge is now ~seconds, so the slot frees quickly; blocking here means the user's
-        // request simply completes a moment later instead of bouncing with "try again".
-        Some(
-            tokio::time::timeout(CONSOLIDATE_QUEUE_WAIT, state.consolidate_gate.acquire())
-                .await
-                .map_err(|_| {
-                    err(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "Still merging other wallets — your consolidation is queued and didn't get a turn this time. It's safe to try again in a minute.",
-                    )
-                })?
-                .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "consolidate gate closed"))?,
-        )
-    } else {
-        None
-    };
-
-    // Then take the proving slot shared with every other wallet.
-    //
-    // A PAYMENT queues: somebody is watching it, and another tenant's send is not this
-    // caller's error. CONSOLIDATION does not queue — it starts only if the prover is
-    // free this instant, and otherwise tells the caller to come back.
-    //
-    // The difference matters most where it is easiest to miss. The hosted daemon runs
-    // `--max-concurrent-proves 1`, so "at most one consolidation at a time" would be an
-    // empty promise there: that one consolidation IS the only slot, and a round
-    // deliberately spends the maximum notes a transaction allows (~38, tens of seconds
-    // of proving) while every payment waits. Yielding rather than queueing is the rule
-    // the daemon's own background merger already follows — "never take cores from a
-    // payment somebody is waiting on" — applied to the merge a user asks for, and to the
-    // background maintenance the wallet app now performs on its own.
-    let _prepare_permit = if self_payment {
-        // WAIT for the prover instead of yielding immediately. Payments still get priority
-        // — their queue window (PREPARE_QUEUE_WAIT) is longer, and on the same fair
-        // semaphore — but a consolidation now waits its short turn rather than bouncing.
-        tokio::time::timeout(CONSOLIDATE_QUEUE_WAIT, state.prepare_gate.acquire())
-            .await
-            .map_err(|_| {
-                err(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "The prover is busy with payments right now — your consolidation is queued and didn't get a turn this time. Try again in a minute.",
-                )
-            })?
-            .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "prepare gate closed"))?
-    } else {
-        tokio::time::timeout(PREPARE_QUEUE_WAIT, state.prepare_gate.acquire())
-            .await
-            .map_err(|_| {
-                err(StatusCode::SERVICE_UNAVAILABLE, "The daemon is still preparing other payments — please try again in a moment.")
-            })?
-            .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "prepare gate closed"))?
-    };
-
     let requested = match (req.amount_sompi, req.amount_fc) {
         (Some(s), _) => s.parse("amount_sompi")?,
         (None, Some(fc)) => (fc * SOMPI_PER_ZKAS as f64).round() as u64,
@@ -8357,6 +8444,68 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
         .map(|(_, _, r)| r)
         .unwrap_or(true);
     let memo = memo_bytes(req.memo.as_deref())?;
+    let _consolidate_permit = if self_payment {
+        // WAIT for a consolidation slot rather than reject on the first busy instant. A
+        // merge is now ~seconds, so the slot frees quickly; blocking here means the user's
+        // request simply completes a moment later instead of bouncing with "try again".
+        Some(
+            tokio::time::timeout(CONSOLIDATE_QUEUE_WAIT, state.consolidate_gate.acquire())
+                .await
+                .map_err(|_| {
+                    err(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "Still merging other wallets — your consolidation is queued and didn't get a turn this time. It's safe to try again in a minute.",
+                    )
+                })?
+                .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "consolidate gate closed"))?,
+        )
+    } else {
+        None
+    };
+
+    // Then take the proving slot shared with every other wallet — taken HERE, once the
+    // inputs are selected and witnessed, not at the top of the handler. The slot exists
+    // to bound concurrent PROVING; held from the start it also covered every cold-wallet
+    // step of one tenant's send (an inline wallet load, the checkpoint adopt wait, the
+    // subtree-cache build wait, the shared-tree lock spin and the FVK-only chain replay),
+    // and on the hosted daemon's single slot that starved every other tenant's warm send
+    // for minutes. The per-FVK `_preparing` guard above still rejects a second prepare
+    // on the SAME wallet from the first instant.
+    //
+    // A PAYMENT queues: somebody is watching it, and another tenant's send is not this
+    // caller's error. CONSOLIDATION does not queue — it starts only if the prover is
+    // free this instant, and otherwise tells the caller to come back.
+    //
+    // The difference matters most where it is easiest to miss. The hosted daemon runs
+    // `--max-concurrent-proves 1`, so "at most one consolidation at a time" would be an
+    // empty promise there: that one consolidation IS the only slot, and a round
+    // deliberately spends the maximum notes a transaction allows (~38, tens of seconds
+    // of proving) while every payment waits. Yielding rather than queueing is the rule
+    // the daemon's own background merger already follows — "never take cores from a
+    // payment somebody is waiting on" — applied to the merge a user asks for, and to the
+    // background maintenance the wallet app now performs on its own.
+    let _prepare_permit = if self_payment {
+        // WAIT for the prover instead of yielding immediately. Payments still get priority
+        // — their queue window (PREPARE_QUEUE_WAIT) is longer, and on the same fair
+        // semaphore — but a consolidation now waits its short turn rather than bouncing.
+        tokio::time::timeout(CONSOLIDATE_QUEUE_WAIT, state.prepare_gate.acquire())
+            .await
+            .map_err(|_| {
+                err(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "The prover is busy with payments right now — your consolidation is queued and didn't get a turn this time. Try again in a minute.",
+                )
+            })?
+            .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "prepare gate closed"))?
+    } else {
+        tokio::time::timeout(PREPARE_QUEUE_WAIT, state.prepare_gate.acquire())
+            .await
+            .map_err(|_| {
+                err(StatusCode::SERVICE_UNAVAILABLE, "The daemon is still preparing other payments — please try again in a moment.")
+            })?
+            .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "prepare gate closed"))?
+    };
+
     let t_proof = std::time::Instant::now();
     let payment = tokio::task::spawn_blocking(move || {
         let _proving = ProvingGuard::new();
@@ -9368,6 +9517,13 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
         // The loopback default stays off, so a public web page still cannot reach a
         // wallet daemon on the user's own machine.
         .allow_private_network(require_bearer.is_some())
+        // Let the browser cache the preflight. tower-http sets no Access-Control-Max-Age
+        // by default, and the WebView then falls back to its own ~5 s cache — so the
+        // Android app (origin `https://localhost`, `X-Wallet-Token` on every call, hence
+        // never a "simple" request) re-ran an OPTIONS round trip through nginx and the
+        // tunnel every few seconds of its 1 s status poll, and paid one on the first
+        // call after any pause. The policy never changes at runtime, so a day is safe.
+        .max_age(std::time::Duration::from_secs(86_400))
         .allow_origin(origins);
 
     let app = Router::new()
