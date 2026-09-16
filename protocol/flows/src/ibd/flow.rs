@@ -295,6 +295,17 @@ impl IbdFlow {
         // every pre-bump peer is rejected with `VersionMismatch` instead of merely lacking the
         // feature. It also only pays once v11 peers exist, so the peer budget is what makes the
         // feature work on today's mixed network.
+        // A node that already holds verified history from genesis (restarted after a completed
+        // backfill, or one that built its whole index itself) has nothing to fetch. Asking anyway
+        // logged "a fresh node holds none" on every restart and spent one ask — a dropped link on
+        // a peer without the feature — for an empty chunk.
+        let already_complete = self.ctx.config.wants_shielded_history()
+            && !SHIELDED_HISTORY_BACKFILL_DONE.load(Ordering::SeqCst)
+            && matches!(session.async_get_shielded_history_status().await, Ok((_, true)));
+        if already_complete {
+            debug!("shielded history: already complete from genesis; not asking {} for a backfill", self.router);
+            SHIELDED_HISTORY_BACKFILL_DONE.store(true, Ordering::SeqCst);
+        }
         // Ask this peer only if it is one we have not already asked, and only while under the
         // peer budget. Both conditions are evaluated once, under the lock, so a concurrent IBD
         // cannot slip a second ask to the same peer through.
@@ -312,11 +323,15 @@ impl IbdFlow {
                 }
                 Err(e) => {
                     let asked = SHIELDED_HISTORY_ASKED_PEERS.lock().unwrap().as_ref().map_or(0, |s| s.len());
+                    // Name the floor the node is left with, so an operator reading this line
+                    // knows what wallets will see rather than only that something failed.
+                    let floor = session.async_get_shielded_history_status().await.map(|(daa, _)| daa).unwrap_or(0);
                     warn!(
                         "archival: shielded history backfill did not complete from {} ({e}); {} of {} \
                          peers asked. Peers on a build without shielded-history support close the \
                          connection on this request. Wallet history below the pruning point is \
-                         unavailable until a peer that supports it is reached.",
+                         unavailable until a peer that supports it is reached — this node serves \
+                         shielded history from DAA {floor} (incomplete) for now.",
                         self.router, asked, SHIELDED_HISTORY_MAX_PEERS
                     );
                 }
@@ -932,12 +947,24 @@ impl IbdFlow {
         // now because ingesting the first chunk renumbers the index and moves the base.
         let verify_base = anchor;
         let (mut total_idx, mut total_rec, mut rounds) = (0u64, 0u64, 0u32);
+        // The floor wallets see while this runs. On a first sync this whole fetch plus its
+        // verification runs BEFORE block bodies are synced, so the node reports NOT synced and
+        // its block count does not move for the duration — without saying so here, that reads as
+        // a stalled sync (reported 2026-09: "why is it so long").
+        let floor = consensus.async_get_shielded_history_status().await.map(|(daa, _)| daa).unwrap_or(0);
         info!(
             "shielded history: fetching note history below {anchor} from {} — a fresh node holds \
-             none, so wallets would otherwise see a partial balance",
+             none, so wallets would otherwise see a partial balance. Block-body sync waits for this \
+             and its verification, so a first sync reports NOT synced meanwhile; wallets connecting \
+             now see shielded history only from DAA {floor}",
             self.router
         );
         let started = std::time::Instant::now();
+        // The peer's GENESIS-based index of our base, learned from the first chunk: exactly the
+        // number of chain blocks below it, i.e. the whole job. Each chunk's lowest index is what
+        // is still left, which is what makes a percentage and an ETA possible here.
+        let mut total_chain_blocks: Option<u64> = None;
+        let mut reached_genesis = false;
 
         loop {
             self.router
@@ -965,6 +992,10 @@ impl IbdFlow {
             }
             records.sort_by_key(|(i, _)| *i);
             let lowest = records.first().map(|(_, r)| r.hash).unwrap_or(anchor);
+            // Chain blocks still below the lowest record of this chunk (its index counts from 0
+            // at genesis), so this is what remains to fetch after the chunk lands.
+            let remaining = records.first().map(|(i, _)| *i).unwrap_or(0);
+            let total = *total_chain_blocks.get_or_insert(msg.anchor_index);
 
             let (idx, rec) = consensus.async_backfill_shielded_history(anchor, msg.anchor_index, records).await?;
             total_idx += idx;
@@ -974,14 +1005,24 @@ impl IbdFlow {
             // Progress, not silence. This moves ~460k records over ~116 round trips while the
             // node does nothing else; with only a start and an end line, a run that wrote NOTHING
             // for 34 minutes looked exactly like one that was working. Reporting what was
-            // actually WRITTEN is what makes that failure visible at a glance.
+            // actually WRITTEN is what makes that failure visible at a glance — and a percentage
+            // with an ETA is what tells an operator it is a long job rather than a stuck one.
+            let done_blocks = total.saturating_sub(remaining);
+            let progress = if total > 0 && done_blocks > 0 {
+                let pct = done_blocks as f64 * 100.0 / total as f64;
+                let eta = started.elapsed().as_secs_f64() * remaining as f64 / done_blocks as f64;
+                format!(" — {pct:.0}% ({remaining} of {total} chain blocks left), about {eta:.0}s left")
+            } else {
+                String::new()
+            };
             info!(
-                "archival: shielded history chunk {rounds}: +{rec} records (+{idx} index) in {:?}, total {total_rec} (at {lowest})",
+                "archival: shielded history chunk {rounds}: +{rec} records (+{idx} index) in {:?}, total {total_rec} (at {lowest}){progress}",
                 chunk_started.elapsed()
             );
 
             if msg.done {
                 info!("archival: reached genesis after {rounds} rounds");
+                reached_genesis = true;
                 break;
             }
             // A chunk that stored nothing means our state is not advancing. Continuing would walk
@@ -1006,6 +1047,15 @@ impl IbdFlow {
              against the chain's own committed state before serving any of it",
             started.elapsed().as_secs_f64()
         );
+        if !reached_genesis {
+            // The loop stopped short (peer ran out, or stopped descending). Say where that leaves
+            // wallets, in the same terms the RPC reports (`history_from_daa_score`).
+            let floor = consensus.async_get_shielded_history_status().await.map(|(daa, _)| daa).unwrap_or(0);
+            warn!(
+                "shielded history: fetch stopped short of genesis; this node serves shielded history from DAA {floor} \
+                 (incomplete) until a later IBD retries"
+            );
+        }
 
         // Verify before this history is served to anyone.
         //
@@ -1059,6 +1109,17 @@ impl IbdFlow {
                 }
                 Err(e) => warn!("archival: shielded history verification did not run ({e}); history is retained but unproven"),
             }
+        }
+        // One closing line in the terms wallets and the RPC use, whatever path led here: the
+        // Unverifiable/Err arms above leave the index reaching genesis but `history_complete`
+        // false, and that is exactly the state a wallet's node check will report back.
+        match consensus.async_get_shielded_history_status().await {
+            Ok((_, true)) => info!("shielded history: backfill finished — complete from genesis; wallets may connect to this node"),
+            Ok((floor, false)) => warn!(
+                "shielded history: backfill finished but history is NOT complete (serving from DAA {floor}); wallets born \
+                 before that see a partial balance"
+            ),
+            Err(_) => {}
         }
         Ok(())
     }

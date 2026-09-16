@@ -43,7 +43,8 @@ use orchard::{
     value::NoteValue,
 };
 use std::cell::OnceCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use zcash_note_encryption::try_output_recovery_with_ovk;
 
 use crate::bundle::ShieldedBundle;
@@ -74,6 +75,11 @@ impl OwnedNote {
     /// The note's value in the base unit.
     pub fn value(&self) -> u64 {
         self.note.value().inner()
+    }
+
+    /// The nullifier this note's spend reveals on-chain.
+    pub fn nullifier(&self) -> [u8; 32] {
+        self.nullifier
     }
 }
 
@@ -354,6 +360,14 @@ pub struct WalletDb {
     /// Excluded from the balance and from spend selection (like spent notes), but
     /// recoverable if the transaction is lost.
     pending_spends: Vec<PendingSpend>,
+    /// Change owed back by each parked spend, keyed by txid — see
+    /// [`Self::note_pending_outflow`]. Display-only: `mark_spent` removes the WHOLE
+    /// input note from the balance, so without this a one-note wallet reads 0 from
+    /// submit until the change note is decrypted on-chain. Never spendable, never in
+    /// `balance()`. Lives exactly as long as a pending spend carries its txid (pruned
+    /// wherever `pending_spends` shrinks) and is NOT persisted: after a restart the
+    /// figure simply reverts to the preview-derived `pending_in`.
+    pending_change: HashMap<[u8; 32], u64>,
     /// DAA score of the newest block ingested with [`BlockMeta`] — the wallet's
     /// chain clock. Only advances as blocks are actually ingested, so pending-spend
     /// expiry never runs ahead of what the wallet has really seen.
@@ -405,18 +419,36 @@ impl SubtreeBuildJob {
     /// `None` if the frontier cannot seed the cache or a subtree root cannot be
     /// recorded, in which case the caller keeps the replay path.
     pub fn run(self) -> Option<BuiltSubtreeCache> {
+        self.run_with_progress(&AtomicU64::new(0))
+    }
+
+    /// As [`Self::run`], counting leaves folded so far into `progress` (relative to this
+    /// job, so `progress / leaves()` is the fraction done). The fold is parallel — see
+    /// `SubtreeCache::fold_parallel` — and the counter is bumped every
+    /// `PROGRESS_EVERY` leaves from whichever thread folded them, so a caller polling
+    /// it from another thread sees a monotone, slightly coarse figure. No logging here:
+    /// this crate has no logger; the daemon reports what it reads.
+    pub fn run_with_progress(self, progress: &AtomicU64) -> Option<BuiltSubtreeCache> {
         let mut c = SubtreeCache::default();
         if !c.seed_from_frontier(&self.base_frontier, self.base_size) {
             return None;
         }
-        for (i, leaf) in self.leaves.iter().enumerate() {
-            if !c.push_leaf(self.base_size + i as u64, *leaf) {
-                return None;
-            }
+        if !c.fold_parallel(self.base_size, &self.leaves, PAR_WINDOW_LOG2, progress) {
+            return None;
         }
         Some(BuiltSubtreeCache { cache: c, base_size: self.base_size })
     }
 }
+
+/// Leaves folded between bumps of a build's progress counter. Coarse enough to keep the
+/// atomic off the hot path, fine enough (~0.2–0.3 s of work) for a live percentage.
+const PROGRESS_EVERY: usize = 1024;
+
+/// Window size (log2) of the parallel fold: `2^14` = 16,384 leaves per window. At
+/// ~150–260 µs per combine a window is ~3 s of work, so a multi-million-leaf stream
+/// splits into hundreds of independent windows — plenty to keep every core busy — while
+/// the ragged head and tail that must fold sequentially stay under one window each.
+const PAR_WINDOW_LOG2: u8 = 14;
 
 /// Level at or above which [`SubtreeCache`] retains complete subtree roots. Below it a
 /// note's siblings are folded from its own `2^CACHE_LEVEL`-leaf window at spend time.
@@ -501,7 +533,17 @@ impl SubtreeCache {
 
     /// Fold one leaf into the mountain range, recording every subtree it completes.
     fn push_leaf(&mut self, pos: u64, leaf: MerkleHashOrchard) -> bool {
-        let mut node = (0u8, pos, leaf);
+        self.push_node(0, pos, leaf)
+    }
+
+    /// Fold one COMPLETE subtree root (level `level`, index `idx`) into the mountain
+    /// range exactly as pushing its last leaf would have: merge with genuine left
+    /// siblings, recording every subtree the merges complete. A leaf is the level-0
+    /// case; [`Self::fold_parallel`] pushes whole windows this way. The node itself is
+    /// NOT recorded here — a leaf is below `CACHE_LEVEL`, and a window root has already
+    /// been recorded by the window that folded it.
+    fn push_node(&mut self, level: u8, idx: u64, hash: MerkleHashOrchard) -> bool {
+        let mut node = (level, idx, hash);
         while let Some(&(tl, ti, th)) = self.peaks.last() {
             // Merge only with a genuine left sibling: same level, even index, adjacent.
             if tl != node.0 || ti % 2 != 0 || ti + 1 != node.1 {
@@ -515,8 +557,90 @@ impl SubtreeCache {
             }
         }
         self.peaks.push(node);
-        self.upto = pos + 1;
+        self.upto = (idx + 1) << level;
         true
+    }
+
+    /// Push `leaves` (absolute positions from `first_pos`) one by one, bumping
+    /// `progress` every [`PROGRESS_EVERY`] leaves and once more for the remainder.
+    fn fold_run(&mut self, first_pos: u64, leaves: &[MerkleHashOrchard], progress: &AtomicU64) -> bool {
+        for (i, leaf) in leaves.iter().enumerate() {
+            if !self.push_leaf(first_pos + i as u64, *leaf) {
+                return false;
+            }
+            if (i + 1) % PROGRESS_EVERY == 0 {
+                progress.fetch_add(PROGRESS_EVERY as u64, Ordering::Relaxed);
+            }
+        }
+        progress.fetch_add((leaves.len() % PROGRESS_EVERY) as u64, Ordering::Relaxed);
+        true
+    }
+
+    /// Fold `leaves` (absolute position `base + i`, of which the first `upto - base`
+    /// are already folded) into the mountain range across every core.
+    ///
+    /// The sweep is one Sinsemilla combine per leaf, and every root it records is a
+    /// pure function of the leaves beneath it — so the stream is cut at absolute
+    /// `2^window_log2` boundaries and each full window folds on its own thread into a
+    /// private cache. A full window is one complete subtree: its cache holds exactly the
+    /// level-`CACHE_LEVEL..=window_log2` roots the sequential sweep would have recorded
+    /// inside it (dense, in index order), and its single peak is what that sweep would
+    /// have been carrying when it left the window. Windows are then replayed in order:
+    /// their roots appended level by level (consecutive aligned windows keep
+    /// [`Self::record`]'s contiguity) and each peak pushed with [`Self::push_node`],
+    /// which performs the merges above `window_log2` in the same order the sequential
+    /// sweep would. The ragged head (up to the first boundary) and tail fold
+    /// sequentially.
+    ///
+    /// The result is identical to the sequential fold — asserted by
+    /// `parallel_fold_matches_sequential` — and every build is root-gated by its caller
+    /// anyway, so a wrong merge could only cost speed, never a wrong witness. This was
+    /// the single-core, hour-long step behind "first send pins one core for an hour":
+    /// on a self-hosted daemon with no shared tree, the first spend paid this whole
+    /// sweep on one thread.
+    fn fold_parallel(&mut self, base: u64, leaves: &[MerkleHashOrchard], window_log2: u8, progress: &AtomicU64) -> bool {
+        use rayon::prelude::*;
+        let Some(start) = self.upto.checked_sub(base) else { return false };
+        let start = start as usize;
+        if start > leaves.len() {
+            return false;
+        }
+        let win = 1usize << window_log2;
+        // Windows are subtrees of the GLOBAL tree, so align absolute positions, not
+        // stream offsets: a compacted wallet's stream starts at an arbitrary `base`.
+        let head_end = {
+            let abs = base + start as u64;
+            let aligned = abs.div_ceil(win as u64) * win as u64;
+            ((aligned - base) as usize).min(leaves.len())
+        };
+        if !self.fold_run(base + start as u64, &leaves[start..head_end], progress) {
+            return false;
+        }
+        let body_end = head_end + ((leaves.len() - head_end) / win) * win;
+        let windows: Vec<Option<SubtreeCache>> = leaves[head_end..body_end]
+            .par_chunks(win)
+            .enumerate()
+            .map(|(k, chunk)| {
+                let mut c = SubtreeCache::default();
+                c.fold_run(base + (head_end + k * win) as u64, chunk, progress).then_some(c)
+            })
+            .collect();
+        for w in windows {
+            let Some(w) = w else { return false };
+            for (l, roots) in w.levels.iter().enumerate() {
+                for (k, h) in roots.iter().enumerate() {
+                    if !self.record(l as u8, w.first[l] + k as u64, *h) {
+                        return false;
+                    }
+                }
+            }
+            // A full aligned window leaves exactly one peak, at `window_log2`.
+            let &[(l, idx, h)] = &w.peaks[..] else { return false };
+            if l != window_log2 || !self.push_node(l, idx, h) {
+                return false;
+            }
+        }
+        self.fold_run(base + body_end as u64, &leaves[body_end..], progress)
     }
 
     /// Seed the peaks with the complete subtrees of `[0, size)` summarised by a
@@ -622,6 +746,7 @@ impl WalletDb {
             borrow_tree: false,
             tree_valid: true,
             pending_spends: Vec::new(),
+            pending_change: HashMap::new(),
             last_daa: 0,
             subtree: SubtreeCache::default(),
             scan_cost: ScanCost::default(),
@@ -669,6 +794,7 @@ impl WalletDb {
             borrow_tree: false,
             tree_valid: true,
             pending_spends: Vec::new(),
+            pending_change: HashMap::new(),
             last_daa: 0,
             subtree: SubtreeCache::default(),
             scan_cost: ScanCost::default(),
@@ -886,6 +1012,7 @@ impl WalletDb {
                 // for good.
                 self.notes.retain(|n| n.nullifier != action.nullifier);
                 self.pending_spends.retain(|p| p.note.nullifier != action.nullifier);
+                self.prune_pending_change();
                 self.spent_nullifiers.insert(action.nullifier);
 
                 let Some(cmx) = Option::<ExtractedNoteCommitment>::from(ExtractedNoteCommitment::from_bytes(&action.cmx)) else {
@@ -1003,6 +1130,7 @@ impl WalletDb {
             for (i, rec) in records.iter().enumerate() {
                 self.notes.retain(|n| n.nullifier != rec.nullifier);
                 self.pending_spends.retain(|p| p.note.nullifier != rec.nullifier);
+                self.prune_pending_change();
                 self.spent_nullifiers.insert(rec.nullifier);
 
                 let Some(cmx) = Option::<ExtractedNoteCommitment>::from(ExtractedNoteCommitment::from_bytes(&rec.cmx)) else {
@@ -1298,7 +1426,62 @@ impl WalletDb {
                 i += 1;
             }
         }
+        // A reclaimed spend owes no change: the note itself is back in `notes`.
+        self.prune_pending_change();
         reclaimed
+    }
+
+    /// Record what a just-submitted spend `txid` sends AWAY (amount + fee), so the
+    /// remainder of its parked input notes can be shown as change coming back.
+    /// Call right after the [`Self::mark_spent`] calls for that transaction. A no-op
+    /// when nothing is parked under `txid`; records no change when nothing is left over.
+    pub fn note_pending_outflow(&mut self, txid: [u8; 32], outflow: u64) {
+        let parked: u64 = self.pending_spends.iter().filter(|p| p.txid == txid).map(|p| p.note.value()).sum();
+        if parked == 0 {
+            return;
+        }
+        let change = parked.saturating_sub(outflow);
+        if change > 0 {
+            self.pending_change.insert(txid, change);
+        } else {
+            self.pending_change.remove(&txid);
+        }
+    }
+
+    /// Change owed back by this wallet's own in-flight spends — the part of each
+    /// parked input note that is neither the amount paid nor the fee. Not in
+    /// [`Self::balance`] and never spendable: it exists on-chain only once the send
+    /// is mined and lands in `notes` when that block is ingested.
+    pub fn pending_change(&self) -> u128 {
+        self.pending_change
+            .iter()
+            .filter(|(txid, _)| self.pending_spends.iter().any(|p| &p.txid == *txid))
+            .map(|(_, v)| *v as u128)
+            .sum()
+    }
+
+    /// Drop change entries whose spend is no longer parked (confirmed on-chain or
+    /// reclaimed) — the change is then either a real note in `notes` or moot.
+    fn prune_pending_change(&mut self) {
+        if self.pending_change.is_empty() {
+            return;
+        }
+        let ps = &self.pending_spends;
+        self.pending_change.retain(|t, _| ps.iter().any(|p| &p.txid == t));
+    }
+
+    /// Whether this bundle is one of the wallet's own submitted spends whose change
+    /// is already published via [`Self::pending_change`]. Its input left the balance
+    /// at submit, so previewing it would count the change a second time (as
+    /// `incoming`). Matched on the whole nullifier set — the builder shuffles
+    /// actions, so no single action index can identify the transaction.
+    fn accounted_pending_spend(&self, mut nullifiers: impl Iterator<Item = [u8; 32]>) -> bool {
+        if self.pending_change.is_empty() {
+            return false;
+        }
+        nullifiers.any(|nf| {
+            self.pending_spends.iter().any(|p| p.note.nullifier == nf && self.pending_change.contains_key(&p.txid))
+        })
     }
 
     /// What an **unsettled** block would do to this wallet's balance, without touching
@@ -1328,6 +1511,10 @@ impl WalletDb {
             // Same drop rule as ingest: a bundle re-spending an already-spent nullifier
             // appends nothing, so it must not be previewed either.
             if bundle.actions.iter().any(|a| self.spent_nullifiers.contains(&a.nullifier)) {
+                continue;
+            }
+            // Our own parked spend with its change already reported: nothing to add.
+            if self.accounted_pending_spend(bundle.actions.iter().map(|a| a.nullifier)) {
                 continue;
             }
             // What this bundle takes from us: an action reveals the nullifier of the note it
@@ -1367,6 +1554,9 @@ impl WalletDb {
         }
         for records in txs {
             if records.iter().any(|a| self.spent_nullifiers.contains(&a.nullifier)) {
+                continue;
+            }
+            if self.accounted_pending_spend(records.iter().map(|a| a.nullifier)) {
                 continue;
             }
             let spent: u128 =
@@ -1734,8 +1924,11 @@ impl WalletDb {
     /// send error) rather than silently root to a wrong tree.
     fn decoded_leaves(&self) -> &[MerkleHashOrchard] {
         self.decoded.get_or_init(|| {
+            // Each leaf decodes independently; a multi-million-leaf stream is seconds of
+            // one core, so spread it.
+            use rayon::prelude::*;
             self.leaves
-                .iter()
+                .par_iter()
                 .map(|b| Option::<MerkleHashOrchard>::from(MerkleHashOrchard::from_bytes(b)))
                 .collect::<Option<Vec<_>>>()
                 .unwrap_or_default()
@@ -1972,7 +2165,69 @@ impl WalletDb {
     /// keeps using the replay. So a bug in the mountain range, in the frontier seeding,
     /// or in the indexing cannot produce a wrong witness; it can only fail to help.
     pub fn build_subtree_cache(&mut self) {
-        self.build_subtree_cache_until(|| false);
+        self.build_subtree_cache_with_progress(&AtomicU64::new(0));
+    }
+
+    /// As [`Self::build_subtree_cache`], folding across every core
+    /// (`SubtreeCache::fold_parallel`) and counting leaves folded into `progress`
+    /// (relative to where this build started). Runs to completion: this is the
+    /// never-yield path a caller takes when the cache is wanted NOW. The sliced,
+    /// resumable [`Self::build_subtree_cache_until`] stays sequential, since a stood-down
+    /// partial must be a plain left-to-right prefix.
+    pub fn build_subtree_cache_with_progress(&mut self, progress: &AtomicU64) -> bool {
+        if self.subtree.failed || (self.subtree.active && self.subtree.upto == self.size) {
+            return self.subtree.active;
+        }
+        let Some((mut c, _)) = self.subtree_build_start() else { return false };
+        let ok = {
+            let leaves = self.decoded_leaves();
+            c.fold_parallel(self.base_size, leaves, PAR_WINDOW_LOG2, progress)
+        };
+        if !ok {
+            self.subtree = SubtreeCache { failed: true, ..Default::default() };
+            return false;
+        }
+        c.partial = false;
+        c.active = true;
+        let ok = self.root_from(&c, self.size).is_some_and(|r| r == self.tree.root());
+        self.subtree = if ok { c } else { SubtreeCache { failed: true, ..Default::default() } };
+        ok
+    }
+
+    /// The cache a build starts from and the stream offset to fold from: a stood-down
+    /// partial resumed at its `upto`, or a fresh cache seeded from the base frontier.
+    /// `None` marks the cache failed (the frontier could not seed it).
+    fn subtree_build_start(&mut self) -> Option<(SubtreeCache, usize)> {
+        // Resume a build that stood down earlier rather than repeat it. The sweep is a
+        // pure left-to-right fold, so a partial cache is a valid prefix and continuing
+        // from `upto` yields exactly the same structure as starting over.
+        //
+        // Without this, yielding costs the WHOLE pass — measured live at 243-296 s per
+        // wallet. That made every stand-down ruinously expensive, which is why the old
+        // code could only afford to yield for proving, and why it could not afford to
+        // yield for a request waiting on the wallet lock at all. Cheap yields are what
+        // make aggressive yielding affordable.
+        //
+        // Only resume when the partial still lines up with the current stream: base
+        // compaction can move `base_size` and re-index `decoded_leaves`, so a prefix
+        // that starts below the current base is discarded rather than reinterpreted.
+        let resume_from = if self.subtree.partial && !self.subtree.active {
+            self.subtree.upto.checked_sub(self.base_size).filter(|&r| r as usize <= self.decoded_leaves().len())
+        } else {
+            None
+        };
+        let c = match resume_from {
+            Some(_) => std::mem::take(&mut self.subtree),
+            None => {
+                let mut c = SubtreeCache::default();
+                if !c.seed_from_frontier(&self.base_frontier, self.base_size) {
+                    self.subtree = SubtreeCache { failed: true, ..Default::default() };
+                    return None;
+                }
+                c
+            }
+        };
+        Some((c, resume_from.unwrap_or(0) as usize))
     }
 
     /// As [`Self::build_subtree_cache`], but abandons the sweep as soon as `should_yield`
@@ -2000,36 +2255,8 @@ impl WalletDb {
             return self.subtree.active;
         }
         let reject = SubtreeCache { failed: true, ..Default::default() };
-        // Resume a build that stood down earlier rather than repeat it. The sweep is a
-        // pure left-to-right fold, so a partial cache is a valid prefix and continuing
-        // from `upto` yields exactly the same structure as starting over.
-        //
-        // Without this, yielding costs the WHOLE pass — measured live at 243-296 s per
-        // wallet. That made every stand-down ruinously expensive, which is why the old
-        // code could only afford to yield for proving, and why it could not afford to
-        // yield for a request waiting on the wallet lock at all. Cheap yields are what
-        // make aggressive yielding affordable.
-        //
-        // Only resume when the partial still lines up with the current stream: base
-        // compaction can move `base_size` and re-index `decoded_leaves`, so a prefix
-        // that starts below the current base is discarded rather than reinterpreted.
-        let resume_from = if self.subtree.partial && !self.subtree.active {
-            self.subtree.upto.checked_sub(self.base_size).filter(|&r| r as usize <= self.decoded_leaves().len())
-        } else {
-            None
-        };
-        let mut c = match resume_from {
-            Some(_) => std::mem::take(&mut self.subtree),
-            None => {
-                let mut c = SubtreeCache::default();
-                if !c.seed_from_frontier(&self.base_frontier, self.base_size) {
-                    self.subtree = reject;
-                    return false;
-                }
-                c
-            }
-        };
-        let start = resume_from.unwrap_or(0) as usize;
+        // Resume a stood-down partial or seed afresh — see `subtree_build_start`.
+        let Some((mut c, start)) = self.subtree_build_start() else { return false };
         {
             let leaves = self.decoded_leaves();
             let base = self.base_size;
@@ -3639,6 +3866,68 @@ mod tests {
         assert!(db.witness_paths_at(&positions, db.size()).iter().all(Option::is_some));
     }
 
+    /// The parallel fold must be bit-identical to the sequential sweep: same roots at
+    /// every level, same `first`, same peaks, same `upto` — for an unseeded stream, an
+    /// aligned base, an unaligned base, and window sizes from one leaf up to the real one.
+    /// The root gate would reject a wrong cache anyway, but the consequence of that is
+    /// a wallet silently on the O(chain) replay forever, which is exactly what this test
+    /// exists to catch before it ships.
+    #[test]
+    fn parallel_fold_matches_sequential() {
+        let mine = [37u8; 32];
+        let mut db = WalletDb::from_seed(mine).unwrap();
+        for b in 0..121u32 {
+            let theirs = coinbase_for(address_of([(b % 251) as u8 + 1; 32]), format!("s{b}").as_bytes(), 100 + b as u64);
+            if b % 3 == 0 {
+                let ours = coinbase_for(address_of(mine), format!("m{b}").as_bytes(), 1_000 + b as u64);
+                db.ingest_block(&[theirs, ours], &[]);
+            } else {
+                db.ingest_block(&[theirs], &[]);
+            }
+        }
+        db.ingest_block(&[coinbase_for(address_of(mine), b"odd", 5_000)], &[]);
+        assert_eq!(db.size() % 2, 1, "an odd stream exercises the ragged tail");
+
+        for &base in &[0u64, 64, 130] {
+            let mut w = WalletDb::from_seed(mine).unwrap();
+            w.leaves = db.leaves.clone();
+            // Compaction never rolls past a held note, so keep only the notes above
+            // `base` — otherwise every base collapses to the earliest note's position.
+            w.notes = db.notes.iter().filter(|n| n.position >= base).cloned().collect();
+            w.size = db.size;
+            w.tree = db.tree.clone();
+            if base > 0 {
+                // Returns whether MORE rolling remains; a full roll to `base` yields false.
+                let more = w.advance_base_capped(base, u64::MAX);
+                assert!(!more, "the roll to base={base} completes in one call");
+            }
+            assert_eq!(w.base_size(), base, "the base under test is the one folded");
+            // Sequential reference.
+            let mut seq = SubtreeCache::default();
+            assert!(seq.seed_from_frontier(&w.base_frontier, w.base_size));
+            for (i, leaf) in w.decoded_leaves().iter().enumerate() {
+                assert!(seq.push_leaf(w.base_size + i as u64, *leaf));
+            }
+            for &log2 in &[0u8, 3, 5, 6, PAR_WINDOW_LOG2] {
+                let progress = AtomicU64::new(0);
+                let mut par = SubtreeCache::default();
+                assert!(par.seed_from_frontier(&w.base_frontier, w.base_size));
+                assert!(par.fold_parallel(w.base_size, w.decoded_leaves(), log2, &progress), "fold base={base} log2={log2}");
+                assert!(par.levels == seq.levels, "levels base={base} log2={log2}");
+                assert!(par.first == seq.first, "first base={base} log2={log2}");
+                assert!(par.peaks == seq.peaks, "peaks base={base} log2={log2}");
+                assert_eq!(par.upto, seq.upto, "upto base={base} log2={log2}");
+                assert_eq!(progress.load(Ordering::Relaxed), w.decoded_leaves().len() as u64, "progress counts every leaf");
+            }
+            // And the public entry point (which now folds in parallel) passes its own
+            // root gate and serves real witnesses.
+            w.build_subtree_cache();
+            assert!(w.subtree_cache_ready(w.size()), "root gate base={base}");
+            let positions: Vec<u64> = w.notes().iter().map(|n| n.position).filter(|&p| p >= w.base_size()).collect();
+            assert!(w.witness_paths_at(&positions, w.size()).iter().all(Option::is_some), "cached witnesses base={base}");
+        }
+    }
+
     /// A wallet that borrowed the shared tree and then had borrowing withdrawn is left
     /// with a mirror it cannot repair.
     ///
@@ -4845,12 +5134,26 @@ mod circuit_tests {
         a.mark_spent(a.notes()[0].position, [0xcc; 32], 15);
         assert_eq!(a.balance(), 0, "submitted note leaves the balance immediately");
         assert_eq!(a.pending_spends().len(), 1);
+        // The balance-dip fix: walletd records amount + fee right after parking, so
+        // the change (8_000 - 5_000 - 1_000) is published instead of reading as 0
+        // until the change note is decrypted on-chain. Never part of `balance()`.
+        a.note_pending_outflow([0xcc; 32], 6_000);
+        assert_eq!(a.pending_change(), 2_000, "change owed back is known at submit");
+        assert_eq!(a.balance(), 0, "pending change is not spendable balance");
+        // The 0-conf preview of the same tx must contribute NOTHING for the sender
+        // (its change is already carried by `pending_change`) ...
+        let own = a.preview_block(&[], &[&wire]);
+        assert_eq!((own.incoming, own.outgoing), (0, 0), "own accounted spend previews as no movement");
+        // ... while the recipient still sees the payment arriving.
+        let theirs = b.preview_block(&[], &[&wire]);
+        assert_eq!((theirs.incoming, theirs.outgoing), (5_000, 0));
 
         let meta2 = BlockMeta { coinbase_txid: [0xbb; 32], txids: vec![[0xcc; 32]], timestamp_ms: 2_000, daa_score: 20 };
         a.ingest_block_with_meta(&[], &[&wire], Some(&meta2));
         b.ingest_block_with_meta(&[], &[&wire], Some(&meta2));
         assert!(a.pending_spends().is_empty(), "observed nullifier confirms the pending spend");
         assert_eq!(a.balance(), 2_000, "change recovered");
+        assert_eq!(a.pending_change(), 0, "confirmed spend: the change is a real note now, not pending");
 
         // Sender: a Sent row with the OVK-recovered recipient, amount and memo.
         assert_eq!(a.history().len(), 2);
@@ -4960,6 +5263,15 @@ mod circuit_tests {
         db.mark_spent(pos, [0xcc; 32], 110);
         assert_eq!(db.balance(), 6_000);
         assert_eq!(db.pending_spends().len(), 1);
+        // Sending 3_000 (incl. fee) out of the 4_000 note owes 1_000 back as change.
+        db.note_pending_outflow([0xcc; 32], 3_000);
+        assert_eq!(db.pending_change(), 1_000);
+        // An outflow for a txid with nothing parked, or one that consumes the whole
+        // note, records nothing.
+        db.note_pending_outflow([0xdd; 32], 1);
+        db.note_pending_outflow([0xcc; 32], 4_000);
+        assert_eq!(db.pending_change(), 0, "no leftover ⇒ no pending change");
+        db.note_pending_outflow([0xcc; 32], 3_000);
 
         // The parked note and the clock survive a checkpoint round-trip (v7).
         let blob = db.to_checkpoint();
@@ -4967,6 +5279,11 @@ mod circuit_tests {
         assert_eq!(db.pending_spends().len(), 1, "pending spends persist across restart");
         assert_eq!(db.last_daa(), 110);
         assert_eq!(db.balance(), 6_000);
+        // The change figure is display-only and deliberately NOT in the checkpoint
+        // (no format bump for it): it reverts to the preview-derived path on restart.
+        assert_eq!(db.pending_change(), 0, "pending change is not persisted");
+        db.note_pending_outflow([0xcc; 32], 3_000);
+        assert_eq!(db.pending_change(), 1_000);
 
         // Too fresh to give up on: nothing reclaimed.
         assert!(db.reclaim_expired(120, 3_600).is_empty());
@@ -4982,6 +5299,7 @@ mod circuit_tests {
         assert_eq!(back, vec![([0xcc; 32], 4_000)], "the lost spend's note is handed back");
         assert_eq!(db.balance(), 10_000, "no money vanished");
         assert!(db.pending_spends().is_empty());
+        assert_eq!(db.pending_change(), 0, "a reclaimed spend owes no change");
         assert_eq!(db.notes()[0].position, pos, "reclaimed note returns in position order");
     }
 

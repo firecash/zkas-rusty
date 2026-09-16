@@ -693,6 +693,35 @@ Do you confirm? (y/n)";
     ));
     let consensus_manager = Arc::new(ConsensusManager::new(consensus_factory));
 
+    // Say what shielded history this node holds, once, at startup. Until now nothing did unless
+    // `--verify-shielded-history` was passed, so an operator whose wallet was refused with
+    // "cannot serve complete shielded history" had no line in the log to compare against. Same
+    // numbers `GetShieldedTreeState` publishes (`history_from_daa_score` / `history_complete`).
+    {
+        let consensus = consensus_manager.consensus().unguarded_session_blocking();
+        match consensus.get_shielded_history_status() {
+            Ok((floor, complete)) => {
+                info!(
+                    "Shielded history: from DAA {floor}, complete={complete} (--shielded-history={}, archival={})",
+                    if config.wants_shielded_history() { "on" } else { "off" },
+                    args.archival
+                );
+                if !complete && config.wants_shielded_history() {
+                    info!(
+                        "Shielded history below DAA {floor} will be fetched from peers during IBD and verified before it \
+                         is served; wallets born before that DAA see a partial balance until the log says VERIFIED"
+                    );
+                } else if !complete {
+                    info!(
+                        "Shielded history below DAA {floor} is NOT fetched (--shielded-history=off); wallets born before \
+                         that DAA cannot be served from this node"
+                    );
+                }
+            }
+            Err(e) => warn!("Shielded history status could not be read at startup: {e}"),
+        }
+    }
+
     // `--verify-shielded-history`: replay the archive against this node's own anchored frontier
     // and report, before serving anything.
     //
