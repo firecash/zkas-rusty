@@ -866,6 +866,20 @@ impl WalletDb {
         &self.notes
     }
 
+    /// Whether the restored notes were derived under THIS wallet's viewing key: every
+    /// stored nullifier must equal the one this key derives for its note. A checkpoint
+    /// blob carries no key material, so this is the only binding between a blob found
+    /// on disk and the key it is being restored under — a blob scanned by another key
+    /// would otherwise install that key's notes here. At most `sample` notes are checked
+    /// (one foreign note is proof enough, and each nullifier is a curve operation).
+    /// `None` when there are no notes to bind with.
+    pub fn notes_bound_to_key(&self, sample: usize) -> Option<bool> {
+        if self.notes.is_empty() {
+            return None;
+        }
+        Some(self.notes.iter().take(sample).all(|n| n.note.nullifier(&self.fvk).to_bytes() == n.nullifier))
+    }
+
     /// Absolute position of the first leaf this wallet actually scanned: 0 for a
     /// full-scan wallet, or the fast-sync checkpoint's leaf count. Notes minted
     /// *before* this base are invisible to the wallet — a caller deciding whether

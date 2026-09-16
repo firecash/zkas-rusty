@@ -236,6 +236,11 @@ const REORG_STRIKES: u32 = 3;
 /// unknown" is what nuked eleven wallets in one 20ms burst on 2026-07-12 and a live
 /// user's wallet seconds after a send on 2026-07-13 (the send's Halo 2 proof is exactly
 /// the CPU spike that makes the probe RPC time out).
+///
+/// A marker is evidence only from a node that has REACHED the cursor (see
+/// [`node_reaches`]): a node still syncing answers `cannot find header` for every block
+/// it has not received yet, and a walletd repointed at one used to retire a synced
+/// checkpoint on that alone (desktop "Chain source" switch, 2026-09).
 const CURSOR_GONE_MARKERS: [&str; 4] = [
     "cannot find full block",
     "cannot find header",
@@ -671,6 +676,14 @@ fn decrypt_seed(blob: &[u8], secret: &str) -> Result<[u8; 32], String> {
     <[u8; 32]>::try_from(pt.as_slice()).map_err(|_| "decrypted seed is not 32 bytes".to_string())
 }
 
+/// The scan birthday recorded in a wallet's file, without touching key material.
+/// `None` when the file is absent or unreadable; `Some(0)` when no birthday is known.
+fn wallet_birthday_on_disk(dir: &str, token: &str) -> Option<u64> {
+    let bytes = std::fs::read(wallet_path(dir, token)).ok()?;
+    let wf: WalletFile = serde_json::from_slice(&bytes).ok()?;
+    Some(wf.birthday)
+}
+
 /// Load a wallet's (key, birthday) from disk, decrypting the seed with `secret`
 /// when the file is encrypted. A file carrying an `fvk_hex` is a watch-only
 /// (non-custodial) wallet: there is no seed on this machine to decrypt.
@@ -848,6 +861,8 @@ pub fn import_backup(dir: &str, token: &str, json: &str, backup_secret: &str, wa
     let seed = decrypt_seed(&blob, backup_secret).map_err(|_| "wrong backup passphrase".to_string())?;
     save_seed(dir, token, &backup.network, &seed, backup.birthday, Some(wallet_secret)).map_err(|e| format!("write wallet: {e}"))?;
     let _ = std::fs::remove_file(scan_path(dir, token));
+    // A previous key's quarantined copies must not be restored under this one.
+    retire_quarantine_copies(dir, token);
     Ok(())
 }
 
@@ -1470,6 +1485,67 @@ fn checkpoint_cursor(dir: &str, token: &str, current_genesis: &RpcHash) -> Optio
     Some(RpcHash::from_bytes(buf[37..69].try_into().ok()?))
 }
 
+/// `(cursor, cursor DAA score)` from the fixed header of the checkpoint file at `path`
+/// (a live `.scan` or a quarantined `.scan.stale-*` / `.scan.bak` copy), or `None` unless
+/// it is a checkpoint for `current_genesis`. Reads only the header — the body can be
+/// hundreds of megabytes and this runs on error paths and at every load.
+fn checkpoint_header(path: &str, current_genesis: &RpcHash) -> Option<(RpcHash, u64)> {
+    use std::io::Read as _;
+    let mut buf = [0u8; SCAN_HEADER_LEN];
+    std::fs::File::open(path).ok()?.read_exact(&mut buf).ok()?;
+    if &buf[0..4] != SCAN_MAGIC || !matches!(buf[4], SCAN_VERSION | SCAN_VERSION_PREV) {
+        return None;
+    }
+    if RpcHash::from_bytes(buf[5..37].try_into().ok()?) != *current_genesis {
+        return None;
+    }
+    let cursor = RpcHash::from_bytes(buf[37..69].try_into().ok()?);
+    let scanned = u64::from_le_bytes(buf[69..77].try_into().ok()?);
+    Some((cursor, scanned))
+}
+
+/// Positive evidence that the node's chain has REACHED a wallet cursor at DAA
+/// `cursor_daa`: the node reports itself synced AND its virtual DAA score is at or past
+/// the cursor. Only then is an absent-header answer for that cursor proof the cursor is
+/// gone (pruned / off the selected chain). A node that is merely behind — in IBD, still
+/// backfilling, or a public node re-syncing from genesis — answers `cannot find header`
+/// for any block it has not received yet, and a walletd repointed at one (desktop
+/// "Chain source" switch, 2026-09) used to retire a fully synced checkpoint on it.
+/// `Err` carries the reason for the log line; a node that cannot answer in time is
+/// `Err` too, never evidence.
+async fn node_reaches(client: &GrpcClient, cursor_daa: u64, timeout: std::time::Duration) -> Result<(), String> {
+    let synced = match tokio::time::timeout(timeout, client.get_sync_status()).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => return Err(format!("get_sync_status failed: {e}")),
+        Err(_) => return Err("get_sync_status timed out".into()),
+    };
+    let tip = match tokio::time::timeout(timeout, client.get_block_dag_info()).await {
+        Ok(Ok(d)) => d.virtual_daa_score,
+        Ok(Err(e)) => return Err(format!("get_block_dag_info failed: {e}")),
+        Err(_) => return Err("get_block_dag_info timed out".into()),
+    };
+    if !synced {
+        return Err(format!("node reports NOT synced (tip DAA {tip}, cursor DAA {cursor_daa})"));
+    }
+    if tip < cursor_daa {
+        return Err(format!("node tip DAA {tip} is below the cursor DAA {cursor_daa}"));
+    }
+    Ok(())
+}
+
+/// Take `token`'s `.scan.stale-<ts>` quarantine copies out of `restore_quarantined`'s
+/// reach by renaming them `.rescanned` (kept for forensics, never auto-restored). Called
+/// by `/rescan`, whose whole point is to rebuild rather than resume.
+fn retire_quarantine_copies(dir: &str, token: &str) {
+    let prefix = format!("{token}.scan.stale-");
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for name in rd.flatten().filter_map(|e| e.file_name().into_string().ok()) {
+        if name.strip_prefix(&prefix).is_some_and(|stamp| stamp.parse::<u64>().is_ok()) {
+            let _ = std::fs::rename(format!("{dir}/{name}"), format!("{dir}/{name}.rescanned"));
+        }
+    }
+}
+
 /// Load a wallet's scan checkpoint if present and still valid for
 /// `current_genesis` (the network genesis hash). Returns the reconstructed
 /// `(db, low_cursor, scanned, boundaries, sink_blue)`, or `None` on any absence /
@@ -1627,8 +1703,14 @@ fn adopt_twin_checkpoint(
         // (`blind_below` > 0) that a birthday-0 / earlier-birthday restore explicitly
         // wants recovered — scanning honestly beats inheriting someone else's blind
         // spot and silently under-reporting the balance.
+        // `birthday == 0` means the client has NO opinion (a re-pair, a second device, a
+        // service switch that lost its local copy), not "scan from genesis": the donor's
+        // birthday is a fact the same user asserted for the same key, so it is adopted
+        // along with the view. Seen live 2026-09-16: seven registrations of one key at
+        // birthday 0, each refusing its own synced twin and rescanning from genesis. A
+        // deliberate everything-from-genesis scan is `/rescan`, not a registration.
         let blind = checkpoint_blind_below(&scan_path(dir, donor)).unwrap_or(u64::MAX);
-        if blind != 0 && (birthday == 0 || birthday < donor_birthday) {
+        if blind != 0 && birthday != 0 && birthday < donor_birthday {
             continue;
         }
         // Freshest donor wins: least catch-up left for the clone.
@@ -1642,7 +1724,7 @@ fn adopt_twin_checkpoint(
     // a consistent file. At worst it lags the donor's RAM state by CHECKPOINT_EVERY
     // blocks; the clone re-scans that tail in seconds.
     std::fs::copy(scan_path(dir, &donor), scan_path(dir, token)).ok()?;
-    Some((donor, donor_birthday.min(birthday)))
+    Some((donor, if birthday == 0 { donor_birthday } else { donor_birthday.min(birthday) }))
 }
 
 /// One pass over every wallet file in `dir` → viewing key → tokens map. Argon2 per
@@ -2577,9 +2659,26 @@ impl WalletEntry {
                         probe_gone && node_alive
                     };
                     if gone {
-                        self.reorged_strikes += 1;
-                        self.error = Some("wallet cursor no longer usable on the node; rescanning".into());
-                        log::info!("wallet cursor unusable (strike {}/{REORG_STRIKES}): {e}", self.reorged_strikes);
+                        // A verdict is only evidence from a node whose chain has REACHED
+                        // the cursor. "cannot find header" is also what a node answers for
+                        // a block it simply has not received yet (IBD, backfill, a public
+                        // node re-syncing from genesis) — and such a node still "serves
+                        // genesis", so nothing downstream caught it: a walletd repointed at
+                        // one retired a fully synced checkpoint within three passes.
+                        match node_reaches(client, self.scanned as u64, SYNC_RPC_TIMEOUT).await {
+                            Ok(()) => {
+                                self.reorged_strikes += 1;
+                                self.error = Some("wallet cursor no longer usable on the node; rescanning".into());
+                                log::info!("wallet cursor unusable (strike {}/{REORG_STRIKES}): {e}", self.reorged_strikes);
+                            }
+                            Err(why) => {
+                                log::debug!(
+                                    "wallet cursor {} reported unusable ({e}) but the node has not reached it ({why}); checkpoint kept, no strike",
+                                    self.low
+                                );
+                                self.error = Some(format!("node is behind the wallet cursor ({why}); waiting"));
+                            }
+                        }
                     } else {
                         log::debug!("wallet sync page failed (transient, checkpoint kept): {e}");
                         self.error = Some(format!("get_shielded_blocks failed: {e}"));
@@ -4691,11 +4790,107 @@ impl AppState {
             .await
             .map_err(|_| format!("cursor verification timed out ({cursor})"))?
             .map_err(|e| e.to_string())?;
+        // The node answers with the nearest checkpointed block when it holds no frontier
+        // for the cursor itself (see `get_wallet`). That frontier is returned AS IS: the
+        // adopted copy then fails `load_checkpoint`'s size binding and the caller discards
+        // it and scans clean. Returning `Err` here instead left the donor's copy in place
+        // as this token's own `.scan`, and the next load quarantined it, adopted the same
+        // donor again, and so on — a fresh `.scan.stale-*` copy per load, never a scan.
         Ok(Some(kaspa_shielded_core::tree::FrontierState {
             size: ts.size,
             leaf: (ts.size > 0).then(|| ts.leaf.as_bytes()),
             ommers: ts.ommers.iter().map(|o| o.as_bytes()).collect(),
         }))
+    }
+
+    /// Bring back the furthest-scanned `.scan.stale-<ts>` copy of `token`'s checkpoint when
+    /// the node NOW serves its cursor and it is meaningfully ahead of what this token resumes
+    /// from. A restored copy is renamed `.restored` so it is used at most once.
+    ///
+    /// Quarantine copies were write-only: after a false quarantine (a node that had not
+    /// reached the cursor — gated in `get_wallet` since) the rebuild's partial `.scan` was
+    /// all any later load resumed from, so a user who reverted to the original node kept
+    /// scanning from genesis with the synced checkpoint sitting next to it. Nothing is
+    /// trusted: the node must serve the frontier at exactly that cursor, the copy goes
+    /// through `parse_scan_bytes`' size/root binding, and its notes must derive their
+    /// nullifiers under THIS key (a blob carries no key material, and the token may have
+    /// held another key when it was quarantined) — all BEFORE it replaces the live file.
+    /// A deliberate `/rescan` retires these copies first (`retire_quarantine_copies`), so
+    /// it is never undone here. `.divergent-*` copies failed a real size/root check and
+    /// `.bak` is also what `/rescan` writes; neither is a candidate.
+    #[allow(clippy::type_complexity)]
+    async fn restore_quarantined(
+        &self,
+        token: &str,
+        key: WalletKey,
+        genesis: &RpcHash,
+        mine_scanned: u64,
+    ) -> Option<(WalletDb, RpcHash, usize, VecDeque<(u64, u64)>, u64, u64)> {
+        let prefix = format!("{token}.scan.stale-");
+        let (_, path, cursor, scanned) = std::fs::read_dir(&self.wallet_dir)
+            .ok()?
+            .flatten()
+            .filter_map(|e| {
+                let name = e.file_name().into_string().ok()?;
+                let stamp = name.strip_prefix(&prefix)?.parse::<u64>().ok()?;
+                let path = format!("{}/{name}", self.wallet_dir);
+                let (cursor, scanned) = checkpoint_header(&path, genesis)?;
+                Some((stamp, path, cursor, scanned))
+            })
+            // The FURTHEST-scanned copy, not the newest: a false quarantine repeats on every
+            // reload while the node stays behind, each time taking the partial rebuild (seen
+            // live: five copies at 6 h intervals, shrinking) — the original synced checkpoint
+            // is the OLDEST of them. Stamp only breaks ties.
+            .max_by_key(|(stamp, _, _, scanned)| (*scanned, *stamp))?;
+        if scanned <= mine_scanned + TWIN_ADOPT_LEAD {
+            return None;
+        }
+        let c = self.request_client().await?;
+        let ts = match tokio::time::timeout(std::time::Duration::from_secs(8), c.get_shielded_tree_state(Some(cursor))).await {
+            Ok(Ok(ts)) => ts,
+            Ok(Err(e)) => {
+                log::info!("wallet {token}: quarantined checkpoint {path} (DAA {scanned}) is not resumable on this node ({e})");
+                return None;
+            }
+            Err(_) => return None,
+        };
+        if ts.block_hash != cursor {
+            log::info!("wallet {token}: node cannot serve the frontier at quarantined cursor {cursor} (served {}); not restoring", ts.block_hash);
+            return None;
+        }
+        let fs = kaspa_shielded_core::tree::FrontierState {
+            size: ts.size,
+            leaf: (ts.size > 0).then(|| ts.leaf.as_bytes()),
+            ommers: ts.ommers.iter().map(|o| o.as_bytes()).collect(),
+        };
+        let buf = std::fs::read(&path).ok()?;
+        let (saved_genesis, rest) = parse_scan_bytes(&buf, key, Some(&fs))?;
+        if saved_genesis != *genesis {
+            return None;
+        }
+        // `None` = the copy holds no notes at all (a synced but still-empty wallet): nothing
+        // to bind, and nothing another key could smuggle in — restore it. Only a copy whose
+        // notes do NOT derive under this key is refused.
+        if rest.0.notes_bound_to_key(8) == Some(false) {
+            log::warn!("wallet {token}: quarantined checkpoint {path} holds notes not derived under this wallet's key; not restoring");
+            return None;
+        }
+        // Keep the partial rebuild it replaces (its pending-spend bookkeeping, if any).
+        let live = scan_path(&self.wallet_dir, token);
+        // Copy first, swap last: a failed copy must not leave the token with no `.scan`.
+        let tmp = format!("{live}.tmp");
+        std::fs::copy(&path, &tmp).ok()?;
+        let _ = std::fs::rename(&live, format!("{live}.replaced-{}", now_unix()));
+        std::fs::rename(&tmp, &live).ok()?;
+        // Consumed: a copy is restored at most once. If the sync loop then finds this cursor
+        // unusable on a node that has reached it (retired to `.bak`), the next reload must
+        // not bring the same copy back and start that cycle over; a later false quarantine
+        // takes a fresh copy of the live file anyway, so nothing is lost by retiring this one.
+        let _ = std::fs::rename(&path, format!("{path}.restored"));
+        log::warn!(
+            "wallet {token}: restored quarantined checkpoint {path} (cursor {cursor}, DAA {scanned}) — the node serves its cursor again; the rebuild had reached DAA {mine_scanned}"
+        );
+        Some(rest)
     }
 
     async fn get_wallet(self: &Arc<Self>, token: &str) -> Option<Wallet> {
@@ -4728,61 +4923,134 @@ impl AppState {
         // Sinsemilla replay into a frontier copy. Best-effort: if the node can't answer
         // (pruned cursor, RPC hiccup), we simply restore the old way.
         let mut abandoned_checkpoint = false;
-        let tip = match checkpoint_cursor(&self.wallet_dir, token, &genesis) {
-            Some(cursor) => match {
+        let tip = match checkpoint_header(&scan_path(&self.wallet_dir, token), &genesis) {
+            Some((cursor, cursor_daa)) => {
                 // Bounded, like fast_sync_entry: this runs FIRST for a returning wallet and
                 // holds the single load permit. Un-timed-out, a half-open node connection
                 // (e.g. Orbot up but the node unreachable) hangs the load forever with no
                 // error -- the wallet sits on "opening" and blocks every other load.
                 let c = self.request_client().await?;
-                match tokio::time::timeout(std::time::Duration::from_secs(8), c.get_shielded_tree_state(Some(cursor))).await {
+                let verified = match tokio::time::timeout(std::time::Duration::from_secs(8), c.get_shielded_tree_state(Some(cursor))).await
+                {
                     Ok(r) => r,
                     Err(_) => {
                         log::warn!("checkpoint cursor verification timed out ({cursor}); keeping checkpoint and retrying");
                         return None;
                     }
-                }
-            } {
-                Ok(ts) => Some(kaspa_shielded_core::tree::FrontierState {
-                    size: ts.size,
-                    leaf: (ts.size > 0).then(|| ts.leaf.as_bytes()),
-                    ommers: ts.ommers.iter().map(|o| o.as_bytes()).collect(),
-                }),
-                // Never load an unverified checkpoint. A transient node failure is
-                // retried on the next request; treating it as permission to trust the
-                // local file is how stale twin state previously propagated.
-                Err(e) => {
-                    let detail = e.to_string();
-                    // A cursor whose header is absent from the selected chain cannot
-                    // become valid by retrying: it is a checkpoint from a discarded
-                    // chain (or an old/pruned store). Keep an immutable forensic copy,
-                    // retire only the active cursor, and rebuild honestly from the
-                    // wallet birthday. Other errors may be transient RPC/node
-                    // failures, so preserve the checkpoint and retry as before.
-                    let permanent = detail.to_ascii_lowercase().contains("cannot find header")
-                        || detail.to_ascii_lowercase().contains("header not found");
-                    if permanent {
-                        let scan = scan_path(&self.wallet_dir, token);
-                        let quarantine = format!("{scan}.stale-{}", now_unix());
-                        if std::fs::copy(&scan, &quarantine).is_ok() {
-                            let _ = std::fs::remove_file(&scan);
+                };
+                match verified {
+                    // The node serves the NEAREST checkpointed block at-or-after a cursor
+                    // it holds no frontier for (below its pruning point, or still
+                    // backfilling). Binding this wallet's tree to another block's frontier
+                    // can only fail the size/root check below and mislabel a good
+                    // checkpoint "divergent" — so a foreign answer is "not resumable on
+                    // this node yet", never a verdict on the checkpoint.
+                    //
+                    // Three cases, told apart by what the node says about itself:
+                    // - not synced / tip below the cursor: it may still receive it — retry;
+                    // - synced, and it claims history at the cursor (complete, or its floor
+                    //   is at/below the cursor) yet cannot serve that exact block: the
+                    //   cursor is not on its chain — the same verdict as an absent header;
+                    // - synced, but its history floor is ABOVE the cursor (a pruned node,
+                    //   or an archival one still filling): resuming here would silently
+                    //   drop every note between the cursor and the floor, so the wallet is
+                    //   parked with that message and the checkpoint stays on disk.
+                    Ok(ts) if ts.block_hash != cursor => {
+                        if let Err(why) = node_reaches(&c, cursor_daa, std::time::Duration::from_secs(8)).await {
                             log::warn!(
-                                "checkpoint cursor is not on the selected chain ({detail}); quarantined as {quarantine} and rebuilding"
+                                "node cannot serve the frontier at the checkpoint cursor {cursor} (served {} instead) and has not reached it ({why}); keeping checkpoint and retrying",
+                                ts.block_hash
                             );
-                            abandoned_checkpoint = true;
-                            None
-                        } else {
-                            log::warn!("cannot quarantine stale checkpoint ({detail}); keeping checkpoint and retrying");
                             return None;
                         }
-                    } else {
-                        log::warn!(
-                            "cannot verify checkpoint cursor against selected chain ({detail}); keeping checkpoint and retrying"
-                        );
-                        return None;
+                        if ts.history_complete || ts.history_from_daa_score <= cursor_daa {
+                            let scan = scan_path(&self.wallet_dir, token);
+                            let quarantine = format!("{scan}.stale-{}", now_unix());
+                            if std::fs::copy(&scan, &quarantine).is_ok() {
+                                let _ = std::fs::remove_file(&scan);
+                                log::warn!(
+                                    "checkpoint cursor {cursor} (DAA {cursor_daa}) is not on the chain of a synced node that holds history there (served {} instead); quarantined as {quarantine} and rebuilding",
+                                    ts.block_hash
+                                );
+                                abandoned_checkpoint = true;
+                                None
+                            } else {
+                                log::warn!("cannot quarantine stale checkpoint (foreign block served); keeping checkpoint and retrying");
+                                return None;
+                            }
+                        } else {
+                            let msg = format!(
+                                "This node holds shielded history only from block {}, but this wallet was last synced at block {cursor_daa}. Resuming here would lose the notes in between, so the wallet is paused with its progress kept. Wait for the node to finish filling in shielded history (its log says \"shielded history: VERIFIED\"), or connect to a node with complete history.",
+                                ts.history_from_daa_score
+                            );
+                            // Not loaded, only logged: a resident placeholder entry would be
+                            // advanced by the sync loop like any other wallet (`sync_chunk`
+                            // clears `error` on its first served page) and its checkpoint
+                            // write would then replace the kept `.scan` with an empty
+                            // wallet at a later cursor. The wallet stays "opening" until
+                            // the node's floor passes the cursor or walletd is repointed.
+                            log::warn!("wallet {token}: {msg}");
+                            return None;
+                        }
+                    }
+                    Ok(ts) => Some(kaspa_shielded_core::tree::FrontierState {
+                        size: ts.size,
+                        leaf: (ts.size > 0).then(|| ts.leaf.as_bytes()),
+                        ommers: ts.ommers.iter().map(|o| o.as_bytes()).collect(),
+                    }),
+                    // Never load an unverified checkpoint. A transient node failure is
+                    // retried on the next request; treating it as permission to trust the
+                    // local file is how stale twin state previously propagated.
+                    Err(e) => {
+                        let detail = e.to_string();
+                        // A cursor whose header is absent from the selected chain cannot
+                        // become valid by retrying: it is a checkpoint from a discarded
+                        // chain (or an old/pruned store). Keep an immutable forensic copy,
+                        // retire only the active cursor, and rebuild honestly from the
+                        // wallet birthday. Other errors may be transient RPC/node
+                        // failures, so preserve the checkpoint and retry as before.
+                        //
+                        // "Absent" is only a verdict from a node that has REACHED the cursor
+                        // (synced, tip DAA at or past it). A node still syncing answers the
+                        // same text for every block it has not received yet, and the warm
+                        // sweep loads every wallet on disk at startup — so a walletd
+                        // restarted against a behind node quarantined every synced
+                        // checkpoint with no user action (desktop "Chain source" switch).
+                        let absent = detail.to_ascii_lowercase().contains("cannot find header")
+                            || detail.to_ascii_lowercase().contains("header not found");
+                        let permanent = absent
+                            && match node_reaches(&c, cursor_daa, std::time::Duration::from_secs(8)).await {
+                                Ok(()) => true,
+                                Err(why) => {
+                                    log::warn!(
+                                        "checkpoint cursor {cursor} is absent on the node ({detail}) but the node has not reached it ({why}); keeping checkpoint and retrying"
+                                    );
+                                    return None;
+                                }
+                            };
+                        if permanent {
+                            let scan = scan_path(&self.wallet_dir, token);
+                            let quarantine = format!("{scan}.stale-{}", now_unix());
+                            if std::fs::copy(&scan, &quarantine).is_ok() {
+                                let _ = std::fs::remove_file(&scan);
+                                log::warn!(
+                                    "checkpoint cursor {cursor} (DAA {cursor_daa}) is not on the selected chain of a synced node that has passed it ({detail}); quarantined as {quarantine} and rebuilding"
+                                );
+                                abandoned_checkpoint = true;
+                                None
+                            } else {
+                                log::warn!("cannot quarantine stale checkpoint ({detail}); keeping checkpoint and retrying");
+                                return None;
+                            }
+                        } else {
+                            log::warn!(
+                                "cannot verify checkpoint cursor against selected chain ({detail}); keeping checkpoint and retrying"
+                            );
+                            return None;
+                        }
                     }
                 }
-            },
+            }
             None => None,
         };
         let restored =
@@ -4796,6 +5064,15 @@ impl AppState {
                 log::warn!("preserved rejected checkpoint as {quarantine}");
             }
         }
+        // A quarantined copy of this token's own checkpoint that the node serves again
+        // beats both the partial rebuild and a twin (same key, further along, verified).
+        let restored = {
+            let mine = restored.as_ref().map(|r| r.2 as u64).unwrap_or(0);
+            match self.restore_quarantined(token, key, &genesis, mine).await {
+                Some(r) => Some(r),
+                None => restored,
+            }
+        };
         // No usable checkpoint — but this wallet may have a TWIN: another token
         // registered against the same viewing key that has already scanned the chain.
         //
@@ -5290,6 +5567,22 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
             );
             return SyncOutcome::Behind;
         }
+        // Belt and braces for the strike gate in `sync_chunk`: retire only on a node that
+        // has reached the cursor. The strikes may predate a repoint (the entry is long
+        // lived), so re-check here, at the moment the file is actually renamed.
+        if let Err(why) = node_reaches(&sync_client, e.scanned as u64, SYNC_RPC_TIMEOUT).await {
+            // Once per episode: `sync_chunk` records the same message on every later
+            // pass the node stays behind, so this fires only on the pass that parks it.
+            if !e.error.as_deref().is_some_and(|m| m.starts_with("node is behind the wallet cursor")) {
+                log::warn!(
+                    "wallet '{token}': cursor reported unusable for {} passes but the node has not reached it ({why}); \
+                     keeping the checkpoint until it does",
+                    e.reorged_strikes
+                );
+            }
+            e.error = Some(format!("node is behind the wallet cursor ({why}); waiting"));
+            return SyncOutcome::Behind;
+        }
         let scan = scan_path(&state.wallet_dir, &token);
         log::warn!(
             "wallet '{token}': cursor off the selected chain for {} consecutive passes ({}) \
@@ -5778,6 +6071,11 @@ struct NoteInfo {
 struct StatusResp {
     has_wallet: bool,
     address: Option<String>,
+    /// The scan birthday (DAA score) this daemon keeps for the wallet; 0 = unknown.
+    /// Lets a client that lost its own copy (a re-pair, a second device, a service
+    /// switch) re-register elsewhere with the real birthday instead of 0.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    birthday: Option<u64>,
     network: String,
     node_connected: bool,
     daa_score: u64,
@@ -5885,6 +6183,7 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Json<
     let mut resp = StatusResp {
         has_wallet: false,
         address: None,
+        birthday: None,
         network: state.network.clone(),
         node_connected,
         daa_score,
@@ -5967,6 +6266,9 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Json<
             resp.has_wallet = true;
             resp.loading = true;
             resp.address = state.address_from_disk(&token).await;
+        }
+        if resp.has_wallet {
+            resp.birthday = wallet_birthday_on_disk(&state.wallet_dir, &token);
         }
         // A subtree-cache build in flight for this wallet: report where it is. This is
         // the figure the app shows as "Preparing … N%" while a first send waits, and
@@ -6082,8 +6384,10 @@ async fn load_new_wallet(
     save_seed(&state.wallet_dir, token, &state.network, &seed, birthday, state.wallet_secret.as_deref())
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to write wallet file: {e}")))?;
     // Drop any prior scan checkpoint: a (re)imported seed must rescan from its own
-    // birthday, not resume a different wallet's stream.
+    // birthday, not resume a different wallet's stream. That includes quarantined copies,
+    // which `restore_quarantined` would otherwise bring back on the next load.
     let _ = std::fs::remove_file(scan_path(&state.wallet_dir, token));
+    retire_quarantine_copies(&state.wallet_dir, token);
     // Same-wallet-on-another-device fast path (see wallet_watch): a re-imported seed
     // whose viewing key some other token already scanned resumes from that
     // checkpoint instead of rescanning history the daemon already walked.
@@ -6240,10 +6544,22 @@ async fn wallet_watch(
     // brand-new wallet — history stays opt-in unless the caller asks for it).
     let existing_history = existing.as_ref().map(|(_, _, h)| *h).unwrap_or(false);
     let history = req.recoverable_history.unwrap_or(existing_history);
-    let has_checkpoint = checkpoint_cursor(&state.wallet_dir, &token, &state.genesis).is_some();
+    // No live checkpoint but a quarantined copy of this key's own scan that the node
+    // serves again (the app re-registers right after a chain-source switch is reverted):
+    // bring it back NOW, before the fast-sync path below installs a resident entry that
+    // would scan from the birthday until the next reload found the copy.
+    let has_checkpoint = checkpoint_cursor(&state.wallet_dir, &token, &state.genesis).is_some()
+        || (same_key && state.restore_quarantined(&token, key, &state.genesis, 0).await.is_some());
+    // A re-registration of the SAME key carrying birthday 0 is a client with no opinion
+    // (the app sends 0 whenever it has no birthday stored — after a service switch,
+    // re-pair or repair), not a request to widen the view. Taking `min` with it persisted
+    // 0, so the next quarantine or retirement rebuilt from genesis (seven of one user's
+    // eight registrations on the hosted daemon carried 0). An explicit genesis rescan
+    // remains available through `/rescan`, which sets the birthday deliberately.
+    let stored_birthday = existing.as_ref().map(|(_, b, _)| *b).unwrap_or(0);
+    let req_birthday = if same_key && req.birthday == 0 && stored_birthday != 0 { stored_birthday } else { req.birthday };
     if same_key && has_checkpoint {
-        let stored_birthday = existing.as_ref().map(|(_, b, _)| *b).unwrap_or(0);
-        let keep_birthday = stored_birthday.min(req.birthday);
+        let keep_birthday = stored_birthday.min(req_birthday);
         save_fvk(&state.wallet_dir, &token, &state.network, &fvk, keep_birthday, history)
             .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to write wallet file: {e}")))?;
         // Evict any stale in-RAM entry so the next load resumes from the preserved checkpoint.
@@ -6256,12 +6572,18 @@ async fn wallet_watch(
         return Ok(Json(AddressResp { address, index: 0 }));
     }
 
-    // A new or changed key must not resume a DIFFERENT key's checkpoint stream.
+    // A new or changed key must not resume a DIFFERENT key's checkpoint stream — nor
+    // have one restored from a quarantined copy on the next load. The same key
+    // re-registering while its own checkpoint sits in quarantine keeps those copies:
+    // that is the case `restore_quarantined` exists for.
     let _ = std::fs::remove_file(scan_path(&state.wallet_dir, &token));
+    if !same_key {
+        retire_quarantine_copies(&state.wallet_dir, &token);
+    }
     // Same-wallet-on-another-device fast path: if any other token here has already
     // scanned this exact viewing key, clone its checkpoint — the second device is
     // synced immediately instead of rescanning history the daemon already walked.
-    if let Some((donor, keep_birthday)) = state.adopt_twin(&token, &fvk, req.birthday).await {
+    if let Some((donor, keep_birthday)) = state.adopt_twin(&token, &fvk, req_birthday).await {
         save_fvk(&state.wallet_dir, &token, &state.network, &fvk, keep_birthday, history)
             .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to write wallet file: {e}")))?;
         state.wallets.lock().await.remove(&token);
@@ -6275,19 +6597,19 @@ async fn wallet_watch(
         // The clone failed to load (corrupt donor file, node hiccup) — scan honestly.
         let _ = std::fs::remove_file(scan_path(&state.wallet_dir, &token));
     }
-    save_fvk(&state.wallet_dir, &token, &state.network, &fvk, req.birthday, history)
+    save_fvk(&state.wallet_dir, &token, &state.network, &fvk, req_birthday, history)
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to write wallet file: {e}")))?;
     // Matches what `save_fvk` just wrote: opt-in unless the caller asked for history.
-    let entry = match state.fast_sync_entry(key, history, state.genesis, req.birthday).await {
+    let entry = match state.fast_sync_entry(key, history, state.genesis, req_birthday).await {
         Some(e) => e,
         None => state
-            .full_scan_entry(key, history, state.genesis, req.birthday)
+            .full_scan_entry(key, history, state.genesis, req_birthday)
             .await
             .ok_or_else(|| err(StatusCode::BAD_GATEWAY, "cannot anchor a full scan (node unreachable or too old)"))?,
     };
     state.wallets.lock().await.insert(token.clone(), Arc::new(Mutex::new(entry)));
     state.index_fvk(&token, &WalletKey::Fvk(fvk)).await;
-    log::info!("registered watch-only wallet for token {token} (birthday {})", req.birthday);
+    log::info!("registered watch-only wallet for token {token} (birthday {req_birthday}, requested {})", req.birthday);
     Ok(Json(AddressResp { address, index: 0 }))
 }
 
@@ -6600,6 +6922,8 @@ async fn wallet_rescan(
     state.wallets.lock().await.remove(&token);
     let scan = scan_path(&state.wallet_dir, &token);
     let _ = std::fs::rename(&scan, format!("{scan}.bak"));
+    // A deliberate rescan must not be undone by `restore_quarantined` on the next load.
+    retire_quarantine_copies(&state.wallet_dir, &token);
     log::info!("wallet '{token}': rescan requested — checkpoint retired, will reload from birthday");
     // Return NOW. Reloading a wallet means a fast-sync anchor fetch and a scan
     // from birthday; doing that inline would hold the request open for minutes and
@@ -9506,15 +9830,20 @@ mod sdk_api_tests {
             "foreign viewing key must not clone someone else's checkpoint"
         );
 
-        // A donor that is BLIND below its fast-sync base must not serve a
-        // birthday-0 restore (which asked for the complete history)...
+        // A donor that is BLIND below its fast-sync base must not serve a restore that
+        // claims an EARLIER birthday than the donor's...
         save_checkpoint(&dir, "donor", &genesis, &RpcHash::from_bytes([9u8; 32]), 777, &db, &boundaries, 100, 555).unwrap();
         std::fs::remove_file(scan_path(&dir, "phone")).unwrap();
         assert!(
-            adopt_twin_checkpoint(&dir, "phone", &fvk, 0, &genesis, None, &candidates).is_none(),
-            "a blind donor must not answer a full-history restore"
+            adopt_twin_checkpoint(&dir, "phone", &fvk, 1000, &genesis, None, &candidates).is_none(),
+            "a blind donor must not answer a restore born before it"
         );
-        // ...but may serve a restore that asked for the same-or-later birthday.
+        // ...but a registration with NO birthday opinion (0) adopts the donor AND its
+        // birthday, instead of rescanning from genesis and persisting 0.
+        let (_, adopted) = adopt_twin_checkpoint(&dir, "phone", &fvk, 0, &genesis, None, &candidates).expect("unknown birthday adopts");
+        assert_eq!(adopted, 4242, "the donor's birthday is adopted when the client has none");
+        std::fs::remove_file(scan_path(&dir, "phone")).unwrap();
+        // ...and one that asked for the same-or-later birthday.
         assert!(
             adopt_twin_checkpoint(&dir, "phone", &fvk, 5000, &genesis, None, &candidates).is_some(),
             "a blind donor is fine for a restore born at/after the donor"
