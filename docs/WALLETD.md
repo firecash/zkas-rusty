@@ -4,16 +4,18 @@ A REST daemon that turns the ZKas shielded pool into an ordinary-looking wallet 
 It scans the chain, recognises notes belonging to the keys it holds, keeps the Merkle
 witnesses a shielded spend needs, and builds/proves/submits payments.
 
-It backs three very different consumers, and the distinction matters for custody:
+It backs four consumers, and the distinction matters for custody **and** privacy:
 
-| Consumer | Endpoints | Who holds the spend key |
-| --- | --- | --- |
-| Web / mobile wallet (`wallet.zkas.info`) | `prepare` → `submit` | **the device** — daemon has the viewing key only |
-| Desktop wallet | embedded in-process (`lib.rs`) | the app |
-| Mining pool / payout service | `send`, `send_many`, `consolidate` | **the daemon** (custodial) |
+| Consumer | How it runs | Who holds the spend key | Who sees the viewing key |
+| --- | --- | --- | --- |
+| Hosted web / mobile wallet (`wallet.zkas.info`) | our server; `watch` → `prepare` → `submit` | **the device** | the server (it can watch, not spend) |
+| Desktop wallet | **embedded in-process** (`lib.rs`) on loopback | the app, on the user's machine | nobody but the user |
+| Android wallet, *Run on this phone* | **embedded in-process** via the `zkas-walletd-mobile` UniFFI library (`firecash/zkas-signer`), on loopback; syncs compact blocks from any node's gRPC | the phone | nobody but the user — the node serves blocks and sees an IP (or not, over Tor) |
+| Mining pool / payout service | `send`, `send_many`, `consolidate` | **the daemon** (custodial) | the operator |
 
-`main.rs` is only flag parsing; the daemon is a library (`lib.rs`) so the desktop
-wallet can embed it.
+`main.rs` is only flag parsing; the daemon is a library (`lib.rs`) so the desktop and
+Android apps can embed it. The embedded daemon speaks the same REST API on
+`127.0.0.1:<port>`, so a wallet UI does not change between hosted and local.
 
 ---
 

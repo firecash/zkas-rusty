@@ -11,6 +11,16 @@ coins.** The hosted `zkas-walletd` of the time was *custodial* — it generated 
 each user's seed (plaintext), so a server compromise would drain everyone. This document
 was the plan to remove that.
 
+> **Status (2026-09).** Phase 1 shipped and is what `wallet.zkas.info` runs: the device
+> signs, the hosted daemon proves with the viewing key only. Phase 2's *goal* — nothing
+> off the device sees the wallet — shipped in a different form than planned: instead of
+> in-browser WASM proving, the **full daemon runs natively inside the app**, on the
+> desktop (embedded `zkas_walletd` lib) and on Android in *Run on this phone* mode (the
+> `zkas-walletd-mobile` UniFFI library). Keys, scanning, witnessing and proving all stay
+> on the device; the server degrades to exactly the "dumb light-server" below — a node
+> serving compact blocks and the tree frontier. In-browser WASM proving for the web page
+> itself remains open.
+
 ## The enabling fact (why this is even possible on a shielded chain)
 
 Orchard splits a spend into two independent steps (see `shielded-core/src/wallet.rs`):

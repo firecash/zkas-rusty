@@ -47,9 +47,12 @@ explorer API.
   suite, but has not had an independent security review. Treat the software accordingly,
   and if you break an invariant we want to hear about it.
 - **Custody:** end-user wallets (web, desktop, mobile, paper) are **non-custodial** —
-  the seed stays on the user's device and the daemon receives a viewing key only
-  (`docs/NON_CUSTODIAL_WALLET.md`). `zkas-walletd`'s custodial mode exists for
-  operators (pools, payout services) that must sign server-side.
+  the seed stays on the user's device and a hosted daemon receives a viewing key only
+  (`docs/NON_CUSTODIAL_WALLET.md`). **Privacy:** the desktop app, and the Android app in
+  *Run on this phone* mode, embed `zkas-walletd` in-process, so no server holds even
+  the viewing key; the node they sync from serves blocks and learns nothing about the
+  wallet. `zkas-walletd`'s custodial mode exists for operators (pools, payout services)
+  that must sign server-side.
 
 ## Run a node
 
