@@ -126,6 +126,12 @@ impl IbdFlow {
     }
 
     async fn start_impl(&mut self) -> Result<(), ProtocolError> {
+        // The backfill below runs inside `ibd()`, and a node enters IBD only when it is behind.
+        // A node that was synced BEFORE its build learned to backfill (a miner's in-process node
+        // upgraded in place, 2026-09-17: log full of accepted blocks, never a history line, wallet
+        // refused forever) never IBDs again, so it never asked. Ask here too, once the node is
+        // synced and the history is still incomplete; same peer budget, same one-ask-per-peer.
+        self.backfill_if_synced_and_incomplete().await;
         while let Ok(relay_block) = self.relay_receiver.recv().await {
             if let Some(_guard) = self.ctx.try_set_ibd_running(self.router.key(), relay_block.header.daa_score) {
                 info!("IBD started with peer {}", self.router);
@@ -141,6 +147,52 @@ impl IbdFlow {
         }
 
         Ok(())
+    }
+
+    /// Fetch the pre-pruning-point shielded history from this peer when the node is already
+    /// synced but still serves partial history — the case `ibd()` never reaches. Runs on this
+    /// flow's own route, so it cannot interleave with an IBD on another peer's route; it is
+    /// skipped while any IBD is running, since IBD renumbers the same chain index.
+    async fn backfill_if_synced_and_incomplete(&mut self) {
+        if !self.ctx.config.wants_shielded_history() || SHIELDED_HISTORY_BACKFILL_DONE.load(Ordering::SeqCst) {
+            return;
+        }
+        if self.ctx.is_ibd_running() {
+            return;
+        }
+        let session = self.ctx.consensus().session().await;
+        if !self.ctx.is_nearly_synced(&session).await {
+            return; // the IBD path handles a node that still has to sync
+        }
+        match session.async_get_shielded_history_status().await {
+            Ok((_, true)) => {
+                SHIELDED_HISTORY_BACKFILL_DONE.store(true, Ordering::SeqCst);
+                return;
+            }
+            Ok((_, false)) => {}
+            Err(_) => return,
+        }
+        let should_ask = {
+            let mut guard = SHIELDED_HISTORY_ASKED_PEERS.lock().unwrap();
+            let asked = guard.get_or_insert_with(HashSet::new);
+            asked.len() < SHIELDED_HISTORY_MAX_PEERS && asked.insert(self.router.key())
+        };
+        if !should_ask {
+            return;
+        }
+        info!("shielded history: this node is synced but holds partial history; asking {} to backfill it", self.router);
+        match self.backfill_shielded_history(&session).await {
+            Ok(()) => SHIELDED_HISTORY_BACKFILL_DONE.store(true, Ordering::SeqCst),
+            Err(e) => {
+                let asked = SHIELDED_HISTORY_ASKED_PEERS.lock().unwrap().as_ref().map_or(0, |s| s.len());
+                let floor = session.async_get_shielded_history_status().await.map(|(daa, _)| daa).unwrap_or(0);
+                warn!(
+                    "archival: shielded history backfill did not complete from {} ({e}); {} of {} peers asked; \
+                     this node serves shielded history from DAA {floor} (incomplete) for now",
+                    self.router, asked, SHIELDED_HISTORY_MAX_PEERS
+                );
+            }
+        }
     }
 
     async fn ibd(&mut self, relay_block: Block) -> Result<(), ProtocolError> {
