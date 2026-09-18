@@ -1906,6 +1906,49 @@ struct DecodedPage {
     blocks: Vec<DecodedBlock>,
 }
 
+/// Whether to trust a node-supplied coinbase commitment verbatim instead of
+/// re-deriving it. Off by default (safety); operators syncing against their own
+/// trusted node can set ZKAS_WALLETD_TRUST_NODE_CMX=1 to skip the Sinsemilla
+/// re-derivation on a full historical backfill.
+fn trust_node_cmx() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("ZKAS_WALLETD_TRUST_NODE_CMX").as_deref() == Ok("1"))
+}
+
+/// Choose the authoritative coinbase note commitment for a coinbase output.
+///
+/// The commitment is fully determined by PoW-committed block data (the recipient
+/// script, coinbase txid, output index and value that feed desc/value), so the
+/// locally-derived value is authoritative. A node-supplied commitment is only a
+/// CPU hint. In the default (secure) mode we derive locally and, if the node also
+/// supplied one, verify they match: a valid-but-wrong supplied leaf would silently
+/// fork the wallet note-commitment tree and break every future spend. In
+/// trust_node mode we take the supplied value as-is (fast path, opt-in).
+fn select_coinbase_cmx(
+    supplied: Option<kaspa_shielded_core::ExtractedNoteCommitment>,
+    desc: &kaspa_shielded_core::coinbase::CoinbaseNoteDesc,
+    value: u64,
+    trust_node: bool,
+) -> Option<kaspa_shielded_core::ExtractedNoteCommitment> {
+    if trust_node {
+        return supplied.or_else(|| kaspa_shielded_core::coinbase::coinbase_note_commitment(desc, value).ok());
+    }
+    match kaspa_shielded_core::coinbase::coinbase_note_commitment(desc, value).ok() {
+        Some(derived) => {
+            if let Some(sup) = supplied {
+                if sup.to_bytes() != derived.to_bytes() {
+                    log::warn!(
+                        "coinbase commitment mismatch: node-supplied value != local derivation; using derived (node may be faulty or malicious)"
+                    );
+                }
+            }
+            Some(derived)
+        }
+        // A well-formed coinbase output always derives; fall back rather than drop.
+        None => supplied,
+    }
+}
+
 /// Shared page decoding gets a bounded pool so it cannot consume every host core
 /// and starve HTTP or kaspad while several wallets ingest concurrently. Two threads
 /// are used on a 4-core box; larger wallet hosts expand to `cores - 2`, capped at
@@ -1922,14 +1965,15 @@ fn decode_block(b: &kaspa_rpc_core::RpcShieldedChainBlock) -> DecodedBlock {
             let desc = derive_coinbase_note_desc(recipient, &note_seed);
             // Only keep a note that commits — exactly `WalletDb::ingest_block`'s skip
             // rule, so the shared leaf stream matches the recompute path leaf-for-leaf.
-            let cmx = out
-                .commitment
-                .and_then(|bytes| {
-                    Option::<kaspa_shielded_core::ExtractedNoteCommitment>::from(
-                        kaspa_shielded_core::ExtractedNoteCommitment::from_bytes(&bytes),
-                    )
-                })
-                .or_else(|| kaspa_shielded_core::coinbase::coinbase_note_commitment(&desc, out.value).ok());
+            let supplied = out.commitment.and_then(|bytes| {
+                Option::<kaspa_shielded_core::ExtractedNoteCommitment>::from(
+                    kaspa_shielded_core::ExtractedNoteCommitment::from_bytes(&bytes),
+                )
+            });
+            // Never trust a coinbase leaf we cannot reproduce: derive it from the
+            // PoW-committed block fields and reject a valid-but-wrong node value
+            // (which would silently fork the wallet tree). See select_coinbase_cmx.
+            let cmx = select_coinbase_cmx(supplied, &desc, out.value, trust_node_cmx());
             if let Some(cmx) = cmx {
                 coinbase.push((desc, out.value, cmx));
             }
@@ -10066,9 +10110,39 @@ mod sdk_api_tests {
                 .unwrap();
         let mut with_commitment = base;
         with_commitment.coinbase_outputs[0].commitment = Some(supplied_cmx.to_bytes());
-        // The supplied bytes are a valid but deliberately different commitment;
-        // decode must use the node value without hashing/deriving it again.
+        // Secure default: a supplied-but-wrong commitment is rejected in favour of
+        // the locally-derived (PoW-committed-input) value.
         let supplied = decode_block(&with_commitment);
-        assert_eq!(supplied.coinbase[0].2.to_bytes(), supplied_cmx.to_bytes());
+        assert_eq!(supplied.coinbase[0].2.to_bytes(), expected.to_bytes());
+    }
+
+    #[test]
+    fn select_coinbase_cmx_verifies_and_rejects_wrong_node_value() {
+        let db = WalletDb::from_seed([0x37; 32]).expect("valid test seed");
+        let recipient = db.my_address_bytes();
+        let txid = RpcHash::from_bytes([0x55; 32]);
+        let mut seed = Vec::with_capacity(36);
+        seed.extend_from_slice(&txid.as_bytes());
+        seed.extend_from_slice(&0u32.to_le_bytes());
+        let desc = derive_coinbase_note_desc(recipient, &seed);
+        let value = 60_00000000u64;
+        let derived = kaspa_shielded_core::coinbase::coinbase_note_commitment(&desc, value).unwrap();
+        let mut other = seed.clone();
+        other[35] = 1;
+        let wrong = kaspa_shielded_core::coinbase::coinbase_note_commitment(
+            &derive_coinbase_note_desc(recipient, &other),
+            value,
+        )
+        .unwrap();
+        assert_ne!(derived.to_bytes(), wrong.to_bytes());
+
+        // verify mode: a wrong supplied value is rejected -> derived wins
+        assert_eq!(select_coinbase_cmx(Some(wrong), &desc, value, false).unwrap().to_bytes(), derived.to_bytes());
+        // verify mode: honest supplied (== derived) is accepted
+        assert_eq!(select_coinbase_cmx(Some(derived), &desc, value, false).unwrap().to_bytes(), derived.to_bytes());
+        // verify mode: no supplied value -> derive locally
+        assert_eq!(select_coinbase_cmx(None, &desc, value, false).unwrap().to_bytes(), derived.to_bytes());
+        // trust mode (opt-in fast path): supplied value used verbatim
+        assert_eq!(select_coinbase_cmx(Some(wrong), &desc, value, true).unwrap().to_bytes(), wrong.to_bytes());
     }
 }
