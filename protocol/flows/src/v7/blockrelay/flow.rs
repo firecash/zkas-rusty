@@ -225,11 +225,9 @@ impl HandleRelayInvsFlow {
             // block. Recorded here because nothing downstream remembers the
             // source — consensus is handed a block, not a sender.
             self.ctx.credit_relay(self.router.key());
-            // Per-block relay source, for tying a ZKas block back to the peer that
-            // first delivered it (a miner relays its own blocks first). Greppable
-            // prefix so an off-node tool can join these against the ZKMM hashes in
-            // Kaspa coinbases → IP ↔ Kaspa payout address. Observability only.
-            log::info!(target: "relay_source", "RELAYSRC {} {}", block.hash(), self.router.net_address().ip());
+            // Per-block relay-source logging removed for privacy: it let an off-node
+            // tool join block-hash+peer-IP against ZKMM tags to deanonymize miners
+            // (IP <-> Kaspa payout). Aggregate per-peer relay credit above is retained.
 
             // We spawn post-processing as a separate task so that this loop
             // can continue processing the following relay blocks
