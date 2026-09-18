@@ -240,22 +240,20 @@ fn configure_rocksdb(args: &Args) -> (RocksDbPreset, Option<usize>, Option<PathB
         RocksDbPreset::Default
     };
 
-    // Calculate cache budget for HDD preset
-    let cache_budget = if matches!(preset, RocksDbPreset::Hdd) {
-        if let Some(cache_mb) = args.rocksdb_cache_size {
-            let cache_bytes = cache_mb * 1024 * 1024;
-            info!("Custom RocksDB cache size: {} MB", cache_mb);
-            Some(cache_bytes)
-        } else {
-            let base_cache = 256 * 1024 * 1024;
-            let scaled_cache = (base_cache as f64 * args.ram_scale) as usize;
-            let min_cache = 64 * 1024 * 1024;
-            let final_cache = scaled_cache.max(min_cache);
-            info!("RocksDB cache size: {} MB (scaled by ram-scale)", final_cache / 1024 / 1024);
-            Some(final_cache)
-        }
+    // Block-cache budget (applies to BOTH presets now: the default preset also
+    // installs a bloom filter + LRU block cache, so the hot nullifier
+    // negative-lookup path stops walking SSTs on every miss).
+    let cache_budget = if let Some(cache_mb) = args.rocksdb_cache_size {
+        let cache_bytes = cache_mb * 1024 * 1024;
+        info!("Custom RocksDB cache size: {} MB", cache_mb);
+        Some(cache_bytes)
     } else {
-        None
+        let base_cache = 256 * 1024 * 1024;
+        let scaled_cache = (base_cache as f64 * args.ram_scale) as usize;
+        let min_cache = 64 * 1024 * 1024;
+        let final_cache = scaled_cache.max(min_cache);
+        info!("RocksDB cache size: {} MB (scaled by ram-scale)", final_cache / 1024 / 1024);
+        Some(final_cache)
     };
 
     // Setup WAL directory if specified

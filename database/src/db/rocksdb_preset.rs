@@ -57,19 +57,40 @@ impl RocksDbPreset {
     /// * `mem_budget` - Memory budget (only used for Default preset, HDD uses fixed 256MB)
     pub fn apply_to_options(&self, opts: &mut Options, parallelism: usize, mem_budget: usize, cache_budget: Option<usize>) {
         match self {
-            Self::Default => self.apply_default(opts, parallelism, mem_budget),
+            Self::Default => self.apply_default(opts, parallelism, mem_budget, cache_budget),
             Self::Hdd => self.apply_hdd(opts, parallelism, cache_budget),
         }
     }
 
     /// Apply default preset configuration
-    fn apply_default(&self, opts: &mut Options, parallelism: usize, mem_budget: usize) {
+    fn apply_default(&self, opts: &mut Options, parallelism: usize, mem_budget: usize, cache_budget: Option<usize>) {
         if parallelism > 1 {
             opts.increase_parallelism(parallelism as i32);
         }
 
         // Use the provided memory budget (typically 64MB)
         opts.optimize_level_style_compaction(mem_budget);
+
+        // Block-based table: bloom filter + LRU block cache.
+        //
+        // The hot path is point lookups — every shielded spend does a *negative*
+        // nullifier lookup — and previously the default preset installed no table
+        // factory at all, so it inherited RocksDB's tiny default cache and NO
+        // bloom filter: every nullifier miss walked the SSTs. A full-key bloom
+        // turns those misses into an in-memory check; the LRU keeps index/filter
+        // and hot data blocks resident. Applied unconditionally, independent of
+        // the ZSTD escape hatch below.
+        {
+            use rocksdb::{BlockBasedOptions, Cache};
+            let mut block_opts = BlockBasedOptions::default();
+            block_opts.set_bloom_filter(10.0, false); // 10 bits/key, full-key filter (~1% FPR)
+            block_opts.set_format_version(5);
+            block_opts.set_cache_index_and_filter_blocks(true);
+            let cache_size = cache_budget.unwrap_or(256 * 1024 * 1024);
+            let cache = Cache::new_lru_cache(cache_size);
+            block_opts.set_block_cache(&cache);
+            opts.set_block_based_table_factory(&block_opts);
+        }
 
         // Compression: LZ4 on the hot levels, ZSTD on the bottommost.
         //
