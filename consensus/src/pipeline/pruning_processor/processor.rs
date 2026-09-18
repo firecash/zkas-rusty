@@ -41,7 +41,7 @@ use kaspa_hashes::{Hash, ZERO_HASH};
 use kaspa_muhash::MuHash;
 use kaspa_utils::iter::IterExtensions;
 use parking_lot::RwLockUpgradableReadGuard;
-use rocksdb::WriteBatch;
+use rocksdb::{WriteBatch, WriteOptions};
 use std::{
     collections::{VecDeque, hash_map::Entry::Vacant},
     ops::Deref,
@@ -526,6 +526,15 @@ impl PruningProcessor {
         let mut queue = VecDeque::<Hash>::from_iter(reachability_read.get_children(ORIGIN).unwrap().iter().copied());
         let (mut counter, mut traversed) = (0, 0);
         info!("Header and Block pruning: starting traversal from: {} (genesis: {})", queue.iter().reusable_format(", "), genesis);
+        // The bulk per-block deletes below are idempotent and this traversal always
+        // restarts from ORIGIN, so they do not need WAL durability: a crash simply
+        // leaves those blocks to be re-pruned on the next run. Writing them WAL-less
+        // removes the per-block WAL commit storm on the first prune after IBD (an
+        // ENOSPC / getBlockTemplate-wedge contributor). WriteBatch stays atomic
+        // regardless of the WAL, and every control-state write in prune() (pruning
+        // point, tips, meta) keeps its WAL below.
+        let mut prune_wopts = WriteOptions::default();
+        prune_wopts.disable_wal(true);
         while let Some(current) = queue.pop_front() {
             if reachability_read.try_is_dag_ancestor_of(retention_period_root, current).unwrap() {
                 continue;
@@ -650,8 +659,8 @@ impl PruningProcessor {
                 let reachability_write = staging_reachability.commit(&mut batch).unwrap();
                 staging_reachability_relations.commit(&mut batch).unwrap();
 
-                // Flush the batch to the DB
-                self.db.write(batch).unwrap();
+                // Flush the batch to the DB (WAL-less; see prune_wopts above)
+                self.db.write_opt(batch, &prune_wopts).unwrap();
 
                 // Calling the drops explicitly after the batch is written in order to avoid possible errors.
                 drop(reachability_write);
