@@ -993,6 +993,10 @@ pub const MAINNET_PARAMS: Params = Params {
 };
 
 pub const TESTNET_PARAMS: Params = Params {
+    // testnet-10 mirrors MAINNET's ZKas feature set (shielded coinbase, Toccata, multi-
+    // producer anchors, dev fee, 1 BPS emission) so a solo miner exercises real ZKas
+    // consensus. Differs from mainnet only in: network id, TESTNET_GENESIS (easy PoW for
+    // CPU solo mining), empty seeders (run standalone), and merged-mining-from-genesis.
     // No ZKas testnet seeders exist yet. These MUST NOT be Kaspa's testnet seeders
     // (inherited here until 2026-08-31): since 64beca1 the connection manager actually
     // dials every address a seeder returns, so a ZKas testnet node would spam Kaspa's
@@ -1008,7 +1012,7 @@ pub const TESTNET_PARAMS: Params = Params {
     min_difficulty_window_size: MIN_DIFFICULTY_WINDOW_SIZE,
     coinbase_payload_script_public_key_max_len: 150,
     max_coinbase_payload_len: 204,
-    shielded_coinbase: false,
+    shielded_coinbase: true,
 
     // Limit the cost of calculating compute/transient/storage masses
     max_tx_inputs: 1000,
@@ -1028,30 +1032,26 @@ pub const TESTNET_PARAMS: Params = Params {
     block_lane_limits: BlockLaneLimits { lanes_per_block: DEFAULT_LANES_PER_BLOCK_LIMIT, gas_per_lane: DEFAULT_GAS_PER_LANE_LIMIT },
 
     storage_mass_parameter: STORAGE_MASS_PARAMETER,
-    // deflationary_phase_daa_score is the DAA score after which the pre-deflationary period
-    // switches to the deflationary period. This number is calculated as follows:
-    // We define a year as 365.25 days
-    // Half a year in seconds = 365.25 / 2 * 24 * 60 * 60 = 15778800
-    // The network was down for three days shortly after launch
-    // Three days in seconds = 3 * 24 * 60 * 60 = 259200
-    deflationary_phase_daa_score: 15778800 - 259200,
-    pre_deflationary_phase_base_subsidy: 50000000000,
+    // 1-BPS-from-genesis emission (same as mainnet): smooth halving applies from block 0,
+    // no flat pre-deflationary plateau.
+    deflationary_phase_daa_score: 0,
+    pre_deflationary_phase_base_subsidy: Bps::<1>::pre_deflationary_phase_base_subsidy(),
     skip_proof_of_work: false,
     max_block_level: 250,
     pruning_proof_m: 1000,
 
-    blockrate: BlockrateParams::new::<10>(),
+    blockrate: BlockrateParams::new::<1>(),
 
-    pre_crescendo_target_time_per_block: 1000,
+    pre_crescendo_target_time_per_block: Bps::<1>::target_time_per_block(),
 
     // 18:30 UTC, March 6, 2025
-    crescendo_activation: ForkActivation::new(88_657_000),
+    crescendo_activation: ForkActivation::always(),
 
     // ~16:00 UTC, May 18, 2026
-    toccata_activation: ForkActivation::new(467_579_632),
-    shielded_anchor_multi_activation: ForkActivation::never(),
+    toccata_activation: ForkActivation::always(),
+    shielded_anchor_multi_activation: ForkActivation::always(),
     shielded_coinbase_seed_activation: ForkActivation::never(),
-    dev_fee_accrual_activation: ForkActivation::never(),
+    dev_fee_accrual_activation: ForkActivation::always(),
     // ~17 minutes at 1 BPS: short enough that the dev fund is never far behind,
     // long enough to cut per-block dev notes by three orders of magnitude.
     dev_fee_payout_interval: 1_000,
@@ -1062,9 +1062,9 @@ pub const TESTNET_PARAMS: Params = Params {
     low_difficulty_start_blocks: 0,
     difficulty_ramp_blocks: 0,
 
-    // No dev fee on this network.
-    dev_fee_permille: 0,
-    dev_fee_recipient: None,
+    // Dev fee mirrors mainnet so the coinbase (miner note + dev note) is identical to production.
+    dev_fee_permille: ZKAS_DEV_FEE_PERMILLE,
+    dev_fee_recipient: Some(ZKAS_DEV_FEE_RECIPIENT),
 };
 
 pub const SIMNET_PARAMS: Params = Params {
