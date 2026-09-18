@@ -15,6 +15,8 @@ use tokio::{sync::mpsc::Receiver as MpscReceiver, time::sleep};
 pub(crate) enum RegistrationError {
     #[error("reached connection capacity of {0}")]
     CapacityReached(usize),
+    #[error("reached per-IP connection cap of {1} for {0}")]
+    PerIpCapacityReached(std::net::IpAddr, usize),
 }
 pub(crate) type RegistrationResult = Result<(), RegistrationError>;
 
@@ -38,11 +40,16 @@ pub(crate) enum ManagerEvent {
 pub struct Manager {
     connections: Arc<RwLock<HashMap<ConnectionId, Connection>>>,
     max_connections: usize,
+    // Per-IP concurrent-connection cap: stops a single source from filling all
+    // slots (the socat-leak DoS class). Loopback is exempt so local self-hosted
+    // clients (walletd, pool, tooling) are never throttled.
+    max_per_ip: usize,
 }
 
 impl Manager {
     pub fn new(max_connections: usize) -> Self {
-        Self { connections: Default::default(), max_connections }
+        let max_per_ip = std::cmp::max(max_connections / 8, 8);
+        Self { connections: Default::default(), max_connections, max_per_ip }
     }
 
     /// Starts a loop for receiving central manager events from all connections. This mechanism is used for
@@ -76,6 +83,16 @@ impl Manager {
         // Check if there is room for a new connection
         if connections_write.len() >= self.max_connections {
             return Err(RegistrationError::CapacityReached(self.max_connections));
+        }
+
+        // Per-IP cap: prevent one source from exhausting the slot pool. Loopback
+        // is exempt (local self-hosted clients legitimately open many).
+        let ip = connection.net_address().ip();
+        if !ip.is_loopback() {
+            let per_ip = connections_write.values().filter(|c| c.net_address().ip() == ip).count();
+            if per_ip >= self.max_per_ip {
+                return Err(RegistrationError::PerIpCapacityReached(ip, self.max_per_ip));
+            }
         }
 
         debug!("GRPC, Registering a new connection from {connection}");
