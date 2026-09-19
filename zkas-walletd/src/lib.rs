@@ -1728,6 +1728,7 @@ fn adopt_twin_checkpoint(
     token: &str,
     fvk: &[u8; 96],
     birthday: u64,
+    want_history: bool,
     genesis: &RpcHash,
     secret: Option<&str>,
     candidates: &[String],
@@ -1740,8 +1741,16 @@ fn adopt_twin_checkpoint(
         if checkpoint_cursor(dir, donor, genesis).is_none() {
             continue;
         }
-        let Some((key, donor_birthday, _)) = load_wallet_meta(dir, donor, secret) else { continue };
+        let Some((key, donor_birthday, donor_history)) = load_wallet_meta(dir, donor, secret) else { continue };
         if key.fvk_bytes() != Some(*fvk) {
+            continue;
+        }
+        // History rows live INSIDE the checkpoint and are only recorded while the flag
+        // is on. A wallet that keeps history must not clone a twin that does not: the
+        // clone carries the twin's notes but none of the rows, and the user's History
+        // tab goes empty from one load to the next (reported 2026-09-19, right after
+        // birthday-0 registrations started adopting twins instead of scanning).
+        if want_history && !donor_history {
             continue;
         }
         // Only adopt a view at least as complete as this registration asked for: a
@@ -4790,7 +4799,7 @@ impl AppState {
     /// Try the twin-adoption fast path for a registration of `fvk` under `token`:
     /// clone the freshest same-key checkpoint another token already scanned. Runs
     /// the donor verification (argon2 decrypts included) off the async workers.
-    async fn adopt_twin(&self, token: &str, fvk: &[u8; 96], birthday: u64) -> Option<(String, u64)> {
+    async fn adopt_twin(&self, token: &str, fvk: &[u8; 96], birthday: u64, want_history: bool) -> Option<(String, u64)> {
         // The index is built in the background at daemon startup. A second device
         // commonly registers while that scan is still running; do not silently miss
         // the reuse path just because the asynchronous warm-up has not finished.
@@ -4850,7 +4859,7 @@ impl AppState {
         let (dir, genesis, secret) = (self.wallet_dir.clone(), self.genesis, self.wallet_secret.clone());
         let (token, fvk) = (token.to_string(), *fvk);
         tokio::task::spawn_blocking(move || {
-            adopt_twin_checkpoint(&dir, &token, &fvk, birthday, &genesis, secret.as_deref(), &candidates)
+            adopt_twin_checkpoint(&dir, &token, &fvk, birthday, want_history, &genesis, secret.as_deref(), &candidates)
         })
         .await
         .ok()?
@@ -5240,7 +5249,7 @@ impl AppState {
         let restored = match restored {
             Some(r) if !prefer_twin => Some(r),
             _ => match key.fvk_bytes() {
-                Some(fvk) => match self.adopt_twin(token, &fvk, birthday).await {
+                Some(fvk) => match self.adopt_twin(token, &fvk, birthday, recoverable_history).await {
                     Some((donor, keep_birthday)) => {
                         // The copied file carries the DONOR's cursor. Verify it against the
                         // node's frontier at THAT block — not `tip`, fetched above for this
@@ -5296,6 +5305,25 @@ impl AppState {
                 },
                 None => None,
             },
+        };
+        // A wallet that keeps history but whose checkpoint has notes and NO rows was
+        // scanned with recording off — a twin clone from a history-off device, or a
+        // checkpoint older than the flag. Every note receipt/mint records a row while
+        // recording is on, so this state cannot arise otherwise. Rebuild from the
+        // birthday now instead of showing an empty History tab forever; the file is
+        // kept as .bak like any other retirement.
+        let restored = match restored {
+            Some((db, ..)) if recoverable_history && db.history().is_empty() && !db.notes().is_empty() => {
+                let scan = scan_path(&self.wallet_dir, token);
+                let _ = std::fs::rename(&scan, format!("{scan}.bak"));
+                retire_quarantine_copies(&self.wallet_dir, token);
+                log::info!(
+                    "wallet {token}: keeps history but its checkpoint has {} notes and no history rows (scanned with recording off); rebuilding from birthday {birthday}",
+                    db.notes().len()
+                );
+                None
+            }
+            other => other,
         };
         let entry = match restored {
             Some((db, low, scanned, boundaries, sink_blue, blind_below)) => {
@@ -6579,7 +6607,8 @@ async fn load_new_wallet(
     // checkpoint instead of rescanning history the daemon already walked.
     if adopt_twin {
         if let Some(fvk) = key.fvk_bytes() {
-            if let Some((donor, keep_birthday)) = state.adopt_twin(token, &fvk, birthday).await {
+            // A freshly written seed wallet starts with history OFF (save_seed), so any twin qualifies.
+            if let Some((donor, keep_birthday)) = state.adopt_twin(token, &fvk, birthday, false).await {
                 if keep_birthday != birthday {
                     save_seed(&state.wallet_dir, token, &state.network, &seed, keep_birthday, state.wallet_secret.as_deref())
                         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to write wallet file: {e}")))?;
@@ -6769,7 +6798,7 @@ async fn wallet_watch(
     // Same-wallet-on-another-device fast path: if any other token here has already
     // scanned this exact viewing key, clone its checkpoint — the second device is
     // synced immediately instead of rescanning history the daemon already walked.
-    if let Some((donor, keep_birthday)) = state.adopt_twin(&token, &fvk, req_birthday).await {
+    if let Some((donor, keep_birthday)) = state.adopt_twin(&token, &fvk, req_birthday, history).await {
         save_fvk(&state.wallet_dir, &token, &state.network, &fvk, keep_birthday, history)
             .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to write wallet file: {e}")))?;
         state.wallets.lock().await.remove(&token);
@@ -10016,7 +10045,7 @@ mod sdk_api_tests {
 
         // A fresh FVK registration adopts the donor's checkpoint, keeping the
         // EARLIER birthday so a later cold rescan can't skip either wallet's notes.
-        let (donor, birthday) = adopt_twin_checkpoint(&dir, "phone", &fvk, 9999, &genesis, None, &candidates).expect("must adopt");
+        let (donor, birthday) = adopt_twin_checkpoint(&dir, "phone", &fvk, 9999, false, &genesis, None, &candidates).expect("must adopt");
         assert_eq!(donor, "donor");
         assert_eq!(birthday, 4242, "keeps the earlier of donor/requested birthdays");
         let restored =
@@ -10026,7 +10055,7 @@ mod sdk_api_tests {
         // A DIFFERENT key must never adopt, however many donors exist.
         let other = WalletDb::from_seed([0x33u8; 32]).unwrap().fvk().to_bytes();
         assert!(
-            adopt_twin_checkpoint(&dir, "other", &other, 0, &genesis, None, &candidates).is_none(),
+            adopt_twin_checkpoint(&dir, "other", &other, 0, false, &genesis, None, &candidates).is_none(),
             "foreign viewing key must not clone someone else's checkpoint"
         );
 
@@ -10035,24 +10064,39 @@ mod sdk_api_tests {
         save_checkpoint(&dir, "donor", &genesis, &RpcHash::from_bytes([9u8; 32]), 777, &db, &boundaries, 100, 555).unwrap();
         std::fs::remove_file(scan_path(&dir, "phone")).unwrap();
         assert!(
-            adopt_twin_checkpoint(&dir, "phone", &fvk, 1000, &genesis, None, &candidates).is_none(),
+            adopt_twin_checkpoint(&dir, "phone", &fvk, 1000, false, &genesis, None, &candidates).is_none(),
             "a blind donor must not answer a restore born before it"
         );
         // ...but a registration with NO birthday opinion (0) adopts the donor AND its
         // birthday, instead of rescanning from genesis and persisting 0.
-        let (_, adopted) = adopt_twin_checkpoint(&dir, "phone", &fvk, 0, &genesis, None, &candidates).expect("unknown birthday adopts");
+        let (_, adopted) = adopt_twin_checkpoint(&dir, "phone", &fvk, 0, false, &genesis, None, &candidates).expect("unknown birthday adopts");
         assert_eq!(adopted, 4242, "the donor's birthday is adopted when the client has none");
         std::fs::remove_file(scan_path(&dir, "phone")).unwrap();
         // ...and one that asked for the same-or-later birthday.
         assert!(
-            adopt_twin_checkpoint(&dir, "phone", &fvk, 5000, &genesis, None, &candidates).is_some(),
+            adopt_twin_checkpoint(&dir, "phone", &fvk, 5000, false, &genesis, None, &candidates).is_some(),
             "a blind donor is fine for a restore born at/after the donor"
         );
+
+        // A wallet that keeps history must not clone a donor that does not: the donor's
+        // checkpoint has no rows, and the History tab would go empty (2026-09-19).
+        std::fs::remove_file(scan_path(&dir, "phone")).ok();
+        assert!(
+            adopt_twin_checkpoint(&dir, "phone", &fvk, 5000, true, &genesis, None, &candidates).is_none(),
+            "a history-on wallet must not adopt a history-off donor"
+        );
+        save_seed(&dir, "donor", "mainnet", &seed, 4242, None).unwrap();
+        std::fs::write(wallet_path(&dir, "donor"), std::fs::read_to_string(wallet_path(&dir, "donor")).unwrap().replace("\"recoverable_history\": false", "\"recoverable_history\": true")).unwrap();
+        assert!(
+            adopt_twin_checkpoint(&dir, "phone", &fvk, 5000, true, &genesis, None, &candidates).is_some(),
+            "a history-on donor serves a history-on wallet"
+        );
+        std::fs::write(wallet_path(&dir, "donor"), std::fs::read_to_string(wallet_path(&dir, "donor")).unwrap().replace("\"recoverable_history\": true", "\"recoverable_history\": false")).unwrap();
 
         // A wrong-genesis (relaunched-chain) checkpoint must never be adopted.
         std::fs::remove_file(scan_path(&dir, "phone")).unwrap();
         assert!(
-            adopt_twin_checkpoint(&dir, "phone", &fvk, 9999, &RpcHash::from_bytes([8u8; 32]), None, &candidates).is_none(),
+            adopt_twin_checkpoint(&dir, "phone", &fvk, 9999, false, &RpcHash::from_bytes([8u8; 32]), None, &candidates).is_none(),
             "checkpoint for another chain must not be adopted"
         );
 
