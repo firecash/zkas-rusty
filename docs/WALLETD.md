@@ -176,8 +176,8 @@ curl -X POST -H "X-Wallet-Token: $TOK" http://127.0.0.1:8501/api/wallet/create
 | `GET` | `/api/wallet/address` | Shielded `zkas:` receive address. `?index=N` returns the wallet's N-th **diversified** address — a distinct address paying into the same wallet, found by the same scan (see §6b). |
 | `GET` | `/api/wallet/reveal` | Reveal the seed (gated). |
 | `GET` | `/api/wallet/balance` | Balance + sync status (see §5). |
-| `GET` | `/api/wallet/history` | Chain-derived history. Opt-in — see `settings`. |
-| `POST` | `/api/wallet/settings` | Toggle recoverable history (OVK) etc. |
+| `GET` | `/api/wallet/history` | Chain-derived history (mints, receipts, own sends with recipient/amount/memo). Always recorded. |
+| `POST` | `/api/wallet/settings` | Kept for old clients; history can no longer be turned off (`recoverable_history` is always `true`). |
 | `POST` | `/api/wallet/rescan` | Retire the checkpoint and rescan from birthday. |
 
 ### Paying (custodial — daemon holds the seed)
@@ -704,10 +704,6 @@ Two designs, one of which does not scale:
 Per-customer addresses, end to end:
 
 ```bash
-# enable the readable record first — off by default; without it no history rows are kept
-curl -X POST -H "X-Wallet-Token: $TOK" -H 'Content-Type: application/json' \
-  -d '{"recoverable_history":true}' http://127.0.0.1:8501/api/wallet/settings
-
 # at signup: give customer 4711 their own deposit address (store the index with the customer)
 curl -H "X-Wallet-Token: $TOK" "http://127.0.0.1:8501/api/wallet/address?index=4711"
 

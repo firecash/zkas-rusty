@@ -565,14 +565,25 @@ struct WalletFile {
     /// Transaction history, **opt-in**: when on, ingest records readable history
     /// rows in the scan checkpoint AND each send's details are encrypted to the
     /// wallet's own OVK (Zcash-standard), so history recovers recipient/amount/
-    /// memo even after a seed restore. Trade-offs the user accepts by enabling:
-    /// anyone holding this wallet's file/token reads the record, and someone the
-    /// user hands the FULL VIEWING KEY to (message-sign verification!) also sees
-    /// outgoing recipients. Default off — nothing readable is stored until the
-    /// user activates it.
+    /// memo even after a seed restore. The cost: anyone holding this wallet's
+    /// file/token reads the record, and whoever holds the FULL VIEWING KEY (a hosted
+    /// daemon, a message-sign verifier) also sees outgoing recipients.
+    ///
+    /// ALWAYS ON since 2026-09-22 (product decision): a wallet with no readable history
+    /// and destinations nobody can ever recover was the #1 support question. The field
+    /// stays in the file for compatibility; every reader treats it as `true` — see
+    /// [`HISTORY_ALWAYS_ON`].
     #[serde(default)]
     recoverable_history: bool,
 }
+
+/// History (row recording + OVK-encrypted sends) is no longer optional. Readers
+/// substitute this for the stored flag, so wallet files written while it was opt-in
+/// (`false`) flip on at their next load — the load path then rebuilds a checkpoint that
+/// has notes but no rows from the birthday, so the history appears instead of staying
+/// empty forever. Sends made while it was off stay unrecoverable: their OVK ciphertext
+/// was never written.
+const HISTORY_ALWAYS_ON: bool = true;
 
 /// What key material the daemon holds for a wallet.
 ///
@@ -696,7 +707,7 @@ fn load_wallet_meta(dir: &str, token: &str, secret: Option<&str>) -> Option<(Wal
     let wf: WalletFile = serde_json::from_slice(&bytes).ok()?;
     if !wf.fvk_hex.is_empty() {
         let fvk = unhex(&wf.fvk_hex).and_then(|b| <[u8; 96]>::try_from(b.as_slice()).ok())?;
-        return Some((WalletKey::Fvk(fvk), wf.birthday, wf.recoverable_history));
+        return Some((WalletKey::Fvk(fvk), wf.birthday, wf.recoverable_history || HISTORY_ALWAYS_ON));
     }
     let seed = if wf.encrypted {
         let blob = unhex(&wf.seed_hex)?;
@@ -708,7 +719,7 @@ fn load_wallet_meta(dir: &str, token: &str, secret: Option<&str>) -> Option<(Wal
     } else {
         unhex(&wf.seed_hex).and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())?
     };
-    Some((WalletKey::Seed(seed), wf.birthday, wf.recoverable_history))
+    Some((WalletKey::Seed(seed), wf.birthday, wf.recoverable_history || HISTORY_ALWAYS_ON))
 }
 
 /// How a wallet file on disk is protected — what an embedding shell (the desktop
@@ -889,10 +900,7 @@ fn save_seed(dir: &str, token: &str, network: &str, seed: &[u8; 32], birthday: u
         encrypted,
         birthday,
         fvk_hex: String::new(),
-        // History is opt-in: nothing readable is recorded until the user
-        // explicitly enables it (accepting that anyone holding the wallet
-        // file / server token could read the record).
-        recoverable_history: false,
+        recoverable_history: HISTORY_ALWAYS_ON,
     };
     write_wallet_file(dir, token, &wf)
 }
@@ -908,8 +916,7 @@ fn save_fvk(dir: &str, token: &str, network: &str, fvk: &[u8; 96], birthday: u64
         encrypted: false,
         birthday,
         fvk_hex: hex(fvk),
-        // Opt-in by default (same as the seed path); a view-key import asks for it on.
-        recoverable_history,
+        recoverable_history: recoverable_history || HISTORY_ALWAYS_ON,
     };
     write_wallet_file(dir, token, &wf)
 }
@@ -6755,10 +6762,9 @@ async fn wallet_watch(
     // takes the rescan-from-birthday path below.
     let existing = load_wallet_meta(&state.wallet_dir, &token, state.wallet_secret.as_deref());
     let same_key = matches!(&existing, Some((WalletKey::Fvk(f), _, _)) if *f == fvk);
-    // An explicit request wins; otherwise keep what the wallet already had (OFF for a
-    // brand-new wallet — history stays opt-in unless the caller asks for it).
-    let existing_history = existing.as_ref().map(|(_, _, h)| *h).unwrap_or(false);
-    let history = req.recoverable_history.unwrap_or(existing_history);
+    // History is always on; the request field is accepted for old clients and ignored.
+    let existing_history = existing.as_ref().map(|(_, _, h)| *h).unwrap_or(HISTORY_ALWAYS_ON);
+    let history = req.recoverable_history.unwrap_or(existing_history) || HISTORY_ALWAYS_ON;
     // No live checkpoint but a quarantined copy of this key's own scan that the node
     // serves again (the app re-registers right after a chain-source switch is reverted):
     // bring it back NOW, before the fast-sync path below installs a resident entry that
@@ -7025,21 +7031,24 @@ async fn wallet_settings(
     let bytes = std::fs::read(wallet_path(&state.wallet_dir, &token)).map_err(|_| err(StatusCode::NOT_FOUND, "no such wallet"))?;
     let mut wf: WalletFile =
         serde_json::from_slice(&bytes).map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "corrupt wallet file"))?;
-    if let Some(v) = req.recoverable_history {
-        wf.recoverable_history = v;
+    // History cannot be turned off any more (see HISTORY_ALWAYS_ON). An old client
+    // asking to disable it gets the truthful answer back; a file still carrying `false`
+    // from the opt-in era is normalised here.
+    let _ = req.recoverable_history;
+    if !wf.recoverable_history {
+        wf.recoverable_history = HISTORY_ALWAYS_ON;
+        write_wallet_file(&state.wallet_dir, &token, &wf)
+            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to write wallet file: {e}")))?;
     }
-    write_wallet_file(&state.wallet_dir, &token, &wf)
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to write wallet file: {e}")))?;
-    // Keep a loaded entry in step so the next send honours the change immediately.
-    // The same flag gates history-row recording: turning it OFF also purges the
-    // rows already recorded (withdrawing consent removes the readable record).
     if let Some(w) = state.cached_wallet(&token).await {
         let mut e = w.lock().await;
-        e.recoverable_history = wf.recoverable_history;
-        e.db.set_history_enabled(wf.recoverable_history);
-        e.force_checkpoint = true; // persist the purge/enable promptly
+        if !e.recoverable_history {
+            e.recoverable_history = true;
+            e.db.set_history_enabled(true);
+            e.force_checkpoint = true;
+        }
     }
-    Ok(Json(serde_json::json!({ "recoverableHistory": wf.recoverable_history })))
+    Ok(Json(serde_json::json!({ "recoverableHistory": true })))
 }
 
 /// Retire this wallet's scan checkpoint and reload it from its birthday — a full
@@ -10078,13 +10087,16 @@ mod sdk_api_tests {
             "a blind donor is fine for a restore born at/after the donor"
         );
 
-        // A wallet that keeps history must not clone a donor that does not: the donor's
-        // checkpoint has no rows, and the History tab would go empty (2026-09-19).
+        // History is always on now (HISTORY_ALWAYS_ON): a donor file still carrying the
+        // opt-in era's `false` reads as history-on, so it IS adopted — and a clone whose
+        // checkpoint has notes but no rows is rebuilt from the birthday by the load path
+        // instead of leaving the History tab empty.
         std::fs::remove_file(scan_path(&dir, "phone")).ok();
         assert!(
-            adopt_twin_checkpoint(&dir, "phone", &fvk, 5000, true, &genesis, None, &candidates).is_none(),
-            "a history-on wallet must not adopt a history-off donor"
+            adopt_twin_checkpoint(&dir, "phone", &fvk, 5000, true, &genesis, None, &candidates).is_some(),
+            "a donor written while history was opt-in is still adopted (the flag is ignored)"
         );
+        std::fs::remove_file(scan_path(&dir, "phone")).ok();
         save_seed(&dir, "donor", "mainnet", &seed, 4242, None).unwrap();
         std::fs::write(wallet_path(&dir, "donor"), std::fs::read_to_string(wallet_path(&dir, "donor")).unwrap().replace("\"recoverable_history\": false", "\"recoverable_history\": true")).unwrap();
         assert!(
