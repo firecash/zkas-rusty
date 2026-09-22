@@ -711,9 +711,21 @@ fn wallet_birthday_on_disk(dir: &str, token: &str) -> Option<u64> {
     Some(wf.birthday)
 }
 
-/// Load a wallet's (key, birthday) from disk, decrypting the seed with `secret`
-/// when the file is encrypted. A file carrying an `fvk_hex` is a watch-only
-/// (non-custodial) wallet: there is no seed on this machine to decrypt.
+/// The `recoverable_history` flag EXACTLY as stored, without the always-on override.
+///
+/// The override is what every reader wants — history is not optional any more — but the
+/// raw value still carries one fact: whether this wallet was recording rows BEFORE
+/// 2026-09-22. A wallet that was not has a checkpoint with notes and no rows, which is
+/// normal for it and must not be mistaken for the corrupt state the rebuild below
+/// exists for (a clone from a history-off twin). Flipping the flag for 83 live wallets
+/// and rebuilding each from its birthday is exactly what that mistake cost.
+fn history_was_on(dir: &str, token: &str) -> bool {
+    std::fs::read(wallet_path(dir, token))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<WalletFile>(&b).ok())
+        .is_some_and(|wf| wf.recoverable_history)
+}
+
 /// Whether this wallet asked for sends nobody can ever recover (see
 /// [`WalletFile::private_sends`]). Read from disk at send time — three endpoints, once
 /// per payment, against a file the OS has cached — so a change takes effect on the very
@@ -725,6 +737,9 @@ fn private_sends(dir: &str, token: &str) -> bool {
         .is_some_and(|wf| wf.private_sends)
 }
 
+/// Load a wallet's (key, birthday) from disk, decrypting the seed with `secret`
+/// when the file is encrypted. A file carrying an `fvk_hex` is a watch-only
+/// (non-custodial) wallet: there is no seed on this machine to decrypt.
 fn load_wallet_meta(dir: &str, token: &str, secret: Option<&str>) -> Option<(WalletKey, u64, bool)> {
     let bytes = std::fs::read(wallet_path(dir, token)).ok()?;
     let wf: WalletFile = serde_json::from_slice(&bytes).ok()?;
@@ -5345,7 +5360,16 @@ impl AppState {
         // birthday now instead of showing an empty History tab forever; the file is
         // kept as .bak like any other retirement.
         let restored = match restored {
-            Some((db, ..)) if recoverable_history && db.history().is_empty() && !db.notes().is_empty() => {
+            // Only a wallet that WAS already recording rows can be in the broken state
+            // this rebuild repairs. A legacy wallet simply has no past rows: it keeps
+            // its checkpoint, records everything from now on, and the user can ask for
+            // the past with "Recover full history" (a rescan) if they want it.
+            Some((db, ..))
+                if recoverable_history
+                    && history_was_on(&self.wallet_dir, token)
+                    && db.history().is_empty()
+                    && !db.notes().is_empty() =>
+            {
                 let scan = scan_path(&self.wallet_dir, token);
                 let _ = std::fs::rename(&scan, format!("{scan}.bak"));
                 retire_quarantine_copies(&self.wallet_dir, token);
