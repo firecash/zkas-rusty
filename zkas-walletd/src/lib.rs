@@ -65,6 +65,7 @@ use kaspa_shielded_core::coinbase::CoinbaseNoteDesc;
 use kaspa_shielded_core::coinbase::derive_coinbase_note_desc;
 use kaspa_shielded_core::message::{FVK_LEN, SIG_LEN, sign_message, verify_message};
 use kaspa_shielded_core::orchard_recipient_bytes;
+use kaspa_shielded_core::payproof;
 use kaspa_shielded_core::tree::{FrontierState, GlobalTree, NoteCommitmentTree};
 use kaspa_shielded_core::wallet::CompactActionRecord;
 use kaspa_shielded_core::wallet::address_bytes_from_seed;
@@ -575,6 +576,17 @@ struct WalletFile {
     /// [`HISTORY_ALWAYS_ON`].
     #[serde(default)]
     recoverable_history: bool,
+    /// Build this wallet's sends WITHOUT the sender-recoverable ciphertext.
+    ///
+    /// Off by default. On, a send carries nothing that anyone holding this wallet's
+    /// viewing key could ever decrypt — not a restored seed, not a second device, not a
+    /// message-signature verifier, not the operator of a hosted daemon. The price is
+    /// symmetric: such a send can never be recovered after a restore and can never be
+    /// proven with a payment proof. The local history row is still written while this
+    /// daemon is the one that built the payment (it knew the recipient at that moment);
+    /// it simply does not survive a rebuild from the chain.
+    #[serde(default)]
+    private_sends: bool,
 }
 
 /// History (row recording + OVK-encrypted sends) is no longer optional. Readers
@@ -702,6 +714,17 @@ fn wallet_birthday_on_disk(dir: &str, token: &str) -> Option<u64> {
 /// Load a wallet's (key, birthday) from disk, decrypting the seed with `secret`
 /// when the file is encrypted. A file carrying an `fvk_hex` is a watch-only
 /// (non-custodial) wallet: there is no seed on this machine to decrypt.
+/// Whether this wallet asked for sends nobody can ever recover (see
+/// [`WalletFile::private_sends`]). Read from disk at send time — three endpoints, once
+/// per payment, against a file the OS has cached — so a change takes effect on the very
+/// next send without touching the resident entry.
+fn private_sends(dir: &str, token: &str) -> bool {
+    std::fs::read(wallet_path(dir, token))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<WalletFile>(&b).ok())
+        .is_some_and(|wf| wf.private_sends)
+}
+
 fn load_wallet_meta(dir: &str, token: &str, secret: Option<&str>) -> Option<(WalletKey, u64, bool)> {
     let bytes = std::fs::read(wallet_path(dir, token)).ok()?;
     let wf: WalletFile = serde_json::from_slice(&bytes).ok()?;
@@ -901,6 +924,7 @@ fn save_seed(dir: &str, token: &str, network: &str, seed: &[u8; 32], birthday: u
         birthday,
         fvk_hex: String::new(),
         recoverable_history: HISTORY_ALWAYS_ON,
+        private_sends: private_sends(dir, token),
     };
     write_wallet_file(dir, token, &wf)
 }
@@ -917,6 +941,7 @@ fn save_fvk(dir: &str, token: &str, network: &str, fvk: &[u8; 96], birthday: u64
         birthday,
         fvk_hex: hex(fvk),
         recoverable_history: recoverable_history || HISTORY_ALWAYS_ON,
+        private_sends: private_sends(dir, token),
     };
     write_wallet_file(dir, token, &wf)
 }
@@ -6297,6 +6322,9 @@ struct StatusResp {
     /// switch) re-register elsewhere with the real birthday instead of 0.
     #[serde(skip_serializing_if = "Option::is_none")]
     birthday: Option<u64>,
+    /// This wallet builds unrecoverable sends (see `WalletFile::private_sends`).
+    #[serde(default)]
+    private_sends: bool,
     network: String,
     node_connected: bool,
     daa_score: u64,
@@ -6405,6 +6433,7 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Json<
         has_wallet: false,
         address: None,
         birthday: None,
+        private_sends: false,
         network: state.network.clone(),
         node_connected,
         daa_score,
@@ -6490,6 +6519,7 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Json<
         }
         if resp.has_wallet {
             resp.birthday = wallet_birthday_on_disk(&state.wallet_dir, &token);
+            resp.private_sends = private_sends(&state.wallet_dir, &token);
         }
         // A subtree-cache build in flight for this wallet: report where it is. This is
         // the figure the app shows as "Preparing … N%" while a first send waits, and
@@ -6953,6 +6983,129 @@ struct HistoryQuery {
     offset: Option<usize>,
 }
 
+#[derive(Deserialize)]
+struct ProofQuery {
+    /// Transaction to prove, hex. Must be one of this wallet's own sends.
+    txid: String,
+}
+
+/// Proof of payment: disclose what one of our own sends paid, to whom.
+///
+/// Returns one entry per output of that transaction that was not our own change
+/// (normally exactly one). The entry is self-contained: anybody can hand it to
+/// `/api/proof/verify` — or to any other node — and check it against the chain,
+/// without learning anything about the rest of the transaction or this wallet.
+///
+/// Only sends whose details this wallet can still recover can be proven: the output
+/// details ride in the transaction encrypted to our own outgoing viewing key. A send
+/// made while that was switched off (before 2026-09-22) is unprovable by anyone,
+/// including us, and answers 409.
+async fn wallet_proof(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<ProofQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let token = token_from(&headers, state.allow_default_token)?;
+    let txid: [u8; 32] = unhex(&query.txid)
+        .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+        .ok_or_else(|| err(StatusCode::BAD_REQUEST, "txid must be 32 bytes of hex"))?;
+    let w = state.get_wallet(&token).await.ok_or_else(|| err(StatusCode::NOT_FOUND, "no wallet loaded"))?;
+    let (daa, ovk, mine) = {
+        let e = w.lock().await;
+        let row = e
+            .db
+            .history()
+            .iter()
+            .rev()
+            .find(|h| h.kind == HistoryKind::Sent && h.txid == txid)
+            .ok_or_else(|| err(StatusCode::NOT_FOUND, "this wallet has no send with that transaction id"))?;
+        (row.daa_score, e.db.ovk(), e.db.my_address_bytes())
+    };
+    let client = state.request_client().await.ok_or_else(|| err(StatusCode::BAD_GATEWAY, "node unreachable"))?;
+    let chain = chain_block_at_daa(&client, daa)
+        .await
+        .ok_or_else(|| err(StatusCode::BAD_GATEWAY, "the node cannot serve the block that accepted this payment"))?;
+    let bundle = fetch_bundle_for_tx(&client, chain, &txid)
+        .await
+        .ok_or_else(|| err(StatusCode::BAD_GATEWAY, "the node no longer serves this transaction"))?;
+    let proofs = payproof::disclose(&txid, daa, &bundle, &ovk, &mine);
+    if proofs.is_empty() {
+        return Err(err(
+            StatusCode::CONFLICT,
+            "this payment cannot be proven: its details were not recorded in the transaction (sent before recoverable history)",
+        ));
+    }
+    Ok(Json(serde_json::json!({
+        "proofs": proofs.iter().map(|p| {
+            let mut v = serde_json::to_value(p).unwrap_or_default();
+            if let (Some(obj), Some(raw)) = (v.as_object_mut(), p.recipient_bytes()) {
+                obj.insert(
+                    "recipientAddress".into(),
+                    serde_json::Value::String(String::from(&Address::new(state.prefix, Version::ShieldedOrchard, &raw))),
+                );
+                obj.insert("amountZkas".into(), serde_json::json!(p.value as f64 / SOMPI_PER_ZKAS as f64));
+            }
+            v
+        }).collect::<Vec<_>>(),
+    })))
+}
+
+/// Check a payment proof against the chain. Needs no wallet and no token: verifying is
+/// something a recipient, an exchange or an arbitrator does with a node, not with an
+/// account here.
+async fn proof_verify(
+    State(state): State<Arc<AppState>>,
+    Json(proof): Json<payproof::PaymentDisclosure>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let txid = proof.txid_bytes().ok_or_else(|| err(StatusCode::BAD_REQUEST, "txid must be 32 bytes of hex"))?;
+    let client = state.request_client().await.ok_or_else(|| err(StatusCode::BAD_GATEWAY, "node unreachable"))?;
+    let chain = chain_block_at_daa(&client, proof.daa)
+        .await
+        .ok_or_else(|| err(StatusCode::BAD_GATEWAY, "the node cannot serve the block this proof names"))?;
+    let Some(bundle) = fetch_bundle_for_tx(&client, chain, &txid).await else {
+        return Ok(Json(serde_json::json!({
+            "valid": false,
+            "reason": "no such transaction in the block this proof names",
+        })));
+    };
+    let tip = tokio::time::timeout(SYNC_RPC_TIMEOUT, client.get_block_dag_info())
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .map(|i| i.virtual_daa_score)
+        .unwrap_or(0);
+    match payproof::verify(&proof, &bundle.actions) {
+        Ok(()) => Ok(Json(serde_json::json!({
+            "valid": true,
+            "txid": proof.txid,
+            "daaScore": proof.daa,
+            "confirmations": tip.saturating_sub(proof.daa),
+            "amountSompi": proof.value,
+            "amountSompiExact": proof.value.to_string(),
+            "amountZkas": proof.value as f64 / SOMPI_PER_ZKAS as f64,
+            "recipient": proof.recipient_bytes().map(|r| String::from(&Address::new(state.prefix, Version::ShieldedOrchard, &r))),
+            "memo": (!proof.memo.is_empty()).then(|| String::from_utf8_lossy(&proof.memo).into_owned()),
+        }))),
+        Err(e) => Ok(Json(serde_json::json!({
+            "valid": false,
+            "reason": match e {
+                payproof::ProofError::NoSuchAction => "the transaction has no output at that index",
+                payproof::ProofError::Malformed => "the proof is not a well-formed payment disclosure",
+                payproof::ProofError::CommitmentMismatch => "the disclosed recipient/amount do not match what the chain records",
+            },
+        }))),
+    }
+}
+
+/// The chain block at exactly `daa`, via the node's DAA locator.
+async fn chain_block_at_daa(client: &GrpcClient, daa: u64) -> Option<RpcHash> {
+    let req = kaspa_rpc_core::GetShieldedTreeStateRequest { block_hash: None, below_daa_score: Some(daa + 1) };
+    match tokio::time::timeout(SYNC_RPC_TIMEOUT, client.get_shielded_tree_state_call(None, req)).await {
+        Ok(Ok(ts)) if ts.daa_score == daa => Some(ts.block_hash),
+        _ => None,
+    }
+}
+
 async fn wallet_history(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -7018,8 +7171,11 @@ async fn wallet_history(
 
 #[derive(Deserialize)]
 struct SettingsReq {
-    /// Toggle OVK-recoverable send history for this wallet (see `WalletFile`).
+    /// Accepted from old clients and ignored: history is always on.
     recoverable_history: Option<bool>,
+    /// Build sends without the sender-recoverable ciphertext (see
+    /// [`WalletFile::private_sends`]).
+    private_sends: Option<bool>,
 }
 
 async fn wallet_settings(
@@ -7035,8 +7191,18 @@ async fn wallet_settings(
     // asking to disable it gets the truthful answer back; a file still carrying `false`
     // from the opt-in era is normalised here.
     let _ = req.recoverable_history;
+    let mut dirty = false;
     if !wf.recoverable_history {
         wf.recoverable_history = HISTORY_ALWAYS_ON;
+        dirty = true;
+    }
+    if let Some(v) = req.private_sends {
+        if wf.private_sends != v {
+            wf.private_sends = v;
+            dirty = true;
+        }
+    }
+    if dirty {
         write_wallet_file(&state.wallet_dir, &token, &wf)
             .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to write wallet file: {e}")))?;
     }
@@ -7048,7 +7214,7 @@ async fn wallet_settings(
             e.force_checkpoint = true;
         }
     }
-    Ok(Json(serde_json::json!({ "recoverableHistory": true })))
+    Ok(Json(serde_json::json!({ "recoverableHistory": true, "privateSends": wf.private_sends })))
 }
 
 /// Retire this wallet's scan checkpoint and reload it from its birthday — a full
@@ -7380,7 +7546,7 @@ async fn wallet_send(
                 format!("wallet has not established a matured anchor yet (scanned DAA {}); wait for initial sync", e.scanned),
             ));
         }
-        (e.key.seed()?, e.recoverable_history)
+        (e.key.seed()?, e.recoverable_history && !private_sends(&state.wallet_dir, &token))
     };
     let memo = memo_bytes(req.memo.as_deref())?;
 
@@ -7711,7 +7877,7 @@ async fn wallet_send_many(
                 format!("wallet has not established a matured anchor yet (scanned DAA {}); wait for initial sync", e.scanned),
             ));
         }
-        (e.key.seed()?, e.recoverable_history)
+        (e.key.seed()?, e.recoverable_history && !private_sends(&state.wallet_dir, &token))
     };
 
     if req.payees.is_empty() {
@@ -7960,6 +8126,9 @@ async fn consolidate_once(
     // Held until this returns: a payment arriving mid-merge waits rather than
     // selecting the same notes (see `CONSOLIDATING`).
     let _merging = ConsolidateGuard::new();
+    // A consolidation pays this wallet itself, so there is no recipient to disclose to
+    // anyone: `private_sends` does not apply here, and the row keeps the wallet's own
+    // merge history readable after a restore.
     let (seed, recoverable) = {
         let e = w.lock().await;
         (e.key.seed()?, e.recoverable_history)
@@ -9619,6 +9788,8 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
         .route("/api/wallet/reveal", get(wallet_reveal))
         .route("/api/wallet/balance", get(wallet_balance))
         .route("/api/wallet/history", get(wallet_history))
+        .route("/api/wallet/proof", get(wallet_proof))
+        .route("/api/proof/verify", post(proof_verify))
         .route("/api/wallet/settings", post(wallet_settings))
         .route("/api/wallet/rescan", post(wallet_rescan))
         .route("/api/wallet/send", post(wallet_send))

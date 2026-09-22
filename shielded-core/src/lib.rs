@@ -26,6 +26,7 @@ pub mod commitment;
 pub mod message;
 pub mod nullifier;
 pub mod payment_check;
+pub mod payproof;
 pub mod state;
 pub mod tree;
 pub mod turnstile;

@@ -807,6 +807,13 @@ impl WalletDb {
         &self.fvk
     }
 
+    /// The wallet's outgoing viewing key — what decrypts the details of its own sends
+    /// (see [`crate::payproof`]). Cloned so a caller can use it after dropping the
+    /// wallet lock.
+    pub fn ovk(&self) -> OutgoingViewingKey {
+        self.ovk.clone()
+    }
+
     /// This wallet's receive address, as raw Orchard address bytes. Derived from the
     /// viewing key, so a watch-only wallet knows it too.
     pub fn my_address_bytes(&self) -> [u8; 43] {
