@@ -11,6 +11,13 @@ repository.workspace = true
 name = "zkas-walletd"
 path = "src/main.rs"
 
+# Offline checkpoint rewriter: v10 <-> v9. Ships beside the daemon because it must
+# read the daemon's OWN .scan envelope and WalletDb checkpoint body -- a second
+# implementation of either format is exactly how a rollback tool corrupts a wallet.
+[[bin]]
+name = "zkas-ckpt-rollback"
+path = "src/bin/zkas-ckpt-rollback.rs"
+
 [lints]
 workspace = true
 

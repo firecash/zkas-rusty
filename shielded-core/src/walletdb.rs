@@ -3007,6 +3007,136 @@ impl WalletDb {
         self.encode_checkpoint(nf_share.filter(|n| *n <= self.nf_len()))
     }
 
+    /// A 32-byte commitment to everything a checkpoint is supposed to preserve.
+    ///
+    /// Two wallets with the same digest hold the same notes at the same positions, the
+    /// same spent-nullifier set, the same balance, the same stream length, the same
+    /// anchor, the same history, the same pending spends and the same witness/subtree
+    /// coverage. It exists because a checkpoint rewrite cannot be checked by comparing
+    /// bytes: `to_checkpoint` is **not** byte-deterministic -- it iterates a set whose
+    /// order was never reproducible, and the `sort()` that used to impose one was
+    /// removed for costing 21.5% of the daemon's CPU. So the two things that legitimately
+    /// vary (set iteration order, and whether the nullifiers are carried or referenced)
+    /// are hashed order-independently, and everything else is hashed exactly.
+    ///
+    /// - The nullifier set enters as `(len, nf_digest)`. `nf_digest` is an XOR of
+    ///   per-element hashes, so it commits to the *set* and not to any order.
+    /// - Owned notes and pending spends enter through a sorted vector of per-record
+    ///   hashes, so a reordering of `notes` cannot change the result either.
+    /// - `nf_pending` is hashed too: a checkpoint still waiting for its shared prefix
+    ///   can never compare equal to one that has it, however plausible it looks.
+    ///
+    /// It is an integrity check, not a security boundary: it protects a rewrite against
+    /// truncation, a wrong artefact and a mis-spliced section, not against someone who
+    /// can already write the wallet directory.
+    pub fn state_digest(&self) -> [u8; 32] {
+        let mut h = blake2b_simd::Params::new().hash_length(32).personal(b"ZKasWalStDig_v1").to_state();
+        // Unresolved vs resolved is never the same state, whatever else agrees.
+        match self.nf_pending {
+            Some((count, digest)) => {
+                h.update(&[1u8]);
+                h.update(&count.to_le_bytes());
+                h.update(&digest);
+            }
+            None => {
+                h.update(&[0u8]);
+            }
+        }
+        h.update(&self.size.to_le_bytes());
+        h.update(&self.base_size.to_le_bytes());
+        let mut f = Vec::new();
+        write_frontier(&mut f, &self.base_frontier);
+        h.update(&f);
+        h.update(&[self.tree_valid as u8]);
+        f.clear();
+        write_frontier(&mut f, &self.tree.to_frontier());
+        h.update(&f);
+        // The retained leaf stream, in order -- it IS ordered state.
+        h.update(&(self.leaves.len() as u64).to_le_bytes());
+        for leaf in &self.leaves {
+            h.update(leaf);
+        }
+        // Owned notes, order-independent.
+        let mut notes: Vec<[u8; 32]> = self.notes.iter().map(Self::owned_note_hash).collect();
+        notes.sort_unstable();
+        h.update(&(notes.len() as u64).to_le_bytes());
+        for n in &notes {
+            h.update(n);
+        }
+        h.update(&self.balance().to_le_bytes());
+        h.update(&self.anchor());
+        // The spent set, order-independent by construction.
+        h.update(&self.nf_len().to_le_bytes());
+        h.update(&self.nf_digest);
+        // `nf_ordered` is deliberately NOT hashed. It is not persisted state: it is read
+        // off the version byte (a pre-v10 writer iterated a `HashSet`), so it necessarily
+        // differs across the very conversion this digest exists to check, and hashing it
+        // would make every correct rewrite look wrong.
+        // History is chain-ordered state, so it is hashed in order.
+        h.update(&[self.history_enabled as u8]);
+        h.update(&(self.history.len() as u64).to_le_bytes());
+        for e in &self.history {
+            h.update(&[e.kind as u8]);
+            h.update(&e.txid);
+            h.update(&e.daa_score.to_le_bytes());
+            h.update(&e.timestamp_ms.to_le_bytes());
+            h.update(&e.amount.to_le_bytes());
+            h.update(&e.fee.to_le_bytes());
+            h.update(&[(e.amount_is_net_outflow as u8) | ((e.fee_known as u8) << 1)]);
+            match &e.recipient {
+                Some(r) => {
+                    h.update(&[1u8]);
+                    h.update(r);
+                }
+                None => {
+                    h.update(&[0u8]);
+                }
+            }
+            h.update(&(e.memo.len() as u64).to_le_bytes());
+            h.update(&e.memo);
+        }
+        // Pending spends, order-independent.
+        let mut pend: Vec<[u8; 32]> = self
+            .pending_spends
+            .iter()
+            .map(|p| {
+                let mut ph = blake2b_simd::Params::new().hash_length(32).personal(b"ZKasWalStPnd_v1").to_state();
+                ph.update(&Self::owned_note_hash(&p.note));
+                ph.update(&p.txid);
+                ph.update(&p.submitted_daa.to_le_bytes());
+                <[u8; 32]>::try_from(ph.finalize().as_bytes()).expect("32-byte digest")
+            })
+            .collect();
+        pend.sort_unstable();
+        h.update(&(pend.len() as u64).to_le_bytes());
+        for p in &pend {
+            h.update(p);
+        }
+        h.update(&self.last_daa.to_le_bytes());
+        // Witness + subtree coverage: pure optimisation, but losing it silently on a
+        // rewrite is still a regression an operator deserves to be told about.
+        h.update(&self.witnessed_upto.to_le_bytes());
+        h.update(&(self.witnesses.len() as u64).to_le_bytes());
+        for (pos, _) in &self.witnesses {
+            h.update(&pos.to_le_bytes());
+        }
+        h.update(&self.subtree.upto.to_le_bytes());
+        h.update(&[self.subtree.active as u8, self.subtree.failed as u8, self.subtree.partial as u8]);
+        <[u8; 32]>::try_from(h.finalize().as_bytes()).expect("32-byte digest")
+    }
+
+    /// One owned note as a 32-byte hash of exactly the fields a checkpoint persists.
+    fn owned_note_hash(n: &OwnedNote) -> [u8; 32] {
+        let mut h = blake2b_simd::Params::new().hash_length(32).personal(b"ZKasWalStNot_v1").to_state();
+        h.update(&n.position.to_le_bytes());
+        h.update(&n.nullifier);
+        h.update(&n.note.recipient().to_raw_address_bytes());
+        h.update(&n.note.value().inner().to_le_bytes());
+        h.update(&n.note.rho().to_bytes());
+        h.update(n.note.rseed().as_bytes());
+        <[u8; 32]>::try_from(h.finalize().as_bytes()).expect("32-byte digest")
+    }
+
     fn encode_checkpoint(&self, nf_share: Option<u64>) -> Vec<u8> {
         let mut out = Vec::with_capacity(64 + self.leaves.len() * 32 + self.notes.len() * 123);
         out.push(CHECKPOINT_VERSION);
@@ -3779,6 +3909,250 @@ impl Cursor<'_> {
     fn done(&self) -> bool {
         self.pos == self.buf.len()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Offline checkpoint rewriting: v10 <-> v9, with no daemon and no node.
+//
+// A v10 checkpoint is unreadable to a pre-v10 binary (`restore` accepts only
+// `V3..=CHECKPOINT_VERSION`), so rolling the storage change back would otherwise mean
+// rescanning every wallet -- an outage in its own right, and the one failure mode the
+// whole design exists to avoid. These functions convert a checkpoint between the two
+// forms directly, so a rollback is a file rewrite instead of a fleet rescan.
+//
+// They are deliberately a **splice**, not a re-encode. Only the nullifier section's
+// bytes change; the leaf stream, the frontiers, the notes and the length-prefixed
+// v5-v8 sections are copied through byte for byte. A re-encode would have to go
+// through `restore`, and `restore` is best-effort about the optional sections (a
+// witness or subtree section it declines to parse simply vanishes), so re-encoding
+// could silently drop work the input had. A splice cannot: what it does not rewrite,
+// it does not touch.
+//
+// Neither function trusts its inputs. `checkpoint_to_v9` re-derives the shared
+// prefix's digest and refuses unless it reproduces the one the checkpoint recorded --
+// the same check `install_shared_nullifiers` makes, for the same reason.
+// `checkpoint_to_v10` mirrors `AppState::nf_share_for`, including its refusal to claim
+// a prefix of a log whose order it cannot vouch for.
+// ---------------------------------------------------------------------------
+
+/// Where a checkpoint blob's spent-nullifier section lives, and which form it is in.
+///
+/// Located with the same `Cursor` and `read_frontier` the loader uses, over the same
+/// layout, so the span cannot drift from what `restore` would read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NfSpan {
+    /// The blob's leading `CHECKPOINT_VERSION` byte.
+    pub version: u8,
+    /// Offset of the section's first byte (the count word, or the v10 sentinel).
+    pub start: usize,
+    /// Offset one past the section's last byte.
+    pub end: usize,
+    /// `Some((count, digest))` when this is a v10 **reference** to a shared set.
+    pub shared: Option<(u64, [u8; 32])>,
+    /// Nullifiers written inline: the whole set in the self-contained form, or the
+    /// post-`count` local tail behind a reference.
+    pub inline: u64,
+    /// Offset of the first inline nullifier.
+    pub inline_at: usize,
+}
+
+/// Bytes of one serialised owned-note record in a checkpoint: position, nullifier,
+/// recipient, value, rho, rseed. Pinned by `note_record_len_matches_the_encoder`.
+const NOTE_RECORD_LEN: u64 = 8 + 32 + 43 + 8 + 32 + 32;
+
+/// Locate the spent-nullifier section of a checkpoint blob without restoring it.
+///
+/// `None` for anything this codebase would not load: a bad version byte, a truncated
+/// blob, or a pre-v10 blob carrying the v10 sentinel.
+pub fn checkpoint_nf_span(blob: &[u8]) -> Option<NfSpan> {
+    let mut r = Cursor { buf: blob, pos: 0 };
+    let version = r.u8()?;
+    if !(CHECKPOINT_VERSION_V3..=CHECKPOINT_VERSION).contains(&version) {
+        return None;
+    }
+    let base_size = r.u64()?;
+    read_frontier(&mut r, base_size)?;
+    let _size = r.u64()?;
+    let n_leaves = r.u64()?;
+    r.take(usize::try_from(n_leaves.checked_mul(32)?).ok()?)?;
+    let n_notes = r.u64()?;
+    r.take(usize::try_from(n_notes.checked_mul(NOTE_RECORD_LEN)?).ok()?)?;
+    let start = r.pos;
+    let n = r.u64()?;
+    if version >= CHECKPOINT_VERSION_V10 && n == NF_SHARED_TAG {
+        let count = r.u64()?;
+        let digest = r.arr::<32>()?;
+        let n_local = r.u64()?;
+        let inline_at = r.pos;
+        r.take(usize::try_from(n_local.checked_mul(32)?).ok()?)?;
+        Some(NfSpan { version, start, end: r.pos, shared: Some((count, digest)), inline: n_local, inline_at })
+    } else if n == NF_SHARED_TAG {
+        None // a pre-v10 blob can never carry the sentinel -- same refusal as `restore`
+    } else {
+        let inline_at = r.pos;
+        r.take(usize::try_from(n.checked_mul(32)?).ok()?)?;
+        Some(NfSpan { version, start, end: r.pos, shared: None, inline: n, inline_at })
+    }
+}
+
+/// Why a checkpoint could not be rewritten. Every variant means **nothing was
+/// written**: the caller still has its input, unaltered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RewriteError {
+    /// Not a checkpoint this codebase can read at all.
+    Unparsable,
+    /// Asked to shed nullifiers from something that is not a v9 blob. v7/v8 are refused
+    /// on purpose: the history section is parsed differently at and above v9, so
+    /// re-tagging one as v10 would misread it.
+    NotV9 { version: u8 },
+    /// Asked to re-materialise nullifiers into something that is not a v10 blob.
+    NotV10 { version: u8 },
+    /// The shared artefact is shorter than the reference the checkpoint holds.
+    ArtefactTooShort { need: u64, have: u64 },
+    /// The shared artefact repeats a nullifier, so its count lies and its digest
+    /// cancels. Refused rather than deduplicated.
+    ArtefactDuplicate,
+    /// The shared set is not the set this wallet built: a truncated artefact, another
+    /// scan, bit-rot, or a wallet whose view is not a prefix of it (`blind_below > 0`).
+    DigestMismatch { count: u64 },
+    /// The wallet has recorded nullifiers the artefact has not reached. Sharing a
+    /// prefix of the wallet's own log would require that log to be in chain order,
+    /// which a pre-v10 blob's is not -- so this is refused, exactly as the daemon
+    /// refuses it. The artefact catches up on its own.
+    WalletAheadOfArtefact { wallet: u64, artefact: u64 },
+    /// An empty set: a 56-byte reference would be larger than the bytes it replaces.
+    NothingToShare,
+}
+
+impl std::fmt::Display for RewriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unparsable => write!(f, "not a readable checkpoint"),
+            Self::NotV9 { version } => write!(f, "checkpoint is v{version}, not v9 (only a v9 checkpoint may shed its nullifiers)"),
+            Self::NotV10 { version } => write!(f, "checkpoint is v{version}, not v10"),
+            Self::ArtefactTooShort { need, have } => write!(f, "shared set holds {have} nullifiers, the reference needs {need}"),
+            Self::ArtefactDuplicate => write!(f, "shared set repeats a nullifier"),
+            Self::DigestMismatch { count } => write!(f, "shared set does not reproduce this wallet's own digest at {count}"),
+            Self::WalletAheadOfArtefact { wallet, artefact } => {
+                write!(f, "wallet holds {wallet} nullifiers, the shared set only {artefact}; refusing to share a prefix of an unordered log")
+            }
+            Self::NothingToShare => write!(f, "no nullifiers to share"),
+        }
+    }
+}
+
+impl std::error::Error for RewriteError {}
+
+/// Rewrite a **v10** checkpoint blob as a self-contained **v9** one, re-materialising
+/// the referenced nullifiers from `shared` (the chain tree's own set, in its own order).
+///
+/// The digest recorded in the reference is re-derived from `shared` and must match
+/// before a single byte is produced, so a wrong, stale or truncated artefact yields an
+/// error rather than a wallet full of somebody else's nullifiers.
+pub fn checkpoint_to_v9(blob: &[u8], shared: &[[u8; 32]]) -> Result<Vec<u8>, RewriteError> {
+    let span = checkpoint_nf_span(blob).ok_or(RewriteError::Unparsable)?;
+    if span.version != CHECKPOINT_VERSION_V10 {
+        return Err(RewriteError::NotV10 { version: span.version });
+    }
+    let Some((count, want)) = span.shared else {
+        // A v10 blob that already carries its own bytes. v9 and v10 differ in nothing
+        // else, so the version byte is the entire conversion.
+        let mut out = blob.to_vec();
+        out[0] = CHECKPOINT_VERSION_V9;
+        return Ok(out);
+    };
+    let too_short = RewriteError::ArtefactTooShort { need: count, have: shared.len() as u64 };
+    let count_usize = usize::try_from(count).map_err(|_| too_short.clone())?;
+    let prefix = shared.get(..count_usize).ok_or(too_short)?;
+    // Rebuilt honestly rather than trusted: a duplicate would make the XOR cancel and
+    // the count lie. Same rule, same order, as `install_shared_nullifiers`.
+    let mut set = IndexSet::with_capacity(count_usize + span.inline as usize);
+    let mut d = [0u8; 32];
+    for nf in prefix {
+        if !set.insert(*nf) {
+            return Err(RewriteError::ArtefactDuplicate);
+        }
+        xor_into(&mut d, &nf_leaf_hash(nf));
+    }
+    if d != want {
+        return Err(RewriteError::DigestMismatch { count });
+    }
+    // The local tail the checkpoint kept in full, spliced back on underneath -- the
+    // same order `restore` + `install_shared_nullifiers` produce in memory.
+    for chunk in blob[span.inline_at..span.end].chunks_exact(32) {
+        set.insert(<[u8; 32]>::try_from(chunk).expect("32-byte chunk"));
+    }
+    let mut out = Vec::with_capacity(span.start + 8 + set.len() * 32 + (blob.len() - span.end));
+    out.extend_from_slice(&blob[..span.start]);
+    out.extend_from_slice(&(set.len() as u64).to_le_bytes());
+    for nf in &set {
+        out.extend_from_slice(nf);
+    }
+    out.extend_from_slice(&blob[span.end..]);
+    out[0] = CHECKPOINT_VERSION_V9;
+    Ok(out)
+}
+
+/// Rewrite a **v9** checkpoint blob as a **v10** one that references `shared` instead
+/// of carrying the nullifier bytes.
+///
+/// This is how an operator re-applies the storage change after a rollback without
+/// waiting for each wallet to be rewritten by the daemon in its own time. The rule is
+/// `AppState::nf_share_for`'s, line for line: share at most what the artefact covers,
+/// prove the two sets agree by digest first, and never claim a prefix of a log whose
+/// order was not built by ingest.
+pub fn checkpoint_to_v10(blob: &[u8], shared: &[[u8; 32]]) -> Result<Vec<u8>, RewriteError> {
+    let span = checkpoint_nf_span(blob).ok_or(RewriteError::Unparsable)?;
+    if span.version != CHECKPOINT_VERSION_V9 {
+        return Err(RewriteError::NotV9 { version: span.version });
+    }
+    let mut set = IndexSet::with_capacity(span.inline as usize);
+    for chunk in blob[span.inline_at..span.end].chunks_exact(32) {
+        set.insert(<[u8; 32]>::try_from(chunk).expect("32-byte chunk"));
+    }
+    let wallet_len = set.len() as u64;
+    let n = wallet_len.min(shared.len() as u64);
+    if n == 0 {
+        return Err(RewriteError::NothingToShare);
+    }
+    if n < wallet_len {
+        // The wallet's side of the comparison would be a prefix of ITS log, and a v9
+        // blob's log is in whatever order a `HashSet` iterated. Skip rather than risk it.
+        return Err(RewriteError::WalletAheadOfArtefact { wallet: wallet_len, artefact: shared.len() as u64 });
+    }
+    let nu = n as usize;
+    // `n == wallet_len`, so this is the wallet's WHOLE-set digest -- order-independent,
+    // which is exactly why a wallet resumed from a pre-v10 checkpoint qualifies at once.
+    let mut dw = [0u8; 32];
+    for nf in set.iter() {
+        xor_into(&mut dw, &nf_leaf_hash(nf));
+    }
+    let mut ds = [0u8; 32];
+    let mut seen = HashSet::with_capacity(nu);
+    for nf in &shared[..nu] {
+        if !seen.insert(*nf) {
+            return Err(RewriteError::ArtefactDuplicate);
+        }
+        xor_into(&mut ds, &nf_leaf_hash(nf));
+    }
+    if dw != ds {
+        return Err(RewriteError::DigestMismatch { count: n });
+    }
+    let mut out = Vec::with_capacity(span.start + 56 + (blob.len() - span.end));
+    out.extend_from_slice(&blob[..span.start]);
+    out.extend_from_slice(&NF_SHARED_TAG.to_le_bytes());
+    out.extend_from_slice(&n.to_le_bytes());
+    out.extend_from_slice(&dw);
+    // Everything past the shared prefix stays in full. With `n == wallet_len` enforced
+    // above this is empty today; it is written out properly so the function stays
+    // correct if that guard is ever relaxed for a chain-ordered input.
+    out.extend_from_slice(&(wallet_len - n).to_le_bytes());
+    for nf in set.iter().skip(nu) {
+        out.extend_from_slice(nf);
+    }
+    out.extend_from_slice(&blob[span.end..]);
+    out[0] = CHECKPOINT_VERSION_V10;
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -5599,6 +5973,331 @@ mod tests {
         let n = &reloaded.notes()[0];
         assert!(reloaded.witness_path(n.position).is_some(), "reloaded fast-sync wallet still witnesses");
     }
+    // -----------------------------------------------------------------------
+    // Offline checkpoint rewriting (`checkpoint_to_v9` / `checkpoint_to_v10`).
+    //
+    // These are the tests that have to hold before a 103 GB storage change can ship,
+    // because they are the ones that make it reversible. A v10 checkpoint is
+    // unreadable to a pre-v10 binary, so without a rewrite that provably preserves
+    // state, rolling back means 2,000 rescans.
+    // -----------------------------------------------------------------------
+
+    /// A wallet at `blocks` of `chain`, and the keyless shared tree over all of it.
+    fn wallet_and_shared(chain: &[(Vec<(CoinbaseNoteDesc, u64)>, Vec<Vec<CompactActionRecord>>)], seed: [u8; 32], blocks: usize) -> (WalletDb, Vec<[u8; 32]>) {
+        let mut wallet = WalletDb::from_seed(seed).unwrap();
+        ingest_chain(&mut wallet, &chain[..blocks]);
+        let mut shared = WalletDb::from_seed([9u8; 32]).unwrap();
+        shared.set_leaves_only(true);
+        ingest_chain(&mut shared, chain);
+        let nfs = shared.nf_prefix(shared.nf_len()).unwrap();
+        (wallet, nfs)
+    }
+
+    /// Restore a blob and resolve it against `shared` if it references one, the way the
+    /// daemon does on load.
+    fn restore_resolved(seed: [u8; 32], blob: &[u8], shared: &[[u8; 32]]) -> WalletDb {
+        let mut db = WalletDb::from_checkpoint(seed, blob).expect("blob restores");
+        if db.nf_pending().is_some() {
+            assert!(db.install_shared_nullifiers(shared), "shared set resolves");
+        }
+        db
+    }
+
+    /// The rollback itself: a v10 checkpoint becomes a self-contained v9 one that a
+    /// pre-v10 binary can read, holding **the same wallet**.
+    #[test]
+    fn a_v10_checkpoint_rewrites_to_a_v9_one_with_the_same_state() {
+        let mine = [7u8; 32];
+        let chain = spendy_chain(mine, 30);
+        let (mut wallet, shared) = wallet_and_shared(&chain, mine, 20);
+
+        wallet.set_nf_share(Some(wallet.nf_len()));
+        let v10 = wallet.to_checkpoint();
+        assert_eq!(v10[0], CHECKPOINT_VERSION_V10);
+
+        let v9 = checkpoint_to_v9(&v10, &shared).expect("rewritten");
+        assert_eq!(v9[0], CHECKPOINT_VERSION_V9, "a pre-v10 binary's version gate accepts this");
+        // The bytes came back: 80 nullifiers, less the 48-byte reference they replaced.
+        assert_eq!(v9.len() - v10.len(), 80 * 32 - 48);
+
+        // It restores WITHOUT the artefact — which is the entire point of a rollback.
+        let rolled = WalletDb::from_checkpoint(mine, &v9).expect("v9 restores on its own");
+        assert!(rolled.nullifiers_resolved(), "self-contained: nothing left to supply");
+
+        let before = restore_resolved(mine, &v10, &shared);
+        assert_eq!(rolled.state_digest(), before.state_digest(), "same wallet");
+        assert_eq!(rolled.spent_nullifiers, before.spent_nullifiers);
+        assert_eq!(rolled.balance(), before.balance());
+        assert_eq!(rolled.anchor(), before.anchor());
+        assert_eq!(rolled.size(), before.size());
+        assert_eq!(rolled.notes().len(), before.notes().len());
+    }
+
+    /// A v10 checkpoint written by a wallet that had run AHEAD of the artefact carries a
+    /// reference *plus* a local tail in full. Rolling it back has to splice both, in the
+    /// right order — the only branch of `checkpoint_to_v9` the level-wallet cases miss.
+    #[test]
+    fn a_v10_checkpoint_with_a_local_tail_rolls_back_whole() {
+        let mine = [7u8; 32];
+        let chain = spendy_chain(mine, 30);
+        let mut shared_db = WalletDb::from_seed([9u8; 32]).unwrap();
+        shared_db.set_leaves_only(true);
+        ingest_chain(&mut shared_db, &chain[..20]);
+        let shared = shared_db.nf_prefix(shared_db.nf_len()).unwrap();
+
+        let mut wallet = WalletDb::from_seed(mine).unwrap();
+        ingest_chain(&mut wallet, &chain);
+        assert!(wallet.nf_len() > shared.len() as u64, "the wallet is ahead");
+
+        wallet.set_nf_share(Some(shared.len() as u64));
+        let v10 = wallet.to_checkpoint();
+        let span = checkpoint_nf_span(&v10).unwrap();
+        assert_eq!(span.shared, Some((80, wallet.nf_prefix_digest(80).unwrap())));
+        assert_eq!(span.inline, 40, "the tail past the artefact is carried in full");
+
+        let v9 = checkpoint_to_v9(&v10, &shared).expect("rolled back");
+        assert_eq!(v9[0], CHECKPOINT_VERSION_V9);
+        let rolled = WalletDb::from_checkpoint(mine, &v9).expect("restores on its own");
+        assert!(rolled.nullifiers_resolved());
+        assert_eq!(rolled.nf_len(), wallet.nf_len(), "prefix AND tail came back");
+        assert_eq!(rolled.state_digest(), restore_resolved(mine, &v10, &shared).state_digest());
+        assert_eq!(rolled.nf_prefix(rolled.nf_len()).unwrap(), wallet.nf_prefix(wallet.nf_len()).unwrap(), "and in chain order");
+    }
+
+    /// The re-apply: a v9 checkpoint sheds its nullifiers again, without a rescan.
+    #[test]
+    fn a_v9_checkpoint_rewrites_to_a_v10_one_with_the_same_state() {
+        let mine = [7u8; 32];
+        let chain = spendy_chain(mine, 30);
+        // Level with the artefact: the daemon only shares what the artefact covers.
+        let (wallet, shared) = wallet_and_shared(&chain, mine, 30);
+
+        let v9 = wallet.to_checkpoint_sharing(None);
+        let mut v9 = v9;
+        v9[0] = CHECKPOINT_VERSION_V9; // what the pre-v10 daemon writes
+
+        let v10 = checkpoint_to_v10(&v9, &shared).expect("rewritten");
+        assert_eq!(v10[0], CHECKPOINT_VERSION_V10);
+        assert_eq!(v9.len() - v10.len(), wallet.nf_len() as usize * 32 - 48, "the bytes really left");
+
+        let span = checkpoint_nf_span(&v10).expect("parses");
+        assert_eq!(span.shared, Some((wallet.nf_len(), wallet.nf_digest())), "references exactly this wallet's set");
+
+        let after = restore_resolved(mine, &v10, &shared);
+        let before = WalletDb::from_checkpoint(mine, &v9).expect("v9 restores");
+        assert_eq!(after.state_digest(), before.state_digest(), "same wallet");
+    }
+
+    /// Round trip, and the reason the check is on state and not on bytes: the artefact's
+    /// order is not the wallet's, so a correct rewrite produces DIFFERENT bytes holding
+    /// the SAME set. A byte comparison would fail every correct rollback.
+    #[test]
+    fn the_round_trip_preserves_state_even_though_the_bytes_move() {
+        let mine = [7u8; 32];
+        let chain = spendy_chain(mine, 30);
+        let (wallet, shared) = wallet_and_shared(&chain, mine, 30);
+
+        let mut v9 = wallet.to_checkpoint_sharing(None);
+        v9[0] = CHECKPOINT_VERSION_V9;
+        let original = WalletDb::from_checkpoint(mine, &v9).expect("restores");
+
+        let v10 = checkpoint_to_v10(&v9, &shared).expect("shed");
+        let back = checkpoint_to_v9(&v10, &shared).expect("re-materialised");
+
+        assert_eq!(back.len(), v9.len(), "the same section, the same size");
+        let round = WalletDb::from_checkpoint(mine, &back).expect("restores");
+        assert_eq!(round.state_digest(), original.state_digest(), "same wallet after a full round trip");
+        assert_eq!(round.spent_nullifiers, original.spent_nullifiers, "same set");
+
+        // Everything outside the nullifier section is the original's bytes, untouched.
+        let a = checkpoint_nf_span(&v9).unwrap();
+        let b = checkpoint_nf_span(&back).unwrap();
+        assert_eq!(a.start, b.start);
+        assert_eq!(&v9[1..a.start], &back[1..b.start], "prefix preserved byte for byte");
+        assert_eq!(&v9[a.end..], &back[b.end..], "tip frontier and v5-v8 sections preserved byte for byte");
+    }
+
+    /// A shared set that is not this wallet's is refused, whatever it looks like.
+    #[test]
+    fn a_rewrite_refuses_an_artefact_that_is_not_this_wallets_set() {
+        let mine = [7u8; 32];
+        let chain = spendy_chain(mine, 30);
+        let (mut wallet, shared) = wallet_and_shared(&chain, mine, 20);
+        wallet.set_nf_share(Some(wallet.nf_len()));
+        let v10 = wallet.to_checkpoint();
+
+        let mut bitrot = shared.clone();
+        // Flip a bit that cannot collide with another entry of the fixture, so this tests
+        // the digest and not the duplicate guard.
+        bitrot[3][31] ^= 0x80;
+        assert_eq!(checkpoint_to_v9(&v10, &bitrot), Err(RewriteError::DigestMismatch { count: 80 }), "a flipped bit is refused");
+
+        let truncated = &shared[..40];
+        assert_eq!(checkpoint_to_v9(&v10, truncated), Err(RewriteError::ArtefactTooShort { need: 80, have: 40 }));
+
+        let mut duped = shared.clone();
+        duped[5] = duped[4];
+        assert_eq!(checkpoint_to_v9(&v10, &duped), Err(RewriteError::ArtefactDuplicate), "a repeat makes the count lie");
+
+        // And nothing was produced in any of those cases: the caller still has its input.
+        assert_eq!(checkpoint_nf_span(&v10).unwrap().shared, Some((80, wallet.nf_digest())));
+    }
+
+    /// A wallet whose view starts above the shared base — the 11 live `blind_below > 0`
+    /// fast-synced wallets — holds a SUBSET of the chain's nullifiers, not a prefix of
+    /// them. It must be refused rather than handed somebody else's set.
+    #[test]
+    fn a_wallet_whose_view_is_not_a_prefix_is_refused() {
+        let mine = [7u8; 32];
+        let chain = spendy_chain(mine, 30);
+        let mut shared_db = WalletDb::from_seed([9u8; 32]).unwrap();
+        shared_db.set_leaves_only(true);
+        ingest_chain(&mut shared_db, &chain);
+        let shared = shared_db.nf_prefix(shared_db.nf_len()).unwrap();
+
+        // Ingests the SECOND half only: same count as a 10-block wallet, different set.
+        let mut blind = WalletDb::from_seed(mine).unwrap();
+        ingest_chain(&mut blind, &chain[20..]);
+        assert_eq!(blind.nf_len(), 40);
+        assert!(blind.nf_len() < shared.len() as u64);
+
+        let mut v9 = blind.to_checkpoint_sharing(None);
+        v9[0] = CHECKPOINT_VERSION_V9;
+        assert_eq!(checkpoint_to_v10(&v9, &shared), Err(RewriteError::DigestMismatch { count: 40 }), "not a prefix: refused");
+    }
+
+    /// A wallet that has run AHEAD of the artefact is left alone rather than made to
+    /// claim a prefix of a log whose order nothing vouches for.
+    #[test]
+    fn a_wallet_ahead_of_the_artefact_is_skipped_not_guessed() {
+        let mine = [7u8; 32];
+        let chain = spendy_chain(mine, 30);
+        let mut shared_db = WalletDb::from_seed([9u8; 32]).unwrap();
+        shared_db.set_leaves_only(true);
+        ingest_chain(&mut shared_db, &chain[..10]);
+        let shared = shared_db.nf_prefix(shared_db.nf_len()).unwrap();
+
+        let mut wallet = WalletDb::from_seed(mine).unwrap();
+        ingest_chain(&mut wallet, &chain);
+        let mut v9 = wallet.to_checkpoint_sharing(None);
+        v9[0] = CHECKPOINT_VERSION_V9;
+        assert_eq!(checkpoint_to_v10(&v9, &shared), Err(RewriteError::WalletAheadOfArtefact { wallet: 120, artefact: 40 }));
+    }
+
+    /// A v7/v8 checkpoint is never re-tagged as v10. The history section is parsed
+    /// differently at and above v9, so bumping the version byte on one of the 340 live
+    /// v7/v8 checkpoints would misread its history — the exact class of bug the
+    /// `unexpected end of file` outage was.
+    #[test]
+    fn a_pre_v9_checkpoint_is_never_retagged() {
+        let mine = [7u8; 32];
+        let chain = spendy_chain(mine, 30);
+        let (wallet, shared) = wallet_and_shared(&chain, mine, 30);
+        for v in [CHECKPOINT_VERSION_V7, CHECKPOINT_VERSION_V8] {
+            let mut old = wallet.to_checkpoint_sharing(None);
+            old[0] = v;
+            assert_eq!(checkpoint_to_v10(&old, &shared), Err(RewriteError::NotV9 { version: v }), "v{v} is left alone");
+        }
+        // ...and a v9 blob is not a v10 one to be rolled back, either.
+        let mut v9 = wallet.to_checkpoint_sharing(None);
+        v9[0] = CHECKPOINT_VERSION_V9;
+        assert_eq!(checkpoint_to_v9(&v9, &shared), Err(RewriteError::NotV10 { version: 9 }));
+    }
+
+    /// The span is found where `restore` reads it, in both forms, and a blob that
+    /// `restore` would reject is not spanned either.
+    #[test]
+    fn the_nullifier_span_is_where_restore_reads_it() {
+        let mine = [7u8; 32];
+        let chain = spendy_chain(mine, 30);
+        let (mut wallet, _shared) = wallet_and_shared(&chain, mine, 20);
+
+        let plain = wallet.to_checkpoint_sharing(None);
+        let s = checkpoint_nf_span(&plain).expect("spanned");
+        assert_eq!(s.shared, None);
+        assert_eq!(s.inline, wallet.nf_len());
+        assert_eq!(u64::from_le_bytes(plain[s.start..s.start + 8].try_into().unwrap()), wallet.nf_len(), "the count word is at `start`");
+        assert_eq!(s.end - s.inline_at, wallet.nf_len() as usize * 32);
+
+        wallet.set_nf_share(Some(wallet.nf_len()));
+        let shared_form = wallet.to_checkpoint();
+        let s2 = checkpoint_nf_span(&shared_form).expect("spanned");
+        assert_eq!(s2.start, s.start, "the sections start at the same offset");
+        assert_eq!(s2.shared, Some((wallet.nf_len(), wallet.nf_digest())));
+        assert_eq!(s2.inline, 0);
+
+        // A pre-v10 blob carrying the sentinel is refused here as it is in `restore`.
+        let mut forged = shared_form.clone();
+        forged[0] = CHECKPOINT_VERSION_V9;
+        assert!(checkpoint_nf_span(&forged).is_none());
+        assert!(WalletDb::from_checkpoint(mine, &forged).is_none());
+
+        // Truncated inside the nullifier section: no span, rather than a short one.
+        assert!(checkpoint_nf_span(&plain[..s.inline_at + 8]).is_none(), "a truncated blob is not spanned");
+        assert!(checkpoint_nf_span(&[]).is_none());
+    }
+
+    /// The note record length the span skips by is the one the encoder writes. If these
+    /// ever drift, every span lands in the middle of the leaf stream.
+    #[test]
+    fn note_record_len_matches_the_encoder() {
+        let mine = [7u8; 32];
+        let chain = spendy_chain(mine, 6);
+        let mut wallet = WalletDb::from_seed(mine).unwrap();
+        ingest_chain(&mut wallet, &chain);
+        let notes = wallet.notes().len() as u64;
+        assert!(notes > 0, "the fixture must actually own notes");
+
+        let mut empty = WalletDb::from_seed(mine).unwrap();
+        empty.set_leaves_only(true);
+        ingest_chain(&mut empty, &chain);
+        assert_eq!(empty.notes().len(), 0);
+
+        let with = checkpoint_nf_span(&wallet.to_checkpoint_sharing(None)).unwrap();
+        let without = checkpoint_nf_span(&empty.to_checkpoint_sharing(None)).unwrap();
+        assert_eq!(with.start - without.start, (notes * NOTE_RECORD_LEN) as usize, "one note is exactly NOTE_RECORD_LEN bytes");
+    }
+
+    /// The digest is not vacuous: it moves when the state it is supposed to commit to
+    /// moves, and it is blind to the one thing that legitimately varies.
+    #[test]
+    fn the_state_digest_sees_what_a_rewrite_could_lose() {
+        let mine = [7u8; 32];
+        let chain = spendy_chain(mine, 30);
+        let (wallet, _shared) = wallet_and_shared(&chain, mine, 20);
+        let base = wallet.state_digest();
+
+        let mut lost_note = WalletDb::from_checkpoint(mine, &wallet.to_checkpoint_sharing(None)).unwrap();
+        lost_note.notes.pop();
+        assert_ne!(lost_note.state_digest(), base, "a dropped note is seen");
+
+        let mut lost_nf = WalletDb::from_checkpoint(mine, &wallet.to_checkpoint_sharing(None)).unwrap();
+        lost_nf.spent_nullifiers.pop();
+        assert_ne!(lost_nf.state_digest(), base, "a dropped nullifier is seen");
+
+        let mut moved = WalletDb::from_checkpoint(mine, &wallet.to_checkpoint_sharing(None)).unwrap();
+        moved.notes[0].position += 1;
+        assert_ne!(moved.state_digest(), base, "a moved note is seen");
+
+        let mut unresolved = WalletDb::from_checkpoint(mine, &wallet.to_checkpoint_sharing(None)).unwrap();
+        unresolved.nf_pending = Some((1, [0u8; 32]));
+        assert_ne!(unresolved.state_digest(), base, "a checkpoint still waiting for its set is never 'the same wallet'");
+
+        // ...but NOT to the iteration order of a set, which is the thing that is not
+        // reproducible and the reason bytes cannot be compared.
+        let control = WalletDb::from_checkpoint(mine, &wallet.to_checkpoint_sharing(None)).unwrap();
+        let mut reordered = WalletDb::from_checkpoint(mine, &wallet.to_checkpoint_sharing(None)).unwrap();
+        let backwards: Vec<[u8; 32]> = reordered.spent_nullifiers.iter().rev().copied().collect();
+        reordered.spent_nullifiers.clear();
+        reordered.nf_digest = [0u8; 32];
+        reordered.nf_marks.clear();
+        for nf in &backwards {
+            reordered.insert_nullifier(*nf);
+        }
+        assert_ne!(reordered.spent_nullifiers.as_slice(), control.spent_nullifiers.as_slice(), "the order really did change");
+        assert_eq!(reordered.state_digest(), control.state_digest(), "set order is not state");
+    }
+
 }
 
 /// The real-wallet spend loop with **live crypto** (circuit feature): a wallet

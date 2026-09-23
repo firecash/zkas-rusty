@@ -3799,6 +3799,7 @@ dependencies = [
  "tonic-prost-build",
  "triggered",
  "workflow-core",
+ "workflow-serializer",
 ]
 
 [[package]]
@@ -4307,6 +4308,7 @@ dependencies = [
  "chacha20 0.9.1",
  "group",
  "incrementalmerkletree",
+ "indexmap 2.14.0",
  "kaspa-addresses",
  "kaspa-hashes",
  "kaspa-seq-commit",
@@ -10059,6 +10061,7 @@ dependencies = [
  "argon2",
  "axum 0.7.9",
  "axum-server",
+ "blake2b_simd",
  "chacha20poly1305",
  "clap",
  "hex",

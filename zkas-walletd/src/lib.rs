@@ -1751,6 +1751,92 @@ fn load_checkpoint(
 /// sink_blue, blind_below))`. Factored out of [`load_checkpoint`] so the offline
 /// admin tooling (`--diagnose`, `--graft`) can read snapshots at arbitrary paths
 /// with exactly the daemon's own parser.
+/// The shape of a `.scan` file, read without a key and without restoring the wallet.
+///
+/// [`parse_scan_bytes`] needs a [`WalletKey`] because it hands the body to `WalletDb`.
+/// Offline tooling that rewrites the body -- `zkas-ckpt-rollback` -- needs the
+/// *envelope* instead: where the checkpoint blob starts and ends, and the header and
+/// trailer that have to be copied through it unchanged. Kept beside the daemon's own
+/// parser, over the same constants, and pinned to it by
+/// `scan_layout_agrees_with_parse_scan_bytes`.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanLayout {
+    /// The file-format version byte (`SCAN_VERSION`, or the previous one).
+    pub scan_version: u8,
+    /// Network genesis this checkpoint belongs to.
+    pub genesis: [u8; 32],
+    /// The cursor block sync resumes from.
+    pub low: [u8; 32],
+    /// Blocks scanned.
+    pub scanned: u64,
+    /// Byte offset of the checkpoint blob inside the file.
+    pub blob_at: usize,
+    /// Length of the checkpoint blob.
+    pub blob_len: usize,
+    /// The matured-anchor ring.
+    pub boundaries: Vec<(u64, u64)>,
+    /// Sink blue score.
+    pub sink_blue: u64,
+    /// The frontier size below which this view is blind (0 = a complete view).
+    pub blind_below: u64,
+}
+
+impl ScanLayout {
+    /// The checkpoint blob itself.
+    pub fn blob<'a>(&self, buf: &'a [u8]) -> &'a [u8] {
+        &buf[self.blob_at..self.blob_at + self.blob_len]
+    }
+}
+
+/// Read a `.scan` file's envelope. `None` for anything the daemon would not load.
+#[doc(hidden)]
+pub fn scan_layout(buf: &[u8]) -> Option<ScanLayout> {
+    if buf.len() < SCAN_HEADER_LEN || &buf[0..4] != SCAN_MAGIC || !matches!(buf[4], SCAN_VERSION | SCAN_VERSION_PREV) {
+        return None;
+    }
+    let scan_version = buf[4];
+    let genesis: [u8; 32] = buf[5..37].try_into().ok()?;
+    let low: [u8; 32] = buf[37..69].try_into().ok()?;
+    let scanned = u64::from_le_bytes(buf[69..77].try_into().ok()?);
+    let mut pos = SCAN_HEADER_LEN;
+    let take = |pos: &mut usize, n: usize| -> Option<&[u8]> {
+        let end = pos.checked_add(n)?;
+        let s = buf.get(*pos..end)?;
+        *pos = end;
+        Some(s)
+    };
+    let blob_len = u64::from_le_bytes(take(&mut pos, 8)?.try_into().ok()?) as usize;
+    let blob_at = pos;
+    take(&mut pos, blob_len)?;
+    let ring_len = u32::from_le_bytes(take(&mut pos, 4)?.try_into().ok()?) as usize;
+    let mut boundaries = Vec::with_capacity(ring_len.min(MATURED_RING));
+    for _ in 0..ring_len {
+        let blue = u64::from_le_bytes(take(&mut pos, 8)?.try_into().ok()?);
+        let leaves = u64::from_le_bytes(take(&mut pos, 8)?.try_into().ok()?);
+        boundaries.push((blue, leaves));
+    }
+    let sink_blue = u64::from_le_bytes(take(&mut pos, 8)?.try_into().ok()?);
+    let blind_below = if scan_version == SCAN_VERSION { u64::from_le_bytes(take(&mut pos, 8)?.try_into().ok()?) } else { 0 };
+    // Trailing bytes mean this is not the file we think it is.
+    if pos != buf.len() {
+        return None;
+    }
+    Some(ScanLayout { scan_version, genesis, low, scanned, blob_at, blob_len, boundaries, sink_blue, blind_below })
+}
+
+/// Rebuild a `.scan` file around a new checkpoint blob, keeping the envelope byte for
+/// byte. Only the blob and its length prefix change.
+#[doc(hidden)]
+pub fn scan_with_blob(buf: &[u8], layout: &ScanLayout, blob: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(buf.len() - layout.blob_len + blob.len());
+    out.extend_from_slice(&buf[..SCAN_HEADER_LEN]);
+    out.extend_from_slice(&(blob.len() as u64).to_le_bytes());
+    out.extend_from_slice(blob);
+    out.extend_from_slice(&buf[layout.blob_at + layout.blob_len..]);
+    out
+}
+
 #[allow(clippy::type_complexity)]
 fn parse_scan_bytes(
     buf: &[u8],
@@ -11028,5 +11114,79 @@ mod sdk_api_tests {
         assert_eq!(select_coinbase_cmx(None, &desc, value, false).unwrap().to_bytes(), derived.to_bytes());
         // trust mode (opt-in fast path): supplied value used verbatim
         assert_eq!(select_coinbase_cmx(Some(wrong), &desc, value, true).unwrap().to_bytes(), wrong.to_bytes());
+    }
+}
+
+#[cfg(test)]
+mod scan_layout_tests {
+    use super::*;
+
+    fn a_checkpoint_file() -> (Vec<u8>, WalletDb, RpcHash, RpcHash, VecDeque<(u64, u64)>) {
+        let db = WalletDb::from_seed([3u8; 32]).expect("valid key");
+        let genesis = RpcHash::from_bytes([1u8; 32]);
+        let low = RpcHash::from_bytes([2u8; 32]);
+        let mut boundaries = VecDeque::new();
+        boundaries.push_back((11u64, 22u64));
+        boundaries.push_back((33u64, 44u64));
+        let buf = checkpoint_bytes(&genesis, &low, 77, &db, &boundaries, 99, 123, None);
+        (buf, db, genesis, low, boundaries)
+    }
+
+    /// The envelope reader the offline rewriter uses must see exactly what the daemon's
+    /// own loader sees. It is a second reader of the same bytes, and a second reader
+    /// that drifts is how a rollback tool writes a file the daemon then rejects.
+    #[test]
+    fn scan_layout_agrees_with_parse_scan_bytes() {
+        let (buf, db, genesis, low, boundaries) = a_checkpoint_file();
+        let l = scan_layout(&buf).expect("layout");
+        let (saved_genesis, (parsed_db, parsed_low, scanned, parsed_boundaries, sink_blue, blind_below)) =
+            parse_scan_bytes(&buf, WalletKey::Seed([3u8; 32]), None).expect("daemon parse");
+
+        assert_eq!(RpcHash::from_bytes(l.genesis), saved_genesis);
+        assert_eq!(RpcHash::from_bytes(l.genesis), genesis);
+        assert_eq!(RpcHash::from_bytes(l.low), parsed_low);
+        assert_eq!(RpcHash::from_bytes(l.low), low);
+        assert_eq!(l.scanned as usize, scanned);
+        assert_eq!(l.boundaries, Vec::from(parsed_boundaries));
+        assert_eq!(l.boundaries, Vec::from(boundaries));
+        assert_eq!(l.sink_blue, sink_blue);
+        assert_eq!(l.blind_below, blind_below);
+        assert_eq!(l.blind_below, 123);
+        assert_eq!(l.blob(&buf), db.to_checkpoint_sharing(None).as_slice(), "the body is where the layout says it is");
+        assert_eq!(parsed_db.state_digest(), db.state_digest());
+    }
+
+    /// Swapping the body keeps the envelope byte for byte and stays loadable.
+    #[test]
+    fn scan_with_blob_replaces_only_the_body() {
+        let (buf, db, ..) = a_checkpoint_file();
+        let l = scan_layout(&buf).expect("layout");
+        // A longer body: the length prefix must move with it.
+        let mut longer = db.to_checkpoint_sharing(None);
+        longer.extend_from_slice(&[0u8; 0]); // same body, exercised through the same path
+        let rebuilt = scan_with_blob(&buf, &l, &longer);
+        assert_eq!(rebuilt, buf, "an unchanged body rebuilds the identical file");
+
+        let l2 = scan_layout(&rebuilt).expect("rebuilt layout");
+        assert_eq!(l2, l);
+        assert!(parse_scan_bytes(&rebuilt, WalletKey::Seed([3u8; 32]), None).is_some(), "the daemon still loads it");
+    }
+
+    /// Anything the daemon would refuse, the layout reader refuses too.
+    #[test]
+    fn scan_layout_refuses_what_the_daemon_refuses() {
+        let (buf, ..) = a_checkpoint_file();
+        assert!(scan_layout(&buf[..buf.len() - 1]).is_none(), "truncated");
+        let mut trailing = buf.clone();
+        trailing.push(0);
+        assert!(scan_layout(&trailing).is_none(), "trailing bytes");
+        assert!(parse_scan_bytes(&trailing, WalletKey::Seed([3u8; 32]), None).is_none());
+        let mut bad_magic = buf.clone();
+        bad_magic[0] ^= 0xff;
+        assert!(scan_layout(&bad_magic).is_none());
+        let mut bad_version = buf.clone();
+        bad_version[4] = 99;
+        assert!(scan_layout(&bad_version).is_none());
+        assert!(scan_layout(&[]).is_none());
     }
 }
