@@ -51,7 +51,7 @@ use crate::bundle::ShieldedBundle;
 use crate::coinbase::{CoinbaseNoteDesc, coinbase_note_commitment};
 use crate::tree::{FrontierState, GlobalTree, TREE_DEPTH};
 use crate::wallet::scan::{
-    CompactActionRecord, ReceivedNote, reconstruct_action, scan_bundle_prepared, scan_compact_auto, scan_compact_prepared, trim_memo,
+    CompactActionRecord, ReceivedNote, reconstruct_action, scan_bundle_prepared, scan_compact_auto, scan_compact_auto_cached, scan_compact_prepared, trim_memo,
 };
 
 /// A note the wallet owns and can spend. The membership witness is **not** held
@@ -230,6 +230,21 @@ pub struct WalletDb {
     fvk: FullViewingKey,
     /// This wallet's raw external address — matches coinbase recipients.
     my_address: [u8; 43],
+    /// Every diversified address this wallet can plausibly have handed out, so a
+    /// coinbase paid to one is recognised. See [`Self::recover_coinbase_note`].
+    ///
+    /// Derived eagerly for indices `0..COINBASE_DIVERSIFIER_SCAN` because the hot path
+    /// must stay a hash lookup: a coinbase note publishes its recipient in the clear,
+    /// so the alternative is FF1-decrypting the diversifier for a candidate index and
+    /// confirming with `address_at(j)` — a scalar multiplication, on roughly half of
+    /// all leaves, for every stranger's coinbase as well as ours.
+    ///
+    /// ⚠️ **This is a bound, not a proof.** An address issued above the bound and not
+    /// requested again in this process's lifetime is still missed. Closing that gap
+    /// properly means persisting the issued-index set in the checkpoint, which is a
+    /// format change; two other changes are already contending for the next
+    /// `CHECKPOINT_VERSION`, so it is deliberately not done here.
+    known_addresses: std::collections::HashSet<[u8; 43]>,
     /// A running mirror of the global tree, used only to report the current tip
     /// [`anchor`](Self::anchor) cheaply (one append per leaf). Initialised from
     /// [`base_frontier`](Self::base_frontier), so it already reflects everything up
@@ -709,6 +724,15 @@ impl SubtreeCache {
 /// checkpoint blob.
 const HISTORY_CAP: usize = 20_000;
 
+/// How many diversified addresses to derive up front for coinbase recognition.
+///
+/// Each costs one scalar multiplication at wallet load (~256 of them is a few ms,
+/// paid once), and buys a coinbase check that is a hash lookup rather than a curve
+/// operation on half of every block's leaves. 256 covers per-customer deposit
+/// addresses at the scale this daemon actually serves; see `known_addresses` for
+/// what it does not cover.
+const COINBASE_DIVERSIFIER_SCAN: u32 = 256;
+
 impl WalletDb {
     /// Build a wallet view from a 32-byte seed. Returns `None` if the seed is not
     /// a valid Orchard spending key (negligibly rare).
@@ -719,12 +743,16 @@ impl WalletDb {
         let prepared_ivk = ivk.prepare();
         let agree_scalar = crate::wallet::ivk_agreement_scalar(&ivk);
         let my_address = fvk.address_at(0u32, Scope::External).to_raw_address_bytes();
+        let known_addresses = (0..COINBASE_DIVERSIFIER_SCAN)
+            .map(|i| fvk.address_at(i, Scope::External).to_raw_address_bytes())
+            .collect();
         let ovk = fvk.to_ovk(Scope::External);
         Some(Self {
             ivk,
             prepared_ivk,
             fvk,
             my_address,
+            known_addresses,
             tree: CommitmentTree::empty(),
             base_frontier: Frontier::empty(),
             base_size: 0,
@@ -767,12 +795,16 @@ impl WalletDb {
         let prepared_ivk = ivk.prepare();
         let agree_scalar = crate::wallet::ivk_agreement_scalar(&ivk);
         let my_address = fvk.address_at(0u32, Scope::External).to_raw_address_bytes();
+        let known_addresses = (0..COINBASE_DIVERSIFIER_SCAN)
+            .map(|i| fvk.address_at(i, Scope::External).to_raw_address_bytes())
+            .collect();
         let ovk = fvk.to_ovk(Scope::External);
         Some(Self {
             ivk,
             prepared_ivk,
             fvk,
             my_address,
+            known_addresses,
             tree: CommitmentTree::empty(),
             base_frontier: Frontier::empty(),
             base_size: 0,
@@ -2075,6 +2107,31 @@ impl WalletDb {
     /// [`Self::end_page`]. Purely an optimisation: anything not found is decrypted the
     /// old way, so a bug here can cost time but not notes.
     pub fn predecrypt_page(&mut self, all: &[CompactActionRecord]) {
+        self.predecrypt_page_cached(all, None)
+    }
+
+    /// As [`Self::predecrypt_page`], reusing the ephemeral keys the decoded page already
+    /// decompressed for the whole cohort. Decompression is key-independent, so without
+    /// this every wallet on a page repeats the identical modular square roots.
+    pub fn predecrypt_page_cached(
+        &mut self,
+        all: &[CompactActionRecord],
+        epks: Option<&[Option<pasta_curves::pallas::Point>]>,
+    ) {
+        self.predecrypt_page_prepared(all, epks, None)
+    }
+
+    /// As [`Self::predecrypt_page_cached`], also reusing the DEVICE-READY form of those
+    /// keys — affine limbs packed once for the cohort. With a device filter installed
+    /// this is the whole of the per-wallet host cost: gather one ciphertext byte per
+    /// action, ask, hand the survivors to orchard. `None` for either cache falls back
+    /// exactly as before, so a drift here costs time and never a note.
+    pub fn predecrypt_page_prepared(
+        &mut self,
+        all: &[CompactActionRecord],
+        epks: Option<&[Option<pasta_curves::pallas::Point>]>,
+        prep: Option<&crate::wallet::PreparedEpks>,
+    ) {
         if self.leaves_only || all.is_empty() {
             return;
         }
@@ -2083,7 +2140,7 @@ impl WalletDb {
         // doing exactly as much work as before — telemetry that flatters the change it
         // is supposed to measure is worse than none, and I nearly reported it as a win.
         let t_dec = std::time::Instant::now();
-        let found = scan_compact_auto(&self.prepared_ivk, self.agree_scalar.as_ref(), all);
+        let found = crate::wallet::scan_compact_auto_prepared(&self.prepared_ivk, self.agree_scalar.as_ref(), all, prep, epks);
         self.scan_cost.decrypt_ns += t_dec.elapsed().as_nanos();
         self.scan_cost.actions += all.len() as u64;
         let mut map: std::collections::HashMap<[u8; 32], Option<ReceivedNote>> = all.iter().map(|r| (r.nullifier, None)).collect();
@@ -2702,11 +2759,29 @@ impl WalletDb {
     }
 
     /// Reconstruct a coinbase note if it was paid to this wallet. A coinbase note
-    /// is ours iff its stated recipient equals our address; the note is then fully
-    /// determined by the public `(recipient, ρ, rseed)` and the public `value`,
+    /// is ours iff its stated recipient is one of our addresses; the note is then
+    /// fully determined by the public `(recipient, ρ, rseed)` and the public `value`,
     /// exactly as [`crate::coinbase`] recomputes the commitment.
+    ///
+    /// **Every diversified address, not just index 0.** A shielded *output* is found
+    /// by trial decryption keyed on the incoming viewing key, which is diversifier-
+    /// independent — so `?index=N` addresses have always worked there, exactly as the
+    /// endpoint advertises ("all of them pay into the same wallet and are found by its
+    /// one scan"). A coinbase note carries its recipient in the clear and took a
+    /// different path: a raw equality against `my_address`, which is `address_at(0)`.
+    /// So a coinbase paid to any issued `?index=N` address — the custodial
+    /// per-customer deposit address that same endpoint exists to provide — was
+    /// silently never recognised. The funds are on chain and this wallet holds the
+    /// key; the balance simply never showed them.
+    ///
+    /// The check is a set membership against addresses derived once at load
+    /// ([`Self::known_addresses`]), so it stays as cheap as the byte compare it
+    /// replaces. That matters: coinbase is roughly half of all leaves, and the old
+    /// comparison returning before any curve work is why coinbase scanning costs
+    /// nothing today. Deriving per candidate instead would have put a scalar
+    /// multiplication on that path.
     fn recover_coinbase_note(&self, desc: &CoinbaseNoteDesc, value: u64) -> Option<Note> {
-        if desc.recipient != self.my_address {
+        if desc.recipient != self.my_address && !self.known_addresses.contains(&desc.recipient) {
             return None;
         }
         let addr = Option::<Address>::from(Address::from_raw_address_bytes(&desc.recipient))?;
@@ -2747,11 +2822,31 @@ impl WalletDb {
             out.extend_from_slice(&n.note.rho().to_bytes());
             out.extend_from_slice(n.note.rseed().as_bytes());
         }
-        // v3: the spent-nullifier set, sorted for a canonical encoding.
-        let mut nfs: Vec<&[u8; 32]> = self.spent_nullifiers.iter().collect();
-        nfs.sort();
-        out.extend_from_slice(&(nfs.len() as u64).to_le_bytes());
-        for nf in nfs {
+        // v3: the spent-nullifier set, in iteration order.
+        //
+        // This used to sort, "for a canonical encoding". Nothing wanted one: the reader
+        // below inserts each entry into a `HashSet`, so the order is semantically
+        // unobservable, and neither consumer of `to_checkpoint` (the daemon's
+        // `checkpoint_bytes`, the SDK engine) hashes, diffs or compares the bytes.
+        //
+        // It was the single largest consumer of CPU in the daemon. Measured live over a
+        // 180 s window: 62 checkpoints rewritten, 223.3 M nullifiers sorted at
+        // 0.853 us each = 190.5 core-seconds, **1.06 of the daemon's 4.92 cores (21.5%)**.
+        // Benched at the live mean (3.48 M nullifiers), the sort is 2.97 s of a 3.32 s
+        // serialisation — 89-94% of it. For scale, trial-decrypting every action at the
+        // tip for all ~2,000 wallets costs 0.047 cores; this sort was 22x the entire
+        // fleet's decryption budget, to produce an ordering nobody reads.
+        //
+        // And it ran with the wallet's `MutexGuard` held on a runtime thread, so each
+        // one also stalled that wallet's /api/status, /api/balance and send-prepare for
+        // 0.9-4.2 s.
+        //
+        // If a byte-stable checkpoint is ever genuinely needed (content-hash dedup,
+        // rsync-by-checksum), do NOT restore the sort: keep `spent_nullifiers` as an
+        // insertion-ordered Vec beside its HashSet index and write that. Chain order is
+        // already canonical and costs nothing.
+        out.extend_from_slice(&(self.spent_nullifiers.len() as u64).to_le_bytes());
+        for nf in &self.spent_nullifiers {
             out.extend_from_slice(nf);
         }
         // v4: the **tip** frontier — the mirror tree summarised in O(1). Without it a
@@ -3231,6 +3326,17 @@ fn read_frontier(r: &mut Cursor<'_>, size: u64) -> Option<Frontier<MerkleHashOrc
         1 => {
             let leaf = r.arr::<32>()?;
             let n_ommers = r.u64()? as usize;
+            // Bound BEFORE allocating. A frontier has one ommer per tree level at
+            // most, so anything larger is a corrupt record — and `with_capacity` on an
+            // unchecked `u64` turns that corruption into an allocation of arbitrary
+            // size, which aborts the process rather than failing the read. Every other
+            // length in this format is already bounded this way (`n_levels`, `n_peaks`,
+            // the per-level root count); this one was missed, and it is reachable from
+            // any damaged `.scan` on disk today. Failing the parse quarantines one
+            // wallet; aborting takes the whole daemon down with it.
+            if n_ommers > TREE_DEPTH as usize {
+                return None;
+            }
             let mut ommers = Vec::with_capacity(n_ommers);
             for _ in 0..n_ommers {
                 ommers.push(r.arr::<32>()?);
@@ -3396,6 +3502,45 @@ mod tests {
 
     fn address_of(seed: [u8; 32]) -> [u8; 43] {
         crate::wallet::scan::address_bytes_from_seed(seed).unwrap()
+    }
+
+    /// A coinbase paid to a DIVERSIFIED address is ours too.
+    ///
+    /// Shielded outputs are found by trial decryption on the incoming viewing key,
+    /// which ignores the diversifier, so `?index=N` addresses always worked there.
+    /// A coinbase publishes its recipient in the clear and was compared for raw
+    /// equality against `address_at(0)` alone — so a coinbase paid to an issued
+    /// per-customer deposit address was silently invisible, with the funds on chain
+    /// and the key in hand. This asserts the diversified case and pins the bound:
+    /// an address beyond `COINBASE_DIVERSIFIER_SCAN` is still missed, by design.
+    #[test]
+    fn a_coinbase_paid_to_a_diversified_address_is_recognised() {
+        let mine = [7u8; 32];
+        let mut db = WalletDb::from_seed(mine).unwrap();
+        let fvk = db.fvk().clone();
+
+        let at = |i: u32| fvk.address_at(i, Scope::External).to_raw_address_bytes();
+        let stranger = address_of([9u8; 32]);
+
+        db.ingest_block(
+            &[
+                coinbase_for(at(0), b"d||0", 1_000),
+                coinbase_for(at(1), b"d||1", 2_000),
+                coinbase_for(at(37), b"d||37", 4_000),
+                coinbase_for(stranger, b"d||x", 8_000),
+            ],
+            &[],
+        );
+
+        assert_eq!(db.notes().len(), 3, "index 0, 1 and 37 are all ours; the stranger is not");
+        assert_eq!(db.balance(), 7_000, "1000 + 2000 + 4000, and none of the stranger's 8000");
+
+        // The bound is a bound. An index past the pre-derived window is still missed,
+        // which is why `known_addresses` says so out loud rather than implying coverage.
+        let beyond = at(COINBASE_DIVERSIFIER_SCAN + 1);
+        let mut far = WalletDb::from_seed(mine).unwrap();
+        far.ingest_block(&[coinbase_for(beyond, b"d||far", 5_000)], &[]);
+        assert_eq!(far.balance(), 0, "beyond the derived window — documented limitation, not a silent one");
     }
 
     /// The wallet recognises a coinbase note paid to it, ignores one paid to a
@@ -4556,6 +4701,40 @@ mod tests {
     /// balance, owned-note positions, the tip anchor, and — the strongest check —
     /// the exact spend witness, all without re-scanning the chain. This is what lets
     /// `zkas-walletd` resume after a restart instead of rescanning from birthday.
+    /// The spent-nullifier section round-trips **as a set**, whatever order it was
+    /// written in.
+    ///
+    /// This pins the invariant that let the sort go: `from_checkpoint` inserts each
+    /// entry into a `HashSet`, so two wallets that saw the same nullifiers in different
+    /// orders must restore identically. If anyone ever reintroduces an ordering
+    /// requirement — a content hash, a checksum-based backup, a byte-equality assert —
+    /// this test still passes, so read the comment in `to_checkpoint` before assuming
+    /// a canonical encoding is available.
+    #[test]
+    fn spent_nullifiers_roundtrip_as_a_set_regardless_of_insertion_order() {
+        let mine = [5u8; 32];
+        let mut a = WalletDb::from_seed(mine).unwrap();
+        let mut b = WalletDb::from_seed(mine).unwrap();
+
+        // The same nullifiers, inserted in opposite orders.
+        let nfs: Vec<[u8; 32]> = (0u8..64).map(|i| [i.wrapping_mul(7).wrapping_add(3); 32]).collect();
+        for nf in nfs.iter() {
+            a.spent_nullifiers.insert(*nf);
+        }
+        for nf in nfs.iter().rev() {
+            b.spent_nullifiers.insert(*nf);
+        }
+
+        let ra = WalletDb::from_checkpoint(mine, &a.to_checkpoint()).expect("restore a");
+        let rb = WalletDb::from_checkpoint(mine, &b.to_checkpoint()).expect("restore b");
+
+        assert_eq!(ra.spent_nullifiers.len(), nfs.len(), "every nullifier survives the round trip");
+        assert_eq!(ra.spent_nullifiers, rb.spent_nullifiers, "insertion order is semantically invisible");
+        for nf in nfs.iter() {
+            assert!(ra.spent_nullifiers.contains(nf), "nullifier missing after restore");
+        }
+    }
+
     #[test]
     fn checkpoint_roundtrips_state_and_witness() {
         let mine = [5u8; 32];

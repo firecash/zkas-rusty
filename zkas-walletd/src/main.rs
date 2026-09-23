@@ -141,6 +141,18 @@ struct Cli {
     /// Maximum one-time cold witness warmups running concurrently.
     #[arg(long, value_name = "N")]
     warm_wallets: Option<usize>,
+    /// Keep the N most recently active wallets resident and fully prepared, never
+    /// evicted. Costs roughly 100-190 MiB of RAM each; 0 (the default) keeps the old
+    /// behaviour. This is what removes the 10-15s "reopen a synced wallet and wait
+    /// before you can send" — the wallet is still there, so there is nothing to rebuild.
+    #[arg(long, value_name = "N")]
+    warm_always: Option<usize>,
+    /// Ceiling on 1-minute load average per core, as a percent, above which the
+    /// background warm sweep stops starting new cold work. Recently active wallets are
+    /// never gated by it; progressively older ones get a progressively smaller share, so
+    /// dormant wallets are prepared out of genuinely idle capacity. Default 60.
+    #[arg(long, value_name = "PCT")]
+    warm_budget: Option<u64>,
     /// Threads used to decode each shared shielded-block page.
     #[arg(long, value_name = "N")]
     page_decode_threads: Option<usize>,
@@ -217,6 +229,12 @@ async fn run(cli: Cli) {
     }
     if let Some(v) = cli.warm_wallets.filter(|v| *v > 0) {
         resources.warm_wallets = v;
+    }
+    if let Some(v) = cli.warm_always {
+        resources.warm_always = v;
+    }
+    if let Some(v) = cli.warm_budget.filter(|v| *v > 0) {
+        resources.warm_budget_pct = v;
     }
     if let Some(v) = cli.page_decode_threads.filter(|v| *v > 0) {
         resources.page_decode_threads = v;

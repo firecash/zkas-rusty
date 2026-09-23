@@ -226,6 +226,11 @@ pub mod scan {
     type AgreeFn = dyn Fn(&pallas::Scalar, &[Option<pallas::Point>]) -> Option<Vec<Option<pallas::Affine>>> + Send + Sync;
     static GPU_AGREE: std::sync::OnceLock<Box<AgreeFn>> = std::sync::OnceLock::new();
 
+    /// Below this the device is not worth asking. See the table and the two live
+    /// regressions in [`scan_compact_auto_cached`] before touching it; every time this
+    /// number moved on the strength of a microbenchmark the daemon got slower.
+    const GPU_MIN_BATCH: usize = 256;
+
     /// Install the device backend. Idempotent; the first call wins.
     pub fn install_gpu_agree(f: Box<AgreeFn>) {
         let _ = GPU_AGREE.set(f);
@@ -256,6 +261,17 @@ pub mod scan {
         prepared: &PreparedIncomingViewingKey,
         agree_scalar: Option<&pallas::Scalar>,
         actions: &[CompactActionRecord],
+    ) -> Vec<ReceivedNote> {
+        scan_compact_auto_cached(prepared, agree_scalar, actions, None)
+    }
+
+    /// As [`scan_compact_auto`], with ephemeral keys the caller already decompressed
+    /// once for the whole cohort — see [`scan_compact_gpu_cached`].
+    pub fn scan_compact_auto_cached(
+        prepared: &PreparedIncomingViewingKey,
+        agree_scalar: Option<&pallas::Scalar>,
+        actions: &[CompactActionRecord],
+        epks: Option<&[Option<pallas::Point>]>,
     ) -> Vec<ReceivedNote> {
         // Below this, the device is not worth asking — measured against the code that
         // would otherwise run, which is the correction that matters here.
@@ -296,11 +312,9 @@ pub mod scan {
         // strength of a microbenchmark it got worse, and every regression was visible in
         // the live counters within minutes. Change it only against a cold-scan blocks/s
         // measurement, and only with no unrelated test wallets syncing.
-        const GPU_MIN_BATCH: usize = 256;
-
         if actions.len() >= GPU_MIN_BATCH {
             if let (Some(f), Some(sc)) = (GPU_AGREE.get(), agree_scalar) {
-                if let Some(found) = scan_compact_gpu(prepared, actions, |epks| f(sc, epks)) {
+                if let Some(found) = scan_compact_gpu_cached(prepared, actions, epks, |e| f(sc, e)) {
                     return found;
                 }
             }
@@ -406,9 +420,48 @@ pub mod scan {
     /// second implementation of consensus-adjacent cryptography.
     ///
     /// Returns `None` if the device could not answer, and the caller uses the CPU path.
+    /// Decompress one action's ephemeral key: recover y from x by modular square root.
+    ///
+    /// Exposed so a caller that sees a page before its wallets do can pay this once for
+    /// the whole cohort — it depends only on the action's bytes, not on any viewing key.
+    /// `None` for a non-canonical encoding, which can never yield a note.
+    pub fn decompress_epk(bytes: &[u8; 32]) -> Option<pallas::Point> {
+        Option::<pallas::Affine>::from(pallas::Affine::from_bytes(bytes)).map(pallas::Point::from)
+    }
+
+    /// As [`scan_compact_gpu`], but reusing ephemeral keys somebody already decompressed.
+    ///
+    /// Decompression is a modular square root over bytes that are the same for every
+    /// wallet, so W wallets scanning one page were paying for the identical curve work W
+    /// times. Measured live: ~9 wallets ride each fetched page (page-cache counters
+    /// 5,595 hit / 1,404 rode-a-peer / 1,024 fetched), against 5-8 us/action to
+    /// decompress — so this was ~8x of pure duplicated work on the hot path, and it is
+    /// larger than the GPU agreement step that follows it.
+    ///
+    /// The caller owns the cache because the natural place for it is the decoded page,
+    /// which the whole cohort already shares. Passing `None` decompresses here exactly
+    /// as before, so nothing depends on the cache existing.
+    pub fn scan_compact_gpu_cached(
+        prepared: &PreparedIncomingViewingKey,
+        actions: &[CompactActionRecord],
+        epks: Option<&[Option<pallas::Point>]>,
+        agree: impl FnOnce(&[Option<pallas::Point>]) -> Option<Vec<Option<pallas::Affine>>>,
+    ) -> Option<Vec<ReceivedNote>> {
+        scan_compact_gpu_inner(prepared, actions, epks, agree)
+    }
+
     pub fn scan_compact_gpu(
         prepared: &PreparedIncomingViewingKey,
         actions: &[CompactActionRecord],
+        agree: impl FnOnce(&[Option<pallas::Point>]) -> Option<Vec<Option<pallas::Affine>>>,
+    ) -> Option<Vec<ReceivedNote>> {
+        scan_compact_gpu_inner(prepared, actions, None, agree)
+    }
+
+    fn scan_compact_gpu_inner(
+        prepared: &PreparedIncomingViewingKey,
+        actions: &[CompactActionRecord],
+        cached_epks: Option<&[Option<pallas::Point>]>,
         agree: impl FnOnce(&[Option<pallas::Point>]) -> Option<Vec<Option<pallas::Affine>>>,
     ) -> Option<Vec<ReceivedNote>> {
         use blake2b_simd::Params;
@@ -436,14 +489,23 @@ pub mod scan {
             Option::<pallas::Affine>::from(pallas::Affine::from_bytes(&r.ephemeral_key)).map(pallas::Point::from)
         };
         const DECOMPRESS_PAR_MIN: usize = 512;
-        let epks: Vec<Option<pallas::Point>> = if actions.len() >= DECOMPRESS_PAR_MIN {
-            use rayon::prelude::*;
-            actions.par_iter().map(decompress).collect()
-        } else {
-            actions.iter().map(decompress).collect()
+        // A cache of the wrong length is a cache for some other page; ignore it rather
+        // than index into it. Falling back costs time and can never cost a note.
+        let owned_epks: Option<Vec<Option<pallas::Point>>> = match cached_epks {
+            Some(e) if e.len() == actions.len() => None,
+            _ if actions.len() >= DECOMPRESS_PAR_MIN => {
+                use rayon::prelude::*;
+                Some(actions.par_iter().map(decompress).collect())
+            }
+            _ => Some(actions.iter().map(decompress).collect()),
+        };
+        let epks: &[Option<pallas::Point>] = match (&owned_epks, cached_epks) {
+            (Some(v), _) => v,
+            (None, Some(e)) => e,
+            (None, None) => unreachable!("owned_epks is Some whenever the cache is unusable"),
         };
 
-        let secrets = agree(&epks)?;
+        let secrets = agree(epks)?;
         if secrets.len() != actions.len() {
             return None;
         }
@@ -515,6 +577,234 @@ pub mod scan {
         )
     }
 
+    // ======================= THE DEVICE FILTER ==============================
+    //
+    // `scan_compact_gpu_inner` above sends the key agreement to a device and does
+    // everything else here: Jacobian to affine, the Orchard KDF, ChaCha20, and the
+    // lead-byte test. Measured, that leftover host half was ~1.3 us of the 2.87 us/pt
+    // the GPU path cost, against a 0.324 us kernel — 45% of the path was marshalling
+    // around the part that had been moved. The comment above says "the device was
+    // waiting on a for-loop"; this is the same observation one level up, and the loop
+    // is now on the device.
+    //
+    // What crosses the bus afterwards is one byte per action. Not a point, not a
+    // secret: a verdict.
+    //
+    // THE RULE, UNCHANGED. The device is a filter and orchard is the judge. Everything
+    // below preserves a SUPERSET of orchard's answer, because a superset is merely slow
+    // and a subset is a note the user never sees. The device having any kind of bad day
+    // yields `None`, which means "scan on the CPU" — never an empty candidate list.
+
+    /// A page's ephemeral keys in the form a device takes them: affine coordinates as
+    /// canonical little-endian limbs, packed ONCE for the whole cohort.
+    ///
+    /// This is the other half of the page cache. Decompressing the keys was already
+    /// shared between wallets; turning them into limbs was not. `batch_normalize` plus
+    /// two `to_repr` per key is ~5 field multiplications and an N-sized allocation, and
+    /// it was being redone inside every wallet's scan — W times per page, immediately
+    /// before the device call. Same duplicated-work shape as the square roots, so it is
+    /// paid in the same place.
+    ///
+    /// `slot[i]` says what the device can be asked about action `i`:
+    ///
+    /// * `>= 0` — the row it occupies in `xy`.
+    /// * [`PreparedEpks::ABSENT`] — the ephemeral key is not a valid encoding. Orchard
+    ///   cannot decrypt such an action either (it parses the same bytes with the same
+    ///   function), so excluding it is a restriction of orchard's behaviour, not of
+    ///   ours, and the superset property holds.
+    /// * [`PreparedEpks::FORCE`] — the ephemeral key is the identity, which has no
+    ///   affine coordinates to send. Such an action goes to orchard UNCONDITIONALLY.
+    ///   Dropping it would be a subset; failing the whole page over it would let any
+    ///   action anyone writes push every wallet onto the CPU path, so it is neither.
+    pub struct PreparedEpks {
+        xy: Vec<u32>,
+        slot: Vec<i32>,
+        rows: usize,
+    }
+
+    impl PreparedEpks {
+        /// Not a valid encoding — orchard finds nothing here either.
+        pub const ABSENT: i32 = -1;
+        /// No affine coordinates to send; goes to orchard regardless.
+        pub const FORCE: i32 = -2;
+
+        /// Rows actually sent to the device.
+        pub fn rows(&self) -> usize {
+            self.rows
+        }
+        /// Actions covered — must equal the caller's action count or the cache is for
+        /// some other page.
+        pub fn len(&self) -> usize {
+            self.slot.len()
+        }
+        pub fn is_empty(&self) -> bool {
+            self.slot.is_empty()
+        }
+        /// The packed limbs, 16 u32 per row: x then y, canonical little-endian.
+        pub fn xy(&self) -> &[u32] {
+            &self.xy
+        }
+
+        /// What the device was told about action `i`: a row index, or [`Self::ABSENT`]
+        /// / [`Self::FORCE`]. Exposed so a differential test can assert the mapping
+        /// rather than reconstruct it and then have to check its own reconstruction.
+        pub fn slot(&self, action: usize) -> i32 {
+            self.slot.get(action).copied().unwrap_or(Self::ABSENT)
+        }
+    }
+
+    /// Pack a cohort's decompressed ephemeral keys for the device. Cheap enough to do
+    /// per page and far too expensive to do per wallet per page.
+    pub fn prepare_epks(epks: &[Option<pallas::Point>]) -> PreparedEpks {
+        use group::Curve;
+        use group::ff::PrimeField;
+        use pasta_curves::arithmetic::CurveAffine;
+
+        let idx: Vec<usize> = epks.iter().enumerate().filter(|(_, e)| e.is_some()).map(|(i, _)| i).collect();
+        let proj: Vec<pallas::Point> = idx.iter().map(|&i| epks[i].unwrap()).collect();
+        // ONE inversion for the page, not one per key: `to_affine()` inverts every time
+        // it is called, which is what made this step worth sharing in the first place.
+        let mut affine = vec![pallas::Affine::default(); proj.len()];
+        pallas::Point::batch_normalize(&proj, &mut affine);
+
+        let mut slot = vec![PreparedEpks::ABSENT; epks.len()];
+        let mut xy: Vec<u32> = Vec::with_capacity(idx.len() * 16);
+        let mut rows = 0usize;
+        for (k, &i) in idx.iter().enumerate() {
+            let c = match Option::<pasta_curves::arithmetic::Coordinates<pallas::Affine>>::from(affine[k].coordinates()) {
+                Some(c) => c,
+                // The identity. Cannot be expressed as (x, y), so it is not sent — and
+                // it is not dropped either.
+                None => {
+                    slot[i] = PreparedEpks::FORCE;
+                    continue;
+                }
+            };
+            let xb = <pallas::Base as PrimeField>::to_repr(c.x());
+            let yb = <pallas::Base as PrimeField>::to_repr(c.y());
+            for l in 0..8 {
+                xy.push(u32::from_le_bytes([xb[l * 4], xb[l * 4 + 1], xb[l * 4 + 2], xb[l * 4 + 3]]));
+            }
+            for l in 0..8 {
+                xy.push(u32::from_le_bytes([yb[l * 4], yb[l * 4 + 1], yb[l * 4 + 2], yb[l * 4 + 3]]));
+            }
+            slot[i] = rows as i32;
+            rows += 1;
+        }
+        PreparedEpks { xy, slot, rows }
+    }
+
+    /// The device filter the daemon installs: agreement scalar, the cohort's packed
+    /// limbs, the row count, and one ciphertext byte per row. Out: one verdict byte per
+    /// row, or `None` meaning "I could not do this" — which is the only thing a device
+    /// is ever allowed to say besides a complete answer.
+    type FilterFn = dyn Fn(&pallas::Scalar, &[u32], usize, &[u8]) -> Option<Vec<u8>> + Send + Sync;
+    static GPU_FILTER: std::sync::OnceLock<Box<FilterFn>> = std::sync::OnceLock::new();
+
+    /// Install the device filter. Idempotent; the first call wins.
+    pub fn install_gpu_filter(f: Box<FilterFn>) {
+        let _ = GPU_FILTER.set(f);
+    }
+
+    /// Whether a device filter is installed.
+    pub fn gpu_filter_enabled() -> bool {
+        GPU_FILTER.get().is_some()
+    }
+
+    /// Trial decryption with the WHOLE per-action filter on the device.
+    ///
+    /// The host does three things: gather one ciphertext byte per row, ask, and hand
+    /// what comes back to orchard. There is no curve arithmetic, no hash, no cipher and
+    /// no per-point allocation left on this path.
+    ///
+    /// # Why the returned byte can be trusted with a user's coins
+    ///
+    /// It cannot, and it is not. The byte decides only whether orchard is asked. A `1`
+    /// the device invented costs one wasted `try_compact_note_decryption`. A `0` it
+    /// invented would cost a note — so every way the device can fail returns `None` for
+    /// the WHOLE batch and the caller scans on the CPU. There is deliberately no path
+    /// that reports a partial mask.
+    ///
+    /// Returns `None` if the device declined, and the caller must use the CPU.
+    pub fn scan_compact_gpu_filter(
+        prepared: &PreparedIncomingViewingKey,
+        actions: &[CompactActionRecord],
+        prep: &PreparedEpks,
+        filter: impl FnOnce(&[u32], usize, &[u8]) -> Option<Vec<u8>>,
+    ) -> Option<Vec<ReceivedNote>> {
+        if actions.is_empty() {
+            return Some(Vec::new());
+        }
+        // A cache of the wrong length is a cache for some other page. Refusing costs
+        // time and can never cost a note.
+        if prep.slot.len() != actions.len() || prep.xy.len() != prep.rows * 16 {
+            return None;
+        }
+
+        // One ciphertext byte per row: the filter reads exactly one plaintext byte, so
+        // one ciphertext byte is all it can use.
+        let mut ct0 = vec![0u8; prep.rows];
+        for (i, rec) in actions.iter().enumerate() {
+            let s = prep.slot[i];
+            if s >= 0 {
+                ct0[s as usize] = rec.enc_ciphertext[0];
+            }
+        }
+
+        let mask = if prep.rows == 0 { Vec::new() } else { filter(&prep.xy, prep.rows, &ct0)? };
+        if mask.len() != prep.rows {
+            return None;
+        }
+
+        let mut candidates: Vec<usize> = Vec::new();
+        for i in 0..actions.len() {
+            let s = prep.slot[i];
+            let keep = if s >= 0 { mask[s as usize] != 0 } else { s == PreparedEpks::FORCE };
+            if keep {
+                candidates.push(i);
+            }
+        }
+        if candidates.is_empty() {
+            return Some(Vec::new());
+        }
+        // Orchard decides. Whatever this function returns is its verdict, not ours.
+        let subset: Vec<CompactActionRecord> = candidates.iter().map(|&i| actions[i]).collect();
+        Some(
+            scan_compact_cpu(prepared, &subset)
+                .into_iter()
+                .map(|mut n| {
+                    n.action_index = candidates[n.action_index];
+                    n
+                })
+                .collect(),
+        )
+    }
+
+    /// As [`scan_compact_auto_cached`], preferring the on-device filter when the caller
+    /// has the cohort's packed ephemeral keys and a device is installed.
+    ///
+    /// Falls through to exactly the old behaviour otherwise — including when the device
+    /// declines mid-call — so this is a speed path and never a semantic one.
+    pub fn scan_compact_auto_prepared(
+        prepared: &PreparedIncomingViewingKey,
+        agree_scalar: Option<&pallas::Scalar>,
+        actions: &[CompactActionRecord],
+        prep: Option<&PreparedEpks>,
+        epks: Option<&[Option<pallas::Point>]>,
+    ) -> Vec<ReceivedNote> {
+        if actions.len() >= GPU_MIN_BATCH {
+            if let (Some(f), Some(sc), Some(p)) = (GPU_FILTER.get(), agree_scalar, prep) {
+                if p.len() == actions.len() {
+                    if let Some(found) = scan_compact_gpu_filter(prepared, actions, p, |xy, rows, ct0| f(sc, xy, rows, ct0))
+                    {
+                        return found;
+                    }
+                }
+            }
+        }
+        scan_compact_auto_cached(prepared, agree_scalar, actions, epks)
+    }
+
     /// Convenience wrapper that prepares the ivk once (see [`scan_compact_prepared`]).
     pub fn scan_compact(ivk: &IncomingViewingKey, actions: &[CompactActionRecord]) -> Vec<ReceivedNote> {
         scan_compact_prepared(&ivk.prepare(), actions)
@@ -523,8 +813,9 @@ pub mod scan {
 
 pub use scan::{
     CompactActionRecord, ReceivedNote, address_bytes_from_seed, gpu_enabled, install_gpu_agree, ivk_agreement_scalar, ivk_from_seed,
-    scan_bundle, scan_bundle_prepared, scan_compact, scan_compact_auto, scan_compact_cpu, scan_compact_gpu,
+    decompress_epk, scan_bundle, scan_bundle_prepared, scan_compact, scan_compact_auto, scan_compact_auto_cached, scan_compact_cpu, scan_compact_gpu, scan_compact_gpu_cached,
     scan_compact_prepared, trim_memo,
+    PreparedEpks, gpu_filter_enabled, install_gpu_filter, prepare_epks, scan_compact_auto_prepared, scan_compact_gpu_filter,
 };
 
 #[cfg(feature = "circuit")]
@@ -1468,6 +1759,81 @@ pub mod build {
             // A refusing device means "use the CPU", never "no notes".
             let refuse = |_: &[Option<pasta_curves::pallas::Point>]| None;
             assert!(crate::wallet::scan_compact_gpu(&prepared, &compact, refuse).is_none());
+
+            // ---- the same contract for the path where the WHOLE filter is on the
+            // ---- device and only a verdict byte comes back.
+            //
+            // The device is stood in for here by the host computing the same bytes, so
+            // this runs on any machine and checks the plumbing: the slot table, the
+            // ciphertext-byte gather, the mask-to-candidate mapping and the index
+            // remap. The DEVICE's own arithmetic is checked against orchard on real
+            // planted notes in `zkas-gpu/tests/device_filter.rs`, where it has a GPU.
+            let epks: Vec<Option<pasta_curves::pallas::Point>> =
+                compact.iter().map(|r| crate::wallet::decompress_epk(&r.ephemeral_key)).collect();
+            let prep = crate::wallet::prepare_epks(&epks);
+            assert_eq!(prep.len(), compact.len(), "one slot per action");
+
+            // A stand-in device: the same key agreement, KDF, cipher and lead-byte test
+            // the kernel does, on the host.
+            let host_mask = |sc: pasta_curves::pallas::Scalar| {
+                // Borrowed, not moved: the stand-in is built once per viewing key and
+                // the page outlives both.
+                let (compact, epks, prep) = (&compact, &epks, &prep);
+                move |_xy: &[u32], rows: usize, ct0: &[u8]| -> Option<Vec<u8>> {
+                    use blake2b_simd::Params;
+                    use chacha20::cipher::{KeyIvInit, StreamCipher, StreamCipherSeek};
+                    use group::GroupEncoding;
+                    let mut out = vec![0u8; rows];
+                    for (i, rec) in compact.iter().enumerate() {
+                        let slot = prep.slot(i);
+                        if slot < 0 {
+                            continue;
+                        }
+                        let Some(epk) = epks[i] else { continue };
+                        let secret = (epk * sc).to_affine();
+                        let key = Params::new()
+                            .hash_length(32)
+                            .personal(b"Zcash_OrchardKDF")
+                            .to_state()
+                            .update(&secret.to_bytes())
+                            .update(&rec.ephemeral_key)
+                            .finalize();
+                        let mut b = [ct0[slot as usize]];
+                        let mut c = chacha20::ChaCha20::new(key.as_bytes().into(), &[0u8; 12].into());
+                        c.seek(64u32);
+                        c.apply_keystream(&mut b);
+                        out[slot as usize] = (b[0] == 0x02) as u8;
+                    }
+                    Some(out)
+                }
+            };
+
+            let via_filter =
+                crate::wallet::scan_compact_gpu_filter(&prepared, &compact, &prep, host_mask(ivk_scalar)).expect("path ran");
+            assert_eq!(via_filter.len(), via_cpu.len(), "verdict path: same number of notes");
+            assert_eq!(via_filter[0].action_index, via_cpu[0].action_index, "verdict path: same action position");
+            assert_eq!(via_filter[0].value(), 4242, "verdict path: the note we planted");
+
+            // A stranger finds nothing down the verdict path either.
+            let s_filter = crate::wallet::scan_compact_gpu_filter(&stranger.prepare(), &compact, &prep, host_mask(s_scalar))
+                .expect("ran");
+            assert!(s_filter.is_empty(), "a stranger recovers nothing from the verdict path");
+
+            // A device that declines means the CPU runs -- NOT that the wallet owns
+            // nothing. This is the assertion the whole design hangs on, so it is made
+            // for the verdict path too and not only for the point path above.
+            assert!(crate::wallet::scan_compact_gpu_filter(&prepared, &compact, &prep, |_, _, _| None).is_none());
+
+            // A mask of the wrong length is refused rather than indexed into.
+            assert!(crate::wallet::scan_compact_gpu_filter(&prepared, &compact, &prep, |_, r, _| Some(vec![1u8; r + 1]))
+                .is_none());
+
+            // An all-ones mask still gives orchard's answer: the filter widens the
+            // candidate set, it never decides. A device stuck at 1 costs time only.
+            let wide = crate::wallet::scan_compact_gpu_filter(&prepared, &compact, &prep, |_, r, _| Some(vec![1u8; r]))
+                .expect("ran");
+            assert_eq!(wide.len(), via_cpu.len(), "a permissive mask changes nothing but speed");
+            assert_eq!(wide[0].action_index, via_cpu[0].action_index);
         }
     }
 }

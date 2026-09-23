@@ -181,6 +181,15 @@ const LAP_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 /// every lap ran to `LAP_BUDGET` on a few note-heavy wallets and the fast ones idled.
 /// The lock is still dropped between chunks, so status keeps interleaving.
 const CATCHUP_BURST_MIN_BEHIND: u64 = 20_000;
+
+/// How recently a request must have touched a wallet for it to count as WATCHED —
+/// someone has it open and is waiting on it.
+///
+/// Generous on purpose: it spans a user reading the screen, composing a payment and
+/// pressing Send, and the cost of being wrong is one tip slot held by a wallet that
+/// went idle, which the next lap reclaims. Being wrong the other way is the reopen
+/// this exists to fix.
+const WATCHED_RECENTLY: std::time::Duration = std::time::Duration::from_secs(120);
 /// The burst's per-pass time budget: comfortably under `LAP_BUDGET`, so a bursting wallet
 /// is never one of the stragglers a lap detaches.
 const CATCHUP_BURST_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
@@ -371,6 +380,19 @@ pub struct ResourceLimits {
     pub active_sync_secs: u64,
     pub idle_evict_secs: u64,
     pub max_resident_wallets: usize,
+    /// Keep the N most recently active wallets resident and fully prepared, exempt from
+    /// BOTH eviction rules. 0 = off (the old behaviour exactly).
+    ///
+    /// Eviction is what makes a reopen expensive: the wallet is gone, so the next request
+    /// pays the whole cold path (file read, Sinsemilla parse, cursor verification, leaf
+    /// decode) before anything can be sent. For the handful of wallets somebody is
+    /// actually using that is a bad trade — they are the ones certain to come back.
+    pub warm_always: usize,
+    /// Ceiling on 1-minute load average PER CORE, as a percentage, above which the warm
+    /// sweep stops starting new cold work. The hot tier ignores it; colder tiers get a
+    /// progressively smaller share (see `WARM_TIER_BUDGET_SCALE`), which is what makes
+    /// dormant wallets get prepared only when the box has nothing better to do.
+    pub warm_budget_pct: u64,
     pub subtree_free_floor_mb: u64,
     /// Full pages to fetch CONCURRENTLY ahead of the ingest cursor during a
     /// deep (restore/catch-up) scan. 1 keeps the single cross-wallet prefetch
@@ -399,6 +421,8 @@ impl Default for ResourceLimits {
             active_sync_secs: 90,
             idle_evict_secs: 30 * 60,
             max_resident_wallets,
+            warm_always: 0,
+            warm_budget_pct: 60,
             subtree_free_floor_mb: 1_200,
             prefetch_depth: 1,
         }
@@ -1822,10 +1846,28 @@ fn adopt_twin_checkpoint(
         }
     }
     let (donor, donor_birthday, _) = best?;
-    // save_checkpoint writes are atomic (tmp + rename), so a plain copy always sees
-    // a consistent file. At worst it lags the donor's RAM state by CHECKPOINT_EVERY
+    // save_checkpoint writes are atomic (tmp + rename), so a clone always sees a
+    // consistent file. At worst it lags the donor's RAM state by CHECKPOINT_EVERY
     // blocks; the clone re-scans that tail in seconds.
-    std::fs::copy(scan_path(dir, &donor), scan_path(dir, token)).ok()?;
+    //
+    // HARDLINK, not copy. Every writer of a `.scan` goes through
+    // `write_checkpoint_bytes`, which writes a temp file and renames over the name —
+    // so an inode is never mutated in place. Linking therefore has exactly the
+    // semantics the copy had: the two names share bytes until whichever is written
+    // next, and that write replaces the directory entry rather than the shared inode.
+    // What it removes is the byte copy: 1,823 adoptions in the last 7 days at a 131 MB
+    // mean checkpoint is ~239 GB/week of pure memcpy through the page cache, on a box
+    // already sustaining 85 MB/s of checkpoint rewrites. One wallet adopted a 169 MB
+    // checkpoint 8 times in 65 seconds.
+    //
+    // Falls back to a copy when the link cannot be made — a cross-device wallet dir,
+    // or a filesystem without hardlinks. `hard_link` also fails if the destination
+    // exists, which is correct here: adoption is for a token with no checkpoint yet,
+    // and clobbering an existing one would be a bug either way.
+    let (from, to) = (scan_path(dir, &donor), scan_path(dir, token));
+    if std::fs::hard_link(&from, &to).is_err() {
+        std::fs::copy(&from, &to).ok()?;
+    }
     Some((donor, if birthday == 0 { donor_birthday } else { donor_birthday.min(birthday) }))
 }
 
@@ -1960,6 +2002,20 @@ struct DecodedPage {
     reorged: bool,
     sink_blue_score: u64,
     blocks: Vec<DecodedBlock>,
+    /// Every action's ephemeral key, decompressed once for the whole cohort.
+    ///
+    /// Recovering y from x is a modular square root — 5-8 us/action measured, against
+    /// 0.15 for the KDF and 0.12 for ChaCha20 — and it depends only on bytes that are
+    /// identical for every wallet. It was being redone inside each wallet's scan, so
+    /// with ~9 wallets riding each fetched page (page-cache counters: 5,595 hit /
+    /// 1,404 rode-a-peer / 1,024 fetched) the same square roots ran ~9 times. Paying
+    /// it here, on the page every wallet already shares, is the same trick the shared
+    /// chain tree plays for the Sinsemilla work.
+    ///
+    /// Flattened in the page's action order, which is exactly the order `sync_chunk`
+    /// builds `page_actions` in; a length mismatch makes the consumer fall back to
+    /// decompressing, so a drift here costs time and never a note.
+    epks: Vec<Option<kaspa_shielded_core::pasta_curves::pallas::Point>>,
 }
 
 /// Whether to trust a node-supplied coinbase commitment verbatim instead of
@@ -2104,6 +2160,17 @@ struct PageCache {
     pool: Arc<rayon::ThreadPool>,
     ttl: std::time::Duration,
     cap: usize,
+    /// Served from the map · served by riding another wallet's in-flight fetch ·
+    /// actually fetched from the node.
+    ///
+    /// The whole justification for this cache is that a cohort walks the same stream,
+    /// so one fetch serves many wallets — and that claim has never been checked. Page
+    /// fetch is 80-93% of sync wall time, so if the hit rate is low it is the first
+    /// thing to fix and nothing else matters; if it is high, the remaining fetch cost
+    /// is the node's and belongs there. Cheap counters beat arguing about it again.
+    hits: u64,
+    dedup_hits: u64,
+    misses: u64,
 }
 
 impl PageCache {
@@ -2120,6 +2187,9 @@ impl PageCache {
             pool: Arc::new(pool),
             ttl: std::time::Duration::from_secs(resources.page_cache_ttl_secs.max(1)),
             cap: resources.page_cache_entries.max(1),
+            hits: 0,
+            dedup_hits: 0,
+            misses: 0,
         }
     }
 }
@@ -2203,10 +2273,12 @@ async fn fetch_shielded_page(
 ) -> Result<Arc<DecodedPage>, kaspa_rpc_core::RpcError> {
     let key = (low, limit);
     {
-        let c = cache.lock().await;
+        let mut c = cache.lock().await;
         if let Some((at, resp)) = c.map.get(&key) {
             if at.elapsed() < c.ttl {
-                return Ok(resp.clone());
+                let resp = resp.clone();
+                c.hits += 1;
+                return Ok(resp);
             }
         }
     }
@@ -2234,11 +2306,22 @@ async fn fetch_shielded_page(
     let _lead = gate.acquire().await;
     // The leader may have filled the cache while we waited, which is the whole point.
     {
-        let c = cache.lock().await;
+        let mut c = cache.lock().await;
         if let Some((at, resp)) = c.map.get(&key) {
             if at.elapsed() < c.ttl {
-                return Ok(resp.clone());
+                let resp = resp.clone();
+                c.dedup_hits += 1;
+                return Ok(resp);
             }
+        }
+        c.misses += 1;
+        let (h, d, m) = (c.hits, c.dedup_hits, c.misses);
+        // Every 256th real fetch, not every call: this is the hot path.
+        if m % 256 == 0 {
+            log::info!(
+                "page cache: {h} hit / {d} rode-a-peer / {m} fetched -> {}% served without touching the node",
+                (h + d) * 100 / (h + d + m).max(1),
+            );
         }
     }
 
@@ -2259,13 +2342,23 @@ async fn fetch_shielded_page(
     // single-thread ceiling), and each block decodes independently. `block_in_place`
     // moves this task off the async worker pool so the rayon fan-out doesn't stall other
     // tokio tasks; the decode is done once here and shared by every wallet via the cache.
-    let blocks = tokio::task::block_in_place(|| {
+    let (blocks, epks) = tokio::task::block_in_place(|| {
         pool.install(|| {
             use rayon::prelude::*;
-            raw.blocks.par_iter().map(decode_block).collect::<Vec<_>>()
+            let blocks = raw.blocks.par_iter().map(decode_block).collect::<Vec<_>>();
+            // Decompress every ephemeral key once, here, on the same pool and in the
+            // same flattening order `sync_chunk` uses to build `page_actions`. This is
+            // the cohort's shared curve work; see `DecodedPage::epks`.
+            let flat: Vec<kaspa_shielded_core::wallet::CompactActionRecord> =
+                blocks.iter().flat_map(|b| b.compact.iter().flatten().copied()).collect();
+            let epks: Vec<Option<kaspa_shielded_core::pasta_curves::pallas::Point>> = flat
+                .par_iter()
+                .map(|r| kaspa_shielded_core::wallet::decompress_epk(&r.ephemeral_key))
+                .collect();
+            (blocks, epks)
         })
     });
-    let decoded = Arc::new(DecodedPage { reorged: raw.reorged, sink_blue_score: raw.sink_blue_score, blocks });
+    let decoded = Arc::new(DecodedPage { reorged: raw.reorged, sink_blue_score: raw.sink_blue_score, blocks, epks });
     let mut c = cache.lock().await;
     // Re-inserting a key must not leave a second copy in the eviction queue. A page
     // refetched after its TTL used to be pushed again while `map` still held one
@@ -2423,6 +2516,15 @@ struct WalletEntry {
     /// one; cleared by `sync_one_wallet` when it takes the snapshot. The build runs off
     /// the wallet lock, so the decision and the work are deliberately separated.
     wants_cache_build: bool,
+    /// Somebody is waiting on this wallet right now, so prepare it even while it is
+    /// still catching up.
+    ///
+    /// Set when a request touches the wallet (see `get_wallet`) and cleared once it is
+    /// fully prepared. It is what separates "a user has this open at 99.4% and is about
+    /// to press Send" from "one of 2,000 wallets nobody has looked at in a week" — the
+    /// first should overlap its warm with its remaining scan, the second must not hold a
+    /// build slot it cannot use.
+    warm_priority: bool,
     /// A detached subtree-cache build is already folding for this wallet. Without it,
     /// every sync pass during the ~247 s fold would queue another identical build.
     build_in_flight: bool,
@@ -2435,6 +2537,12 @@ struct WalletEntry {
     page_fetch_ns: u128,
     page_ingest_ns: u128,
     page_count: u64,
+    /// Compact actions seen across those pages. Reported as actions/page beside the
+    /// fetch/ingest split because it is the constant every cost model here divides by,
+    /// and it was never logged: reconstructing it from the cumulative scan counters
+    /// gave answers between 0.05 and 1.8 actions/block depending on which report you
+    /// picked — a 38x spread on the one number that sizes the whole scan budget.
+    page_actions: u64,
     /// Leaf count at the last scan-cost report, so it is emitted per unit of WORK
     /// rather than per tick (a tick can be a whole chunk or almost nothing).
     scan_cost_reported: u64,
@@ -2544,11 +2652,13 @@ impl WalletEntry {
             spend_fast_ready: false,
             build_permit: None,
             wants_cache_build: false,
+            warm_priority: false,
             build_in_flight: false,
             subtree_build_pct_logged: 0,
             page_fetch_ns: 0,
             page_ingest_ns: 0,
             page_count: 0,
+            page_actions: 0,
             scan_cost_reported: 0,
             subtree_low_mem_logged: None,
             force_checkpoint: false,
@@ -2922,8 +3032,15 @@ impl WalletEntry {
                 {
                     let page_actions: Vec<kaspa_shielded_core::wallet::CompactActionRecord> =
                         resp.blocks.iter().flat_map(|b| b.compact.iter().flatten().copied()).collect();
+                    self.page_actions += page_actions.len() as u64;
                     if !page_actions.is_empty() {
-                        tokio::task::block_in_place(|| self.db.predecrypt_page(&page_actions));
+                        // The page decompressed these ephemeral keys once for the whole
+                        // cohort. Only offer them if the count matches what we flattened
+                        // here — a mismatch means the two orders drifted, and the callee
+                        // then decompresses for itself rather than indexing into the
+                        // wrong page.
+                        let shared = (resp.epks.len() == page_actions.len()).then_some(resp.epks.as_slice());
+                        tokio::task::block_in_place(|| self.db.predecrypt_page_cached(&page_actions, shared));
                     }
                 }
                 for (i, b) in resp.blocks.iter().enumerate() {
@@ -3108,10 +3225,29 @@ impl WalletEntry {
         // A wallet that has fallen behind the tip again will not reach the build block
         // below, so it would sit on its slot without using it. Hand it back now; it
         // re-queues when it catches up.
-        if !self.caught_up && self.build_permit.is_some() {
+        if !self.caught_up && !self.warm_priority && self.build_permit.is_some() {
             self.build_permit = None;
         }
-        if self.caught_up {
+        // Warm a wallet somebody is WAITING ON even while it finishes the last stretch.
+        //
+        // `caught_up` alone was the wrong gate for the case users actually hit: reopen an
+        // app whose wallet sits at 99.4%, and it is ~30,000 blocks behind — far outside
+        // `DEFAULT_ANCHOR_DEPTH`, so `spend_ready` is false AND this whole block is
+        // skipped. The wallet then finishes the last stretch completely cold and only
+        // starts building the structures a send needs once it arrives, so the user pays
+        // the scan and the warm end to end instead of overlapping them.
+        //
+        // The two are independent: the subtree cache and the witness set are built
+        // against the MATURED anchor, which exists and is meaningful long before the
+        // wallet reaches the tip. Warming early is not a correctness risk — everything
+        // here re-checks `matured_leaves()` and any note not yet reached still rebuilds
+        // on demand in `witness_path_at`.
+        //
+        // Restricted to `warm_priority` (a wallet recently touched by a request) so a
+        // backlog of never-scanned wallets cannot claim build slots: the reason the
+        // original gate existed was to stop wallets sitting on a slot they could not use,
+        // and that still holds for everything nobody is waiting on.
+        if self.caught_up || self.warm_priority {
             if let Some(matured) = self.matured_leaves() {
                 // How many witnesses this wallet maintains. Every step below costs
                 // `leaves × budget`, so pinning the budget to a constant for a note-heavy
@@ -3187,6 +3323,14 @@ impl WalletEntry {
                     && !self.db.subtree_cache_ready(matured)
                     && !self.db.subtree_cache_failed()
                     && !shared_serves;
+                // Stand the priority down once there is nothing left to prepare. The flag
+                // buys a wallet the right to warm while still behind; it must not become a
+                // permanent claim on a build slot, or the first wallet anyone opens keeps
+                // one forever. `witnesses_warm` and the cache are the whole of "prepared",
+                // so when neither is outstanding this wallet is as ready as it can be.
+                if self.warm_priority && !needs_cache && self.witnesses_warm {
+                    self.warm_priority = false;
+                }
                 // Take a build slot and KEEP it across passes until the build finishes —
                 // see `build_permit`. Releasing the moment a wallet no longer needs one
                 // hands the slot straight to whoever is queued.
@@ -3943,6 +4087,22 @@ struct AppState {
     /// runtime worker and starve even `/health` (a live outage). With a small cap, most
     /// workers stay free for HTTP and loads queue briefly instead of melting the box.
     load_gate: tokio::sync::Semaphore,
+    /// One in-flight load per token, so racing requests for the SAME wallet collapse
+    /// into one.
+    ///
+    /// `load_gate` above bounds how many DIFFERENT wallets load at once; it does not
+    /// stop N requests for one token from each starting their own load, because the
+    /// cache re-check after the permit only sees a load that already FINISHED. A load
+    /// that rebuilds from birthday 0 is a full genesis rescan taking many minutes, so
+    /// every request that arrives in that window started another one: on 2026-09-22
+    /// two wallets accumulated 26 concurrent genesis rescans between them, which
+    /// saturated the node's page RPC and dragged every other wallet's fetch from
+    /// ~100 ms to 2.4 s per page. The wallets were not corrupt and the rebuild was not
+    /// wrong — it just ran 13 times each.
+    ///
+    /// A failed load releases the lock and caches nothing, so the next request retries;
+    /// the token is never poisoned (see the `spawn_load` warning above).
+    loading: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Payment preparation is deliberately serialized: witness reconstruction and Halo2
     /// proving are CPU-heavy synchronous work, and overlapping copies exhaust every
     /// runtime worker and take the whole wallet API offline.
@@ -5083,13 +5243,63 @@ impl AppState {
         {
             let map = self.wallets.lock().await;
             if let Some(w) = map.get(token) {
+                let w = w.clone();
+                // Somebody is asking for this wallet, so it is one somebody may be about
+                // to spend from. Say so, and ARM THE PREPARATION HERE rather than waiting
+                // to be asked for it.
+                //
+                // `/api/wallet/warm` exists for this and is effectively dead: the SPA only
+                // calls it when `synced && localEngine()`, so the hosted fleet never armed
+                // a single warm, and on-device skipped it in exactly the case that hurts —
+                // a wallet reopened at 99.4% is not `synced`. The daemon does not need to
+                // be told; it knows it just handed out a wallet.
+                //
+                // Cheap and idempotent: it sets two flags. The actual build is still gated
+                // by the warm slot, the memory floor and a proof in flight, so this cannot
+                // stampede the box — it only stops the work being skipped entirely.
+                if let Ok(mut e) = w.try_lock() {
+                    e.warm_priority = true;
+                    if !e.build_in_flight {
+                        e.wants_cache_build = true;
+                    }
+                }
+                return Some(w);
+            }
+        }
+        // Cache miss → an expensive load.
+        //
+        // Time every phase of it. "Reopen a wallet sitting at 99.4 % and it is 10-15 s
+        // before you can send" was, until this line existed, diagnosed by guessing: the
+        // candidates (queueing behind another load, the node's frontier verification, the
+        // file read + Sinsemilla parse, a catch-up scan, the leaf-stream decode, the
+        // subtree build) all plausibly cost seconds, and only the last one was timed. One
+        // line per cold load, phases cumulative from t0, so the deltas between them are
+        // the phases themselves.
+        let t_load0 = std::time::Instant::now();
+        // Cache miss → an expensive load. Take this TOKEN's load lock before the global
+        // gate: the losers must queue here rather than hold permits the winner needs,
+        // and a permit-then-recheck alone cannot dedupe a load that has not finished.
+        // Entries whose only reference is the map itself are finished loads, so drop
+        // them here (same shape as the page cache's in-flight gate).
+        let lock = {
+            let mut loading = self.loading.lock().await;
+            loading.retain(|k, l| k == token || Arc::strong_count(l) > 1);
+            loading.entry(token.to_string()).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))).clone()
+        };
+        let _load = lock.lock().await;
+        let t_queued = t_load0.elapsed();
+        // The winner may have finished while we queued — answer from its result rather
+        // than paying for the same scan again.
+        {
+            let map = self.wallets.lock().await;
+            if let Some(w) = map.get(token) {
                 return Some(w.clone());
             }
         }
-        // Cache miss → an expensive load. Gate concurrent loads so a reconnect storm
-        // can't pin every worker with tree rebuilds. Re-check the cache after acquiring
-        // the permit: while we waited, another task may have loaded this same wallet.
+        // Gate concurrent loads of DIFFERENT wallets so a reconnect storm can't pin
+        // every worker with tree rebuilds. Re-check once more after the permit.
         let _permit = self.load_gate.acquire().await.ok()?;
+        let t_permit = t_load0.elapsed();
         {
             let map = self.wallets.lock().await;
             if let Some(w) = map.get(token) {
@@ -5097,6 +5307,7 @@ impl AppState {
             }
         }
         let (key, birthday, recoverable_history) = load_wallet_meta(&self.wallet_dir, token, self.wallet_secret.as_deref())?;
+        let t_meta = t_load0.elapsed();
         let genesis = self.genesis;
         // Resume from a persisted checkpoint when one is present and version/genesis
         // valid; otherwise fast-sync (birthday-gated: a fast-synced wallet is blind
@@ -5236,6 +5447,7 @@ impl AppState {
             }
             None => None,
         };
+        let t_verify = t_load0.elapsed();
         let restored =
             (!abandoned_checkpoint).then(|| load_checkpoint(&self.wallet_dir, token, key, &genesis, tip.as_ref())).flatten();
         // Preserve a rejected checkpoint for forensic recovery/grafting. Never let
@@ -5381,6 +5593,10 @@ impl AppState {
             }
             other => other,
         };
+        let t_restore = t_load0.elapsed();
+        // Which of the three ways this wallet came back, so a slow load can be read
+        // without cross-referencing the surrounding warnings.
+        let load_path = if restored.is_some() { "checkpoint" } else { "rebuild" };
         let entry = match restored {
             Some((db, low, scanned, boundaries, sink_blue, blind_below)) => {
                 let mut e = WalletEntry::from_parts(key, recoverable_history, db, genesis, low, scanned, boundaries, sink_blue);
@@ -5392,6 +5608,7 @@ impl AppState {
                 None => self.full_scan_entry(key, recoverable_history, genesis, birthday).await?,
             },
         };
+        let t_entry = t_load0.elapsed();
         // Decode the leaf stream to curve points NOW, on a blocking thread, while we still
         // own the entry exclusively. `warm_leaves` was written for exactly this and then
         // never called, so the cost landed on the first *spend* instead — a big chunk of the
@@ -5405,6 +5622,21 @@ impl AppState {
         })
         .await
         .ok()?;
+        // Cumulative marks; each phase is the gap to the one before it.
+        log::info!(
+            "load {token} via {load_path}: total {:.1?} = queue {:.1?} + gate {:.1?} + meta {:.1?} + verify {:.1?} + restore {:.1?} + entry {:.1?} + decode {:.1?} ({} notes, {} leaves, scanned {})",
+            t_load0.elapsed(),
+            t_queued,
+            t_permit.saturating_sub(t_queued),
+            t_meta.saturating_sub(t_permit),
+            t_verify.saturating_sub(t_meta),
+            t_restore.saturating_sub(t_verify),
+            t_entry.saturating_sub(t_restore),
+            t_load0.elapsed().saturating_sub(t_entry),
+            entry.db.notes().len(),
+            entry.db.size(),
+            entry.scanned,
+        );
         let w = Arc::new(Mutex::new(entry));
         self.wallets.lock().await.insert(token.to_string(), w.clone());
         // NB: do NOT eagerly decode the leaf stream here. It is tempting — only a spend
@@ -5761,6 +5993,12 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
                     e.page_count,
                     fetch_ms * 100 / (fetch_ms + ingest_ms).max(1),
                 );
+                log::info!(
+                    "page contents: {} actions over {} pages = {:.0} actions/page",
+                    e.page_actions,
+                    e.page_count,
+                    e.page_actions as f64 / e.page_count as f64,
+                );
             }
         }
     }
@@ -5975,8 +6213,34 @@ async fn evict_idle_wallets(state: &Arc<AppState>) {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect()
     };
+    // `--warm-always N`: the N most recently active wallets are never evicted, by either
+    // rule. They are also marked `warm_priority`, so the sync loop keeps preparing them
+    // instead of dropping their build permit whenever they fall behind the tip.
+    //
+    // This is the whole point of the flag. A wallet reopened at 99.4 % is slow because it
+    // was evicted and has to be rebuilt from its file; for the few wallets somebody is
+    // actually using, holding them in RAM removes the cost rather than optimising it.
+    // The cost is bounded and explicit: N x ~100-190 MiB, chosen by the operator.
+    let protected: HashSet<String> = if state.resources.warm_always > 0 {
+        let mut by_recent: Vec<(&String, &std::time::Instant)> = touches.iter().collect();
+        by_recent.sort_by_key(|(_, at)| std::cmp::Reverse(**at));
+        by_recent.into_iter().take(state.resources.warm_always).map(|(t, _)| t.clone()).collect()
+    } else {
+        HashSet::new()
+    };
+    for (token, w) in resident.iter().filter(|(t, _)| protected.contains(t)) {
+        if let Ok(mut e) = w.try_lock() {
+            e.warm_priority = true;
+            if !e.build_in_flight {
+                e.wants_cache_build = true;
+            }
+        } else {
+            let _ = token; // busy: it is being worked on, which is the state we wanted
+        }
+    }
     let mut victims: Vec<String> = resident
         .iter()
+        .filter(|(t, _)| !protected.contains(t))
         .filter(|(t, _)| {
             touches
                 .get(t)
@@ -5996,6 +6260,7 @@ async fn evict_idle_wallets(state: &Arc<AppState>) {
         let active_window = std::time::Duration::from_secs(state.resources.active_sync_secs);
         let mut by_touch: Vec<(String, std::time::Instant)> = resident
             .iter()
+            .filter(|(t, _)| !protected.contains(t))
             .filter_map(|(t, _)| {
                 let at = touches.get(t).copied().unwrap_or(now);
                 (now.duration_since(at) >= active_window).then(|| (t.clone(), at))
@@ -6093,7 +6358,22 @@ async fn prune_token_bookkeeping(state: &Arc<AppState>) {
 
 async fn sync_loop(state: Arc<AppState>) {
     // Shared across every lap for the lifetime of the daemon; see where it is used.
-    let sync_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(sync_concurrency(&state.resources)));
+    //
+    // TWO lanes, not one. The lap sorts furthest-behind first so that wallets converge
+    // on the same cursor and the page cache can actually hit — correct for sharing
+    // fetches, and precisely why a wallet somebody is watching starves: the scheduler's
+    // sort key is "most work to do", so a handful of cold rescans take every permit and
+    // hold it for the whole lap. That is the `sync lap exceeded 30s with N wallet(s)
+    // still working` line, 631 times in three days with N reaching 23 of 28 slots.
+    //
+    // Splitting the permits fixes it by construction: a cold wallet can never take a
+    // tip wallet's slot, whatever the sort says. The furthest-behind ordering is kept,
+    // so cohort formation inside each lane is unchanged.
+    let cold_slots = (sync_concurrency(&state.resources) / 7).clamp(1, 4);
+    let tip_slots = sync_concurrency(&state.resources).saturating_sub(cold_slots).max(1);
+    let sync_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(tip_slots));
+    let cold_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(cold_slots));
+    log::info!("sync lanes: {tip_slots} tip slot(s) + {cold_slots} cold slot(s) (cold = at least {CATCHUP_BURST_MIN_BEHIND} DAA behind)");
     loop {
         // Snapshot token names, not Wallet Arcs. Holding an Arc for every resident
         // wallet across the whole cohort kept evicted multi-hundred-MiB checkpoints
@@ -6173,10 +6453,36 @@ async fn sync_loop(state: Arc<AppState>) {
             // cursor) and share every subsequent fetch and decode. Purely a scheduling
             // order: every wallet still scans its own full range, so no wallet can miss a
             // block because of it.
+            // Who has somebody waiting on them. A wallet a request touched seconds ago is
+            // one a user has open, and it must not be classed by how far behind it is.
+            let watched: HashSet<String> = {
+                let now = std::time::Instant::now();
+                state
+                    .last_touch
+                    .lock()
+                    .await
+                    .iter()
+                    .filter(|(_, t)| now.duration_since(**t) < WATCHED_RECENTLY)
+                    .map(|(k, _)| k.clone())
+                    .collect()
+            };
             let mut wallet_tokens = wallet_tokens;
             {
                 let snaps = state.snapshots.lock().await;
-                wallet_tokens.sort_by_key(|t| snaps.get(t).map(|s| s.scanned).unwrap_or(usize::MAX));
+                // Furthest-behind first so cursors converge and the page cache can hit —
+                // but WATCHED wallets ahead of all of them.
+                //
+                // The convergence argument is about throughput across the fleet; it says
+                // nothing about who should go first when someone is waiting. And it ranks
+                // a watched wallet worst precisely when it is nearly done, which is the
+                // reopen case: 99.4% scanned is 0.6% of work and last place in the queue.
+                // Sorting watched wallets to the front costs the cohort nothing (there are
+                // a handful at a time) and is the difference between a few seconds and a
+                // few laps for the only user who is actually looking.
+                wallet_tokens.sort_by_key(|t| {
+                    let scanned = snaps.get(t).map(|s| s.scanned).unwrap_or(usize::MAX);
+                    (!watched.contains(t), scanned)
+                });
             }
             // ONE budget for all laps, not a fresh one per lap.
             //
@@ -6192,8 +6498,14 @@ async fn sync_loop(state: Arc<AppState>) {
             // rather than an await, because blocking the lap on a permit held by a stuck
             // wallet would restore exactly the head-of-line stall LAP_BUDGET removes: a
             // wallet that cannot get a permit this lap is simply swept in the next one.
-            let sem = sync_sem.clone();
             let mut set = tokio::task::JoinSet::new();
+            // How far behind each wallet is, to pick its lane. Read once for the lap:
+            // the snapshot lock is contended and the classification does not need to be
+            // fresher than the sort that was just taken from the same map.
+            let behind: HashMap<String, u64> = {
+                let snaps = state.snapshots.lock().await;
+                snaps.iter().map(|(t, s)| (t.clone(), chain_len.saturating_sub(s.scanned as u64))).collect()
+            };
             for token in wallet_tokens {
                 if !active.contains(&token) {
                     continue; // parked: nobody is looking at this wallet right now
@@ -6202,6 +6514,23 @@ async fn sync_loop(state: Arc<AppState>) {
                 if token == CHAIN_TREE_TOKEN && !state.build_shared_tree {
                     continue; // on-device: no shared tree to build; the wallet serves itself
                 }
+                // The chain tree feeds every borrowing wallet, so it is never a straggler
+                // to be pushed into the slow lane however far behind it looks.
+                //
+                // A WATCHED wallet is never cold, however far behind it looks. Reopen an
+                // app whose wallet sits at 99.4% and it is ~30,000 blocks short — over
+                // `CATCHUP_BURST_MIN_BEHIND`, so the lane split I added put the one wallet
+                // a user is actually staring at into the 4-slot cold lane, queued behind
+                // hundreds nobody has opened in a week. The furthest-behind sort then put
+                // it last within that lane, because it is the closest to done.
+                //
+                // That is the wrong end of both orderings. The cold lane exists to stop a
+                // mass rescan starving tip-followers, not to deprioritise the last 0.6% of
+                // a wallet somebody is waiting on. Recency wins over distance.
+                let cold = token != CHAIN_TREE_TOKEN
+                    && !watched.contains(&token)
+                    && behind.get(&token).is_some_and(|b| *b >= CATCHUP_BURST_MIN_BEHIND);
+                let sem = if cold { cold_sem.clone() } else { sync_sem.clone() };
                 let Some(guard) = InPassGuard::claim(&state, &token) else { continue };
                 let Ok(Ok(permit)) =
                     tokio::time::timeout(PERMIT_WAIT, sem.clone().acquire_owned()).await
@@ -9347,6 +9676,73 @@ async fn wallet_warm(
 }
 
 /// How often the warm sweep looks for something to do. Cheap when idle-gated out.
+/// Warm tiers, hottest first, by how long ago the wallet was last active.
+///
+/// Age comes from the `.scan` mtime, not `last_touch`: the daemon rewrites a checkpoint
+/// whenever the wallet advances, and the file survives a restart. `last_touch` is
+/// in-memory, so after every restart the sweep saw every wallet as equally untouched and
+/// worked through them in ALPHABETICAL order — somebody who was here five minutes ago
+/// waited behind a wallet last seen in June, which is the opposite of what the sweep is
+/// for.
+const WARM_TIERS: [(&str, u64); 5] = [
+    ("hot", 60 * 60),
+    ("recent", 24 * 60 * 60),
+    ("week", 7 * 24 * 60 * 60),
+    ("month", 30 * 24 * 60 * 60),
+    ("dormant", u64::MAX),
+];
+
+/// Share of `--warm-budget` each tier may spend. The hot tier is unbounded on purpose:
+/// those wallets have an owner watching right now, and making them wait for a quiet box
+/// is the latency this whole mechanism exists to remove. Everything colder yields.
+const WARM_TIER_BUDGET_SCALE: [f64; 5] = [f64::INFINITY, 1.0, 0.75, 0.55, 0.40];
+
+/// Which tier a wallet last active `age` seconds ago belongs to.
+fn warm_tier(age: u64) -> usize {
+    WARM_TIERS.iter().position(|(_, bound)| age <= *bound).unwrap_or(WARM_TIERS.len() - 1)
+}
+
+/// 1-minute load average per core. `None` when /proc is unreadable (non-Linux, a
+/// container without it), and every caller treats `None` as "no reason to hold back" —
+/// the sweep's other gates (proving, memory, residency) still apply.
+fn load_per_core() -> Option<f64> {
+    let s = std::fs::read_to_string("/proc/loadavg").ok()?;
+    let one: f64 = s.split_whitespace().next()?.parse().ok()?;
+    let cores = std::thread::available_parallelism().map(|c| c.get()).unwrap_or(1);
+    Some(one / cores as f64)
+}
+
+/// Whether the box is quiet enough to start cold work for `tier`.
+fn tier_admits(tier: usize, budget_pct: u64) -> bool {
+    let scale = WARM_TIER_BUDGET_SCALE[tier.min(WARM_TIER_BUDGET_SCALE.len() - 1)];
+    if !scale.is_finite() {
+        return true;
+    }
+    match load_per_core() {
+        Some(load) => load <= (budget_pct as f64 / 100.0) * scale,
+        None => true,
+    }
+}
+
+/// Every sweep candidate paired with its tier, hottest first.
+fn sweep_candidates_tiered(dir: &str) -> Vec<(String, usize)> {
+    let mut v: Vec<(String, usize)> = sweep_candidates(dir)
+        .into_iter()
+        .map(|t| {
+            let age = std::fs::metadata(scan_path(dir, &t))
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|m| m.elapsed().ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(u64::MAX);
+            (t, warm_tier(age))
+        })
+        .collect();
+    // Tier first, then token, so the order is total and a pass is reproducible.
+    v.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+    v
+}
+
 const WARM_SWEEP_TICK_SECS: u64 = 30;
 /// Rest after a full pass over every wallet before rescanning for new wallets and
 /// previously failed installs.
@@ -9400,6 +9796,16 @@ fn sweep_candidates(dir: &str) -> Vec<String> {
 async fn warm_sweep_loop(state: Arc<AppState>) {
     let mut done: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut attempts: HashMap<String, u32> = HashMap::new();
+    // Wallets passed over this round because they were mid-catch-up. Kept separate from
+    // `done` so they are retried, and cleared whenever the round runs out of other work.
+    //
+    // Without this the sweep spun: `find(|t| !done.contains(t))` returns the SAME token
+    // every tick, and a wallet that is still catching up is neither marked done nor
+    // counted as an attempt — so one wallet a few thousand blocks behind stalled the
+    // entire sweep for as long as it took to reach the tip, and every wallet after it in
+    // the order waited. That is the opposite of "prepare all of them".
+    let mut deferred: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut last_tier_log: Option<usize> = None;
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(WARM_SWEEP_TICK_SECS)).await;
         if proving_now() || CONSOLIDATING.load(std::sync::atomic::Ordering::Relaxed) > 0 {
@@ -9416,13 +9822,48 @@ async fn warm_sweep_loop(state: Arc<AppState>) {
         if state.wallets.lock().await.len() >= state.resources.max_resident_wallets / 2 {
             continue;
         }
-        let Some(token) = sweep_candidates(&state.wallet_dir).into_iter().find(|t| !done.contains(t)) else {
+        // Recompute the tiering every tick: a wallet whose owner just showed up has a
+        // fresh `.scan` mtime and is promoted to `hot` mid-pass, which is exactly when
+        // promoting it is worth anything.
+        let candidates = sweep_candidates_tiered(&state.wallet_dir);
+        let remaining = candidates.iter().filter(|(t, _)| !done.contains(t)).count();
+        if remaining == 0 {
             log::info!("warm sweep: pass complete ({} wallets checked); resting", done.len());
             done.clear();
             attempts.clear();
+            deferred.clear();
+            last_tier_log = None;
             tokio::time::sleep(WARM_SWEEP_REST).await;
             continue;
+        }
+        let picked = candidates
+            .iter()
+            .find(|(t, tier)| !done.contains(t) && !deferred.contains(t) && tier_admits(*tier, state.resources.warm_budget_pct));
+        let Some((token, tier)) = picked.cloned() else {
+            // Either everything left is deferred (give them another round) or the box is
+            // too busy for the tiers that remain (wait; the hot tier is never gated, so
+            // this can only ever be holding back cold work).
+            if !deferred.is_empty() {
+                deferred.clear();
+            } else if last_tier_log.is_some() {
+                log::info!(
+                    "warm sweep: {remaining} wallets left, all below the load budget ({}%, load/core {:.2}); waiting for a quieter box",
+                    state.resources.warm_budget_pct,
+                    load_per_core().unwrap_or(0.0)
+                );
+                last_tier_log = None;
+            }
+            continue;
         };
+        if last_tier_log != Some(tier) {
+            log::info!(
+                "warm sweep: entering tier '{}' ({remaining} wallets left, load/core {:.2}, budget {}%)",
+                WARM_TIERS[tier].0,
+                load_per_core().unwrap_or(0.0),
+                state.resources.warm_budget_pct
+            );
+            last_tier_log = Some(tier);
+        }
         let Some(w) = state.get_wallet(&token).await else {
             done.insert(token);
             continue;
@@ -9442,7 +9883,9 @@ async fn warm_sweep_loop(state: Arc<AppState>) {
                 // Still syncing: the stream WILL move under a build (observed 3/3 failed
                 // installs on a wallet catching up ~40 leaves/s). Touching it above already
                 // made it active, so the sync loop is bringing it to the tip right now —
-                // build on a later tick, once the stream is still.
+                // build on a later tick, once the stream is still. Defer rather than
+                // retrying the same token every tick, so the rest of the pass proceeds.
+                deferred.insert(token.clone());
                 None
             } else if e.build_in_flight {
                 // The sync loop is already building it; check back next tick.
@@ -9481,7 +9924,61 @@ async fn warm_sweep_loop(state: Arc<AppState>) {
 
 #[cfg(test)]
 mod warm_sweep_tests {
-    use super::sweep_candidates;
+    use super::{
+        scan_path, sweep_candidates, sweep_candidates_tiered, tier_admits, warm_tier, WARM_TIERS, WARM_TIER_BUDGET_SCALE,
+    };
+
+    #[test]
+    fn warm_tiers_are_ordered_and_total() {
+        // Every age lands in exactly one tier, boundaries included, and the tiers only
+        // get colder. A gap here would silently drop wallets out of the sweep entirely.
+        assert_eq!(warm_tier(0), 0);
+        assert_eq!(warm_tier(60 * 60), 0, "the boundary belongs to the hotter tier");
+        assert_eq!(warm_tier(60 * 60 + 1), 1);
+        assert_eq!(warm_tier(24 * 60 * 60), 1);
+        assert_eq!(warm_tier(24 * 60 * 60 + 1), 2);
+        assert_eq!(warm_tier(7 * 24 * 60 * 60 + 1), 3);
+        assert_eq!(warm_tier(30 * 24 * 60 * 60 + 1), 4);
+        // A wallet whose mtime is unreadable is treated as the coldest thing there is,
+        // never as the hottest — an unreadable file must not jump the queue.
+        assert_eq!(warm_tier(u64::MAX), WARM_TIERS.len() - 1);
+        for w in WARM_TIERS.windows(2) {
+            assert!(w[0].1 < w[1].1, "tier bounds must increase");
+        }
+        assert_eq!(WARM_TIERS.len(), WARM_TIER_BUDGET_SCALE.len());
+    }
+
+    #[test]
+    fn the_hot_tier_ignores_the_load_budget_and_colder_tiers_do_not() {
+        // The one property that matters: a wallet somebody is using right now is never
+        // made to wait for a quiet box, and everything colder yields by a widening
+        // margin. Asserted on the scale table so it holds whatever the live load is.
+        assert!(WARM_TIER_BUDGET_SCALE[0].is_infinite(), "the hot tier must never be load-gated");
+        assert!(tier_admits(0, 0), "budget 0 must still admit the hot tier");
+        for w in WARM_TIER_BUDGET_SCALE[1..].windows(2) {
+            assert!(w[0] > w[1], "colder tiers must get a smaller share, got {w:?}");
+        }
+        assert!(WARM_TIER_BUDGET_SCALE[1..].iter().all(|s| s.is_finite() && *s > 0.0));
+    }
+
+    #[test]
+    fn sweep_orders_hot_wallets_before_cold_ones() {
+        let dir = std::env::temp_dir().join(format!("sweep-tier-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_s = dir.to_str().unwrap().to_string();
+        // Three wallets, aged by mtime: the sweep must visit the freshest first. Before
+        // tiering this was alphabetical, so "aaa" (dormant) preceded "zzz" (active).
+        let now = std::time::SystemTime::now();
+        for (name, age_secs) in [("zzz", 10u64), ("mmm", 3 * 24 * 60 * 60), ("aaa", 60 * 24 * 60 * 60)] {
+            let path = scan_path(&dir_s, name);
+            std::fs::write(&path, b"x").unwrap();
+            let when = now - std::time::Duration::from_secs(age_secs);
+            std::fs::File::options().write(true).open(&path).unwrap().set_modified(when).unwrap();
+        }
+        let got: Vec<String> = sweep_candidates_tiered(&dir_s).into_iter().map(|(t, _)| t).collect();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(got, vec!["zzz", "mmm", "aaa"], "hottest first, not alphabetical");
+    }
 
     #[test]
     fn sweep_skips_chain_tree_and_quarantine_artifacts() {
@@ -9615,6 +10112,7 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
         page_cache: Mutex::new(PageCache::new(&resources)),
         last_touch: Mutex::new(HashMap::new()),
         load_gate: tokio::sync::Semaphore::new(resources.load_wallets.max(1)),
+        loading: Mutex::new(HashMap::new()),
         // Concurrent preparations are capped by config (`--max-concurrent-proves`):
         // proving is CPU-heavy, and unbounded overlap is a CPU DoS on a hosted daemon.
         prepare_gate: tokio::sync::Semaphore::new(cfg.max_concurrent_proves.max(1)),

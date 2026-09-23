@@ -10,6 +10,16 @@ pasta_curves = { package = "zakura-pasta-curves", version = "=1.0.1" }
 group = "0.14"
 libloading = "0.8"
 log.workspace = true
+# The canary and the start-up self-test compute the Orchard KDF and the one ChaCha20
+# keystream byte the filter looks at, so this crate can check the device against a
+# host answer rather than against nothing. Same versions shielded-core pins.
+blake2b_simd = { workspace = true }
+chacha20 = "0.9"
+# Runtime, not just tests: the self-test needs random points.
+rand = "0.10"
 
 [dev-dependencies]
-rand = "0.10"
+kaspa-shielded-core = { workspace = true, features = ["circuit"] }
+# The `xover` example already used this; it was never declared, so `cargo test -p
+# zkas-gpu` did not build.
+rayon.workspace = true

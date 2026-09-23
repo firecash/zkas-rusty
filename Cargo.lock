@@ -9979,10 +9979,14 @@ dependencies = [
 name = "zkas-gpu"
 version = "0.1.0"
 dependencies = [
+ "blake2b_simd",
+ "chacha20 0.9.1",
  "group",
+ "kaspa-shielded-core",
  "libloading",
  "log",
  "rand 0.10.1",
+ "rayon",
  "zakura-pasta-curves",
 ]
 
