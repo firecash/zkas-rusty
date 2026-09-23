@@ -498,6 +498,89 @@ fn build_chain_tree(dir: &str, genesis: RpcHash) -> Wallet {
     Arc::new(Mutex::new(entry))
 }
 
+/// The daemon's ONE copy of the chain-global spent-nullifier set, and the marks that
+/// make any prefix of it cheap to verify.
+///
+/// Measured on the live box, 2026-09-23: this set is **103.6 GB of the 245.7 GB** held
+/// across 2,009 wallet checkpoints (42.2%), bit-identical in every one of them, against
+/// 218 MB (0.08%) of actual owned notes. The largest checkpoint is 472 MB and holds 5
+/// notes. The daemon already maintains the authoritative copy in the shared chain tree
+/// (5,028,944 entries); this is that copy, published so a wallet can borrow it instead
+/// of persisting its own.
+///
+/// **This makes the chain tree a single point of failure for every wallet that borrows
+/// from it**, which is not hypothetical here: the 48-day log holds 2,973
+/// `rejecting divergent wallet checkpoint` events, 2,868 of them one bad shared artefact
+/// cascading through every wallet that had adopted it. So nothing is ever taken on
+/// trust: `verified` is set only after the chain tree's own leaf stream has been bound
+/// to the node's frontier at its cursor, and each borrowing wallet independently proves
+/// the prefix it is handed is the set it built (`WalletDb::install_shared_nullifiers`).
+#[derive(Default)]
+struct SharedNfLog {
+    /// Chain order — the order the ingest path saw them, which is what makes one
+    /// wallet's set a prefix of this one.
+    nfs: Vec<[u8; 32]>,
+    /// The running digest every `NF_MARK_STRIDE` entries; see `prefix_digest`.
+    marks: Vec<[u8; 32]>,
+    /// Whether the chain tree this came from has been bound to the node's frontier at
+    /// its own cursor. Until then NOTHING may be shared: an unverified artefact is
+    /// exactly the cascade above.
+    verified: bool,
+}
+
+/// How often the shared nullifier set's binding to the node is re-affirmed, in seconds.
+const NF_VERIFY_EVERY: u64 = 30;
+
+/// Must equal `NF_DIGEST_STRIDE` in `shielded-core` — the two digests have to agree.
+/// Asserted in `shared_nf_log_agrees_with_the_wallet_digest`.
+const NF_MARK_STRIDE: usize = 4096;
+
+impl SharedNfLog {
+    fn len(&self) -> u64 {
+        self.nfs.len() as u64
+    }
+
+    fn push(&mut self, nf: [u8; 32]) {
+        let mut d = *self.marks.last().unwrap_or(&[0u8; 32]);
+        // Only the marks are kept, so the running value is rebuilt from the last mark
+        // forward when a new mark is due. Cheap: at most STRIDE hashes per STRIDE pushes.
+        let from = (self.nfs.len() / NF_MARK_STRIDE) * NF_MARK_STRIDE;
+        self.nfs.push(nf);
+        if self.nfs.len() % NF_MARK_STRIDE == 0 {
+            for x in &self.nfs[from..] {
+                xor32(&mut d, &nf_mark_hash(x));
+            }
+            self.marks.push(d);
+        }
+    }
+
+    /// The order-independent digest of the first `k` entries — what a wallet's own
+    /// `nf_prefix_digest(k)` is compared against, at write time and at load time.
+    fn prefix_digest(&self, k: u64) -> Option<[u8; 32]> {
+        let k = usize::try_from(k).ok()?;
+        if k > self.nfs.len() {
+            return None;
+        }
+        let mark = k / NF_MARK_STRIDE;
+        let mut d = if mark == 0 { [0u8; 32] } else { *self.marks.get(mark - 1)? };
+        for x in self.nfs.get(mark * NF_MARK_STRIDE..k)? {
+            xor32(&mut d, &nf_mark_hash(x));
+        }
+        Some(d)
+    }
+}
+
+/// Must match `shielded-core`'s `nf_leaf_hash` — same personalisation, same length.
+fn nf_mark_hash(nf: &[u8; 32]) -> [u8; 32] {
+    blake2b_simd::Params::new().hash_length(32).personal(b"ZKasNfSetDig_v1_").hash(nf).as_bytes().try_into().expect("32 bytes")
+}
+
+fn xor32(dst: &mut [u8; 32], src: &[u8; 32]) {
+    for (d, s) in dst.iter_mut().zip(src.iter()) {
+        *d ^= s;
+    }
+}
+
 /// Token of the daemon-wide **shared chain tree** — one keyless copy of the public
 /// commitment stream that every wallet witnesses against.
 ///
@@ -1501,8 +1584,11 @@ fn save_checkpoint(
     boundaries: &VecDeque<(u64, u64)>,
     sink_blue: u64,
     blind_below: u64,
+    // How many of this wallet's spent nullifiers the shared artefact has been verified
+    // to hold (see `AppState::nf_share_for`). `None` writes the self-contained form.
+    nf_share: Option<u64>,
 ) -> std::io::Result<()> {
-    let buf = checkpoint_bytes(genesis, low, scanned, db, boundaries, sink_blue, blind_below);
+    let buf = checkpoint_bytes(genesis, low, scanned, db, boundaries, sink_blue, blind_below, nf_share);
     write_checkpoint_bytes(dir, token, &buf)
 }
 
@@ -1519,8 +1605,9 @@ fn checkpoint_bytes(
     boundaries: &VecDeque<(u64, u64)>,
     sink_blue: u64,
     blind_below: u64,
+    nf_share: Option<u64>,
 ) -> Vec<u8> {
-    let db_blob = db.to_checkpoint();
+    let db_blob = db.to_checkpoint_sharing(nf_share);
     let mut buf = Vec::with_capacity(SCAN_HEADER_LEN + 8 + db_blob.len() + 4 + boundaries.len() * 16 + 8);
     buf.extend_from_slice(SCAN_MAGIC);
     buf.push(SCAN_VERSION);
@@ -1822,10 +1909,28 @@ fn adopt_twin_checkpoint(
         }
     }
     let (donor, donor_birthday, _) = best?;
-    // save_checkpoint writes are atomic (tmp + rename), so a plain copy always sees
-    // a consistent file. At worst it lags the donor's RAM state by CHECKPOINT_EVERY
+    // save_checkpoint writes are atomic (tmp + rename), so a clone always sees a
+    // consistent file. At worst it lags the donor's RAM state by CHECKPOINT_EVERY
     // blocks; the clone re-scans that tail in seconds.
-    std::fs::copy(scan_path(dir, &donor), scan_path(dir, token)).ok()?;
+    //
+    // HARDLINK, not copy. Every writer of a `.scan` goes through
+    // `write_checkpoint_bytes`, which writes a temp file and renames over the name —
+    // so an inode is never mutated in place. Linking therefore has exactly the
+    // semantics the copy had: the two names share bytes until whichever is written
+    // next, and that write replaces the directory entry rather than the shared inode.
+    // What it removes is the byte copy: 1,823 adoptions in the last 7 days at a 131 MB
+    // mean checkpoint is ~239 GB/week of pure memcpy through the page cache, on a box
+    // already sustaining 85 MB/s of checkpoint rewrites. One wallet adopted a 169 MB
+    // checkpoint 8 times in 65 seconds.
+    //
+    // Falls back to a copy when the link cannot be made — a cross-device wallet dir,
+    // or a filesystem without hardlinks. `hard_link` also fails if the destination
+    // exists, which is correct here: adoption is for a token with no checkpoint yet,
+    // and clobbering an existing one would be a bug either way.
+    let (from, to) = (scan_path(dir, &donor), scan_path(dir, token));
+    if std::fs::hard_link(&from, &to).is_err() {
+        std::fs::copy(&from, &to).ok()?;
+    }
     Some((donor, if birthday == 0 { donor_birthday } else { donor_birthday.min(birthday) }))
 }
 
@@ -1914,7 +2019,7 @@ pub fn graft_wallet(dir: &str, token: &str, older_scan: &str, secret: Option<&st
     let before = db.stranded_notes().len();
     let restored = db.graft_history(&old_db).map_err(|e| e.to_string())?;
     let after = db.stranded_notes().len();
-    save_checkpoint(dir, token, &genesis, &low, scanned as u64, &db, &boundaries, sink_blue, blind_below)
+    save_checkpoint(dir, token, &genesis, &low, scanned as u64, &db, &boundaries, sink_blue, blind_below, None)
         .map_err(|e| format!("write repaired checkpoint: {e}"))?;
     Ok(format!("grafted {restored} leaves back (base now {}); stranded notes {before} -> {after}", db.base_size()))
 }
@@ -1960,6 +2065,20 @@ struct DecodedPage {
     reorged: bool,
     sink_blue_score: u64,
     blocks: Vec<DecodedBlock>,
+    /// Every action's ephemeral key, decompressed once for the whole cohort.
+    ///
+    /// Recovering y from x is a modular square root — 5-8 us/action measured, against
+    /// 0.15 for the KDF and 0.12 for ChaCha20 — and it depends only on bytes that are
+    /// identical for every wallet. It was being redone inside each wallet's scan, so
+    /// with ~9 wallets riding each fetched page (page-cache counters: 5,595 hit /
+    /// 1,404 rode-a-peer / 1,024 fetched) the same square roots ran ~9 times. Paying
+    /// it here, on the page every wallet already shares, is the same trick the shared
+    /// chain tree plays for the Sinsemilla work.
+    ///
+    /// Flattened in the page's action order, which is exactly the order `sync_chunk`
+    /// builds `page_actions` in; a length mismatch makes the consumer fall back to
+    /// decompressing, so a drift here costs time and never a note.
+    epks: Vec<Option<kaspa_shielded_core::pasta_curves::pallas::Point>>,
 }
 
 /// Whether to trust a node-supplied coinbase commitment verbatim instead of
@@ -2104,6 +2223,17 @@ struct PageCache {
     pool: Arc<rayon::ThreadPool>,
     ttl: std::time::Duration,
     cap: usize,
+    /// Served from the map · served by riding another wallet's in-flight fetch ·
+    /// actually fetched from the node.
+    ///
+    /// The whole justification for this cache is that a cohort walks the same stream,
+    /// so one fetch serves many wallets — and that claim has never been checked. Page
+    /// fetch is 80-93% of sync wall time, so if the hit rate is low it is the first
+    /// thing to fix and nothing else matters; if it is high, the remaining fetch cost
+    /// is the node's and belongs there. Cheap counters beat arguing about it again.
+    hits: u64,
+    dedup_hits: u64,
+    misses: u64,
 }
 
 impl PageCache {
@@ -2120,6 +2250,9 @@ impl PageCache {
             pool: Arc::new(pool),
             ttl: std::time::Duration::from_secs(resources.page_cache_ttl_secs.max(1)),
             cap: resources.page_cache_entries.max(1),
+            hits: 0,
+            dedup_hits: 0,
+            misses: 0,
         }
     }
 }
@@ -2203,10 +2336,12 @@ async fn fetch_shielded_page(
 ) -> Result<Arc<DecodedPage>, kaspa_rpc_core::RpcError> {
     let key = (low, limit);
     {
-        let c = cache.lock().await;
+        let mut c = cache.lock().await;
         if let Some((at, resp)) = c.map.get(&key) {
             if at.elapsed() < c.ttl {
-                return Ok(resp.clone());
+                let resp = resp.clone();
+                c.hits += 1;
+                return Ok(resp);
             }
         }
     }
@@ -2234,11 +2369,22 @@ async fn fetch_shielded_page(
     let _lead = gate.acquire().await;
     // The leader may have filled the cache while we waited, which is the whole point.
     {
-        let c = cache.lock().await;
+        let mut c = cache.lock().await;
         if let Some((at, resp)) = c.map.get(&key) {
             if at.elapsed() < c.ttl {
-                return Ok(resp.clone());
+                let resp = resp.clone();
+                c.dedup_hits += 1;
+                return Ok(resp);
             }
+        }
+        c.misses += 1;
+        let (h, d, m) = (c.hits, c.dedup_hits, c.misses);
+        // Every 256th real fetch, not every call: this is the hot path.
+        if m % 256 == 0 {
+            log::info!(
+                "page cache: {h} hit / {d} rode-a-peer / {m} fetched -> {}% served without touching the node",
+                (h + d) * 100 / (h + d + m).max(1),
+            );
         }
     }
 
@@ -2259,13 +2405,23 @@ async fn fetch_shielded_page(
     // single-thread ceiling), and each block decodes independently. `block_in_place`
     // moves this task off the async worker pool so the rayon fan-out doesn't stall other
     // tokio tasks; the decode is done once here and shared by every wallet via the cache.
-    let blocks = tokio::task::block_in_place(|| {
+    let (blocks, epks) = tokio::task::block_in_place(|| {
         pool.install(|| {
             use rayon::prelude::*;
-            raw.blocks.par_iter().map(decode_block).collect::<Vec<_>>()
+            let blocks = raw.blocks.par_iter().map(decode_block).collect::<Vec<_>>();
+            // Decompress every ephemeral key once, here, on the same pool and in the
+            // same flattening order `sync_chunk` uses to build `page_actions`. This is
+            // the cohort's shared curve work; see `DecodedPage::epks`.
+            let flat: Vec<kaspa_shielded_core::wallet::CompactActionRecord> =
+                blocks.iter().flat_map(|b| b.compact.iter().flatten().copied()).collect();
+            let epks: Vec<Option<kaspa_shielded_core::pasta_curves::pallas::Point>> = flat
+                .par_iter()
+                .map(|r| kaspa_shielded_core::wallet::decompress_epk(&r.ephemeral_key))
+                .collect();
+            (blocks, epks)
         })
     });
-    let decoded = Arc::new(DecodedPage { reorged: raw.reorged, sink_blue_score: raw.sink_blue_score, blocks });
+    let decoded = Arc::new(DecodedPage { reorged: raw.reorged, sink_blue_score: raw.sink_blue_score, blocks, epks });
     let mut c = cache.lock().await;
     // Re-inserting a key must not leave a second copy in the eviction queue. A page
     // refetched after its TTL used to be pushed again while `map` still held one
@@ -2435,6 +2591,12 @@ struct WalletEntry {
     page_fetch_ns: u128,
     page_ingest_ns: u128,
     page_count: u64,
+    /// Compact actions seen across those pages. Reported as actions/page beside the
+    /// fetch/ingest split because it is the constant every cost model here divides by,
+    /// and it was never logged: reconstructing it from the cumulative scan counters
+    /// gave answers between 0.05 and 1.8 actions/block depending on which report you
+    /// picked — a 38x spread on the one number that sizes the whole scan budget.
+    page_actions: u64,
     /// Leaf count at the last scan-cost report, so it is emitted per unit of WORK
     /// rather than per tick (a tick can be a whole chunk or almost nothing).
     scan_cost_reported: u64,
@@ -2549,6 +2711,7 @@ impl WalletEntry {
             page_fetch_ns: 0,
             page_ingest_ns: 0,
             page_count: 0,
+            page_actions: 0,
             scan_cost_reported: 0,
             subtree_low_mem_logged: None,
             force_checkpoint: false,
@@ -2922,8 +3085,15 @@ impl WalletEntry {
                 {
                     let page_actions: Vec<kaspa_shielded_core::wallet::CompactActionRecord> =
                         resp.blocks.iter().flat_map(|b| b.compact.iter().flatten().copied()).collect();
+                    self.page_actions += page_actions.len() as u64;
                     if !page_actions.is_empty() {
-                        tokio::task::block_in_place(|| self.db.predecrypt_page(&page_actions));
+                        // The page decompressed these ephemeral keys once for the whole
+                        // cohort. Only offer them if the count matches what we flattened
+                        // here — a mismatch means the two orders drifted, and the callee
+                        // then decompresses for itself rather than indexing into the
+                        // wrong page.
+                        let shared = (resp.epks.len() == page_actions.len()).then_some(resp.epks.as_slice());
+                        tokio::task::block_in_place(|| self.db.predecrypt_page_cached(&page_actions, shared));
                     }
                 }
                 for (i, b) in resp.blocks.iter().enumerate() {
@@ -3913,6 +4083,13 @@ struct AppState {
     /// — the shared tree's base was raised to ~2.06M by the 2026-08 compaction bug and can
     /// never come back down on a pruned node, so every note below it was silently uncovered.
     chain_tree_base: std::sync::atomic::AtomicU64,
+    /// The shared spent-nullifier set — see [`SharedNfLog`]. A plain `RwLock`, not the
+    /// chain tree's async `Mutex`: this is read on the checkpoint-write path and on the
+    /// wallet-load path, neither of which may queue behind a page ingest.
+    shared_nfs: std::sync::Arc<std::sync::RwLock<SharedNfLog>>,
+    /// Unix second the shared set's node binding was last re-affirmed; see
+    /// [`NF_VERIFY_EVERY`].
+    nf_verified_at: std::sync::atomic::AtomicU64,
     /// The shared tree's tip frontier, republished after each of its own passes.
     ///
     /// A short-lived lock held only long enough to clone ~32 ommers, never across
@@ -3943,6 +4120,22 @@ struct AppState {
     /// runtime worker and starve even `/health` (a live outage). With a small cap, most
     /// workers stay free for HTTP and loads queue briefly instead of melting the box.
     load_gate: tokio::sync::Semaphore,
+    /// One in-flight load per token, so racing requests for the SAME wallet collapse
+    /// into one.
+    ///
+    /// `load_gate` above bounds how many DIFFERENT wallets load at once; it does not
+    /// stop N requests for one token from each starting their own load, because the
+    /// cache re-check after the permit only sees a load that already FINISHED. A load
+    /// that rebuilds from birthday 0 is a full genesis rescan taking many minutes, so
+    /// every request that arrives in that window started another one: on 2026-09-22
+    /// two wallets accumulated 26 concurrent genesis rescans between them, which
+    /// saturated the node's page RPC and dragged every other wallet's fetch from
+    /// ~100 ms to 2.4 s per page. The wallets were not corrupt and the rebuild was not
+    /// wrong — it just ran 13 times each.
+    ///
+    /// A failed load releases the lock and caches nothing, so the next request retries;
+    /// the token is never poisoned (see the `spawn_load` warning above).
+    loading: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Payment preparation is deliberately serialized: witness reconstruction and Halo2
     /// proving are CPU-heavy synchronous work, and overlapping copies exhaust every
     /// runtime worker and take the whole wallet API offline.
@@ -4280,6 +4473,191 @@ impl Drop for PreparingGuard {
 }
 
 impl AppState {
+    // -----------------------------------------------------------------------
+    // The shared spent-nullifier set. Three operations, each of which fails closed.
+    // -----------------------------------------------------------------------
+
+    /// Refill the published set from the shared chain tree, from index `from` onward.
+    /// Called after every chain-tree pass, so the log tracks the tree without copying it.
+    fn publish_shared_nfs(&self, db: &WalletDb) {
+        let Ok(mut log) = self.shared_nfs.write() else { return };
+        let from = log.len();
+        if db.nf_len() < from {
+            // The tree went BACKWARDS — it rescanned, or was replaced. Anything already
+            // handed out described a set that no longer exists, so drop the whole log and
+            // un-verify it rather than serving a mixture of two scans.
+            log::warn!(
+                "shared nullifier set shrank ({} -> {}); dropping it — borrowing wallets will re-verify or park",
+                from,
+                db.nf_len()
+            );
+            *log = SharedNfLog::default();
+            return;
+        }
+        for nf in db.nf_tail_from(from) {
+            log.push(nf);
+        }
+    }
+
+    /// Bind the shared chain tree's own leaf stream to the node's frontier at its
+    /// cursor, and only then let wallets borrow its nullifier set.
+    ///
+    /// **This check did not exist.** `build_chain_tree` loads the shared tree with
+    /// `tip: None` (see its `load_checkpoint` call), so `parse_scan_bytes` skips the
+    /// size/root binding it applies to every ordinary wallet — the one artefact on the
+    /// daemon that nothing verified is the one every wallet is about to depend on.
+    ///
+    /// The binding is indirect but it is the strongest one available: the nullifier set
+    /// and the leaf stream are produced by the SAME ingest pass over the same pages, and
+    /// every possible error in the set moves the stream. A nullifier wrongly present
+    /// drops a transaction that belongs, removing its leaves; one wrongly absent keeps a
+    /// transaction consensus dropped, adding leaves. Either way the leaf count and root
+    /// change, and the node's frontier at this cursor says what they must be. A set that
+    /// is wrong and a stream that is right is therefore not a state this ingest path can
+    /// reach.
+    ///
+    /// What it does NOT prove: that the ingest CODE is right. Both copies run it, so a
+    /// bug in the drop rule itself produces a self-consistent wrong set and a
+    /// self-consistent wrong stream, and neither this check nor any cross-check between
+    /// two copies of the same program can see it. Only the node disagreeing can.
+    /// Whether the shared set's binding to the node is due to be re-affirmed. Claims the
+    /// slot as it answers, so two concurrent passes cannot both issue the RPC.
+    fn nf_verify_due(&self) -> bool {
+        let now = now_unix();
+        let last = self.nf_verified_at.load(std::sync::atomic::Ordering::Relaxed);
+        now.saturating_sub(last) >= NF_VERIFY_EVERY
+            && self
+                .nf_verified_at
+                .compare_exchange(last, now, std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed)
+                .is_ok()
+    }
+
+    /// Bind the shared chain tree — the source of the shared nullifier set — to the
+    /// node's own frontier at the tree's cursor.
+    ///
+    /// **This is the check `build_chain_tree` has never done.** It loads the chain
+    /// tree's checkpoint with `tip: None`, so the one artefact the whole daemon's
+    /// borrowing rests on is the only one that has never been through
+    /// `parse_scan_bytes`' size/root binding. That was tolerable while the tree was a
+    /// pure optimisation a wallet could ignore; it is not tolerable once 2,000 wallets
+    /// persist a reference to it instead of their own data.
+    ///
+    /// The binding itself is the ordinary one: the node's note-commitment tree at the
+    /// cursor block must have the same leaf count and the same root as the tree we
+    /// built. Sinsemilla collision resistance then says the leaf streams are equal, and
+    /// the nullifier set is what that stream's ingest produced. That is an INDIRECT
+    /// argument for the set — see the report's "what this does not catch".
+    ///
+    /// Takes the tree's `(size, anchor)` by value rather than the `WalletDb`: a
+    /// `WalletDb` is not `Send` (its decoded-leaf cache is a `OnceCell`), so holding one
+    /// across this await would make every task that calls it un-spawnable.
+    async fn verify_shared_nullifier_source(&self, cursor: RpcHash, size: u64, anchor: [u8; 32], tree_valid: bool) -> Result<(), String> {
+        if !tree_valid {
+            return Err("the shared tree's own mirror is not valid".into());
+        }
+        let c = self.request_client().await.ok_or_else(|| "no node connection".to_string())?;
+        let ts = tokio::time::timeout(std::time::Duration::from_secs(3), c.get_shielded_tree_state(Some(cursor)))
+            .await
+            .map_err(|_| format!("tree state at {cursor} timed out"))?
+            .map_err(|e| e.to_string())?;
+        let fs = kaspa_shielded_core::tree::FrontierState {
+            size: ts.size,
+            leaf: (ts.size > 0).then(|| ts.leaf.as_bytes()),
+            ommers: ts.ommers.iter().map(|o| o.as_bytes()).collect(),
+        };
+        if fs.size != size {
+            return Err(format!("node says {} leaves at {cursor}, the shared tree holds {size}", fs.size));
+        }
+        let expected = kaspa_shielded_core::tree::GlobalTree::from_state(&fs)
+            .map_err(|e| format!("node frontier does not reconstruct: {e:?}"))?
+            .anchor()
+            .to_bytes();
+        if anchor != expected {
+            return Err(format!("root mismatch at {size} leaves: tree {} vs node {}", hex(&anchor), hex(&expected)));
+        }
+        Ok(())
+    }
+
+    /// Mark the shared set usable. Only ever called once the chain tree's own leaf
+    /// stream has been bound to the node's frontier at its cursor — the same binding
+    /// `parse_scan_bytes` applies to every wallet, which `build_chain_tree` has never
+    /// applied to the chain tree itself (it passes `tip: None`).
+    fn mark_shared_nfs_verified(&self, verified: bool) {
+        if let Ok(mut log) = self.shared_nfs.write() {
+            log.verified = verified;
+        }
+    }
+
+    /// How many of this wallet's nullifiers a checkpoint may reference instead of
+    /// writing. `None` = write the whole set, the pre-v10 behaviour.
+    ///
+    /// The answer is only non-`None` when the shared set is verified AND its prefix at
+    /// that length reproduces the digest of the wallet's own first `n` nullifiers. So
+    /// the decision to omit bytes is never taken on the strength of a length alone: it
+    /// is taken because the two sets were compared and agreed, at the moment of writing.
+    /// Cost is at most `NF_MARK_STRIDE` hashes on each side (~0.5 ms), against a
+    /// checkpoint write that copies tens to hundreds of megabytes.
+    fn nf_share_for(&self, token: &str, db: &WalletDb) -> Option<u64> {
+        // The shared tree must never reference itself. Its checkpoint IS the artefact;
+        // writing a reference into it would make a restart restore an empty set that
+        // nothing can fill (the log is loaded FROM this file), losing the one copy the
+        // whole fleet depends on. Gated on the PROPERTY as well as the token, so a
+        // future second keyless tree cannot slip through a name check.
+        if db.is_leaves_only() || token == CHAIN_TREE_TOKEN {
+            return None;
+        }
+        let log = self.shared_nfs.read().ok()?;
+        if !log.verified {
+            return None;
+        }
+        let n = db.nf_len().min(log.len());
+        if n == 0 {
+            return None; // nothing to save, and a 48-byte reference is bigger than nothing
+        }
+        // When the wallet is BEHIND the artefact (the normal case) `n == db.nf_len()`, so
+        // the wallet's side of this comparison is its WHOLE-set digest, which is
+        // order-independent — a wallet resumed from a pre-v10 checkpoint qualifies at
+        // once, with no rebuild of its own. When the wallet has run AHEAD, `n` is a
+        // prefix of the wallet's own log, which only means something if that log is in
+        // chain order. Skip rather than risk it; the artefact catches up within a pass.
+        if n < db.nf_len() && !db.nf_is_chain_ordered() {
+            return None;
+        }
+        (log.prefix_digest(n)? == db.nf_prefix_digest(n)?).then_some(n)
+    }
+
+    /// Supply a restored checkpoint the shared prefix it referenced.
+    ///
+    /// `true` means the wallet's drop rule is complete and it may sync. `false` means it
+    /// must NOT: it is parked with its balance, notes and history intact (all of which
+    /// are in its own checkpoint) but its cursor frozen, until a good shared set appears.
+    ///
+    /// Parking rather than rescanning is deliberate. If the shared artefact is lost or
+    /// rejected, the cure is ONE keyless pass — the chain tree rebuilding from genesis —
+    /// not 2,009 wallet rescans. A fleet-wide rescan is itself an outage (it pins every
+    /// core, and a wallet mid-rescan shows a partial balance as final), so the failure
+    /// mode has to be "wait", not "start over".
+    fn resolve_shared_nullifiers(&self, token: &str, db: &mut WalletDb) -> bool {
+        let Some((count, _)) = db.nf_pending() else { return true };
+        let Ok(log) = self.shared_nfs.read() else { return false };
+        if !log.verified {
+            log::warn!("wallet {token}: needs {count} shared nullifiers but the shared set is not verified yet; parked");
+            return false;
+        }
+        if db.install_shared_nullifiers(&log.nfs) {
+            return true;
+        }
+        // The artefact is present and verified but is NOT the set this wallet built —
+        // truncated, from another scan, or this wallet's view is not a prefix of it
+        // (a fast-synced wallet whose `blind_below` is non-zero: 11 of 2,009 live).
+        // Refuse. The wallet keeps everything it has and simply does not advance.
+        log::warn!(
+            "wallet {token}: shared nullifier set (len {}) does not reproduce this wallet's own digest at {count}; parked, NOT restored",
+            log.len()
+        );
+        false
+    }
+
     /// The request-path channel, or `None` while the node is unreachable.
     ///
     /// Every caller already tolerates an RPC failure, so "no node yet" travels the
@@ -4894,6 +5272,7 @@ impl AppState {
                         &e.boundaries,
                         e.sink_blue,
                         e.blind_below,
+                        self.nf_share_for(&t, &e.db),
                     )
                     .is_ok()
                 {
@@ -5086,9 +5465,27 @@ impl AppState {
                 return Some(w.clone());
             }
         }
-        // Cache miss → an expensive load. Gate concurrent loads so a reconnect storm
-        // can't pin every worker with tree rebuilds. Re-check the cache after acquiring
-        // the permit: while we waited, another task may have loaded this same wallet.
+        // Cache miss → an expensive load. Take this TOKEN's load lock before the global
+        // gate: the losers must queue here rather than hold permits the winner needs,
+        // and a permit-then-recheck alone cannot dedupe a load that has not finished.
+        // Entries whose only reference is the map itself are finished loads, so drop
+        // them here (same shape as the page cache's in-flight gate).
+        let lock = {
+            let mut loading = self.loading.lock().await;
+            loading.retain(|k, l| k == token || Arc::strong_count(l) > 1);
+            loading.entry(token.to_string()).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))).clone()
+        };
+        let _load = lock.lock().await;
+        // The winner may have finished while we queued — answer from its result rather
+        // than paying for the same scan again.
+        {
+            let map = self.wallets.lock().await;
+            if let Some(w) = map.get(token) {
+                return Some(w.clone());
+            }
+        }
+        // Gate concurrent loads of DIFFERENT wallets so a reconnect storm can't pin
+        // every worker with tree rebuilds. Re-check once more after the permit.
         let _permit = self.load_gate.acquire().await.ok()?;
         {
             let map = self.wallets.lock().await;
@@ -5238,6 +5635,18 @@ impl AppState {
         };
         let restored =
             (!abandoned_checkpoint).then(|| load_checkpoint(&self.wallet_dir, token, key, &genesis, tip.as_ref())).flatten();
+        // A checkpoint that referenced the shared nullifier set needs it supplied before
+        // the wallet is usable. Failing here is NOT a reason to discard the checkpoint:
+        // everything the user cares about (notes, balance, history, cursor) is in the
+        // file and is correct. The wallet loads, and `sync_one_wallet` parks it until the
+        // set verifies. Rescanning 2,009 wallets because one shared file is late would be
+        // an outage in its own right.
+        let restored = restored.map(|mut r| {
+            if !self.resolve_shared_nullifiers(token, &mut r.0) {
+                log::warn!("wallet {token}: loaded but PARKED — its checkpoint references the shared nullifier set");
+            }
+            r
+        });
         // Preserve a rejected checkpoint for forensic recovery/grafting. Never let
         // the subsequent clean scan overwrite the only copy of older owned notes.
         if restored.is_none() && tip.is_some() && checkpoint_cursor(&self.wallet_dir, token, &genesis).is_some() {
@@ -5312,7 +5721,13 @@ impl AppState {
                                 return None;
                             }
                         };
-                        match load_checkpoint(&self.wallet_dir, token, key, &genesis, twin_tip.as_ref()) {
+                        match load_checkpoint(&self.wallet_dir, token, key, &genesis, twin_tip.as_ref()).map(|mut r| {
+                            // A twin's checkpoint may reference the shared set too; the
+                            // donor's digest is the donor's own, so this is a real check,
+                            // not a formality.
+                            let _ = self.resolve_shared_nullifiers(token, &mut r.0);
+                            r
+                        }) {
                             Some(restored) => {
                                 log::info!(
                                     "wallet {token}: adopted checkpoint from twin token {donor} (birthday {keep_birthday}) instead of rescanning from {birthday}"
@@ -5635,6 +6050,21 @@ enum SyncOutcome {
 async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_len: u64) -> SyncOutcome {
     let mut e = w.lock().await;
     e.chain_len = chain_len;
+    // A wallet whose checkpoint referenced the shared nullifier set has no drop rule
+    // until that set is supplied. Ingesting without it would keep bundles consensus
+    // DROPPED and append leaves that are not on the chain — a silent fork of this
+    // wallet's tree, which is the one outcome worse than not syncing. Retry the install
+    // each pass (the shared tree may have caught up or been re-verified since) and
+    // otherwise park: balance, notes and history are all intact in this wallet's own
+    // checkpoint, only the cursor is frozen.
+    if !e.db.nullifiers_resolved() {
+        if state.resolve_shared_nullifiers(&token, &mut e.db) {
+            log::info!("wallet {token}: shared nullifier set installed; resuming sync");
+        } else {
+            e.error = Some("waiting for the shared chain state to be verified".into());
+            return SyncOutcome::Behind;
+        }
+    }
     // Advance one chunk from `low` (also the cheap tip catch-up once already synced).
     let was_caught_up = e.caught_up;
     e.caught_up = false;
@@ -5720,6 +6150,30 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
         state.chain_tree_base.store(e.db.base_size(), std::sync::atomic::Ordering::Relaxed);
         let fs = e.db.tip_frontier_state();
         *state.chain_tree_frontier.lock().await = fs;
+        // Republish the nullifier set alongside the tree — one copy for the whole
+        // daemon — and re-affirm, every pass, that the node still agrees with the stream
+        // it came from. Re-affirming rather than trusting a startup verdict matters: the
+        // tree advances continuously, and a divergence that appears at leaf N must stop
+        // NEW borrowing immediately, not at the next restart.
+        state.publish_shared_nfs(&e.db);
+        // One RPC per [`NF_VERIFY_EVERY`], not one per page. This await happens under
+        // the chain tree's lock, which a spend polls `try_lock` for every 20 ms, so the
+        // duty cycle matters more than the freshness: a divergence that appears now is
+        // acted on within 30 s, and in the meantime the per-wallet digest check is still
+        // standing between every wallet and the artefact.
+        if state.nf_verify_due() {
+            let (cursor, size, anchor, valid) = (e.low, e.db.size(), e.db.anchor(), e.db.tree_is_valid());
+            match state.verify_shared_nullifier_source(cursor, size, anchor, valid).await {
+            Ok(()) => state.mark_shared_nfs_verified(true),
+            Err(why) => {
+                // Not verified => not shared. Checkpoints go back to carrying their own
+                // set (correct, just bigger) and wallets that already reference one park
+                // rather than restoring from an artefact nothing vouches for.
+                state.mark_shared_nfs_verified(false);
+                log::warn!("shared nullifier set NOT verified at {size} leaves: {why}; wallets will not borrow it");
+            }
+            }
+        }
     }
     // Report where scan CPU actually goes, once per SCAN_COST_REPORT_ACTIONS of work.
     //
@@ -5760,6 +6214,12 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
                     ingest_ms as f64 / e.page_count as f64,
                     e.page_count,
                     fetch_ms * 100 / (fetch_ms + ingest_ms).max(1),
+                );
+                log::info!(
+                    "page contents: {} actions over {} pages = {:.0} actions/page",
+                    e.page_actions,
+                    e.page_count,
+                    e.page_actions as f64 / e.page_count as f64,
                 );
             }
         }
@@ -5894,7 +6354,7 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
     let pending_checkpoint = if e.error.is_none() && (due_by_blocks || (just_caught_up && advanced > 0) || force || overdue) {
         e.force_checkpoint = false;
         Some((
-            checkpoint_bytes(&e.genesis, &e.low, e.scanned as u64, &e.db, &e.boundaries, e.sink_blue, e.blind_below),
+            checkpoint_bytes(&e.genesis, &e.low, e.scanned as u64, &e.db, &e.boundaries, e.sink_blue, e.blind_below, state.nf_share_for(&token, &e.db)),
             e.scanned,
         ))
     } else {
@@ -6026,6 +6486,7 @@ async fn evict_idle_wallets(state: &Arc<AppState>) {
                     &e.boundaries,
                     e.sink_blue,
                     e.blind_below,
+                    state.nf_share_for(&token, &e.db),
                 )
                 .is_ok()
                 {
@@ -6093,7 +6554,22 @@ async fn prune_token_bookkeeping(state: &Arc<AppState>) {
 
 async fn sync_loop(state: Arc<AppState>) {
     // Shared across every lap for the lifetime of the daemon; see where it is used.
-    let sync_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(sync_concurrency(&state.resources)));
+    //
+    // TWO lanes, not one. The lap sorts furthest-behind first so that wallets converge
+    // on the same cursor and the page cache can actually hit — correct for sharing
+    // fetches, and precisely why a wallet somebody is watching starves: the scheduler's
+    // sort key is "most work to do", so a handful of cold rescans take every permit and
+    // hold it for the whole lap. That is the `sync lap exceeded 30s with N wallet(s)
+    // still working` line, 631 times in three days with N reaching 23 of 28 slots.
+    //
+    // Splitting the permits fixes it by construction: a cold wallet can never take a
+    // tip wallet's slot, whatever the sort says. The furthest-behind ordering is kept,
+    // so cohort formation inside each lane is unchanged.
+    let cold_slots = (sync_concurrency(&state.resources) / 7).clamp(1, 4);
+    let tip_slots = sync_concurrency(&state.resources).saturating_sub(cold_slots).max(1);
+    let sync_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(tip_slots));
+    let cold_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(cold_slots));
+    log::info!("sync lanes: {tip_slots} tip slot(s) + {cold_slots} cold slot(s) (cold = at least {CATCHUP_BURST_MIN_BEHIND} DAA behind)");
     loop {
         // Snapshot token names, not Wallet Arcs. Holding an Arc for every resident
         // wallet across the whole cohort kept evicted multi-hundred-MiB checkpoints
@@ -6192,8 +6668,14 @@ async fn sync_loop(state: Arc<AppState>) {
             // rather than an await, because blocking the lap on a permit held by a stuck
             // wallet would restore exactly the head-of-line stall LAP_BUDGET removes: a
             // wallet that cannot get a permit this lap is simply swept in the next one.
-            let sem = sync_sem.clone();
             let mut set = tokio::task::JoinSet::new();
+            // How far behind each wallet is, to pick its lane. Read once for the lap:
+            // the snapshot lock is contended and the classification does not need to be
+            // fresher than the sort that was just taken from the same map.
+            let behind: HashMap<String, u64> = {
+                let snaps = state.snapshots.lock().await;
+                snaps.iter().map(|(t, s)| (t.clone(), chain_len.saturating_sub(s.scanned as u64))).collect()
+            };
             for token in wallet_tokens {
                 if !active.contains(&token) {
                     continue; // parked: nobody is looking at this wallet right now
@@ -6202,6 +6684,11 @@ async fn sync_loop(state: Arc<AppState>) {
                 if token == CHAIN_TREE_TOKEN && !state.build_shared_tree {
                     continue; // on-device: no shared tree to build; the wallet serves itself
                 }
+                // The chain tree feeds every borrowing wallet, so it is never a straggler
+                // to be pushed into the slow lane however far behind it looks.
+                let cold = token != CHAIN_TREE_TOKEN
+                    && behind.get(&token).is_some_and(|b| *b >= CATCHUP_BURST_MIN_BEHIND);
+                let sem = if cold { cold_sem.clone() } else { sync_sem.clone() };
                 let Some(guard) = InPassGuard::claim(&state, &token) else { continue };
                 let Ok(Ok(permit)) =
                     tokio::time::timeout(PERMIT_WAIT, sem.clone().acquire_owned()).await
@@ -9605,6 +10092,8 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
         chain_tree_size: std::sync::atomic::AtomicU64::new(0),
         chain_tree_base: std::sync::atomic::AtomicU64::new(0),
         chain_tree_frontier: Mutex::new(None),
+        shared_nfs: std::sync::Arc::new(std::sync::RwLock::new(SharedNfLog::default())),
+        nf_verified_at: std::sync::atomic::AtomicU64::new(0),
         wallet_dir,
         prefix: prefix_from(&cfg.network),
         network: cfg.network,
@@ -9615,6 +10104,7 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
         page_cache: Mutex::new(PageCache::new(&resources)),
         last_touch: Mutex::new(HashMap::new()),
         load_gate: tokio::sync::Semaphore::new(resources.load_wallets.max(1)),
+        loading: Mutex::new(HashMap::new()),
         // Concurrent preparations are capped by config (`--max-concurrent-proves`):
         // proving is CPU-heavy, and unbounded overlap is a CPU DoS on a hosted daemon.
         prepare_gate: tokio::sync::Semaphore::new(cfg.max_concurrent_proves.max(1)),
@@ -10010,6 +10500,7 @@ async fn flush_checkpoints(state: &Arc<AppState>, only: Option<&str>) -> (usize,
             &e.boundaries,
             e.sink_blue,
             e.blind_below,
+            state.nf_share_for(&token, &e.db),
         )
         .is_ok()
         {
@@ -10106,6 +10597,58 @@ mod idle_bound_tests {
         assert_eq!(resolve(None), None);
         assert_eq!(resolve(Some(0)), None);
         assert_eq!(resolve(Some(30)), Some(Duration::from_secs(1800)));
+    }
+}
+
+#[cfg(test)]
+mod shared_nullifier_tests {
+    use super::*;
+    use kaspa_shielded_core::walletdb::WalletDb;
+
+    /// A wallet is only allowed to drop 42% of its checkpoint because the daemon and the
+    /// wallet compute the SAME digest over the same prefix. Two implementations, two
+    /// crates: if the personalisation, the stride or the XOR ever drift apart, a wallet
+    /// would be told it may borrow a set that is not its own. Pin them together.
+    #[test]
+    fn the_daemons_prefix_digest_agrees_with_the_wallets() {
+        assert_eq!(NF_MARK_STRIDE, kaspa_shielded_core::walletdb::NF_DIGEST_STRIDE_FOR_TESTS, "stride must match shielded-core");
+        let mut log = SharedNfLog::default();
+        let mut db = WalletDb::from_seed([3u8; 32]).unwrap();
+        // Past several stride boundaries, so the mark arithmetic is exercised on both
+        // sides rather than only the first window.
+        let n = NF_MARK_STRIDE * 2 + 37;
+        for i in 0..n {
+            let mut nf = [0u8; 32];
+            nf[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            log.push(nf);
+            db.insert_nullifier_for_tests(nf);
+        }
+        assert_eq!(log.len(), n as u64);
+        for k in [0u64, 1, 4095, 4096, 4097, 8192, n as u64] {
+            assert_eq!(log.prefix_digest(k), db.nf_prefix_digest(k), "digests disagree at prefix {k}");
+        }
+        assert_eq!(log.prefix_digest(n as u64 + 1), None, "past the end is refused, not extrapolated");
+    }
+
+    /// The log tracks the shared tree forward, and DROPS ITSELF if the tree ever goes
+    /// backwards. A tree that rescanned is a different scan; serving a mixture of the two
+    /// is how one bad artefact becomes 2,000 broken wallets.
+    #[test]
+    fn a_shrinking_shared_tree_invalidates_the_published_set() {
+        let mut log = SharedNfLog::default();
+        for i in 0..10u8 {
+            log.push([i; 32]);
+        }
+        log.verified = true;
+        assert_eq!(log.len(), 10);
+        // `publish_shared_nfs` resets on a shrink; replicate its rule here (it needs an
+        // AppState, which needs a node).
+        let shrunk = 4u64;
+        if shrunk < log.len() {
+            log = SharedNfLog::default();
+        }
+        assert_eq!(log.len(), 0);
+        assert!(!log.verified, "and it is no longer verified");
     }
 }
 
@@ -10222,6 +10765,96 @@ mod sdk_api_tests {
         std::fs::remove_dir_all(&dir3).ok();
     }
 
+
+    /// The daemon's copy of the shared spent-nullifier set agrees, byte for byte, with
+    /// the wallet's own — and a checkpoint that references it round-trips through the
+    /// real `save_checkpoint` / `load_checkpoint` path.
+    ///
+    /// This is the cross-crate half of the v10 safety argument: `SharedNfLog` and
+    /// `WalletDb` compute the same digest with the same stride and the same
+    /// personalisation, in two different crates. If they ever drift, every wallet would
+    /// silently stop borrowing (safe) — or, if the drift were in the stride alone, agree
+    /// on a digest for the wrong prefix (not safe). So it is pinned here.
+    #[test]
+    fn a_checkpoint_can_reference_the_shared_nullifier_set_and_get_it_back() {
+        let tmp = std::env::temp_dir().join(format!("zkas-nfshare-test-{}", std::process::id()));
+        let dir = tmp.to_string_lossy().to_string();
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let genesis = RpcHash::from_bytes([7u8; 32]);
+        let seed = [0x5au8; 32];
+
+        // A chain with real spends, ingested by BOTH a keyless shared copy and the
+        // wallet — the same construction the daemon runs.
+        let blocks: Vec<(Vec<(CoinbaseNoteDesc, u64)>, Vec<Vec<CompactActionRecord>>)> = (0..24u32)
+            .map(|b| {
+                let cb = vec![(derive_coinbase_note_desc(address_bytes_from_seed(seed).unwrap(), format!("cb-{b}").as_bytes()), 1_000)];
+                let tx: Vec<CompactActionRecord> = (0..3u32)
+                    .map(|a| {
+                        let mut nullifier = [0u8; 32];
+                        nullifier[..4].copy_from_slice(&b.to_le_bytes());
+                        nullifier[4..8].copy_from_slice(&a.to_le_bytes());
+                        let desc = derive_coinbase_note_desc(address_bytes_from_seed([3u8; 32]).unwrap(), format!("a-{b}-{a}").as_bytes());
+                        let cmx = kaspa_shielded_core::coinbase::coinbase_note_commitment(&desc, 7).unwrap().to_bytes();
+                        CompactActionRecord { nullifier, cmx, ephemeral_key: [0u8; 32], enc_ciphertext: [0u8; 52] }
+                    })
+                    .collect();
+                (cb, vec![tx])
+            })
+            .collect();
+
+        let mut shared = WalletDb::from_seed([9u8; 32]).unwrap();
+        shared.set_leaves_only(true);
+        let mut db = WalletDb::from_seed(seed).unwrap();
+        for (cb, txs) in &blocks {
+            shared.ingest_block_compact_with_meta(cb, txs, None);
+        }
+        for (cb, txs) in &blocks[..16] {
+            db.ingest_block_compact_with_meta(cb, txs, None); // the wallet is BEHIND
+        }
+
+        // The daemon's published log, built exactly as `publish_shared_nfs` builds it.
+        let mut log = SharedNfLog::default();
+        for nf in shared.nf_tail_from(0) {
+            log.push(nf);
+        }
+        log.verified = true;
+        assert_eq!(log.len(), shared.nf_len());
+        // THE cross-crate invariant: same digest, same stride, same personalisation.
+        assert_eq!(log.prefix_digest(db.nf_len()), db.nf_prefix_digest(db.nf_len()), "walletd and shielded-core must agree");
+        assert_eq!(log.prefix_digest(log.len()), shared.nf_prefix_digest(shared.nf_len()), "full-length digests agree");
+
+        // Write the checkpoint referencing the shared set, and read it back.
+        save_seed(&dir, "w", "mainnet", &seed, 1, None).unwrap();
+        let boundaries: VecDeque<(u64, u64)> = VecDeque::from([(100, 0)]);
+        let cursor = RpcHash::from_bytes([9u8; 32]);
+        save_checkpoint(&dir, "w", &genesis, &cursor, 16, &db, &boundaries, 100, 0, None).unwrap();
+        let standalone = std::fs::metadata(scan_path(&dir, "w")).unwrap().len();
+        save_checkpoint(&dir, "w", &genesis, &cursor, 16, &db, &boundaries, 100, 0, Some(db.nf_len())).unwrap();
+        let borrowed = std::fs::metadata(scan_path(&dir, "w")).unwrap().len();
+        assert_eq!(standalone - borrowed, db.nf_len() * 32 - 48, "the bytes left the FILE, not just the blob");
+
+        let (mut restored, ..) = load_checkpoint(&dir, "w", WalletKey::Seed(seed), &genesis, None).expect("parses");
+        assert!(!restored.nullifiers_resolved(), "parked until the shared set is supplied");
+        assert!(restored.install_shared_nullifiers(&log.nfs), "the real shared log is accepted");
+        assert!(restored.nullifiers_resolved());
+        assert_eq!(restored.nf_digest(), db.nf_digest(), "the wallet got its own set back");
+
+        // A corrupted daemon-side log is refused, and the wallet stays parked.
+        let (mut victim, ..) = load_checkpoint(&dir, "w", WalletKey::Seed(seed), &genesis, None).unwrap();
+        let mut bad = log.nfs.clone();
+        bad[5][31] ^= 0x80;
+        assert!(!victim.install_shared_nullifiers(&bad), "one flipped bit and every borrower refuses");
+        assert!(!victim.nullifiers_resolved(), "parked, not restored wrong");
+
+        // Truncated below what the file referenced: refused, not half-applied.
+        let (mut victim, ..) = load_checkpoint(&dir, "w", WalletKey::Seed(seed), &genesis, None).unwrap();
+        assert!(!victim.install_shared_nullifiers(&log.nfs[..(db.nf_len() as usize) - 1]));
+        assert!(!victim.nullifiers_resolved());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// "Enter the seed on a second device → synced at once": a registration whose
     /// viewing key another token already scanned must clone that checkpoint, and
     /// the clone must parse under EITHER key form (the desktop imported the seed;
@@ -10240,7 +10873,7 @@ mod sdk_api_tests {
         // Donor: a seed wallet with a persisted, complete-view checkpoint.
         save_seed(&dir, "donor", "mainnet", &seed, 4242, None).unwrap();
         let boundaries: VecDeque<(u64, u64)> = VecDeque::from([(100, 0)]);
-        save_checkpoint(&dir, "donor", &genesis, &RpcHash::from_bytes([9u8; 32]), 777, &db, &boundaries, 100, 0).unwrap();
+        save_checkpoint(&dir, "donor", &genesis, &RpcHash::from_bytes([9u8; 32]), 777, &db, &boundaries, 100, 0, None).unwrap();
 
         // The index build finds the donor by viewing key.
         let index = build_fvk_index(&dir, None);
@@ -10265,7 +10898,7 @@ mod sdk_api_tests {
 
         // A donor that is BLIND below its fast-sync base must not serve a restore that
         // claims an EARLIER birthday than the donor's...
-        save_checkpoint(&dir, "donor", &genesis, &RpcHash::from_bytes([9u8; 32]), 777, &db, &boundaries, 100, 555).unwrap();
+        save_checkpoint(&dir, "donor", &genesis, &RpcHash::from_bytes([9u8; 32]), 777, &db, &boundaries, 100, 555, None).unwrap();
         std::fs::remove_file(scan_path(&dir, "phone")).unwrap();
         assert!(
             adopt_twin_checkpoint(&dir, "phone", &fvk, 1000, false, &genesis, None, &candidates).is_none(),

@@ -173,7 +173,15 @@ pub trait RpcApi: Sync + Send + AnySync {
     /// The per-chain-block shielded effects stream for wallet sync: coinbase
     /// mint + accepted (post-retain) bundles, consensus order, oldest first.
     async fn get_shielded_blocks(&self, start_hash: RpcHash, limit: u64) -> RpcResult<GetShieldedBlocksResponse> {
-        self.get_shielded_blocks_call(None, GetShieldedBlocksRequest { start_hash, limit, metadata_only: false }).await
+        // Every caller of this helper is, by construction, built against this version of
+        // the model, so it can read the raw form. A node that cannot produce it ignores the
+        // flag and answers in hex, and the conversion layer follows the node's own
+        // `actions_are_binary` rather than assuming the ask was honoured.
+        self.get_shielded_blocks_call(
+            None,
+            GetShieldedBlocksRequest { start_hash, limit, metadata_only: false, binary_actions: true },
+        )
+        .await
     }
     async fn get_shielded_blocks_call(
         &self,
@@ -187,7 +195,13 @@ pub trait RpcApi: Sync + Send + AnySync {
     /// Metadata-only variant used for cursor/birthday discovery. A legacy node
     /// may ignore the flag and return full blocks; callers must tolerate that.
     async fn get_shielded_block_metadata(&self, start_hash: RpcHash, limit: u64) -> RpcResult<GetShieldedBlocksResponse> {
-        self.get_shielded_blocks_call(None, GetShieldedBlocksRequest { start_hash, limit, metadata_only: true }).await
+        // Metadata-only pages carry no action records at all, so the encoding is moot;
+        // asked for consistently anyway so one code path is exercised everywhere.
+        self.get_shielded_blocks_call(
+            None,
+            GetShieldedBlocksRequest { start_hash, limit, metadata_only: true, binary_actions: true },
+        )
+        .await
     }
 
     /// The shielded turnstile totals (minted / fees / burned / pool value) as of a

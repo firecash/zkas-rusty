@@ -580,14 +580,28 @@ pub struct GetShieldedBlocksRequest {
     /// immediately discarded. Older nodes ignore the flag and return full pages.
     #[serde(default)]
     pub metadata_only: bool,
+    /// Ask for the compact action records raw instead of hex-encoded.
+    ///
+    /// This is a transport detail in a transport-neutral struct, which is not free, but
+    /// it is the honest place for it: the encoding has to be NEGOTIATED, because the two
+    /// forms are indistinguishable by inspection (hex of one 148-byte record is 296 bytes
+    /// and 296 % 148 == 0), so a receiver can never safely guess which it was handed.
+    /// Making it a request flag means the node keeps answering old callers in hex and
+    /// only ever switches for a caller that said it understands the raw form.
+    ///
+    /// Ignored by a node built before this field, which simply answers in hex — and says
+    /// so, via `GetShieldedBlocksResponse::actions_are_binary` staying false.
+    #[serde(default)]
+    pub binary_actions: bool,
 }
 
 impl Serializer for GetShieldedBlocksRequest {
     fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        store!(u16, &2, writer)?;
+        store!(u16, &3, writer)?;
         store!(RpcHash, &self.start_hash, writer)?;
         store!(u64, &self.limit, writer)?;
         store!(bool, &self.metadata_only, writer)?;
+        store!(bool, &self.binary_actions, writer)?;
         Ok(())
     }
 }
@@ -598,7 +612,10 @@ impl Deserializer for GetShieldedBlocksRequest {
         let start_hash = load!(RpcHash, reader)?;
         let limit = load!(u64, reader)?;
         let metadata_only = if version >= 2 { load!(bool, reader)? } else { false };
-        Ok(Self { start_hash, limit, metadata_only })
+        // v3 appended the encoding opt-in. A v1/v2 blob lacks it, and false is the
+        // correct reading of its absence: that caller wants hex.
+        let binary_actions = if version >= 3 { load!(bool, reader)? } else { false };
+        Ok(Self { start_hash, limit, metadata_only, binary_actions })
     }
 }
 
@@ -694,25 +711,43 @@ pub struct GetShieldedBlocksResponse {
     /// The sink's blue score at reply time, so the caller can hold back a
     /// maturity margin (ingest only blocks a safe depth below the tip).
     pub sink_blue_score: u64,
+    /// Which wire form the node used for the compact action records: the raw
+    /// `acceptedActionsBin` field (true) or the hex `acceptedActions` field (false).
+    ///
+    /// The node sets this from the request's `binary_actions`, so it is an echo the
+    /// caller can check rather than a surprise. It matters because "field 9 is empty"
+    /// is ambiguous on its own — a block with no shielded activity looks exactly like a
+    /// node that never writes field 9 — and resolving that ambiguity by guessing is how
+    /// a page of real notes would be read as a page of no notes.
+    ///
+    /// Always false from a node built before this existed, which is the truthful answer
+    /// for one: it sent hex.
+    #[serde(default)]
+    pub actions_are_binary: bool,
 }
 
 impl Serializer for GetShieldedBlocksResponse {
     fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        store!(u16, &1, writer)?;
+        store!(u16, &2, writer)?;
         serialize!(Vec<RpcShieldedChainBlock>, &self.blocks, writer)?;
         store!(bool, &self.reorged, writer)?;
         store!(u64, &self.sink_blue_score, writer)?;
+        store!(bool, &self.actions_are_binary, writer)?;
         Ok(())
     }
 }
 
 impl Deserializer for GetShieldedBlocksResponse {
     fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
-        let _version = load!(u16, reader)?;
+        let version = load!(u16, reader)?;
         let blocks = deserialize!(Vec<RpcShieldedChainBlock>, reader)?;
         let reorged = load!(bool, reader)?;
         let sink_blue_score = load!(u64, reader)?;
-        Ok(Self { blocks, reorged, sink_blue_score })
+        // This path carries `accepted_actions` as bytes in BOTH versions — the hex only
+        // ever existed in the protobuf mapping — so a v1 blob is not lying when it reads
+        // back as false here; there was nothing to decode differently.
+        let actions_are_binary = if version >= 2 { load!(bool, reader)? } else { false };
+        Ok(Self { blocks, reorged, sink_blue_score, actions_are_binary })
     }
 }
 

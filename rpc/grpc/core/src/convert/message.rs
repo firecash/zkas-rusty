@@ -237,7 +237,12 @@ from!(item: RpcResult<&kaspa_rpc_core::GetShieldedTreeStateResponse>, protowire:
 });
 
 from!(item: &kaspa_rpc_core::GetShieldedBlocksRequest, protowire::GetShieldedBlocksRequestMessage, {
-    Self { start_hash: item.start_hash.to_string(), limit: item.limit, metadata_only: item.metadata_only }
+    Self {
+        start_hash: item.start_hash.to_string(),
+        limit: item.limit,
+        metadata_only: item.metadata_only,
+        binary_actions: item.binary_actions,
+    }
 });
 from!(item: &kaspa_rpc_core::RpcShieldedChainBlock, protowire::RpcShieldedChainBlock, {
     Self {
@@ -257,11 +262,54 @@ from!(item: &kaspa_rpc_core::RpcShieldedChainBlock, protowire::RpcShieldedChainB
         accepted_actions: item.accepted_actions.iter().map(|b| b.to_rpc_hex()).collect(),
         accepted_txids: item.accepted_txids.iter().map(|t| t.to_string()).collect(),
         timestamp: item.timestamp,
+        // The hex mapping above stays the default, so this `From` keeps answering exactly
+        // as it always did. The raw form is produced only by `shielded_block_to_binary`,
+        // which the response conversion selects when the caller asked for it.
+        accepted_actions_bin: Vec::new(),
     }
 });
 from!(item: RpcResult<&kaspa_rpc_core::GetShieldedBlocksResponse>, protowire::GetShieldedBlocksResponseMessage, {
-    Self { blocks: item.blocks.iter().map(|b| b.into()).collect(), reorged: item.reorged, sink_blue_score: item.sink_blue_score, error: None }
+    Self {
+        blocks: if item.actions_are_binary {
+            item.blocks.iter().map(shielded_block_to_binary).collect()
+        } else {
+            item.blocks.iter().map(|b| b.into()).collect()
+        },
+        reorged: item.reorged,
+        sink_blue_score: item.sink_blue_score,
+        actions_are_binary: item.actions_are_binary,
+        error: None,
+    }
 });
+
+/// The raw-action wire form of a shielded chain block: identical to the hex `From` in
+/// every field except that the compact records go in `accepted_actions_bin` and the hex
+/// `accepted_actions` is left empty.
+///
+/// Exactly one of the two is ever populated. That is not tidiness — it is what lets the
+/// receiving side treat "the other field is empty" as a checkable invariant instead of a
+/// guess, and it is checked on the way back in.
+fn shielded_block_to_binary(item: &kaspa_rpc_core::RpcShieldedChainBlock) -> protowire::RpcShieldedChainBlock {
+    protowire::RpcShieldedChainBlock {
+        hash: item.hash.to_string(),
+        blue_score: item.blue_score,
+        daa_score: item.daa_score,
+        coinbase_txid: item.coinbase_txid.to_string(),
+        coinbase_outputs: item
+            .coinbase_outputs
+            .iter()
+            .map(|o| protowire::RpcShieldedCoinbaseOutput {
+                script_public_key: o.script_public_key.to_rpc_hex(),
+                value: o.value,
+                commitment: o.commitment.map(|c| c.to_vec()).unwrap_or_default(),
+            })
+            .collect(),
+        accepted_actions: Vec::new(),
+        accepted_txids: item.accepted_txids.iter().map(|t| t.to_string()).collect(),
+        timestamp: item.timestamp,
+        accepted_actions_bin: item.accepted_actions.clone(),
+    }
+}
 
 from!(item: &kaspa_rpc_core::GetShieldedSupplyRequest, protowire::GetShieldedSupplyRequestMessage, {
     Self { block_hash: item.block_hash.map(|h| h.to_string()).unwrap_or_default() }
@@ -849,7 +897,14 @@ try_from!(item: &protowire::GetShieldedTreeStateResponseMessage, RpcResult<kaspa
 });
 
 try_from!(item: &protowire::GetShieldedBlocksRequestMessage, kaspa_rpc_core::GetShieldedBlocksRequest, {
-    Self { start_hash: RpcHash::from_str(&item.start_hash)?, limit: item.limit, metadata_only: item.metadata_only }
+    Self {
+        start_hash: RpcHash::from_str(&item.start_hash)?,
+        limit: item.limit,
+        metadata_only: item.metadata_only,
+        // Absent from an old client's message, and protobuf gives absent bools as false,
+        // which is the reading we want: answer that caller in hex.
+        binary_actions: item.binary_actions,
+    }
 });
 try_from!(item: &protowire::RpcShieldedChainBlock, kaspa_rpc_core::RpcShieldedChainBlock, {
     Self {
@@ -875,18 +930,78 @@ try_from!(item: &protowire::RpcShieldedChainBlock, kaspa_rpc_core::RpcShieldedCh
                 })
             })
             .collect::<Result<Vec<_>, Self::Error>>()?,
-        accepted_actions: item.accepted_actions.iter().map(|b| Vec::from_rpc_hex(b)).collect::<Result<Vec<_>, _>>()?,
+        // This impl is the HEX reading, and it refuses to be used on a block that carries
+        // raw records. Without the guard it would return an empty action list for such a
+        // block, which downstream cannot tell from a block that genuinely had no shielded
+        // activity — the page would be ingested as real and the notes in it would be gone
+        // with no error anywhere. A response is converted through
+        // `shielded_block_from_binary` instead when the node said the records are raw.
+        accepted_actions: if item.accepted_actions_bin.is_empty() {
+            item.accepted_actions.iter().map(|b| Vec::from_rpc_hex(b)).collect::<Result<Vec<_>, _>>()?
+        } else {
+            return Err("shielded block carries raw acceptedActionsBin but is being read as hex".into());
+        },
         accepted_txids: item.accepted_txids.iter().map(|t| RpcHash::from_str(t)).collect::<Result<Vec<_>, _>>()?,
         timestamp: item.timestamp,
     }
 });
 try_from!(item: &protowire::GetShieldedBlocksResponseMessage, RpcResult<kaspa_rpc_core::GetShieldedBlocksResponse>, {
     Self {
-        blocks: item.blocks.iter().map(kaspa_rpc_core::RpcShieldedChainBlock::try_from).collect::<Result<Vec<_>, _>>()?,
+        // The node states which field it filled; nothing here infers it from a length or
+        // from which vector happens to be non-empty. Both readings below reject the wrong
+        // field being populated, so a node and a client that disagree produce an error on
+        // the very first page instead of a stream of blocks with their notes missing.
+        blocks: if item.actions_are_binary {
+            item.blocks.iter().map(shielded_block_from_binary).collect::<Result<Vec<_>, _>>()?
+        } else {
+            item.blocks.iter().map(kaspa_rpc_core::RpcShieldedChainBlock::try_from).collect::<Result<Vec<_>, _>>()?
+        },
         reorged: item.reorged,
         sink_blue_score: item.sink_blue_score,
+        actions_are_binary: item.actions_are_binary,
     }
 });
+
+/// Read a shielded chain block whose compact records arrived raw.
+///
+/// Mirrors the hex `TryFrom` field for field, and applies the same refusal in the other
+/// direction: a block that still carries hex `accepted_actions` has no business being in
+/// a response flagged binary, and taking its raw field (empty) would present its notes as
+/// absent rather than as an error.
+fn shielded_block_from_binary(
+    item: &protowire::RpcShieldedChainBlock,
+) -> Result<kaspa_rpc_core::RpcShieldedChainBlock, RpcError> {
+    if !item.accepted_actions.is_empty() {
+        return Err("shielded block carries hex acceptedActions in a response flagged binary".into());
+    }
+    Ok(kaspa_rpc_core::RpcShieldedChainBlock {
+        hash: RpcHash::from_str(&item.hash)?,
+        blue_score: item.blue_score,
+        daa_score: item.daa_score,
+        coinbase_txid: RpcHash::from_str(&item.coinbase_txid)?,
+        coinbase_outputs: item
+            .coinbase_outputs
+            .iter()
+            .map(|o| {
+                let commitment = if o.commitment.is_empty() {
+                    None
+                } else if o.commitment.len() == 32 {
+                    Some(o.commitment.as_slice().try_into().expect("checked commitment length"))
+                } else {
+                    return Err(RpcError::from("shielded coinbase commitment must be 32 bytes"));
+                };
+                Ok(kaspa_rpc_core::RpcShieldedCoinbaseOutput {
+                    script_public_key: Vec::from_rpc_hex(&o.script_public_key)?,
+                    value: o.value,
+                    commitment,
+                })
+            })
+            .collect::<Result<Vec<_>, RpcError>>()?,
+        accepted_actions: item.accepted_actions_bin.clone(),
+        accepted_txids: item.accepted_txids.iter().map(|t| RpcHash::from_str(t)).collect::<Result<Vec<_>, _>>()?,
+        timestamp: item.timestamp,
+    })
+}
 
 try_from!(item: &protowire::GetShieldedSupplyRequestMessage, kaspa_rpc_core::GetShieldedSupplyRequest, {
     Self { block_hash: if item.block_hash.is_empty() { None } else { Some(RpcHash::from_str(&item.block_hash)?) } }
@@ -1377,6 +1492,143 @@ fn hash_from_bytes(bytes: &[u8]) -> RpcResult<RpcHash> {
 // ----------------------------------------------------------------------------
 
 // TODO: tests
+
+#[cfg(test)]
+mod shielded_action_encoding_tests {
+    use crate::protowire;
+    use kaspa_rpc_core::{GetShieldedBlocksResponse, RpcHash, RpcResult, RpcShieldedChainBlock};
+
+    /// A compact action record is 148 bytes (nullifier ‖ cmx ‖ epk ‖ enc[52]).
+    const RECORD: usize = 148;
+
+    fn sample(actions: Vec<Vec<u8>>) -> RpcShieldedChainBlock {
+        RpcShieldedChainBlock {
+            hash: RpcHash::from_bytes([7; 32]),
+            blue_score: 11,
+            daa_score: 12,
+            coinbase_txid: RpcHash::from_bytes([8; 32]),
+            coinbase_outputs: Vec::new(),
+            accepted_actions: actions,
+            accepted_txids: vec![RpcHash::from_bytes([9; 32])],
+            timestamp: 1700,
+        }
+    }
+
+    fn resp(blocks: Vec<RpcShieldedChainBlock>, binary: bool) -> GetShieldedBlocksResponse {
+        GetShieldedBlocksResponse { blocks, reorged: false, sink_blue_score: 5, actions_are_binary: binary }
+    }
+
+    /// The reason `acceptedActionsBin` is field 9 and not a retyping of field 6.
+    ///
+    /// `string` and `bytes` are the same protobuf wire type, so a new client reading an old
+    /// node's field 6 as bytes would "succeed" and hand the hex TEXT to the note decoder.
+    /// Every length check in the tree is `len % 148 == 0`, and the hex of one record is 296
+    /// bytes — an exact multiple. So the page would parse as twice as many perfectly
+    /// well-formed, entirely fabricated actions, with nothing anywhere returning an error.
+    /// This test exists so that arithmetic is written down rather than rediscovered.
+    #[test]
+    fn hex_of_a_record_passes_the_record_length_check_and_is_why_the_field_is_new() {
+        let hex_len = RECORD * 2;
+        assert_eq!(hex_len % RECORD, 0, "hex of a record is NOT a record multiple - re-examine the field choice");
+        assert_eq!(hex_len / RECORD, 2, "hex of one record looks like exactly two records");
+    }
+
+    /// Raw records survive the round trip byte for byte, and land in the binary field.
+    #[test]
+    fn binary_actions_round_trip_and_use_the_binary_field() {
+        let actions = vec![vec![0xABu8; RECORD], vec![0x5Cu8; RECORD * 3]];
+        let core = resp(vec![sample(actions.clone())], true);
+        let wire: protowire::GetShieldedBlocksResponseMessage = Ok(&core).into();
+        assert!(wire.actions_are_binary);
+        assert!(wire.blocks[0].accepted_actions.is_empty(), "hex field must stay empty when binary is used");
+        assert_eq!(wire.blocks[0].accepted_actions_bin, actions);
+        let back: RpcResult<GetShieldedBlocksResponse> = (&wire).try_into();
+        assert_eq!(back.unwrap().blocks[0].accepted_actions, actions);
+    }
+
+    /// The hex path is untouched: an old client asking the old way gets exactly what it got.
+    #[test]
+    fn hex_actions_round_trip_unchanged_and_leave_the_binary_field_empty() {
+        let actions = vec![vec![0x11u8; RECORD]];
+        let core = resp(vec![sample(actions.clone())], false);
+        let wire: protowire::GetShieldedBlocksResponseMessage = Ok(&core).into();
+        assert!(!wire.actions_are_binary);
+        assert!(wire.blocks[0].accepted_actions_bin.is_empty());
+        assert_eq!(wire.blocks[0].accepted_actions, vec![faster_hex::hex_string(&actions[0])]);
+        let back: RpcResult<GetShieldedBlocksResponse> = (&wire).try_into();
+        assert_eq!(back.unwrap().blocks[0].accepted_actions, actions);
+    }
+
+    /// A block with no shielded activity leaves BOTH fields empty, which is precisely why
+    /// the encoding is announced by a flag instead of inferred from which field is empty.
+    /// Both readings must return an empty action list rather than an error.
+    #[test]
+    fn a_block_with_no_actions_is_read_the_same_either_way() {
+        for binary in [false, true] {
+            let core = resp(vec![sample(Vec::new())], binary);
+            let wire: protowire::GetShieldedBlocksResponseMessage = Ok(&core).into();
+            assert!(wire.blocks[0].accepted_actions.is_empty() && wire.blocks[0].accepted_actions_bin.is_empty());
+            let back: RpcResult<GetShieldedBlocksResponse> = (&wire).try_into();
+            assert!(back.unwrap().blocks[0].accepted_actions.is_empty());
+        }
+    }
+
+    /// A node and a client that disagree must fail LOUDLY. Silence here is the dangerous
+    /// outcome: a page read with the wrong field yields blocks whose actions are empty,
+    /// which ingests as "these blocks contained no notes" and loses money with no error.
+    #[test]
+    fn a_mixed_pair_errors_instead_of_reading_an_empty_action_list() {
+        // Node sent raw records but the response claims hex.
+        let mut wire: protowire::GetShieldedBlocksResponseMessage = Ok(&resp(vec![sample(vec![vec![1u8; RECORD]])], true)).into();
+        wire.actions_are_binary = false;
+        let back: RpcResult<GetShieldedBlocksResponse> = (&wire).try_into();
+        assert!(back.is_err(), "raw records read as hex must error, not silently yield no actions");
+
+        // Node sent hex but the response claims raw.
+        let mut wire: protowire::GetShieldedBlocksResponseMessage = Ok(&resp(vec![sample(vec![vec![1u8; RECORD]])], false)).into();
+        wire.actions_are_binary = true;
+        let back: RpcResult<GetShieldedBlocksResponse> = (&wire).try_into();
+        assert!(back.is_err(), "hex records read as raw must error, not silently yield no actions");
+    }
+
+    /// An old node answers a new client's opt-in by ignoring it: no binary field, flag
+    /// false. The new client must follow the node's answer, not its own request.
+    #[test]
+    fn an_old_node_ignoring_the_opt_in_is_still_read_correctly() {
+        let actions = vec![vec![0x33u8; RECORD]];
+        // Exactly what an old node produces: hex populated, new fields at their defaults.
+        let wire: protowire::GetShieldedBlocksResponseMessage = Ok(&resp(vec![sample(actions.clone())], false)).into();
+        assert!(!wire.actions_are_binary);
+        let back: RpcResult<GetShieldedBlocksResponse> = (&wire).try_into();
+        assert_eq!(back.unwrap().blocks[0].accepted_actions, actions);
+    }
+
+    /// The request opt-in survives the borsh/wRPC version word, and a pre-v3 request
+    /// deserialises as "hex please" rather than failing or defaulting to binary.
+    #[test]
+    fn request_opt_in_is_append_only_across_the_version_word() {
+        use kaspa_rpc_core::GetShieldedBlocksRequest;
+        use workflow_serializer::prelude::{Deserializer, Serializer};
+        let req = GetShieldedBlocksRequest {
+            start_hash: RpcHash::from_bytes([4; 32]),
+            limit: 900,
+            metadata_only: false,
+            binary_actions: true,
+        };
+        let mut buf = Vec::new();
+        req.serialize(&mut buf).unwrap();
+        let back = GetShieldedBlocksRequest::deserialize(&mut &buf[..]).unwrap();
+        assert!(back.binary_actions);
+        assert_eq!(back.limit, 900);
+
+        // A v2 blob: same fields, version word 2, no trailing bool.
+        let mut v2 = Vec::new();
+        v2.extend_from_slice(&2u16.to_le_bytes());
+        v2.extend_from_slice(&buf[2..buf.len() - 1]);
+        let back = GetShieldedBlocksRequest::deserialize(&mut &v2[..]).unwrap();
+        assert!(!back.binary_actions, "a pre-v3 caller must be answered in hex");
+    }
+}
 
 #[cfg(test)]
 mod tests {

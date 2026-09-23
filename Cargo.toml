@@ -397,23 +397,54 @@ overflow-checks = true
 # are audited constant-time field/curve arithmetic that relies on wrapping ops, so
 # the workspace's `overflow-checks = true` buys no safety there and taxes every
 # multiplication. Build them for speed: full opt, one codegen unit, no checks.
-[profile.release.package.halo2_proofs]
+#
+# ⚠️ NAME THESE AS CARGO SEES THEM, NOT AS WE IMPORT THEM. The Zakura port renamed
+# every one of these packages (`orchard` -> `zakura-orchard` and so on) while the
+# `package = "..."` aliases kept the old names at the use site. A profile override
+# keys on the PACKAGE name, so all four sections here silently stopped matching
+# anything on 2026-08-30 and every curve and proving crate has been built at the
+# workspace default ever since — with the overflow checks this comment exists to
+# turn off. Cargo says so on every build, once per section:
+#
+#     warning: profile package spec `pasta_curves` in profile `release`
+#              did not match any packages
+#
+# which is easy to read past among the other build noise. If you add a crate here,
+# check `grep '^name = ' Cargo.lock` first.
+[profile.release.package.zakura-halo2-proofs]
 opt-level = 3
 codegen-units = 1
 overflow-checks = false
 
 
-[profile.release.package.halo2_gadgets]
+[profile.release.package.zakura-halo2-gadgets]
 opt-level = 3
 codegen-units = 1
 overflow-checks = false
 
-[profile.release.package.pasta_curves]
+[profile.release.package.zakura-pasta-curves]
 opt-level = 3
 codegen-units = 1
 overflow-checks = false
 
-[profile.release.package.orchard]
+[profile.release.package.zakura-orchard]
+opt-level = 3
+codegen-units = 1
+overflow-checks = false
+
+# Sinsemilla is the note-commitment tree hash — the shared chain tree's whole cost —
+# and reddsa signs every spend. Same arithmetic, same reasoning, never listed.
+[profile.release.package.zakura-sinsemilla]
+opt-level = 3
+codegen-units = 1
+overflow-checks = false
+
+[profile.release.package.zakura-reddsa]
+opt-level = 3
+codegen-units = 1
+overflow-checks = false
+
+[profile.release.package.zakura-halo2-poseidon]
 opt-level = 3
 codegen-units = 1
 overflow-checks = false

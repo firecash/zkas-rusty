@@ -17,6 +17,13 @@
 //! `incrementalmerkletree` and will pin them to audited commits before launch
 //! (PLAN §5, non-negotiable #4).
 
+/// The Pasta curve implementation this crate's note arithmetic is defined over.
+///
+/// Re-exported so callers can name `pallas::Point` — e.g. to hand the scan path
+/// ephemeral keys they already decompressed — without taking their own dependency
+/// and risking a second, incompatible version of the curve in the tree.
+pub use pasta_curves;
+
 pub mod account;
 pub mod attestation;
 pub mod bundle;

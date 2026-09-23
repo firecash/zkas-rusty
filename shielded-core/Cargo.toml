@@ -42,6 +42,9 @@ group = "0.14"
 pasta_curves = { package = "zakura-pasta-curves", version = "=1.0.1" }
 # Shielded-transaction sighash.
 blake2b_simd = { workspace = true }
+# Insertion-ordered spent-nullifier set: chain order is what makes one wallet's set a
+# prefix of another's, and therefore shareable. One copy of each key, unlike Vec+HashSet.
+indexmap = { workspace = true }
 chacha20 = "0.9"
 # Trial decryption is ~99% of a scan and is per-action independent, so a page batch
 # is split across cores. Needed by the library now, not only the benches.

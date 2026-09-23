@@ -29,6 +29,13 @@ kaspa-core.workspace = true
 kaspa-database.workspace = true
 faster-hex.workspace = true
 kaspa-grpc-server.workspace = true
+# `zkas-page-bench` only: protobuf shapes and a gRPC client, so the page wire format
+# can be timed in the same process that reads the archive.
+kaspa-grpc-core.workspace = true
+kaspa-grpc-client.workspace = true
+prost.workspace = true
+# Same gzip tonic applies to every gRPC payload, so the bench can price it.
+flate2.workspace = true
 kaspa-hashes.workspace = true
 kaspa-shielded-core.workspace = true
 bincode.workspace = true

@@ -128,6 +128,51 @@ pub struct RpcCoreService {
 
 const RPC_CORE: &str = "rpc-core";
 
+/// Blocks per `spawn_blocking` call when serving a `GetShieldedBlocks` page.
+/// `ZKAS_SHIELDED_PAGE_CHUNK`, read once; 0 or unset means the whole page in one call.
+///
+/// **The default is deliberately "do not chunk", and that is a measured choice, not an
+/// omission.** What a page actually costs on the blocking thread, measured on the live
+/// mainnet archive at 1,000 blocks per page (`zkas-page-bench --db`):
+///
+/// ```text
+/// chain index enumerate   4.1 ms
+/// rocksdb get_pinned      7.4 ms
+/// bincode decode          0.9 ms
+/// build the RPC model     0.2 ms
+///                        -------
+/// one dispatch holds a blocking thread for ~12.6 ms
+/// ```
+///
+/// Chunking at 50-100 blocks would turn one dispatch into 10-20 and buy nothing:
+///
+/// * It does not shorten how long the consensus session is held. The session is the
+///   PRUNING lock — `ConsensusManager::session()` takes `session_lock.read_owned()` and
+///   the pruning processor takes `pruning_lock.blocking_write()` on that same
+///   `SessionLock` — and the guard here is created once at the top of the call and lives
+///   until the call returns. `session.clone()` clones an `Arc`'d read guard, so a chunk
+///   boundary releases nothing. Whatever the chunk size, the pruning lock is held for the
+///   whole page. (That is also what makes a chunk boundary safe: no pruning can delete a
+///   record the enumeration already committed to, mid-page, in either shape.)
+/// * It does not protect against a read racing a write. Scan records are written in the
+///   block-commit `WriteBatch` and never rewritten or reorg-reverted, so a `get` returns a
+///   whole record or none. The `unexpected end of file` that froze wallets on 2026-08-07
+///   was not a race — it was `e49ce61` adding `coinbase_commitments` mid-struct to a
+///   positional bincode layout, diagnosed and fixed by `5d94f7f` an hour after the
+///   one-dispatch change landed. The one-dispatch change was never reverted; it is the
+///   code this comment sits in.
+/// * It costs. The ~1.75 ms/block that made the old per-block loop take 1.7 s per page was
+///   blocking-pool QUEUEING under load, not a fixed per-call fee. Re-introducing 10-20
+///   dispatches per page re-introduces a share of exactly that.
+///
+/// So the knob exists as a control, not as a recommendation: if the blocking pool is ever
+/// saturated enough that a 12.6 ms occupancy starves something more urgent, this bounds it
+/// without a rebuild. Leave it unset otherwise.
+fn shielded_page_chunk() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("ZKAS_SHIELDED_PAGE_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+}
+
 impl RpcCoreService {
     pub const IDENT: &'static str = "rpc-core-service";
 
@@ -809,6 +854,7 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         _connection: Option<&DynRpcConnection>,
         request: GetShieldedBlocksRequest,
     ) -> RpcResult<GetShieldedBlocksResponse> {
+
         const DEFAULT_LIMIT: usize = 500;
         const MAX_LIMIT: usize = 2000;
         let limit = match request.limit as usize {
@@ -846,10 +892,16 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         // many times the runtime is asked to schedule it.
         let metadata_only = request.metadata_only;
         let hashes: Vec<RpcHash> = added.iter().take(limit).copied().collect();
-        let blocks = if reorged {
-            Vec::new()
-        } else {
-            session
+        // How many blocks one `spawn_blocking` handles. 0 (the default) means the whole
+        // page in one call, which is what the measurement says to do — see
+        // `shielded_page_chunk()` for the numbers and for what this knob is actually for.
+        let chunk = shielded_page_chunk();
+        let step = if chunk == 0 { hashes.len().max(1) } else { chunk };
+        let mut blocks: Vec<RpcShieldedChainBlock> = Vec::with_capacity(hashes.len());
+        if !reorged {
+            for part in hashes.chunks(step) {
+            let hashes: Vec<RpcHash> = part.to_vec();
+            let part_blocks = session
                 .clone()
                 .spawn_blocking(move |c| -> kaspa_consensus_core::errors::consensus::ConsensusResult<Vec<RpcShieldedChainBlock>> {
                     let mut out = Vec::with_capacity(hashes.len());
@@ -908,9 +960,19 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
                     }
                     Ok(out)
                 })
-                .await?
-        };
-        Ok(GetShieldedBlocksResponse { blocks, reorged, sink_blue_score })
+                .await?;
+            blocks.extend(part_blocks);
+            }
+        }
+        Ok(GetShieldedBlocksResponse {
+            blocks,
+            reorged,
+            sink_blue_score,
+            // Echo the caller's choice rather than deciding unilaterally: a node that
+            // switched encodings on its own would be changing what every existing client
+            // parses, and the two forms are not distinguishable by inspection.
+            actions_are_binary: request.binary_actions,
+        })
     }
 
     /// The turnstile totals as of a chain block (default: the sink).

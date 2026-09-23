@@ -47,6 +47,9 @@ clap.workspace = true
 # CSPRNG for fresh wallet seeds + message signing.
 rand.workspace = true
 rand10 = { package = "rand", version = "0.10" }
+# Must match shielded-core's nullifier-set digest hash byte for byte — the daemon
+# recomputes prefix digests to verify a wallet may borrow the shared set.
+blake2b_simd = { workspace = true }
 # Seed-file encryption at rest (XChaCha20-Poly1305 with an Argon2-derived key).
 argon2.workspace = true
 chacha20poly1305.workspace = true

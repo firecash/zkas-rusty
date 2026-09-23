@@ -838,7 +838,7 @@ async fn sanity_test() {
                     let response = rpc_client
                         .get_shielded_blocks_call(
                             None,
-                            GetShieldedBlocksRequest { start_hash: SIMNET_GENESIS.hash, limit: 0, metadata_only: false },
+                            GetShieldedBlocksRequest { start_hash: SIMNET_GENESIS.hash, limit: 0, metadata_only: false, binary_actions: true },
                         )
                         .await
                         .unwrap();

@@ -257,6 +257,17 @@ pub mod scan {
         agree_scalar: Option<&pallas::Scalar>,
         actions: &[CompactActionRecord],
     ) -> Vec<ReceivedNote> {
+        scan_compact_auto_cached(prepared, agree_scalar, actions, None)
+    }
+
+    /// As [`scan_compact_auto`], with ephemeral keys the caller already decompressed
+    /// once for the whole cohort — see [`scan_compact_gpu_cached`].
+    pub fn scan_compact_auto_cached(
+        prepared: &PreparedIncomingViewingKey,
+        agree_scalar: Option<&pallas::Scalar>,
+        actions: &[CompactActionRecord],
+        epks: Option<&[Option<pallas::Point>]>,
+    ) -> Vec<ReceivedNote> {
         // Below this, the device is not worth asking — measured against the code that
         // would otherwise run, which is the correction that matters here.
         //
@@ -300,7 +311,7 @@ pub mod scan {
 
         if actions.len() >= GPU_MIN_BATCH {
             if let (Some(f), Some(sc)) = (GPU_AGREE.get(), agree_scalar) {
-                if let Some(found) = scan_compact_gpu(prepared, actions, |epks| f(sc, epks)) {
+                if let Some(found) = scan_compact_gpu_cached(prepared, actions, epks, |e| f(sc, e)) {
                     return found;
                 }
             }
@@ -406,9 +417,48 @@ pub mod scan {
     /// second implementation of consensus-adjacent cryptography.
     ///
     /// Returns `None` if the device could not answer, and the caller uses the CPU path.
+    /// Decompress one action's ephemeral key: recover y from x by modular square root.
+    ///
+    /// Exposed so a caller that sees a page before its wallets do can pay this once for
+    /// the whole cohort — it depends only on the action's bytes, not on any viewing key.
+    /// `None` for a non-canonical encoding, which can never yield a note.
+    pub fn decompress_epk(bytes: &[u8; 32]) -> Option<pallas::Point> {
+        Option::<pallas::Affine>::from(pallas::Affine::from_bytes(bytes)).map(pallas::Point::from)
+    }
+
+    /// As [`scan_compact_gpu`], but reusing ephemeral keys somebody already decompressed.
+    ///
+    /// Decompression is a modular square root over bytes that are the same for every
+    /// wallet, so W wallets scanning one page were paying for the identical curve work W
+    /// times. Measured live: ~9 wallets ride each fetched page (page-cache counters
+    /// 5,595 hit / 1,404 rode-a-peer / 1,024 fetched), against 5-8 us/action to
+    /// decompress — so this was ~8x of pure duplicated work on the hot path, and it is
+    /// larger than the GPU agreement step that follows it.
+    ///
+    /// The caller owns the cache because the natural place for it is the decoded page,
+    /// which the whole cohort already shares. Passing `None` decompresses here exactly
+    /// as before, so nothing depends on the cache existing.
+    pub fn scan_compact_gpu_cached(
+        prepared: &PreparedIncomingViewingKey,
+        actions: &[CompactActionRecord],
+        epks: Option<&[Option<pallas::Point>]>,
+        agree: impl FnOnce(&[Option<pallas::Point>]) -> Option<Vec<Option<pallas::Affine>>>,
+    ) -> Option<Vec<ReceivedNote>> {
+        scan_compact_gpu_inner(prepared, actions, epks, agree)
+    }
+
     pub fn scan_compact_gpu(
         prepared: &PreparedIncomingViewingKey,
         actions: &[CompactActionRecord],
+        agree: impl FnOnce(&[Option<pallas::Point>]) -> Option<Vec<Option<pallas::Affine>>>,
+    ) -> Option<Vec<ReceivedNote>> {
+        scan_compact_gpu_inner(prepared, actions, None, agree)
+    }
+
+    fn scan_compact_gpu_inner(
+        prepared: &PreparedIncomingViewingKey,
+        actions: &[CompactActionRecord],
+        cached_epks: Option<&[Option<pallas::Point>]>,
         agree: impl FnOnce(&[Option<pallas::Point>]) -> Option<Vec<Option<pallas::Affine>>>,
     ) -> Option<Vec<ReceivedNote>> {
         use blake2b_simd::Params;
@@ -436,14 +486,23 @@ pub mod scan {
             Option::<pallas::Affine>::from(pallas::Affine::from_bytes(&r.ephemeral_key)).map(pallas::Point::from)
         };
         const DECOMPRESS_PAR_MIN: usize = 512;
-        let epks: Vec<Option<pallas::Point>> = if actions.len() >= DECOMPRESS_PAR_MIN {
-            use rayon::prelude::*;
-            actions.par_iter().map(decompress).collect()
-        } else {
-            actions.iter().map(decompress).collect()
+        // A cache of the wrong length is a cache for some other page; ignore it rather
+        // than index into it. Falling back costs time and can never cost a note.
+        let owned_epks: Option<Vec<Option<pallas::Point>>> = match cached_epks {
+            Some(e) if e.len() == actions.len() => None,
+            _ if actions.len() >= DECOMPRESS_PAR_MIN => {
+                use rayon::prelude::*;
+                Some(actions.par_iter().map(decompress).collect())
+            }
+            _ => Some(actions.iter().map(decompress).collect()),
+        };
+        let epks: &[Option<pallas::Point>] = match (&owned_epks, cached_epks) {
+            (Some(v), _) => v,
+            (None, Some(e)) => e,
+            (None, None) => unreachable!("owned_epks is Some whenever the cache is unusable"),
         };
 
-        let secrets = agree(&epks)?;
+        let secrets = agree(epks)?;
         if secrets.len() != actions.len() {
             return None;
         }
@@ -523,7 +582,7 @@ pub mod scan {
 
 pub use scan::{
     CompactActionRecord, ReceivedNote, address_bytes_from_seed, gpu_enabled, install_gpu_agree, ivk_agreement_scalar, ivk_from_seed,
-    scan_bundle, scan_bundle_prepared, scan_compact, scan_compact_auto, scan_compact_cpu, scan_compact_gpu,
+    decompress_epk, scan_bundle, scan_bundle_prepared, scan_compact, scan_compact_auto, scan_compact_auto_cached, scan_compact_cpu, scan_compact_gpu, scan_compact_gpu_cached,
     scan_compact_prepared, trim_memo,
 };
 

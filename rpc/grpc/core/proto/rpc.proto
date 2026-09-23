@@ -273,6 +273,10 @@ message GetShieldedBlocksRequestMessage {
   string startHash = 1;                 // resume cursor (exclusive); must be a chain block
   uint64 limit = 2;                     // max chain blocks returned (0 = server default)
   bool metadataOnly = 3;                // return headers/timestamps only
+  // Opt in to acceptedActionsBin (field 9 below) instead of the hex acceptedActions.
+  // A caller that does not set this gets the hex form, so an old client is unaffected
+  // and a new node never silently changes what an old client is parsing.
+  bool binaryActions = 4;
 }
 
 message RpcShieldedCoinbaseOutput {
@@ -290,12 +294,33 @@ message RpcShieldedChainBlock {
   repeated string acceptedActions = 6;  // hex compact shielded action records per accepted tx, applied order
   repeated string acceptedTxids = 7;    // txid per accepted tx (parallel to acceptedActions)
   uint64 timestamp = 8;                 // chain block header timestamp (ms since epoch)
+  // The same records as acceptedActions, raw. A NEW FIELD NUMBER rather than changing
+  // field 6 from `string` to `bytes`, which would look tempting because both are
+  // protobuf wire type 2 and would therefore decode "successfully" across a version gap.
+  //
+  // It must never be field 6. A compact record is 148 bytes; its hex is 296; and
+  // 296 % 148 == 0. So a new client reading an OLD node's hex as raw bytes passes every
+  // length check in the tree and yields exactly TWO well-formed-looking garbage records
+  // per real action — silent note corruption, the one failure mode that presents to a
+  // user as vanished coins. Separate field numbers make that arithmetic unreachable:
+  // a node that did not write field 9 leaves it empty, and emptiness is disambiguated
+  // by actionsAreBinary on the response, never guessed from a length.
+  //
+  // Exactly one of field 6 and field 9 is populated for any given response; which one
+  // is stated by GetShieldedBlocksResponseMessage.actionsAreBinary.
+  repeated bytes acceptedActionsBin = 9;
 }
 
 message GetShieldedBlocksResponseMessage {
   repeated RpcShieldedChainBlock blocks = 1;
   bool reorged = 2;                     // true: startHash reorged out; caller must rescan
   uint64 sinkBlueScore = 3;             // lets the wallet hold back a maturity margin
+  // Which action field the blocks above carry: false (the default, and what every node
+  // built before this field says) means the hex acceptedActions; true means the raw
+  // acceptedActionsBin. Stated explicitly rather than inferred from which field happens
+  // to be non-empty, because a block with no shielded activity leaves BOTH empty and an
+  // inference would have to guess. A node only sets this true when the request asked.
+  bool actionsAreBinary = 4;
   RPCError error = 1000;
 }
 

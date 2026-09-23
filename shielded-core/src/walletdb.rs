@@ -42,6 +42,7 @@ use orchard::{
     tree::{MerkleHashOrchard, MerklePath},
     value::NoteValue,
 };
+use indexmap::IndexSet;
 use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -51,7 +52,7 @@ use crate::bundle::ShieldedBundle;
 use crate::coinbase::{CoinbaseNoteDesc, coinbase_note_commitment};
 use crate::tree::{FrontierState, GlobalTree, TREE_DEPTH};
 use crate::wallet::scan::{
-    CompactActionRecord, ReceivedNote, reconstruct_action, scan_bundle_prepared, scan_compact_auto, scan_compact_prepared, trim_memo,
+    CompactActionRecord, ReceivedNote, reconstruct_action, scan_bundle_prepared, scan_compact_auto, scan_compact_auto_cached, scan_compact_prepared, trim_memo,
 };
 
 /// A note the wallet owns and can spend. The membership witness is **not** held
@@ -301,7 +302,58 @@ pub struct WalletDb {
     /// transparent inputs, so nothing conflicts there — observed live when two
     /// parallel DAG blocks both carried the same tx) double-counts its outputs
     /// and shifts every later leaf position off the consensus tree.
-    spent_nullifiers: HashSet<[u8; 32]>,
+    ///
+    /// **Insertion-ordered** (`IndexSet`, one copy of each key plus a compact index —
+    /// not a `Vec` beside a `HashSet`). Insertion order here IS chain order, because the
+    /// only writer is [`Self::insert_nullifier`] on the ingest path, which walks blocks,
+    /// then transactions, then actions in consensus order. That ordering is what makes
+    /// one wallet's set a *prefix* of another's, and therefore what makes the set
+    /// shareable — see [`Self::nf_prefix`].
+    spent_nullifiers: IndexSet<[u8; 32]>,
+    /// Running XOR-of-hash digest of `spent_nullifiers`, maintained on every insert.
+    ///
+    /// Order-independent by construction (XOR is commutative), which is the point: two
+    /// wallets that saw the same nullifiers in different orders still agree. It is the
+    /// *identity check* a wallet uses to prove a borrowed nullifier prefix is the set it
+    /// actually built — see [`Self::install_shared_nullifiers`].
+    nf_digest: [u8; 32],
+    /// The running digest snapshotted every [`NF_DIGEST_STRIDE`] insertions, so the
+    /// digest of an arbitrary prefix costs one lookup plus `< STRIDE` hashes instead of a
+    /// fold over millions of entries. 32 B per 4096 nullifiers (39 KB at the live
+    /// 5.0 M) — the whole reason a borrowing wallet's load stays cheap.
+    nf_marks: Vec<[u8; 32]>,
+    /// Writer-side switch: when `Some(n)`, a shared artefact has been *verified* to hold
+    /// this wallet's first `n` nullifiers, so [`Self::to_checkpoint`] writes a reference
+    /// instead of the bytes. `None` (the default) writes the full set, exactly as before.
+    /// Never persisted — it describes the daemon's situation, not the wallet's state.
+    nf_share: Option<u64>,
+    /// Loader-side marker: this checkpoint referenced a shared nullifier set that has not
+    /// been supplied yet. `(count, digest)`.
+    ///
+    /// While it is `Some`, the wallet's drop rule is **missing data** and every ingest
+    /// path refuses to run (see [`Self::nullifiers_resolved`]). Ingesting with an empty
+    /// set would keep bundles consensus dropped, append leaves that are not on the chain
+    /// and silently fork the wallet's tree — the exact failure the shared set exists to
+    /// avoid. Refusing to advance is recoverable; advancing wrongly is not.
+    nf_pending: Option<(u64, [u8; 32])>,
+    /// Whether `spent_nullifiers` is in true CHAIN order, as opposed to whatever order a
+    /// pre-v10 checkpoint happened to serialise its `HashSet` in.
+    ///
+    /// This matters for exactly one thing, and it is the thing the whole saving rests
+    /// on: the shared artefact's first `n` nullifiers are a borrowing wallet's own set
+    /// **only if the shared artefact is in chain order**. A set built by ingest is; a set
+    /// restored from a v3-v9 blob is not, because the writer iterated a `HashSet`
+    /// (the sort that used to impose an order was removed for costing 21.5% of the
+    /// daemon's CPU, and it was a *sorted* order, not a chain one, so it would not have
+    /// helped either).
+    ///
+    /// The digest check fails closed without this flag — an out-of-order artefact simply
+    /// never matches anyone and nothing is shared. The flag exists so the daemon can say
+    /// WHY instead of silently saving nothing: after this ships, the shared chain tree
+    /// must be rebuilt once (one keyless pass from genesis) before any wallet can shed
+    /// its copy. Individual wallets need no rebuild: their side of the comparison is the
+    /// whole-set digest, which is order-independent.
+    nf_ordered: bool,
     /// Outgoing viewing key (external scope) — recovers the recipient/amount/memo
     /// of our own past sends *if* they were built with it (`recoverable history`).
     /// Derived from the FVK, so a watch-only wallet has it too.
@@ -736,7 +788,12 @@ impl WalletDb {
             witness_budget: MAX_LIVE_WITNESSES,
             lag_tree: CommitmentTree::empty(),
             witnessed_upto: 0,
-            spent_nullifiers: HashSet::new(),
+            spent_nullifiers: IndexSet::new(),
+            nf_digest: [0u8; 32],
+            nf_marks: Vec::new(),
+            nf_share: None,
+            nf_pending: None,
+            nf_ordered: true,
             ovk,
             history: Vec::new(),
             history_enabled: true,
@@ -784,7 +841,12 @@ impl WalletDb {
             witness_budget: MAX_LIVE_WITNESSES,
             lag_tree: CommitmentTree::empty(),
             witnessed_upto: 0,
-            spent_nullifiers: HashSet::new(),
+            spent_nullifiers: IndexSet::new(),
+            nf_digest: [0u8; 32],
+            nf_marks: Vec::new(),
+            nf_share: None,
+            nf_pending: None,
+            nf_ordered: true,
             ovk,
             history: Vec::new(),
             history_enabled: true,
@@ -947,6 +1009,15 @@ impl WalletDb {
     /// records [`HistoryEntry`] rows (with `meta: None` no history is written —
     /// the wallet still syncs correctly against a pre-v2 node).
     pub fn ingest_block_with_meta(&mut self, coinbase: &[(CoinbaseNoteDesc, u64)], txs: &[&ShieldedBundle], meta: Option<&BlockMeta>) {
+        // The drop rule is missing its data: this checkpoint referenced a shared
+        // nullifier set that has not been supplied (see `install_shared_nullifiers`).
+        // Ingesting now would keep bundles consensus DROPPED, append leaves that are not
+        // on the chain, and fork this wallet's tree from position `size` onward —
+        // silently, because nothing downstream re-derives the drop decision. Refusing is
+        // recoverable (the daemon parks the wallet and retries); advancing is not.
+        if self.nf_pending.is_some() {
+            return;
+        }
         if let Some(m) = meta {
             self.last_daa = self.last_daa.max(m.daa_score);
         }
@@ -994,6 +1065,15 @@ impl WalletDb {
         txs: &[&ShieldedBundle],
         meta: Option<&BlockMeta>,
     ) {
+        // The drop rule is missing its data: this checkpoint referenced a shared
+        // nullifier set that has not been supplied (see `install_shared_nullifiers`).
+        // Ingesting now would keep bundles consensus DROPPED, append leaves that are not
+        // on the chain, and fork this wallet's tree from position `size` onward —
+        // silently, because nothing downstream re-derives the drop decision. Refusing is
+        // recoverable (the daemon parks the wallet and retries); advancing is not.
+        if self.nf_pending.is_some() {
+            return;
+        }
         if let Some(m) = meta {
             self.last_daa = self.last_daa.max(m.daa_score);
         }
@@ -1034,7 +1114,7 @@ impl WalletDb {
                 self.notes.retain(|n| n.nullifier != action.nullifier);
                 self.pending_spends.retain(|p| p.note.nullifier != action.nullifier);
                 self.prune_pending_change();
-                self.spent_nullifiers.insert(action.nullifier);
+                self.insert_nullifier(action.nullifier);
 
                 let Some(cmx) = Option::<ExtractedNoteCommitment>::from(ExtractedNoteCommitment::from_bytes(&action.cmx)) else {
                     continue;
@@ -1066,6 +1146,15 @@ impl WalletDb {
         txs: &[Vec<CompactActionRecord>],
         meta: Option<&BlockMeta>,
     ) {
+        // The drop rule is missing its data: this checkpoint referenced a shared
+        // nullifier set that has not been supplied (see `install_shared_nullifiers`).
+        // Ingesting now would keep bundles consensus DROPPED, append leaves that are not
+        // on the chain, and fork this wallet's tree from position `size` onward —
+        // silently, because nothing downstream re-derives the drop decision. Refusing is
+        // recoverable (the daemon parks the wallet and retries); advancing is not.
+        if self.nf_pending.is_some() {
+            return;
+        }
         if let Some(m) = meta {
             self.last_daa = self.last_daa.max(m.daa_score);
         }
@@ -1094,6 +1183,15 @@ impl WalletDb {
         txs: &[Vec<CompactActionRecord>],
         meta: Option<&BlockMeta>,
     ) {
+        // The drop rule is missing its data: this checkpoint referenced a shared
+        // nullifier set that has not been supplied (see `install_shared_nullifiers`).
+        // Ingesting now would keep bundles consensus DROPPED, append leaves that are not
+        // on the chain, and fork this wallet's tree from position `size` onward —
+        // silently, because nothing downstream re-derives the drop decision. Refusing is
+        // recoverable (the daemon parks the wallet and retries); advancing is not.
+        if self.nf_pending.is_some() {
+            return;
+        }
         if let Some(m) = meta {
             self.last_daa = self.last_daa.max(m.daa_score);
         }
@@ -1152,7 +1250,7 @@ impl WalletDb {
                 self.notes.retain(|n| n.nullifier != rec.nullifier);
                 self.pending_spends.retain(|p| p.note.nullifier != rec.nullifier);
                 self.prune_pending_change();
-                self.spent_nullifiers.insert(rec.nullifier);
+                self.insert_nullifier(rec.nullifier);
 
                 let Some(cmx) = Option::<ExtractedNoteCommitment>::from(ExtractedNoteCommitment::from_bytes(&rec.cmx)) else {
                     continue;
@@ -2075,6 +2173,17 @@ impl WalletDb {
     /// [`Self::end_page`]. Purely an optimisation: anything not found is decrypted the
     /// old way, so a bug here can cost time but not notes.
     pub fn predecrypt_page(&mut self, all: &[CompactActionRecord]) {
+        self.predecrypt_page_cached(all, None)
+    }
+
+    /// As [`Self::predecrypt_page`], reusing the ephemeral keys the decoded page already
+    /// decompressed for the whole cohort. Decompression is key-independent, so without
+    /// this every wallet on a page repeats the identical modular square roots.
+    pub fn predecrypt_page_cached(
+        &mut self,
+        all: &[CompactActionRecord],
+        epks: Option<&[Option<pasta_curves::pallas::Point>]>,
+    ) {
         if self.leaves_only || all.is_empty() {
             return;
         }
@@ -2083,7 +2192,7 @@ impl WalletDb {
         // doing exactly as much work as before — telemetry that flatters the change it
         // is supposed to measure is worse than none, and I nearly reported it as a win.
         let t_dec = std::time::Instant::now();
-        let found = scan_compact_auto(&self.prepared_ivk, self.agree_scalar.as_ref(), all);
+        let found = scan_compact_auto_cached(&self.prepared_ivk, self.agree_scalar.as_ref(), all, epks);
         self.scan_cost.decrypt_ns += t_dec.elapsed().as_nanos();
         self.scan_cost.actions += all.len() as u64;
         let mut map: std::collections::HashMap<[u8; 32], Option<ReceivedNote>> = all.iter().map(|r| (r.nullifier, None)).collect();
@@ -2715,6 +2824,160 @@ impl WalletDb {
         Option::<Note>::from(Note::from_parts(addr, NoteValue::from_raw(value), rho, rseed, orchard::note::NoteVersion::V2))
     }
 
+    // -----------------------------------------------------------------------
+    // The spent-nullifier set: chain-global, shareable, and verifiable.
+    //
+    // Every wallet on a daemon derives this set from the same public chain with the
+    // same key-independent rule, so N wallets hold N copies of one object. Live
+    // measurement over 2,009 checkpoints: 103.6 GB of 245.7 GB (42.2%) is this set,
+    // against 218 MB (0.08%) of actual owned notes. The daemon already maintains one
+    // authoritative copy in the shared chain tree.
+    //
+    // Sharing it is only safe if a wallet can PROVE the copy it is handed is the copy
+    // it built. The three primitives below are that proof.
+    // -----------------------------------------------------------------------
+
+    /// Record a nullifier as spent, keeping the order log and the digest in step.
+    ///
+    /// The single insertion point on purpose: a raw `spent_nullifiers.insert` would
+    /// leave `nf_digest` describing a set the wallet no longer has, and the digest is
+    /// the only thing standing between a borrowing wallet and someone else's data.
+    fn insert_nullifier(&mut self, nf: [u8; 32]) {
+        if !self.spent_nullifiers.insert(nf) {
+            return; // already present — the set, and therefore the digest, is unchanged
+        }
+        xor_into(&mut self.nf_digest, &nf_leaf_hash(&nf));
+        if self.spent_nullifiers.len() % NF_DIGEST_STRIDE == 0 {
+            self.nf_marks.push(self.nf_digest);
+        }
+    }
+
+    /// `insert_nullifier`, for cross-crate tests that need to build a set by hand.
+    #[doc(hidden)]
+    pub fn insert_nullifier_for_tests(&mut self, nf: [u8; 32]) {
+        self.insert_nullifier(nf);
+    }
+
+    /// Is this wallet's nullifier log in chain order, and therefore shareable as a
+    /// prefix? See [`Self::nf_ordered`]. Always true for a set built by ingest.
+    pub fn nf_is_chain_ordered(&self) -> bool {
+        self.nf_ordered
+    }
+
+    /// How many nullifiers this wallet has recorded.
+    pub fn nf_len(&self) -> u64 {
+        self.spent_nullifiers.len() as u64
+    }
+
+    /// The order-independent digest of the whole set.
+    pub fn nf_digest(&self) -> [u8; 32] {
+        self.nf_digest
+    }
+
+    /// The digest of this wallet's **first `k`** nullifiers, in chain order.
+    ///
+    /// `None` when `k` exceeds what we hold. Costs one mark lookup plus fewer than
+    /// [`NF_DIGEST_STRIDE`] hashes, so the shared tree can answer this for every wallet
+    /// on the daemon in milliseconds rather than folding 5 M entries per wallet.
+    pub fn nf_prefix_digest(&self, k: u64) -> Option<[u8; 32]> {
+        let k = usize::try_from(k).ok()?;
+        if k > self.spent_nullifiers.len() {
+            return None;
+        }
+        let mark = k / NF_DIGEST_STRIDE;
+        let mut d = if mark == 0 { [0u8; 32] } else { *self.nf_marks.get(mark - 1)? };
+        for nf in self.spent_nullifiers.as_slice().get_range(mark * NF_DIGEST_STRIDE..k)?.iter() {
+            xor_into(&mut d, &nf_leaf_hash(nf));
+        }
+        Some(d)
+    }
+
+    /// This wallet's first `k` nullifiers in chain order — what a borrower is handed.
+    pub fn nf_prefix(&self, k: u64) -> Option<Vec<[u8; 32]>> {
+        let k = usize::try_from(k).ok()?;
+        Some(self.spent_nullifiers.as_slice().get_range(..k)?.iter().copied().collect())
+    }
+
+    /// Everything recorded at or after index `from`, in chain order — how the daemon
+    /// keeps its shared snapshot in step with the chain tree without re-copying the
+    /// whole set on every page.
+    pub fn nf_tail_from(&self, from: u64) -> impl Iterator<Item = [u8; 32]> + '_ {
+        let from = usize::try_from(from).unwrap_or(usize::MAX).min(self.spent_nullifiers.len());
+        self.spent_nullifiers.as_slice().get_range(from..).into_iter().flat_map(|s| s.iter().copied())
+    }
+
+    /// Ask the next [`Self::to_checkpoint`] to write a *reference* to the first `n`
+    /// shared nullifiers instead of their bytes.
+    ///
+    /// The caller must already have established that a shared artefact holds exactly
+    /// this wallet's first `n` nullifiers — i.e. that `nf_prefix_digest(n)` on both
+    /// sides agrees. `None` restores the self-contained form. Passing an `n` greater
+    /// than `nf_len()` is ignored rather than trusted.
+    pub fn set_nf_share(&mut self, n: Option<u64>) {
+        self.nf_share = n.filter(|n| *n <= self.nf_len());
+    }
+
+    /// `(count, digest)` a restored checkpoint is waiting to have supplied, or `None`
+    /// when this wallet's nullifier set is complete and its own.
+    pub fn nf_pending(&self) -> Option<(u64, [u8; 32])> {
+        self.nf_pending
+    }
+
+    /// Whether the drop rule has all its data. **Ingest must not run while this is
+    /// false** — the ingest paths enforce it, and the daemon must not advance the
+    /// wallet's cursor either.
+    pub fn nullifiers_resolved(&self) -> bool {
+        self.nf_pending.is_none()
+    }
+
+    /// Supply the shared nullifier prefix a restored checkpoint referenced.
+    ///
+    /// Returns `true` only if `src` reproduces the digest the checkpoint recorded. That
+    /// equality is the whole safety argument: the digest was computed by THIS wallet
+    /// over the set it had actually ingested, so matching it means `src[..count]` is
+    /// that same set, element for element — not merely a set of the same size, and not
+    /// a prefix of some other chain. A mismatch (truncated artefact, a different chain,
+    /// bit-rot, a wallet whose view starts above the shared base and is therefore not a
+    /// prefix at all) leaves the wallet unresolved and still refusing to ingest, which
+    /// is the fallback the caller then acts on.
+    pub fn install_shared_nullifiers(&mut self, src: &[[u8; 32]]) -> bool {
+        let Some((count, want)) = self.nf_pending else { return true };
+        let Ok(count_usize) = usize::try_from(count) else { return false };
+        let Some(prefix) = src.get(..count_usize) else { return false };
+        let mut d = [0u8; 32];
+        let mut marks = Vec::with_capacity(count_usize / NF_DIGEST_STRIDE);
+        let mut set = IndexSet::with_capacity(count_usize + self.spent_nullifiers.len());
+        for nf in prefix {
+            // A duplicate in `src` would make the XOR cancel and the count lie, so the
+            // set is rebuilt honestly rather than trusted to be duplicate-free.
+            if !set.insert(*nf) {
+                return false;
+            }
+            xor_into(&mut d, &nf_leaf_hash(nf));
+            if set.len() % NF_DIGEST_STRIDE == 0 {
+                marks.push(d);
+            }
+        }
+        if d != want {
+            return false;
+        }
+        // The local tail (anything this wallet recorded past the shared artefact's reach
+        // at write time) was persisted in full and is already in `spent_nullifiers`.
+        let tail: Vec<[u8; 32]> = self.spent_nullifiers.iter().copied().collect();
+        self.spent_nullifiers = set;
+        self.nf_digest = d;
+        self.nf_marks = marks;
+        self.nf_pending = None;
+        // What was just installed came from a chain-ordered artefact and was proven to be
+        // this wallet's set, so this wallet's log is now chain-ordered too — even if the
+        // blob it was restored from was not.
+        self.nf_ordered = true;
+        for nf in tail {
+            self.insert_nullifier(nf);
+        }
+        true
+    }
+
     /// Serialize the wallet's **scanned state** — the fast-sync base frontier, the
     /// post-checkpoint commitment stream, and the owned notes — into a compact,
     /// versioned blob. This is a checkpoint a caller (e.g. `zkas-walletd`)
@@ -2726,8 +2989,25 @@ impl WalletDb {
     /// Layout (little-endian): `[version:u8][base_size:u64]
     /// [base:0 | 1 (base_leaf:32)(n_ommers:u64)(ommer:32)*] [size:u64]
     /// [n_leaves:u64](leaf:32)* [n_notes:u64]
-    /// (position:u64, nullifier:32, recipient:43, value:u64, rho:32, rseed:32)*`.
+    /// (position:u64, nullifier:32, recipient:43, value:u64, rho:32, rseed:32)*`,
+    /// then the nullifier section (v10: optionally a reference — see below), the tip
+    /// frontier, and the length-prefixed v5-v8 sections.
     pub fn to_checkpoint(&self) -> Vec<u8> {
+        self.encode_checkpoint(self.nf_share)
+    }
+
+    /// [`Self::to_checkpoint`] with the shared-nullifier decision supplied by the caller
+    /// rather than read from `nf_share`.
+    ///
+    /// The daemon takes this decision per write, because it depends on the shared
+    /// artefact's state at that instant — not on anything the wallet knows. `None`
+    /// writes the fully self-contained form, which is always correct and always
+    /// readable; it is what every caller that has no shared artefact passes.
+    pub fn to_checkpoint_sharing(&self, nf_share: Option<u64>) -> Vec<u8> {
+        self.encode_checkpoint(nf_share.filter(|n| *n <= self.nf_len()))
+    }
+
+    fn encode_checkpoint(&self, nf_share: Option<u64>) -> Vec<u8> {
         let mut out = Vec::with_capacity(64 + self.leaves.len() * 32 + self.notes.len() * 123);
         out.push(CHECKPOINT_VERSION);
         // Fast-sync base: absolute base size, then the base frontier (empty ⇒ tag 0).
@@ -2747,12 +3027,62 @@ impl WalletDb {
             out.extend_from_slice(&n.note.rho().to_bytes());
             out.extend_from_slice(n.note.rseed().as_bytes());
         }
-        // v3: the spent-nullifier set, sorted for a canonical encoding.
-        let mut nfs: Vec<&[u8; 32]> = self.spent_nullifiers.iter().collect();
-        nfs.sort();
-        out.extend_from_slice(&(nfs.len() as u64).to_le_bytes());
-        for nf in nfs {
-            out.extend_from_slice(nf);
+        // v3: the spent-nullifier set, in iteration order.
+        //
+        // This used to sort, "for a canonical encoding". Nothing wanted one: the reader
+        // below inserts each entry into a `HashSet`, so the order is semantically
+        // unobservable, and neither consumer of `to_checkpoint` (the daemon's
+        // `checkpoint_bytes`, the SDK engine) hashes, diffs or compares the bytes.
+        //
+        // It was the single largest consumer of CPU in the daemon. Measured live over a
+        // 180 s window: 62 checkpoints rewritten, 223.3 M nullifiers sorted at
+        // 0.853 us each = 190.5 core-seconds, **1.06 of the daemon's 4.92 cores (21.5%)**.
+        // Benched at the live mean (3.48 M nullifiers), the sort is 2.97 s of a 3.32 s
+        // serialisation — 89-94% of it. For scale, trial-decrypting every action at the
+        // tip for all ~2,000 wallets costs 0.047 cores; this sort was 22x the entire
+        // fleet's decryption budget, to produce an ordering nobody reads.
+        //
+        // And it ran with the wallet's `MutexGuard` held on a runtime thread, so each
+        // one also stalled that wallet's /api/status, /api/balance and send-prepare for
+        // 0.9-4.2 s.
+        //
+        // If a byte-stable checkpoint is ever genuinely needed (content-hash dedup,
+        // rsync-by-checksum), do NOT restore the sort: keep `spent_nullifiers` as an
+        // insertion-ordered Vec beside its HashSet index and write that. Chain order is
+        // already canonical and costs nothing.
+        //
+        // v10: this section is 42% of every checkpoint on the live box (103.6 GB of
+        // 245.7 GB across 2,009 wallets) and it is bit-identical chain-global data that
+        // the daemon already maintains once in the shared chain tree. When the caller
+        // has VERIFIED that a shared artefact holds this wallet's first `n` nullifiers
+        // (`set_nf_share`), write a reference to them instead of the bytes, followed by
+        // whatever this wallet has recorded past `n` in full.
+        //
+        // The reference is `[NF_SHARED_TAG:u64][count:u64][digest:32]` where the tag is
+        // `u64::MAX`. That value is a count no checkpoint can ever legitimately carry
+        // (2^64 nullifiers at 32 B is 590 exabytes), so a reader that somehow reaches
+        // this section without the version gate fails on the very next read instead of
+        // walking off into the following sections. The version byte is still the real
+        // gate; this is the second one. See `restore`.
+        match nf_share.filter(|n| *n <= self.nf_len()) {
+            Some(n) => {
+                out.extend_from_slice(&NF_SHARED_TAG.to_le_bytes());
+                out.extend_from_slice(&n.to_le_bytes());
+                // The digest of exactly the prefix being referenced — computed from this
+                // wallet's own set, so the loader is checking the shared copy against
+                // what THIS wallet ingested, not against the sharer's own claim.
+                out.extend_from_slice(&self.nf_prefix_digest(n).unwrap_or([0u8; 32]));
+                out.extend_from_slice(&self.nf_len().saturating_sub(n).to_le_bytes());
+                for nf in self.nf_tail_from(n) {
+                    out.extend_from_slice(&nf);
+                }
+            }
+            None => {
+                out.extend_from_slice(&(self.spent_nullifiers.len() as u64).to_le_bytes());
+                for nf in &self.spent_nullifiers {
+                    out.extend_from_slice(nf);
+                }
+            }
         }
         // v4: the **tip** frontier — the mirror tree summarised in O(1). Without it a
         // restore has to replay every leaf back through Sinsemilla to rebuild `tree`,
@@ -2924,9 +3254,44 @@ impl WalletDb {
             let note = Option::<Note>::from(Note::from_parts(addr, NoteValue::from_raw(value), rho, rseed, orchard::note::NoteVersion::V2))?;
             db.notes.push(OwnedNote { note, position, nullifier });
         }
-        let n_nfs = r.u64()? as usize;
-        for _ in 0..n_nfs {
-            db.spent_nullifiers.insert(r.arr::<32>()?);
+        // The spent-nullifier set. v10 may carry a REFERENCE to the shared artefact in
+        // place of the bytes (see `to_checkpoint`).
+        //
+        // Dispatch is on the version byte, not on the sentinel: a v9 blob is read by the
+        // v9 arm and a v10 blob by the v10 arm, so neither can be parsed as the other.
+        // The sentinel then makes the v10 arm's own first read unambiguous. A pre-v10
+        // binary handed a v10 blob rejects it at the version check above (`restore`
+        // accepts only `V3..=CHECKPOINT_VERSION`) — a clean rescan, never a misparse.
+        // This layout was added at the END of a positional record on purpose, but the
+        // sections after it are NOT length-prefixed (the tip frontier), which is exactly
+        // how the 2026 `unexpected end of file` outage happened: see
+        // `an_old_blob_is_never_misparsed_as_a_new_one`.
+        let n_nfs = r.u64()?;
+        if version >= CHECKPOINT_VERSION_V10 && n_nfs == NF_SHARED_TAG {
+            let count = r.u64()?;
+            let digest = r.arr::<32>()?;
+            let n_local = r.u64()? as usize;
+            for _ in 0..n_local {
+                db.insert_nullifier(r.arr::<32>()?);
+            }
+            // The set is INCOMPLETE until `install_shared_nullifiers` succeeds, and the
+            // ingest paths refuse to run until then. The local tail already loaded stays
+            // put; installing splices the shared prefix underneath it.
+            db.nf_pending = Some((count, digest));
+        } else {
+            if n_nfs == NF_SHARED_TAG {
+                return None; // a pre-v10 blob can never carry the sentinel
+            }
+            for _ in 0..n_nfs {
+                db.insert_nullifier(r.arr::<32>()?);
+            }
+            // A v3-v9 writer iterated a `HashSet`, so the order in the file is arbitrary.
+            // The set is correct and the wallet restores exactly as before; it simply
+            // cannot be used AS A SHARED ARTEFACT until it has been rebuilt by ingest.
+            // v10 writes chain order, so a v10 blob keeps the flag.
+            if version < CHECKPOINT_VERSION_V10 && n_nfs > 0 {
+                db.nf_ordered = false;
+            }
         }
         // The tip mirror tree. v4 carries it as a frontier, so restoring it is O(1) —
         // no hashing at all. A v3 blob has no such field, so fall back to replaying the
@@ -3319,7 +3684,18 @@ fn read_witness(r: &mut Cursor<'_>) -> Option<IncrementalWitness<MerkleHashOrcha
 /// rebuild after every daemon eviction/restart. It contains public chain state only.
 /// v9 annotates history rows reconstructed from compact scan data, so clients never
 /// mistake their net outflow or placeholder fee for exact payment details.
-const CHECKPOINT_VERSION: u8 = 9;
+const CHECKPOINT_VERSION: u8 = 10;
+/// v10 lets the spent-nullifier section be a REFERENCE to a shared artefact rather than
+/// the bytes (42% of every live checkpoint). Unlike v4-v9 this is NOT a pure suffix — it
+/// rewrites a section in the middle of the record — so it is gated on this constant in
+/// both directions: a v10 reader takes the v9 path for a v9 blob, and a v9 reader
+/// rejects a v10 blob outright at the version check. Nothing is ever reinterpreted.
+///
+/// NOTE for whoever ships v11: a checkpoint written with a shared reference CANNOT be
+/// read by a binary that predates v10. A rollback therefore needs
+/// `--rewrite-checkpoints-standalone` (which re-materialises the bytes from the shared
+/// artefact) run BEFORE the old binary starts, or every wallet rescans.
+const CHECKPOINT_VERSION_V10: u8 = 10;
 const CHECKPOINT_VERSION_V9: u8 = 9;
 /// v8 introduced the persisted complete-subtree index. Gate its section on THIS
 /// constant, never on `CHECKPOINT_VERSION`: when v9 was added the gate silently moved to
@@ -3337,6 +3713,44 @@ const CHECKPOINT_VERSION_V4: u8 = 4;
 /// tree rebuild once). Reading them is what lets a newer binary deploy without forcing
 /// every live wallet into a full rescan from birthday.
 const CHECKPOINT_VERSION_V3: u8 = 3;
+
+/// Sentinel written in the v10 nullifier section's count slot to mean "a reference to
+/// the shared set follows". No real checkpoint can carry this count — 2^64 nullifiers at
+/// 32 B is 590 exabytes — so a reader that reaches this field without the version gate
+/// fails immediately rather than consuming the sections behind it.
+const NF_SHARED_TAG: u64 = u64::MAX;
+
+/// Snapshot the running nullifier digest every this many insertions. Sets the cost of
+/// `nf_prefix_digest`: one lookup plus at most this many hashes (~0.25 ms at 4096),
+/// against 32 B of memory per stride (39 KB for the live 5.0 M-entry chain set).
+const NF_DIGEST_STRIDE: usize = 4096;
+
+/// The stride, for the daemon-side test that pins the two implementations together.
+#[doc(hidden)]
+pub const NF_DIGEST_STRIDE_FOR_TESTS: usize = NF_DIGEST_STRIDE;
+
+/// Per-element hash for the nullifier set digest, domain-separated so a nullifier can
+/// never be confused with any other 32-byte value this codebase hashes.
+fn nf_leaf_hash(nf: &[u8; 32]) -> [u8; 32] {
+    blake2b_simd::Params::new().hash_length(32).personal(b"ZKasNfSetDig_v1_").hash(nf).as_bytes().try_into().expect("32-byte digest")
+}
+
+/// XOR `src` into `dst`.
+///
+/// XOR is what makes the digest **order-independent**, which it must be: a wallet's set
+/// and the shared set are the same elements, but a `HashSet`'s iteration order is not
+/// reproducible and never was (the sort that used to impose one was removed for costing
+/// 21.5% of the daemon's CPU). XOR-of-hash is a sound set commitment for the
+/// duplicate-free sets involved here — `install_shared_nullifiers` rebuilds the set and
+/// refuses on any duplicate, so the classic cancellation is excluded by construction.
+/// It is NOT a defence against an attacker who can already write the wallet directory;
+/// its job is to catch truncation, bit-rot, a stale or foreign artefact, and a wallet
+/// whose view is not a prefix of the shared one.
+fn xor_into(dst: &mut [u8; 32], src: &[u8; 32]) {
+    for (d, s) in dst.iter_mut().zip(src.iter()) {
+        *d ^= s;
+    }
+}
 
 /// A minimal forward byte-reader for [`WalletDb::from_checkpoint`]: every read is
 /// bounds-checked and returns `None` past the end, so a truncated or corrupt blob
@@ -3456,6 +3870,374 @@ mod tests {
         );
         assert_eq!(recompute.size(), shared.size(), "same leaf count");
         assert_eq!(recompute.anchor(), shared.anchor(), "identical tip anchor");
+    }
+
+    // -----------------------------------------------------------------------
+    // Shared spent-nullifier set (checkpoint v10)
+    // -----------------------------------------------------------------------
+
+    /// A chain with real spends: each block pays a coinbase to `mine` and carries one
+    /// transaction whose actions reveal fresh nullifiers. Every `cmx` is a genuine
+    /// commitment, so every action appends a leaf exactly as it would on chain.
+    fn spendy_chain(mine: [u8; 32], blocks: u32) -> Vec<(Vec<(CoinbaseNoteDesc, u64)>, Vec<Vec<CompactActionRecord>>)> {
+        (0..blocks)
+            .map(|b| {
+                let cb = vec![coinbase_for(address_of(mine), format!("cb-{b}").as_bytes(), 1_000 + b as u64)];
+                let txs: Vec<Vec<CompactActionRecord>> = (0..2u32)
+                    .map(|t| {
+                        (0..2u32)
+                            .map(|a| {
+                                let mut nullifier = [0u8; 32];
+                                nullifier[..4].copy_from_slice(&b.to_le_bytes());
+                                nullifier[4..8].copy_from_slice(&t.to_le_bytes());
+                                nullifier[8..12].copy_from_slice(&a.to_le_bytes());
+                                let (desc, v) = coinbase_for(address_of([99u8; 32]), format!("a-{b}-{t}-{a}").as_bytes(), 7);
+                                let cmx = coinbase_note_commitment(&desc, v).unwrap().to_bytes();
+                                CompactActionRecord { nullifier, cmx, ephemeral_key: [0u8; 32], enc_ciphertext: [0u8; 52] }
+                            })
+                            .collect()
+                    })
+                    .collect();
+                (cb, txs)
+            })
+            .collect()
+    }
+
+    fn ingest_chain(db: &mut WalletDb, chain: &[(Vec<(CoinbaseNoteDesc, u64)>, Vec<Vec<CompactActionRecord>>)]) {
+        for (cb, txs) in chain {
+            db.ingest_block_compact_with_meta(cb, txs, None);
+        }
+    }
+
+    /// The premise: the shared (keyless) copy builds the SAME spent-nullifier set, in the
+    /// SAME chain order, as a real wallet — so one wallet's set is a prefix of the
+    /// shared one, and the order-independent digest of that prefix matches.
+    ///
+    /// This is to the nullifier set what
+    /// `leaves_only_tree_is_identical_and_can_witness_another_wallets_note` is to the
+    /// leaf stream: the whole sharing design rests on it.
+    #[test]
+    fn the_shared_nullifier_set_is_a_superset_whose_prefix_is_the_wallets_own() {
+        let chain = spendy_chain([7u8; 32], 30);
+        let mut wallet = WalletDb::from_seed([7u8; 32]).unwrap();
+        let mut shared = WalletDb::from_seed([9u8; 32]).unwrap();
+        shared.set_leaves_only(true);
+
+        ingest_chain(&mut wallet, &chain[..20]); // the wallet is BEHIND the shared tree
+        ingest_chain(&mut shared, &chain);
+
+        assert_eq!(wallet.nf_len(), 80, "20 blocks x 2 txs x 2 actions");
+        assert_eq!(shared.nf_len(), 120);
+        // Prefix, element for element — not merely a subset.
+        assert_eq!(shared.nf_prefix(wallet.nf_len()).unwrap(), wallet.nf_prefix(wallet.nf_len()).unwrap());
+        // ...and the cheap check agrees with the expensive one.
+        assert_eq!(shared.nf_prefix_digest(wallet.nf_len()), Some(wallet.nf_digest()));
+        // The digest really is order-independent: the same elements inserted backwards
+        // give the same value. (A `HashSet`'s order is not reproducible, which is why
+        // a byte digest of the section would be useless here.)
+        let mut backwards = WalletDb::from_seed([7u8; 32]).unwrap();
+        for nf in wallet.nf_prefix(wallet.nf_len()).unwrap().iter().rev() {
+            backwards.insert_nullifier(*nf);
+        }
+        assert_eq!(backwards.nf_digest(), wallet.nf_digest(), "digest is order-independent");
+    }
+
+    /// The saving, end to end: a checkpoint that references the shared set restores to a
+    /// wallet **identical** to one that carried its own copy — and then keeps syncing to
+    /// the same leaf stream, anchor and balance.
+    #[test]
+    fn a_shared_nullifier_checkpoint_restores_and_syncs_identically() {
+        let mine = [7u8; 32];
+        let chain = spendy_chain(mine, 30);
+        let mut shared = WalletDb::from_seed([9u8; 32]).unwrap();
+        shared.set_leaves_only(true);
+        ingest_chain(&mut shared, &chain);
+
+        let mut wallet = WalletDb::from_seed(mine).unwrap();
+        ingest_chain(&mut wallet, &chain[..20]);
+
+        let standalone = wallet.to_checkpoint();
+        wallet.set_nf_share(Some(wallet.nf_len()));
+        let borrowed = wallet.to_checkpoint();
+        // The section is gone: 80 nullifiers x 32 B, minus the 48-byte reference.
+        assert_eq!(standalone.len() - borrowed.len(), 80 * 32 - 48, "the bytes really left the blob");
+
+        let mut restored = WalletDb::from_checkpoint(mine, &borrowed).expect("a referencing checkpoint parses");
+        assert!(!restored.nullifiers_resolved(), "unresolved until the shared set is supplied");
+        assert_eq!(restored.nf_pending(), Some((80, wallet.nf_digest())));
+        assert!(restored.install_shared_nullifiers(&shared.nf_prefix(shared.nf_len()).unwrap()), "install accepted");
+        assert!(restored.nullifiers_resolved());
+
+        let control = WalletDb::from_checkpoint(mine, &standalone).expect("the self-contained form still parses");
+        assert_eq!(restored.spent_nullifiers, control.spent_nullifiers, "same set");
+        assert_eq!(restored.nf_digest(), control.nf_digest(), "same digest");
+        assert_eq!(restored.size(), control.size());
+        assert_eq!(restored.anchor(), control.anchor());
+        assert_eq!(restored.balance(), control.balance());
+
+        // And it must stay identical under further ingest — including the drop rule,
+        // which is the only thing the nullifier set is FOR.
+        let mut replayed = chain[20..].to_vec();
+        // Re-submit block 0's first transaction: consensus drops it, and a wallet that
+        // lost its nullifier set would wrongly append its two leaves.
+        replayed[0].1.push(chain[0].1[0].clone());
+        let mut a = restored;
+        let mut b = control;
+        ingest_chain(&mut a, &replayed);
+        ingest_chain(&mut b, &replayed);
+        assert_eq!(a.size(), b.size(), "same leaf count after the drop rule ran");
+        assert_eq!(a.anchor(), b.anchor(), "identical anchor");
+        assert_eq!(a.size(), 30 * 5, "the re-submitted transaction appended nothing");
+    }
+
+    /// **The failure case that matters.** A corrupted, truncated, reordered or simply
+    /// foreign shared artefact is REFUSED by every wallet that referenced it, and the
+    /// wallet stays unresolved and refuses to ingest rather than restoring wrong state.
+    ///
+    /// The live precedent is real: 2,973 `rejecting divergent wallet checkpoint` events
+    /// in 48 days, 2,868 of them one bad shared artefact cascading through every wallet
+    /// that had adopted it. Sharing the PERSISTED set makes the chain tree a single
+    /// point of failure for the whole fleet, so the only acceptable behaviour on a bad
+    /// artefact is "refuse, and say so".
+    #[test]
+    fn a_corrupted_shared_artefact_is_refused_by_every_borrowing_wallet() {
+        let mine = [7u8; 32];
+        let chain = spendy_chain(mine, 30);
+        let mut shared = WalletDb::from_seed([9u8; 32]).unwrap();
+        shared.set_leaves_only(true);
+        ingest_chain(&mut shared, &chain);
+        let good = shared.nf_prefix(shared.nf_len()).unwrap();
+
+        let mut wallet = WalletDb::from_seed(mine).unwrap();
+        ingest_chain(&mut wallet, &chain[..20]);
+        wallet.set_nf_share(Some(wallet.nf_len()));
+        let blob = wallet.to_checkpoint();
+        let fresh = || WalletDb::from_checkpoint(mine, &blob).expect("parses");
+
+        // 1. One flipped bit, anywhere inside the referenced prefix.
+        let mut bitrot = good.clone();
+        bitrot[7][0] ^= 1;
+        let mut w = fresh();
+        assert!(!w.install_shared_nullifiers(&bitrot), "a flipped bit is refused");
+        assert!(!w.nullifiers_resolved());
+
+        // 2. Truncated below the count this wallet referenced.
+        let mut w = fresh();
+        assert!(!w.install_shared_nullifiers(&good[..79]), "a short artefact is refused");
+        assert!(!w.nullifiers_resolved());
+
+        // 3. Reordered — the same 80 elements, a different chain order. The DIGEST
+        //    cannot see this (it is order-independent on purpose), so this documents
+        //    exactly what the gate does NOT catch, and why the leaf-stream root check
+        //    behind it is not optional.
+        let mut swapped = good.clone();
+        swapped.swap(3, 11);
+        let mut w = fresh();
+        assert!(w.install_shared_nullifiers(&swapped), "reordering is invisible to a set digest");
+        assert_eq!(w.spent_nullifiers, fresh_with(&good, mine, &blob).spent_nullifiers, "...but the SET is still correct");
+
+        // 4. A foreign artefact: the right length, entirely different elements.
+        let foreign: Vec<[u8; 32]> = (0..120u8).map(|i| [i; 32]).collect();
+        let mut w = fresh();
+        assert!(!w.install_shared_nullifiers(&foreign), "another chain's set is refused");
+        assert!(!w.nullifiers_resolved());
+
+        // 5. Nothing at all — the artefact is gone.
+        let mut w = fresh();
+        assert!(!w.install_shared_nullifiers(&[]), "a missing artefact is refused");
+
+        // An unresolved wallet REFUSES TO INGEST. This is the invariant that makes a bad
+        // artefact a stall instead of a fork: without the drop rule the wallet would keep
+        // bundles consensus dropped and append leaves that are not on the chain.
+        let mut w = fresh();
+        let (size, anchor) = (w.size(), w.anchor());
+        ingest_chain(&mut w, &chain[20..]);
+        assert_eq!(w.size(), size, "an unresolved wallet appended nothing");
+        assert_eq!(w.anchor(), anchor, "...and its tree did not move");
+
+        // And it recovers the moment a good artefact appears — no rescan.
+        assert!(w.install_shared_nullifiers(&good));
+        ingest_chain(&mut w, &chain[20..]);
+        let mut control = WalletDb::from_seed(mine).unwrap();
+        ingest_chain(&mut control, &chain);
+        assert_eq!(w.anchor(), control.anchor(), "recovered to the identical tree");
+        assert_eq!(w.balance(), control.balance());
+    }
+
+    fn fresh_with(good: &[[u8; 32]], mine: [u8; 32], blob: &[u8]) -> WalletDb {
+        let mut w = WalletDb::from_checkpoint(mine, blob).unwrap();
+        assert!(w.install_shared_nullifiers(good));
+        w
+    }
+
+    /// A wallet whose view does not START at the shared artefact's base is not a prefix
+    /// of it, and is refused — it keeps its own copy. On the live box that is 11 of
+    /// 2,009 wallets (0.5%, 0.5 GB of the 103.6 GB): every wallet with a non-zero
+    /// `blind_below`, i.e. one fast-synced onto a frontier rather than scanned from
+    /// genesis. The gate self-selects; there is no list to keep up to date.
+    #[test]
+    fn a_wallet_whose_view_is_not_a_prefix_keeps_its_own_set() {
+        let mine = [7u8; 32];
+        let chain = spendy_chain(mine, 30);
+        let mut shared = WalletDb::from_seed([9u8; 32]).unwrap();
+        shared.set_leaves_only(true);
+        ingest_chain(&mut shared, &chain);
+
+        // The blind wallet: it joined at block 10, so its set is a SUBSET of the shared
+        // one but skips the first 40 entries — same length as a complete view at block 10,
+        // entirely different contents.
+        let mut blind = WalletDb::from_seed(mine).unwrap();
+        ingest_chain(&mut blind, &chain[10..20]);
+        assert_eq!(blind.nf_len(), 40);
+        assert!(blind.nf_prefix(40).unwrap().iter().all(|nf| shared.spent_nullifiers.contains(nf)), "still a subset");
+        assert_ne!(shared.nf_prefix_digest(40), Some(blind.nf_digest()), "but NOT a prefix");
+
+        blind.set_nf_share(Some(blind.nf_len()));
+        let blob = blind.to_checkpoint();
+        let mut restored = WalletDb::from_checkpoint(mine, &blob).unwrap();
+        assert!(!restored.install_shared_nullifiers(&shared.nf_prefix(shared.nf_len()).unwrap()), "refused");
+        assert!(!restored.nullifiers_resolved(), "and it stays unresolved, so the daemon parks it");
+    }
+
+    /// A wallet that has run PAST the shared artefact keeps the excess itself, and the
+    /// two halves splice back together in the right order. 9 of 2,009 live wallets were
+    /// ahead of the shared tree at survey time (by 37-448 leaves) — a normal, transient
+    /// state, not an error.
+    #[test]
+    fn a_wallet_ahead_of_the_shared_artefact_persists_only_its_own_tail() {
+        let mine = [7u8; 32];
+        let chain = spendy_chain(mine, 30);
+        let mut shared = WalletDb::from_seed([9u8; 32]).unwrap();
+        shared.set_leaves_only(true);
+        ingest_chain(&mut shared, &chain[..20]); // the SHARED copy is behind
+
+        let mut wallet = WalletDb::from_seed(mine).unwrap();
+        ingest_chain(&mut wallet, &chain);
+        assert!(wallet.nf_len() > shared.nf_len());
+
+        let standalone = wallet.to_checkpoint();
+        wallet.set_nf_share(Some(shared.nf_len()));
+        let borrowed = wallet.to_checkpoint();
+        assert_eq!(standalone.len() - borrowed.len(), 80 * 32 - 48, "only the shared prefix left the blob");
+
+        let mut restored = WalletDb::from_checkpoint(mine, &borrowed).unwrap();
+        assert_eq!(restored.nf_len(), 40, "the tail is already there");
+        assert!(restored.install_shared_nullifiers(&shared.nf_prefix(shared.nf_len()).unwrap()));
+        let control = WalletDb::from_checkpoint(mine, &standalone).unwrap();
+        assert_eq!(restored.spent_nullifiers, control.spent_nullifiers);
+        assert_eq!(restored.nf_digest(), control.nf_digest(), "prefix and tail spliced in chain order");
+        assert_eq!(restored.nf_prefix(restored.nf_len()), control.nf_prefix(control.nf_len()), "same order, too");
+    }
+
+    /// A pre-v10 checkpoint holds the right nullifier SET in an arbitrary ORDER — its
+    /// writer iterated a `HashSet`. A prefix of an arbitrary order is an arbitrary
+    /// subset, so such a set can never serve AS the shared artefact, and the daemon must
+    /// know that rather than silently matching nothing.
+    ///
+    /// The wallet side is unaffected: a borrowing wallet compares its WHOLE-set digest,
+    /// which is order-independent, so no wallet needs rebuilding — only the one shared
+    /// chain tree does, once.
+    #[test]
+    fn a_pre_v10_checkpoint_is_not_usable_as_the_shared_artefact() {
+        let mine = [7u8; 32];
+        let chain = spendy_chain(mine, 12);
+        let mut db = WalletDb::from_seed(mine).unwrap();
+        ingest_chain(&mut db, &chain);
+        assert!(db.nf_is_chain_ordered(), "a set built by ingest is chain-ordered");
+
+        let v10 = db.to_checkpoint();
+        assert!(WalletDb::from_checkpoint(mine, &v10).unwrap().nf_is_chain_ordered(), "v10 preserves the order");
+
+        let mut v9 = v10.clone();
+        v9[0] = CHECKPOINT_VERSION_V9;
+        let legacy = WalletDb::from_checkpoint(mine, &v9).unwrap();
+        assert_eq!(legacy.spent_nullifiers, db.spent_nullifiers, "the SET is still exactly right");
+        assert!(!legacy.nf_is_chain_ordered(), "...but its order is not to be trusted");
+
+        // An empty legacy set is trivially ordered — a fresh wallet must not be branded.
+        let empty = WalletDb::from_seed(mine).unwrap();
+        let mut e9 = empty.to_checkpoint();
+        e9[0] = CHECKPOINT_VERSION_V9;
+        assert!(WalletDb::from_checkpoint(mine, &e9).unwrap().nf_is_chain_ordered());
+
+        // And a wallet that borrows a verified prefix inherits the order with it.
+        let mut shared = WalletDb::from_seed([9u8; 32]).unwrap();
+        shared.set_leaves_only(true);
+        ingest_chain(&mut shared, &chain);
+        let mut borrower = WalletDb::from_checkpoint(mine, &v9).unwrap();
+        borrower.nf_pending = Some((borrower.nf_len(), borrower.nf_digest()));
+        assert!(borrower.install_shared_nullifiers(&shared.nf_prefix(shared.nf_len()).unwrap()));
+        assert!(borrower.nf_is_chain_ordered(), "installing a chain-ordered prefix fixes the order too");
+    }
+
+    /// **Format safety.** This project has had a production outage from a positional
+    /// serialisation change: a field added mid-record made a new binary unable to read
+    /// its own database (`unexpected end of file`), and because a failed page fetch does
+    /// not advance the cursor, every wallet froze forever.
+    ///
+    /// v10 rewrites a section in the MIDDLE of the record (everything after it — the tip
+    /// frontier — is not length-prefixed), so it is the same shape of change. These are
+    /// the assertions that say it cannot happen again: the version byte alone decides
+    /// which layout is read, in BOTH directions, and the sentinel is a second gate that
+    /// fails loudly if the first is ever bypassed.
+    #[test]
+    fn an_old_blob_is_never_misparsed_as_a_new_one() {
+        let mine = [7u8; 32];
+        let chain = spendy_chain(mine, 12);
+        let mut wallet = WalletDb::from_seed(mine).unwrap();
+        ingest_chain(&mut wallet, &chain);
+
+        // Written with no share, a v10 blob is byte-identical to a v9 one below the
+        // version byte — so this IS a genuine v9 blob.
+        let v10_plain = wallet.to_checkpoint();
+        assert_eq!(v10_plain[0], CHECKPOINT_VERSION_V10);
+        let mut v9 = v10_plain.clone();
+        v9[0] = CHECKPOINT_VERSION_V9;
+
+        // Forward compatibility: the v10 reader reads a v9 blob through the v9 path and
+        // gets exactly the same wallet. (This is what stops a deploy rescanning the fleet.)
+        let from_v9 = WalletDb::from_checkpoint(mine, &v9).expect("a v9 blob still restores");
+        let from_v10 = WalletDb::from_checkpoint(mine, &v10_plain).expect("a v10 blob restores");
+        assert_eq!(from_v9.spent_nullifiers, from_v10.spent_nullifiers);
+        assert_eq!(from_v9.anchor(), from_v10.anchor());
+        assert_eq!(from_v9.size(), from_v10.size());
+
+        // Backward: a v10 blob that REFERENCES the shared set, mislabelled as v9, must be
+        // rejected — never read as if its sentinel were a nullifier count. A pre-v10
+        // binary rejects it one step earlier still, at the version check.
+        wallet.set_nf_share(Some(wallet.nf_len()));
+        let mut shared_blob = wallet.to_checkpoint();
+        assert_eq!(u64::from_le_bytes(find_nf_count(&shared_blob)), NF_SHARED_TAG, "the sentinel is where we think");
+        shared_blob[0] = CHECKPOINT_VERSION_V9;
+        assert!(WalletDb::from_checkpoint(mine, &shared_blob).is_none(), "a v9 reader refuses the v10 layout");
+
+        // A version this binary does not know is refused outright, not best-efforted.
+        let mut future = v10_plain.clone();
+        future[0] = CHECKPOINT_VERSION_V10 + 1;
+        assert!(WalletDb::from_checkpoint(mine, &future).is_none(), "an unknown version is refused");
+
+        // Truncation anywhere in the reference is refused rather than half-read.
+        wallet.set_nf_share(Some(wallet.nf_len()));
+        let sb = wallet.to_checkpoint();
+        for cut in [8usize, 24, 40, 56] {
+            assert!(WalletDb::from_checkpoint(mine, &sb[..sb.len() - cut]).is_none(), "truncated by {cut} is refused");
+        }
+    }
+
+    /// Where the nullifier count sits in a checkpoint: past the header, the base
+    /// frontier, the leaf stream and the notes. Recomputed rather than hard-coded so the
+    /// test above fails loudly if the layout ahead of it ever moves.
+    fn find_nf_count(blob: &[u8]) -> [u8; 8] {
+        let mut r = Cursor { buf: blob, pos: 0 };
+        let _version = r.u8().unwrap();
+        let base_size = r.u64().unwrap();
+        read_frontier(&mut r, base_size).unwrap();
+        let _size = r.u64().unwrap();
+        let n_leaves = r.u64().unwrap() as usize;
+        r.take(32 * n_leaves).unwrap();
+        let n_notes = r.u64().unwrap() as usize;
+        r.take(155 * n_notes).unwrap();
+        r.take(8).unwrap().try_into().unwrap()
     }
 
     /// A **keyless, leaves-only** wallet builds a leaf stream identical to a real
@@ -4556,6 +5338,40 @@ mod tests {
     /// balance, owned-note positions, the tip anchor, and — the strongest check —
     /// the exact spend witness, all without re-scanning the chain. This is what lets
     /// `zkas-walletd` resume after a restart instead of rescanning from birthday.
+    /// The spent-nullifier section round-trips **as a set**, whatever order it was
+    /// written in.
+    ///
+    /// This pins the invariant that let the sort go: `from_checkpoint` inserts each
+    /// entry into a `HashSet`, so two wallets that saw the same nullifiers in different
+    /// orders must restore identically. If anyone ever reintroduces an ordering
+    /// requirement — a content hash, a checksum-based backup, a byte-equality assert —
+    /// this test still passes, so read the comment in `to_checkpoint` before assuming
+    /// a canonical encoding is available.
+    #[test]
+    fn spent_nullifiers_roundtrip_as_a_set_regardless_of_insertion_order() {
+        let mine = [5u8; 32];
+        let mut a = WalletDb::from_seed(mine).unwrap();
+        let mut b = WalletDb::from_seed(mine).unwrap();
+
+        // The same nullifiers, inserted in opposite orders.
+        let nfs: Vec<[u8; 32]> = (0u8..64).map(|i| [i.wrapping_mul(7).wrapping_add(3); 32]).collect();
+        for nf in nfs.iter() {
+            a.insert_nullifier(*nf);
+        }
+        for nf in nfs.iter().rev() {
+            b.insert_nullifier(*nf);
+        }
+
+        let ra = WalletDb::from_checkpoint(mine, &a.to_checkpoint()).expect("restore a");
+        let rb = WalletDb::from_checkpoint(mine, &b.to_checkpoint()).expect("restore b");
+
+        assert_eq!(ra.spent_nullifiers.len(), nfs.len(), "every nullifier survives the round trip");
+        assert_eq!(ra.spent_nullifiers, rb.spent_nullifiers, "insertion order is semantically invisible");
+        for nf in nfs.iter() {
+            assert!(ra.spent_nullifiers.contains(nf), "nullifier missing after restore");
+        }
+    }
+
     #[test]
     fn checkpoint_roundtrips_state_and_witness() {
         let mine = [5u8; 32];

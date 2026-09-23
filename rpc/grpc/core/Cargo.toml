@@ -33,6 +33,8 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "ti
 tokio-stream.workspace = true
 tonic = { workspace = true, features = ["gzip"] }
 tonic-prost.workspace = true
+# Test-only: exercises the request's borsh version word for the encoding opt-in.
+workflow-serializer.workspace = true
 triggered.workspace = true
 workflow-core.workspace = true
 
