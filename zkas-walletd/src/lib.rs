@@ -5611,28 +5611,34 @@ impl AppState {
         // recording is on, so this state cannot arise otherwise. Rebuild from the
         // birthday now instead of showing an empty History tab forever; the file is
         // kept as .bak like any other retirement.
-        let restored = match restored {
-            // Only a wallet that WAS already recording rows can be in the broken state
-            // this rebuild repairs. A legacy wallet simply has no past rows: it keeps
-            // its checkpoint, records everything from now on, and the user can ask for
-            // the past with "Recover full history" (a rescan) if they want it.
-            Some((db, ..))
-                if recoverable_history
-                    && history_was_on(&self.wallet_dir, token)
-                    && db.history().is_empty()
-                    && !db.notes().is_empty() =>
-            {
-                let scan = scan_path(&self.wallet_dir, token);
-                let _ = std::fs::rename(&scan, format!("{scan}.bak"));
-                retire_quarantine_copies(&self.wallet_dir, token);
-                log::info!(
-                    "wallet {token}: keeps history but its checkpoint has {} notes and no history rows (scanned with recording off); rebuilding from birthday {birthday}",
-                    db.notes().len()
-                );
-                None
-            }
-            other => other,
-        };
+        // A wallet that keeps history but whose checkpoint has notes and NO rows was
+        // scanned with recording off. That is a gap in the History TAB — a display
+        // convenience. The balance, the notes and the ability to spend are all intact,
+        // because they live in the notes, which are right there.
+        //
+        // This used to respond by renaming the checkpoint to .bak and rescanning from the
+        // birthday. It was not a one-off repair: nothing about the rescan clears the
+        // condition, so the very next load saw the same wallet in the same state and did
+        // it again. Live on the hosted daemon it fired 123 times, 16 of them for a single
+        // wallet and 7 within one second — a genesis rescan of 5.1M blocks each time. The
+        // user-visible effect is a wallet that climbs to ~99% and then starts over from
+        // zero, forever, and it is why a wallet could sit at "99.2%" across a whole
+        // evening while appearing to make progress.
+        //
+        // So: keep the checkpoint. This is exactly the treatment the legacy case beside it
+        // already got, and the reasoning is the same — a wallet with no past rows records
+        // everything from now on, and the user can ask for the past explicitly with
+        // "Recover full history", which is a rescan they chose and can see the cost of.
+        // Throwing away a valid, fully-scanned checkpoint to repopulate a history tab is
+        // never a trade worth making on the user's behalf.
+        if recoverable_history
+            && history_was_on(&self.wallet_dir, token)
+            && restored.as_ref().is_some_and(|(db, ..)| db.history().is_empty() && !db.notes().is_empty())
+        {
+            log::info!(
+                "wallet {token}: keeps history but its checkpoint has no history rows (scanned with recording off) — keeping the checkpoint and recording from here; \"Recover full history\" rescans on request"
+            );
+        }
         let t_restore = t_load0.elapsed();
         // Which of the three ways this wallet came back, so a slow load can be read
         // without cross-referencing the surrounding warnings.
