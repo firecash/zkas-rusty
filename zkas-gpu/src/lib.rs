@@ -55,6 +55,20 @@ pub struct Gpu {
     /// agreement behind it costs ~75 us and is paid once per wallet for the life of the
     /// process.
     canaries: std::sync::Mutex<std::collections::HashMap<[u8; 32], Canary>>,
+    /// One host thread in the device at a time.
+    ///
+    /// There is exactly one GPU, and the hosted daemon runs 28 sync lanes. Without this
+    /// they all entered the driver at once, each with its own allocate / copy-in / launch
+    /// / copy-out / free, and the driver serialised them at its own discretion. Measured
+    /// live on 2026-09-23 that produced min 7.9 us/action, MEDIAN 8,948, max 57,248 — the
+    /// classic thundering-herd spread, and ~600x worse than simply staying on the CPU
+    /// (median 14.2). One batch's kernel is ~0.5 ms, so a whole page in ~17 s was never
+    /// the device computing; it was 28 threads fighting over it.
+    ///
+    /// The gate covers ONLY the FFI call. Marshalling — `batch_normalize`, limb packing,
+    /// the Jacobian-to-affine fixup — is pure host arithmetic and stays parallel across
+    /// lanes, which is where the host time actually goes.
+    submit: std::sync::Mutex<()>,
 }
 
 /// Where to look for the kernel. An explicit path wins so an operator can point at a
@@ -107,6 +121,7 @@ impl Gpu {
                 filter,
                 debug_kdf,
                 canaries: std::sync::Mutex::new(std::collections::HashMap::new()),
+                submit: std::sync::Mutex::new(()),
             };
             if gpu.filter.is_some() {
                 if let Err(why) = gpu.filter_self_test() {
@@ -189,8 +204,11 @@ impl Gpu {
         }
 
         let mut out = vec![0u32; idx.len() * 3 * LIMBS];
-        let rc = unsafe {
-            (self.batch_ka)(scalar.as_ptr(), bits, input.as_ptr(), out.as_mut_ptr(), idx.len() as i32)
+        let rc = {
+            // A poisoned gate means another lane panicked mid-call. The device is then of
+            // unknown state, so decline and let the caller take the CPU path.
+            let Ok(_slot) = self.submit.lock() else { return None };
+            unsafe { (self.batch_ka)(scalar.as_ptr(), bits, input.as_ptr(), out.as_mut_ptr(), idx.len() as i32) }
         };
         if rc != 0 {
             self.poison(&format!("kernel returned {rc}"));
@@ -407,7 +425,10 @@ impl Gpu {
         ct.extend_from_slice(&canary.ct0);
 
         let mut mask = vec![0u8; n];
-        let rc = unsafe { f(scalar.as_ptr(), bits, input.as_ptr(), ct.as_ptr(), mask.as_mut_ptr(), n as i32) };
+        let rc = {
+            let Ok(_slot) = self.submit.lock() else { return None };
+            unsafe { f(scalar.as_ptr(), bits, input.as_ptr(), ct.as_ptr(), mask.as_mut_ptr(), n as i32) }
+        };
         if rc != 0 {
             self.poison(&format!("filter kernel returned {rc}"));
             return None;

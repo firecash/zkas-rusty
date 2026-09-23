@@ -182,6 +182,39 @@ const LAP_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 /// The lock is still dropped between chunks, so status keeps interleaving.
 const CATCHUP_BURST_MIN_BEHIND: u64 = 20_000;
 
+/// How far behind the tip a wallet may be and still have `warm_priority` buy it the
+/// right to warm *while it is still scanning*.
+///
+/// The overlap exists for one case: reopening an app whose wallet sits at ~99.4%, which
+/// on today's chain is ~30k blocks out. There, finishing the scan and then starting the
+/// warm serially is the 10-15s the user waits. Near the tip the matured anchor is
+/// essentially where it will end up, so warming against it is real work.
+///
+/// Far from the tip it is not. The anchor still has a long way to travel, and every core
+/// spent warming is a core not spent scanning — which is the only thing that gets the
+/// wallet to the tip. 50k is ~1% of the chain: comfortably above the reopen case, well
+/// below the percent-scale distances where scanning has to win.
+const WARM_OVERLAP_MAX_BEHIND: u64 = 50_000;
+
+/// Whether `warm_priority` should let this wallet warm before it is caught up.
+///
+/// `warm_priority` on its own is NOT a licence to warm. `get_wallet` sets it on every
+/// request touch and the app polls once a second, so it means "somebody has this wallet
+/// open" — true of nearly every active wallet, continuously. It never stands down either:
+/// the stand-down in the sync loop clears it and the next poll sets it straight back.
+///
+/// Used unbounded it killed the guard it was added next to. A wallet far from the tip kept
+/// its build slot and ran O(chain) witness work instead of scanning; live, sync-lap
+/// overruns went from 1-6 per ten minutes to 9-16, with up to 27 wallets "still working"
+/// in a single lap, and wallets visibly stopped advancing mid-scan.
+///
+/// `chain_len == 0` means the tip is not known yet (a freshly constructed entry). That must
+/// read as "no", not as "zero blocks behind" — the subtraction saturates to 0 and would
+/// otherwise hand the bypass to every wallet that had never seen a tip.
+fn warm_overlap_allowed(warm_priority: bool, chain_len: u64, scanned: u64) -> bool {
+    warm_priority && chain_len > 0 && chain_len.saturating_sub(scanned) <= WARM_OVERLAP_MAX_BEHIND
+}
+
 /// How recently a request must have touched a wallet for it to count as WATCHED —
 /// someone has it open and is waiting on it.
 ///
@@ -3225,7 +3258,8 @@ impl WalletEntry {
         // A wallet that has fallen behind the tip again will not reach the build block
         // below, so it would sit on its slot without using it. Hand it back now; it
         // re-queues when it catches up.
-        if !self.caught_up && !self.warm_priority && self.build_permit.is_some() {
+        let warm_overlap = warm_overlap_allowed(self.warm_priority, self.chain_len, self.scanned as u64);
+        if !self.caught_up && !warm_overlap && self.build_permit.is_some() {
             self.build_permit = None;
         }
         // Warm a wallet somebody is WAITING ON even while it finishes the last stretch.
@@ -3247,7 +3281,7 @@ impl WalletEntry {
         // backlog of never-scanned wallets cannot claim build slots: the reason the
         // original gate existed was to stop wallets sitting on a slot they could not use,
         // and that still holds for everything nobody is waiting on.
-        if self.caught_up || self.warm_priority {
+        if self.caught_up || warm_overlap {
             if let Some(matured) = self.matured_leaves() {
                 // How many witnesses this wallet maintains. Every step below costs
                 // `leaves × budget`, so pinning the budget to a constant for a note-heavy
@@ -3933,7 +3967,13 @@ fn spawn_subtree_build(state: &Arc<AppState>, token: &str, w: &Wallet, job: kasp
         e.build_in_flight = false;
         // Hand the slot back either way, so a queued wallet starts immediately.
         e.build_permit = None;
-        let installed = built.is_some_and(|b| e.db.install_subtree_cache(b));
+        let install = built.map(|b| e.db.install_subtree_cache_reason(b));
+        let installed = matches!(install, Some(Ok(())));
+        let why = match &install {
+            Some(Err(r)) => *r,
+            Some(Ok(())) => "",
+            None => "build produced nothing",
+        };
         if installed {
             // Persist at once: this was expensive and a restart must not repeat it.
             e.force_checkpoint = true;
@@ -3943,7 +3983,7 @@ fn spawn_subtree_build(state: &Arc<AppState>, token: &str, w: &Wallet, job: kasp
             );
         } else {
             log::warn!(
-                "subtree cache build for {who} did not install after {:.1?} ({leaves} leaves, asked by {origin}) — the stream moved under it; keeping the replay path and retrying",
+                "subtree cache build for {who} did not install after {:.1?} ({leaves} leaves, asked by {origin}) — {why}; keeping the replay path and retrying",
                 t.elapsed()
             );
         }
@@ -5609,22 +5649,9 @@ impl AppState {
             },
         };
         let t_entry = t_load0.elapsed();
-        // Decode the leaf stream to curve points NOW, on a blocking thread, while we still
-        // own the entry exclusively. `warm_leaves` was written for exactly this and then
-        // never called, so the cost landed on the first *spend* instead — a big chunk of the
-        // ~29s a send took. Doing it here costs the user nothing: the wallet is already
-        // usable (balance, notes, receive) and this finishes long before anyone hits Send.
-        let entry = tokio::task::spawn_blocking(move || {
-            let t = std::time::Instant::now();
-            entry.db.warm_leaves();
-            log::info!("wallet leaf-stream decoded in {:.1?} (kept off the spend path)", t.elapsed());
-            entry
-        })
-        .await
-        .ok()?;
         // Cumulative marks; each phase is the gap to the one before it.
         log::info!(
-            "load {token} via {load_path}: total {:.1?} = queue {:.1?} + gate {:.1?} + meta {:.1?} + verify {:.1?} + restore {:.1?} + entry {:.1?} + decode {:.1?} ({} notes, {} leaves, scanned {})",
+            "load {token} via {load_path}: total {:.1?} = queue {:.1?} + gate {:.1?} + meta {:.1?} + verify {:.1?} + restore {:.1?} + entry {:.1?} + publish {:.1?} ({} notes, {} leaves, scanned {}; decode deferred)",
             t_load0.elapsed(),
             t_queued,
             t_permit.saturating_sub(t_queued),
@@ -5639,14 +5666,27 @@ impl AppState {
         );
         let w = Arc::new(Mutex::new(entry));
         self.wallets.lock().await.insert(token.to_string(), w.clone());
-        // NB: do NOT eagerly decode the leaf stream here. It is tempting — only a spend
-        // needs curve points, so "warm them in the background" sounds free. It is not:
-        // decoding is ~60s of curve arithmetic per wallet, and firing it for every wallet
-        // that loads (a restart touches all of them) buries every tokio worker on a
-        // 4-core box and starves the HTTP handler — the daemon stops answering entirely
-        // (observed live: a 331-deep accept backlog, every wallet reading "node offline").
-        // The decode stays lazy: it happens inside the spend path, which already runs on
-        // a blocking thread, and is paid once by the one wallet that actually spends.
+        // The leaf stream is NOT decoded here, and nothing heavy happens on this path.
+        //
+        // A load is what a user blocks on, and `--load-wallets` bounds it to 16 at a time,
+        // so any per-wallet cost here is multiplied straight into everybody else's wait.
+        // `warm_leaves` used to run inline while still holding the load permit: ~100s of
+        // curve arithmetic at 10.5M leaves. Measured live on 2026-09-23, that produced two
+        // populations in the same log — `decode=94-109s, gate~0` for the wallets doing it,
+        // and `gate=66-91s, decode~0` for every wallet queued behind them. To a user, that
+        // second number is the app sitting on "Opening wallet".
+        //
+        // The decoded stream is only ever read by the witness climb, `advance_base_capped`
+        // and `subtree_build_job` — the O(chain) work the subtree cache exists to replace,
+        // plus the build of that cache itself. So it is an INPUT TO PREPARATION, not a
+        // property of being loaded, and `subtree_build_job` already materialises it when a
+        // build runs. A wallet whose cache (or the shared tree) serves its witnesses never
+        // needs it at all; one with no cache still decodes lazily inside the spend path, on
+        // a blocking thread, exactly as it always did.
+        //
+        // Preparation is the warm scheduler's job: it catches the wallet up, builds the
+        // cache, and persists it (v8), tier-ordered and load-budgeted. That is what makes a
+        // reopened wallet spend fast — not doing the work again on every load.
         Some(w)
     }
 }
@@ -9560,7 +9600,7 @@ async fn warm_chain_tree(
                 let built = run_subtree_build(&state2, CHAIN_TREE_TOKEN, "the shared chain tree", job).await;
                 let mut e = ct2.lock().await;
                 e.build_in_flight = false;
-                if built.is_some_and(|b| e.db.install_subtree_cache(b)) {
+                if built.map(|b| e.db.install_subtree_cache_reason(b)).is_some_and(|r| r.is_ok()) {
                     e.force_checkpoint = true;
                     log::info!(
                         "admin warm_chain_tree: shared tree subtree-cache COMPLETE in {:.1?} ({leaves} leaves) — consolidations now witness O(depth)",
@@ -9902,7 +9942,13 @@ async fn warm_sweep_loop(state: Arc<AppState>) {
         let built = run_subtree_build(&state, &token, &token, job).await;
         let mut e = w.lock().await;
         e.build_in_flight = false;
-        let installed = built.is_some_and(|b| e.db.install_subtree_cache(b));
+        let install = built.map(|b| e.db.install_subtree_cache_reason(b));
+        let installed = matches!(install, Some(Ok(())));
+        let why = match &install {
+            Some(Err(r)) => *r,
+            Some(Ok(())) => "",
+            None => "build produced nothing",
+        };
         if installed {
             // Expensive and durable: persist so a restart reloads it warm.
             e.force_checkpoint = true;
@@ -9914,11 +9960,67 @@ async fn warm_sweep_loop(state: Arc<AppState>) {
         } else {
             let n = attempts.entry(token.clone()).or_insert(0);
             *n += 1;
-            log::warn!("warm sweep: {token} cache did not install (attempt {n}) — the stream moved under it; will retry");
+            log::warn!("warm sweep: {token} cache did not install (attempt {n}) — {why}; will retry");
             if *n >= WARM_SWEEP_MAX_ATTEMPTS {
                 done.insert(token);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod warm_overlap_tests {
+    use super::{warm_overlap_allowed, WARM_OVERLAP_MAX_BEHIND};
+
+    /// The case the overlap exists for: an app reopened on a wallet at ~99.4%, ~30k
+    /// blocks from the tip. It must warm while it finishes, or the user pays the scan
+    /// and the warm end to end.
+    #[test]
+    fn a_wallet_near_the_tip_may_warm_while_it_finishes() {
+        assert!(warm_overlap_allowed(true, 5_120_000, 5_090_000), "99.4% reopen must overlap");
+        assert!(warm_overlap_allowed(true, 5_120_000, 5_120_000), "caught up");
+        assert!(
+            warm_overlap_allowed(true, 5_120_000, 5_120_000 - WARM_OVERLAP_MAX_BEHIND),
+            "the boundary itself is allowed"
+        );
+    }
+
+    /// The regression this bound exists to prevent. `warm_priority` is set by every
+    /// request touch and the app polls once a second, so without a distance bound a
+    /// wallet percent-scale behind held a build slot doing O(chain) witness work instead
+    /// of scanning — and stopped advancing. 97.9% of this chain is ~107k blocks out.
+    #[test]
+    fn a_wallet_far_from_the_tip_must_scan_not_warm() {
+        assert!(!warm_overlap_allowed(true, 5_120_000, 5_012_000), "97.9% must scan, not warm");
+        assert!(
+            !warm_overlap_allowed(true, 5_120_000, 5_120_000 - WARM_OVERLAP_MAX_BEHIND - 1),
+            "one block past the boundary is refused"
+        );
+        assert!(!warm_overlap_allowed(true, 5_120_000, 0), "a wallet scanning from zero must scan");
+    }
+
+    /// An entry that has never seen a tip has `chain_len == 0`. The subtraction saturates
+    /// to zero, so without an explicit guard "tip unknown" would read as "zero blocks
+    /// behind" and hand the bypass to exactly the wallets that must not have it.
+    #[test]
+    fn an_unknown_tip_is_not_mistaken_for_being_caught_up() {
+        assert!(!warm_overlap_allowed(true, 0, 0));
+        assert!(!warm_overlap_allowed(true, 0, 12_345));
+    }
+
+    /// Without the flag there is no overlap at all, whatever the distance: the permit
+    /// handback this gates is the original behaviour and must survive untouched.
+    #[test]
+    fn without_warm_priority_there_is_no_overlap() {
+        assert!(!warm_overlap_allowed(false, 5_120_000, 5_120_000));
+        assert!(!warm_overlap_allowed(false, 5_120_000, 5_090_000));
+    }
+
+    /// A wallet can transiently report more scanned than the last tip it saw. That is
+    /// ahead, not behind — it must not underflow into a refusal.
+    #[test]
+    fn scanning_past_the_last_known_tip_is_still_near_it() {
+        assert!(warm_overlap_allowed(true, 5_120_000, 5_120_500));
     }
 }
 

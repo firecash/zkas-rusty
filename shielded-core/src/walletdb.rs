@@ -2379,30 +2379,50 @@ impl WalletDb {
     /// exactly the same root gate as an in-line build before anything can serve from it.
     /// Returns false on any mismatch, leaving the wallet on the replay path.
     pub fn install_subtree_cache(&mut self, built: BuiltSubtreeCache) -> bool {
-        if self.subtree.failed || built.base_size != self.base_size {
-            return false;
+        self.install_subtree_cache_reason(built).is_ok()
+    }
+
+    /// As [`Self::install_subtree_cache`], but says WHY it refused.
+    ///
+    /// 728 of 846 builds on the hosted daemon were discarded, all of them logged as "the
+    /// stream moved under it" — a single message covering four distinct rejections, only
+    /// one of which is actually a moving stream. Four minutes of CPU per attempt were being
+    /// thrown away without recording which precondition failed, so there was nothing to fix
+    /// against. The caller logs this string.
+    pub fn install_subtree_cache_reason(&mut self, built: BuiltSubtreeCache) -> Result<(), &'static str> {
+        if self.subtree.failed {
+            return Err("cache already marked failed");
+        }
+        // The base is the one thing a build CANNOT absorb: it summarises away the very
+        // leaves the cache indexes, so a compaction mid-build invalidates the result.
+        if built.base_size != self.base_size {
+            return Err("base moved during the build");
         }
         let mut c = built.cache;
         {
             let base = self.base_size;
-            let Some(start) = c.upto.checked_sub(base) else { return false };
+            let Some(start) = c.upto.checked_sub(base) else { return Err("cache starts below the base") };
             let leaves = self.decoded_leaves();
             if start as usize > leaves.len() {
-                return false;
+                return Err("cache reaches past the leaf stream");
             }
+            // Leaves that arrived WHILE the build ran are simply folded in here, so a
+            // growing stream is expressly not a failure.
             for (i, leaf) in leaves.iter().enumerate().skip(start as usize) {
                 if !c.push_leaf(base + i as u64, *leaf) {
-                    return false;
+                    return Err("catch-up leaf rejected by the cache");
                 }
             }
         }
         c.active = true;
         c.partial = false;
-        if self.root_from(&c, self.size).is_some_and(|r| r == self.tree.root()) {
-            self.subtree = c;
-            true
-        } else {
-            false
+        match self.root_from(&c, self.size) {
+            Some(r) if r == self.tree.root() => {
+                self.subtree = c;
+                Ok(())
+            }
+            Some(_) => Err("cache root disagrees with the wallet tree"),
+            None => Err("cache cannot produce a root at the wallet size"),
         }
     }
 
