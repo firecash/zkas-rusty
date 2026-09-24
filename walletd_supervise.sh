@@ -38,7 +38,7 @@ FLAGS="--network mainnet --rpc-server 127.0.0.1:16810 --listen 0.0.0.0:8501 --al
 --allow-origin https://localhost --allow-origin capacitor://localhost --allow-default-token --runtime-threads 32 \
 --proof-threads 3 --max-concurrent-proves 6 --sync-wallets 28 --sync-wallet-memory-mb 384 --load-wallets 16 \
 --warm-wallets 1 --page-decode-threads 12 --page-cache-entries 768 --page-cache-ttl 90 --active-sync-window 1800 \
---idle-evict 2100 --max-resident-wallets 64 --subtree-free-floor-mb 12000 --warm-always 16 --warm-budget 60"
+--idle-evict 2100 --max-resident-wallets 40 --subtree-free-floor-mb 12000 --warm-always 16 --warm-budget 60"
 
 backoff=2
 while true; do

@@ -5298,10 +5298,20 @@ impl AppState {
                 // by the warm slot, the memory floor and a proof in flight, so this cannot
                 // stampede the box — it only stops the work being skipped entirely.
                 if let Ok(mut e) = w.try_lock() {
+                    // Priority only. `wants_cache_build` is NOT ours to set: it is what
+                    // launches an off-lock subtree build, and the one place allowed to
+                    // raise it (`sync_chunk`) does so only while holding a `--warm-wallets`
+                    // permit. Setting it here — on EVERY request, with the app polling once
+                    // a second — launched builds for wallets that held no permit at all, so
+                    // the concurrency cap was bypassed entirely.
+                    //
+                    // That was survivable only while every install failed. Once the root
+                    // gate was fixed and builds began completing, each in-flight build kept
+                    // its wallet's decoded leaves alive (~340 MB at 10.5M leaves) and the
+                    // daemon was OOM-killed at 54.7 GB with 12 builds running against a cap
+                    // of 1. Raising priority is enough: `sync_chunk` sees the flag on its
+                    // next pass and takes a permit in the proper order.
                     e.warm_priority = true;
-                    if !e.build_in_flight {
-                        e.wants_cache_build = true;
-                    }
                 }
                 return Some(w);
             }
@@ -6276,10 +6286,9 @@ async fn evict_idle_wallets(state: &Arc<AppState>) {
     };
     for (token, w) in resident.iter().filter(|(t, _)| protected.contains(t)) {
         if let Ok(mut e) = w.try_lock() {
+            // Priority only — see the note in `get_wallet`. A build is launched by
+            // `sync_chunk`, under a `--warm-wallets` permit, and nowhere else.
             e.warm_priority = true;
-            if !e.build_in_flight {
-                e.wants_cache_build = true;
-            }
         } else {
             let _ = token; // busy: it is being worked on, which is the state we wanted
         }
