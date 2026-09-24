@@ -2267,7 +2267,7 @@ impl WalletDb {
         }
         c.partial = false;
         c.active = true;
-        let ok = self.root_from(&c, self.size).is_some_and(|r| r == self.tree.root());
+        let ok = self.cache_matches_tree(&c);
         self.subtree = if ok { c } else { SubtreeCache { failed: true, ..Default::default() } };
         ok
     }
@@ -2355,7 +2355,7 @@ impl WalletDb {
         }
         c.partial = false;
         c.active = true;
-        let ok = self.root_from(&c, self.size).is_some_and(|r| r == self.tree.root());
+        let ok = self.cache_matches_tree(&c);
         self.subtree = if ok { c } else { reject };
         ok
     }
@@ -2417,12 +2417,14 @@ impl WalletDb {
         c.active = true;
         c.partial = false;
         match self.root_from(&c, self.size) {
-            Some(r) if r == self.tree.root() => {
+            None => Err("cache cannot produce a root at the wallet size"),
+            // A borrowed tree is not this wallet's to disagree with — see
+            // `cache_matches_tree`.
+            Some(r) if !self.tree_valid || r == self.tree.root() => {
                 self.subtree = c;
                 Ok(())
             }
             Some(_) => Err("cache root disagrees with the wallet tree"),
-            None => Err("cache cannot produce a root at the wallet size"),
         }
     }
 
@@ -2513,6 +2515,34 @@ impl WalletDb {
             };
         }
         Some(out)
+    }
+
+    /// Whether `c` reproduces this wallet's own tree — the belt-and-braces check on an
+    /// assembled subtree cache.
+    ///
+    /// It is only ANSWERABLE when `tree_valid`. A wallet that borrows the shared chain
+    /// tree has no meaningful mirror of its own: `tree_valid` is cleared by every leaf
+    /// appended while borrowing, and a checkpoint written in that state records no tip
+    /// frontier, so `self.tree` restores empty. Comparing a correct cache against that
+    /// empty tree rejects it every single time.
+    ///
+    /// Measured on the hosted daemon 2026-09-24: 1140 install attempts, 1140 rejections,
+    /// ALL of them "root disagrees", zero successes — including builds of 733 leaves that
+    /// finished in 25 ms, where nothing can have moved. That is not a race; it is a
+    /// comparison against a tree that was never the wallet's.
+    ///
+    /// Dropping the comparison when it cannot be made is not dropping the guarantee. It
+    /// was never what kept a spend honest: `subtree_paths` re-derives the anchor root for
+    /// every assembled path and declines each one that does not reproduce it, so a wrong
+    /// cache costs a fall back to the O(chain) replay — the old slow path — and can never
+    /// produce a wrong witness. The structural requirement stays: a cache that cannot
+    /// produce a root at all is still refused.
+    fn cache_matches_tree(&self, c: &SubtreeCache) -> bool {
+        let Some(root) = self.root_from(c, self.size) else { return false };
+        if !self.tree_valid {
+            return true;
+        }
+        root == self.tree.root()
     }
 
     /// The tree root at exactly `matured` leaves, derived from the cache in O(depth).
@@ -3170,7 +3200,7 @@ impl WalletDb {
         let Some(cache) = parse(&mut r) else { return };
         // Never restore a partial active cache. A failed/inactive marker is harmless,
         // but an active cache must describe precisely the tree persisted in this blob.
-        if cache.active && cache.upto == db.size && db.root_from(&cache, db.size).is_some_and(|root| root == db.tree.root()) {
+        if cache.active && cache.upto == db.size && db.cache_matches_tree(&cache) {
             db.subtree = cache;
         } else if cache.failed {
             db.subtree.failed = true;
@@ -4026,6 +4056,64 @@ mod tests {
     /// load-bearing: on a 1-BPS chain the stream grows every second, so a cache that
     /// fell one leaf behind could never catch up on its own, and every spend from that
     /// wallet would pay the O(chain) climb the cache exists to delete.
+    /// A wallet that BORROWS the shared chain tree must still be able to install a
+    /// subtree cache.
+    ///
+    /// `tree_valid` is cleared by every leaf appended while borrowing, and a checkpoint
+    /// written in that state records no tip frontier, so the restored mirror tree is
+    /// empty. The install gate compared the assembled cache's root against that empty
+    /// tree and therefore rejected every cache, forever. Live on 2026-09-24: 1140
+    /// attempts, 1140 rejections, all "root disagrees", zero successes — including
+    /// 733-leaf builds that finished in 25 ms, where nothing can have moved.
+    ///
+    /// The consequence was not a wrong witness; `subtree_paths` re-checks every path it
+    /// assembles. It was that no wallet on this daemon ever became spend-ready, so every
+    /// send paid the O(chain) replay the cache exists to delete.
+    #[test]
+    fn a_wallet_borrowing_the_shared_tree_can_still_install_a_cache() {
+        let mine = [37u8; 32];
+        let mut db = WalletDb::from_seed(mine).unwrap();
+        for b in 0..80u32 {
+            let recipient = if b % 9 == 0 { address_of(mine) } else { address_of([(b % 250 + 1) as u8; 32]) };
+            db.ingest_block(&[coinbase_for(recipient, &b.to_le_bytes(), 1_000 + b as u64)], &[]);
+        }
+        // Exactly the state a borrowing wallet is in: leaves of its own, no tree it can
+        // claim as its own.
+        db.tree_valid = false;
+
+        db.build_subtree_cache();
+        assert!(db.subtree_cache_ready(db.size()), "a borrowed tree is not a reason to refuse the cache");
+        assert!(!db.subtree_cache_failed());
+
+        // And the witnesses it serves are real, which is the property that actually
+        // matters — it is re-derived per path at spend time either way.
+        let positions: Vec<u64> = db.notes().iter().map(|n| n.position).collect();
+        assert!(!positions.is_empty(), "the wallet must own notes for this to prove anything");
+        assert!(db.witness_paths_at(&positions, db.size()).iter().all(Option::is_some));
+    }
+
+    /// The gate is only relaxed where it cannot be evaluated. A wallet with its OWN tree
+    /// still has its cache checked against it, and a cache that cannot produce a root at
+    /// all is refused whatever the tree's state.
+    #[test]
+    fn a_wallet_with_its_own_tree_still_has_the_cache_checked() {
+        let mine = [38u8; 32];
+        let mut db = WalletDb::from_seed(mine).unwrap();
+        for b in 0..80u32 {
+            db.ingest_block(&[coinbase_for(address_of(mine), &b.to_le_bytes(), 1_000 + b as u64)], &[]);
+        }
+        assert!(db.tree_is_valid(), "an ordinary wallet owns its tree");
+        db.build_subtree_cache();
+        assert!(db.cache_matches_tree(&db.subtree), "a correct cache matches the wallet's own tree");
+
+        // An empty cache cannot produce a root at this size, and is refused in both
+        // regimes — the structural requirement is not what was relaxed.
+        let empty = SubtreeCache::default();
+        assert!(!db.cache_matches_tree(&empty), "no root, no install (own tree)");
+        db.tree_valid = false;
+        assert!(!db.cache_matches_tree(&empty), "no root, no install (borrowed tree)");
+    }
+
     #[test]
     fn subtree_cache_keeps_serving_as_the_chain_grows() {
         let mine = [36u8; 32];
@@ -4170,7 +4258,7 @@ mod tests {
             db.ingest_block(&[coinbase_for(recipient, &b.to_le_bytes(), 1_000 + b as u64)], &[]);
         }
         db.build_subtree_cache();
-        assert!(db.subtree_cache_ready(db.size()));
+        assert!(db.subtree_cache_ready(db.size()), "a borrowed tree is not a reason to refuse the cache");
 
         let blob = db.to_checkpoint();
         let restored = WalletDb::from_checkpoint(mine, &blob).expect("v8 restores");
