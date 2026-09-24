@@ -9798,6 +9798,19 @@ fn sweep_candidates_tiered(dir: &str) -> Vec<(String, usize)> {
     v
 }
 
+/// The coldest tier that maintenance will hold resident and at the tip. Anything colder
+/// is prepared by the cache sweep out of idle capacity, and is not worth the memory of
+/// being kept live on the chance its owner returns.
+const WARM_TIER_RECENT: usize = 1;
+
+/// Free memory below which maintenance will not pull a COLD wallet back in. Refreshing a
+/// resident one is unaffected — that costs a map write, and giving it up under pressure
+/// is what lets the evictor undo the whole point.
+const MAINTAIN_LOAD_FLOOR_MB: u64 = 6_000;
+
+/// Maintenance runs every tick; say so at most this often.
+const WARM_MAINTAIN_RELOG: std::time::Duration = std::time::Duration::from_secs(300);
+
 const WARM_SWEEP_TICK_SECS: u64 = 30;
 /// Rest after a full pass over every wallet before rescanning for new wallets and
 /// previously failed installs.
@@ -9861,8 +9874,12 @@ async fn warm_sweep_loop(state: Arc<AppState>) {
     // the order waited. That is the opposite of "prepare all of them".
     let mut deferred: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut last_tier_log: Option<usize> = None;
+    let mut last_maintain_log = std::time::Instant::now() - WARM_MAINTAIN_RELOG;
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(WARM_SWEEP_TICK_SECS)).await;
+        // Tiering first: maintenance below needs it, and it must not sit behind the
+        // build gates.
+        let candidates = sweep_candidates_tiered(&state.wallet_dir);
         if proving_now() || CONSOLIDATING.load(std::sync::atomic::Ordering::Relaxed) > 0 {
             continue;
         }
@@ -9874,13 +9891,74 @@ async fn warm_sweep_loop(state: Arc<AppState>) {
                 continue;
             }
         }
+
+        // ---- MAINTENANCE: keep the recently-active wallets OPEN and AT THE TIP -------
+        //
+        // The half of "prepare completely" that a user actually feels. A cache makes the
+        // witness step fast; it does nothing about the two costs that dominate a reopen:
+        //
+        //   * `sync_loop` only advances wallets whose `last_touch` is inside
+        //     `--active-sync-window`, so a wallet stops being synced once its owner has
+        //     been away that long;
+        //   * `evict_idle_wallets` then drops it, and the next visit pays a `restore` —
+        //     measured on this daemon at a median of 8.8 s and a p90 of 93.6 s, because
+        //     these checkpoints reach 486 MB.
+        //
+        // Come back after a few hours and you pay both. Neither is touched by any amount
+        // of cache building.
+        //
+        // TWO REGIMES, and conflating them is what made the first version of this dead
+        // code: it sat below the subtree-build memory floor and `proving_now()`, so it
+        // ran exactly never — under memory pressure, which is when wallets are being
+        // evicted and maintenance matters most, the loop had already `continue`d.
+        //
+        //   * a wallet ALREADY RESIDENT costs nothing to keep: refreshing `last_touch` is
+        //     a map write. It is unconditional, and it is what stops the sync loop parking
+        //     a wallet and the evictor dropping it.
+        //   * a wallet NOT resident must be LOADED, which costs a restore and its memory.
+        //     That is gated on real headroom, and skipped entirely when the box is busy.
+        let maintain = state.resources.warm_always;
+        if maintain > 0 {
+            let hot: Vec<String> = candidates
+                .iter()
+                .take_while(|(_, tier)| *tier <= WARM_TIER_RECENT)
+                .take(maintain)
+                .map(|(t, _)| t.clone())
+                .collect();
+            let resident: HashSet<String> = state.wallets.lock().await.keys().cloned().collect();
+            let now = std::time::Instant::now();
+            let mut kept = 0usize;
+            {
+                let mut touch = state.last_touch.lock().await;
+                for token in hot.iter().filter(|t| resident.contains(*t)) {
+                    touch.insert(token.clone(), now);
+                    kept += 1;
+                }
+            }
+            // Pull the missing ones back in, one per tick so a cohort of 486 MB restores
+            // cannot arrive at once, and only with room to put them.
+            let mut pulled = 0usize;
+            let headroom = mem_available_mb().unwrap_or(u64::MAX);
+            if headroom > MAINTAIN_LOAD_FLOOR_MB && !proving_now() {
+                if let Some(token) = hot.iter().find(|t| !resident.contains(*t)) {
+                    if state.get_wallet(token).await.is_some() {
+                        pulled = 1;
+                    }
+                }
+            }
+            if (kept > 0 || pulled > 0) && last_maintain_log.elapsed() >= WARM_MAINTAIN_RELOG {
+                last_maintain_log = std::time::Instant::now();
+                log::info!(
+                    "warm maintenance: {kept} recently-active wallet(s) held open and at the tip, {pulled} pulled back in ({} MB free, cap --warm-always {maintain})",
+                    headroom
+                );
+            }
+        }
+
+        // ---- PREPARATION: build caches for everything else, on spare capacity ---------
         if state.wallets.lock().await.len() >= state.resources.max_resident_wallets / 2 {
             continue;
         }
-        // Recompute the tiering every tick: a wallet whose owner just showed up has a
-        // fresh `.scan` mtime and is promoted to `hot` mid-pass, which is exactly when
-        // promoting it is worth anything.
-        let candidates = sweep_candidates_tiered(&state.wallet_dir);
         let remaining = candidates.iter().filter(|(t, _)| !done.contains(t)).count();
         if remaining == 0 {
             log::info!("warm sweep: pass complete ({} wallets checked); resting", done.len());

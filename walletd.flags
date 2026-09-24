@@ -1,0 +1,21 @@
+# Flags for the hosted walletd. The supervisor re-reads this file before every spawn, so
+# changing a knob needs only a SIGTERM to the daemon — not a second supervisor, which is
+# what put two multi-gigabyte daemons on the box at once and drove it to 1 GB free.
+#
+# ZKAS_GPU=off: measured 2026-09-23, the device path's MEDIAN was 8948 us/action against
+# 211.9 for the CPU. The submit gate in zkas-gpu is committed; the filter path still needs
+# profiling before this goes back on.
+ZKAS_GPU=off
+
+# --warm-wallets 1      one subtree build at a time; each holds its wallet's decoded leaf
+#                       stream (~340 MB at 10.5M leaves) and 12 at once OOM-killed us.
+# --idle-evict 7200     a restore costs a median 8.8 s and a p90 of 93.6 s, so dropping a
+#                       wallet after 35 minutes was a bad trade. Pressure evicts via
+#                       --max-resident-wallets instead of the clock.
+# --warm-always 16      the set maintenance holds open and at the tip.
+WALLETD_FLAGS="--network mainnet --rpc-server 127.0.0.1:16810 --listen 0.0.0.0:8501 --allow-remote \
+--wallet-dir /root/firecash/wallets --allow-origin https://wallet.zkas.info --allow-origin https://wallet.firecash.info \
+--allow-origin https://localhost --allow-origin capacitor://localhost --allow-default-token --runtime-threads 32 \
+--proof-threads 3 --max-concurrent-proves 6 --sync-wallets 28 --sync-wallet-memory-mb 384 --load-wallets 16 \
+--warm-wallets 1 --page-decode-threads 12 --page-cache-entries 768 --page-cache-ttl 90 --active-sync-window 1800 \
+--idle-evict 7200 --max-resident-wallets 40 --subtree-free-floor-mb 12000 --warm-always 16 --warm-budget 60"
