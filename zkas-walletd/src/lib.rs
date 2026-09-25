@@ -4125,6 +4125,9 @@ struct AppState {
     /// likely to come back to, rather than whichever ones the sync loop happened to write
     /// most recently.
     activity: Mutex<HashMap<String, u64>>,
+    /// Durable last-known status per wallet — see [`SNAPSHOT_FILE`]. Unlike `snapshots`
+    /// this is NOT pruned when a wallet is evicted; that is the whole point.
+    persisted_snaps: Mutex<HashMap<String, StatusSnap>>,
     /// Caps how many wallets load (rebuild their Merkle tree from the checkpoint /
     /// pruning point — tens of thousands of Sinsemilla hashes, synchronous on the async
     /// worker) at once. Without it, a daemon restart makes every reconnecting browser
@@ -4360,6 +4363,30 @@ fn snap_from_entry(address: String, e: &WalletEntry, daa_score: u64) -> StatusSn
 }
 
 /// Project a cached snapshot onto a `StatusResp` (the wire shape the SPA reads).
+/// Answer for a wallet that is NOT loaded, from its last persisted status.
+///
+/// Without this the daemon reports zeros, and a client that will not describe a balance it
+/// does not trust has no choice but to show a blocking "Opening your wallet" bar for the
+/// length of a 177-522 MB restore — a median of 8.8 s and a p90 of 93.6 s on the hosted
+/// daemon.
+///
+/// Degraded on purpose. The balance, address and cursor are real (they are what this wallet
+/// last was), but `loading` stays true and `synced`/`spend_ready` are forced FALSE: a wallet
+/// that is not in memory is not up to date and cannot pay, and saying otherwise would let a
+/// client offer a Send that `/prepare` then refuses. Last-known view, never a promise.
+async fn apply_last_known(resp: &mut StatusResp, state: &Arc<AppState>, token: &str) {
+    let Some(snap) = state.persisted_snaps.lock().await.get(token).cloned() else { return };
+    let address = resp.address.clone();
+    fill_status_from_snap(resp, &snap);
+    resp.loading = true;
+    resp.synced = false;
+    resp.spend_ready = false;
+    // `address_from_disk` is authoritative for a wallet we have not opened.
+    if address.is_some() {
+        resp.address = address;
+    }
+}
+
 fn fill_status_from_snap(resp: &mut StatusResp, s: &StatusSnap) {
     resp.has_wallet = true;
     resp.address = Some(s.address.clone());
@@ -4396,7 +4423,7 @@ fn fill_status_from_snap(resp: &mut StatusResp, s: &StatusSnap) {
 /// flickered to 0 on every poll that raced a scan pass, which read as "the wallet
 /// stopped updating". The sync loop refreshes this after each pass; `status` also
 /// refreshes it whenever it does get the lock.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 struct StatusSnap {
     address: String,
     watch_only: bool,
@@ -6213,7 +6240,8 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
     // Refresh the out-of-band status snapshot while we still hold the lock.
     let snap = snap_from_entry(state.address_of(&e.db), &e, chain_len);
     drop(e);
-    state.snapshots.lock().await.insert(token.clone(), snap);
+    state.snapshots.lock().await.insert(token.clone(), snap.clone());
+    state.persisted_snaps.lock().await.insert(token.clone(), snap);
     if let Some((buf, scanned)) = pending_checkpoint {
         let dir = state.wallet_dir.clone();
         let who = token.clone();
@@ -6898,6 +6926,7 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Json<
                 let snap = snap_from_entry(state.address_of(&e.db), &e, daa_score);
                 drop(e);
                 state.snapshots.lock().await.insert(token.clone(), snap.clone());
+                state.persisted_snaps.lock().await.insert(token.clone(), snap.clone());
                 fill_status_from_snap(&mut resp, &snap);
             } else if let Some(snap) = state.snapshots.lock().await.get(&token).cloned() {
                 // Lock held by the sync loop this instant — answer from the last-known-good
@@ -6923,6 +6952,7 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Json<
                 resp.has_wallet = true;
                 resp.loading = true;
                 resp.address = state.address_from_disk(&token).await;
+                apply_last_known(&mut resp, &state, &token).await;
             }
         } else if wallet_exists(&state.wallet_dir, &token) {
             // Known wallet, not yet in memory — load it in the background. Same again:
@@ -6931,6 +6961,7 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Json<
             resp.has_wallet = true;
             resp.loading = true;
             resp.address = state.address_from_disk(&token).await;
+            apply_last_known(&mut resp, &state, &token).await;
         }
         if resp.has_wallet {
             resp.birthday = wallet_birthday_on_disk(&state.wallet_dir, &token);
@@ -9856,6 +9887,46 @@ const WARM_TIER_RECENT: usize = 1;
 /// It holds no key material and no balance — only which tokens were asked for and when.
 const ACTIVITY_FILE: &str = ".activity";
 
+/// Last-known status of every wallet, so the daemon always has something true to say
+/// about one it has not loaded.
+///
+/// `status` never loads a wallet on the request path — correctly, since a load is seconds
+/// of work — so for an unloaded wallet it answered zeros with `loading: true`. The client
+/// cannot render that: a zero balance it does not trust is not a balance, so it shows a
+/// blocking "Opening your wallet" bar and the user waits for a 177-522 MB restore.
+///
+/// The daemon already computes exactly the right answer (`StatusSnap`: address, balance,
+/// cursor, note count) — it just kept it in memory and PRUNED IT ON EVICTION, so the one
+/// wallet guaranteed to need it was the one guaranteed not to have it. Persisting it costs
+/// a few hundred bytes per wallet and turns "I don't know yet" into "here is where you
+/// were, and I am catching up".
+///
+/// What is served from here is deliberately degraded: `loading` stays true and BOTH
+/// `synced` and `spend_ready` are forced false, because a wallet that is not in memory
+/// cannot pay and is not up to date. It is a last-known view, never a promise.
+const SNAPSHOT_FILE: &str = ".snapshots";
+
+fn snapshot_path(dir: &str) -> String {
+    format!("{dir}/{SNAPSHOT_FILE}")
+}
+
+fn load_snaps(dir: &str) -> HashMap<String, StatusSnap> {
+    std::fs::read_to_string(snapshot_path(dir))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+/// Temp + rename: a half-written file that survived a crash would hand every client a
+/// truncated view of its own wallet.
+fn save_snaps(dir: &str, map: &HashMap<String, StatusSnap>) {
+    let Ok(body) = serde_json::to_string(map) else { return };
+    let tmp = format!("{}.tmp", snapshot_path(dir));
+    if std::fs::write(&tmp, body).is_ok() {
+        let _ = std::fs::rename(&tmp, snapshot_path(dir));
+    }
+}
+
 /// How often the ledger is flushed. A user's recency does not need second precision, and
 /// this must never become a write per request.
 const ACTIVITY_FLUSH_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
@@ -9906,6 +9977,26 @@ const MAINTAIN_LOAD_FLOOR_MB: u64 = 6_000;
 
 /// Cold wallets maintenance may pull back per tick while filling the pin.
 const MAINTAIN_PULL_PER_TICK: usize = 3;
+
+/// Ticks between rotation steps.
+///
+/// A pin alone only ever helps the same few wallets; everybody else stays cold forever.
+/// Rotation walks the rest of the active set so each one is brought to the tip and gets a
+/// subtree cache built — and BOTH of those persist (the cursor in the checkpoint, the cache
+/// as its v8 section), so a wallet keeps the benefit long after it is evicted. One pass
+/// makes every active wallet permanently cheaper to open.
+///
+/// The rate is not a preference, it is a safety bound. A wallet that has just been touched
+/// is inside `--active-sync-window` and the LRU-overflow rule deliberately will not evict
+/// it, so rotating faster than `max_resident_wallets / active_sync_secs` pushes residency
+/// past its cap with nothing able to reclaim it — which is exactly how this daemon was
+/// OOM-killed on 2026-09-24. At 40 resident and a 1800 s window the ceiling is ~1.3
+/// wallets/minute; two ticks (60 s) sits under it with room for the pin and live traffic.
+const ROTATE_EVERY_TICKS: u64 = 2;
+
+/// Coldest tier rotation will visit. Beyond this the cache sweep handles them on idle
+/// capacity; rotation is for wallets whose owner plausibly returns.
+const ROTATE_MAX_TIER: usize = 2;
 
 /// Maintenance runs every tick; say so at most this often.
 const WARM_MAINTAIN_RELOG: std::time::Duration = std::time::Duration::from_secs(300);
@@ -9975,14 +10066,22 @@ async fn warm_sweep_loop(state: Arc<AppState>) {
     let mut last_tier_log: Option<usize> = None;
     let mut last_maintain_log = std::time::Instant::now() - WARM_MAINTAIN_RELOG;
     let mut last_activity_flush = std::time::Instant::now();
+    let mut ticks: u64 = 0;
+    let mut rotate_cursor: usize = 0;
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(WARM_SWEEP_TICK_SECS)).await;
         // Persist request-recency so a restart does not forget who was active.
         if last_activity_flush.elapsed() >= ACTIVITY_FLUSH_EVERY {
             last_activity_flush = std::time::Instant::now();
             let snapshot = state.activity.lock().await.clone();
+            let snaps = state.persisted_snaps.lock().await.clone();
             let dir = state.wallet_dir.clone();
-            tokio::task::spawn_blocking(move || save_activity(&dir, &snapshot)).await.ok();
+            tokio::task::spawn_blocking(move || {
+                save_activity(&dir, &snapshot);
+                save_snaps(&dir, &snaps);
+            })
+            .await
+            .ok();
         }
         // Tiering first: maintenance below needs it, and it must not sit behind the
         // build gates.
@@ -10064,10 +10163,42 @@ async fn warm_sweep_loop(state: Arc<AppState>) {
                     }
                 }
             }
-            if (kept > 0 || pulled > 0) && last_maintain_log.elapsed() >= WARM_MAINTAIN_RELOG {
+            // ---- ROTATION --------------------------------------------------------
+            //
+            // The pin covers the hottest few. Everyone else in the active set is visited in
+            // turn: touching a wallet loads it and refreshes `last_touch`, so the sync loop
+            // brings it to the tip and the cache sweep can build its index — and both of
+            // those outlive the visit. The cursor simply walks on, so over a pass every
+            // active wallet ends up current with a cache, instead of ten wallets being
+            // perfect and the rest untouched.
+            //
+            // Skipped entirely while proving or when memory is tight: this is opportunistic
+            // work and must never compete with a payment somebody is waiting for.
+            let mut rotated: Option<String> = None;
+            ticks = ticks.wrapping_add(1);
+            if ticks % ROTATE_EVERY_TICKS == 0
+                && !proving_now()
+                && mem_available_mb().unwrap_or(u64::MAX) > MAINTAIN_LOAD_FLOOR_MB
+            {
+                let pool: Vec<&String> = candidates
+                    .iter()
+                    .filter(|(t, tier)| *tier <= ROTATE_MAX_TIER && !hot.contains(t))
+                    .map(|(t, _)| t)
+                    .collect();
+                if !pool.is_empty() {
+                    rotate_cursor = rotate_cursor.wrapping_add(1);
+                    let token = pool[rotate_cursor % pool.len()].clone();
+                    if state.get_wallet(&token).await.is_some() {
+                        rotated = Some(token);
+                    }
+                }
+            }
+            if (kept > 0 || pulled > 0 || rotated.is_some()) && last_maintain_log.elapsed() >= WARM_MAINTAIN_RELOG {
                 last_maintain_log = std::time::Instant::now();
                 log::info!(
-                    "warm maintenance: {kept} recently-active wallet(s) held open and at the tip, {pulled} pulled back in ({} MB free, cap --warm-always {maintain})",
+                    "warm maintenance: {kept} held open and at the tip, {pulled} pulled back in, rotating through {}{} ({} MB free, cap --warm-always {maintain})",
+                    candidates.iter().filter(|(t, tier)| *tier <= ROTATE_MAX_TIER && !hot.contains(t)).count(),
+                    rotated.as_deref().map(|t| format!(" (now {})", &t[..8.min(t.len())])).unwrap_or_default(),
                     headroom
                 );
             }
@@ -10378,6 +10509,7 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
     let wallet_dir = cfg.wallet_dir;
     // Read before `wallet_dir` is moved into the state below.
     let activity_seed = load_activity(&wallet_dir);
+    let snap_seed = load_snaps(&wallet_dir);
     let _ = std::fs::create_dir_all(&wallet_dir);
 
     // Two node connections: one for the request path, one for the background sync loop,
@@ -10477,6 +10609,7 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
         page_cache: Mutex::new(PageCache::new(&resources)),
         last_touch: Mutex::new(HashMap::new()),
         activity: Mutex::new(activity_seed),
+        persisted_snaps: Mutex::new(snap_seed),
         load_gate: tokio::sync::Semaphore::new(resources.load_wallets.max(1)),
         loading: Mutex::new(HashMap::new()),
         // Concurrent preparations are capped by config (`--max-concurrent-proves`):
