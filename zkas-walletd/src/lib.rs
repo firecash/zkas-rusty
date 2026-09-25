@@ -4120,6 +4120,11 @@ struct AppState {
     /// `/health` — a live outage. A returning user's first poll re-touches and resumes
     /// it from its checkpoint.
     last_touch: Mutex<HashMap<String, std::time::Instant>>,
+    /// Durable mirror of `last_touch`, in unix seconds — see [`ACTIVITY_FILE`]. This is
+    /// what survives a restart and lets maintenance pick the wallets a person is actually
+    /// likely to come back to, rather than whichever ones the sync loop happened to write
+    /// most recently.
+    activity: Mutex<HashMap<String, u64>>,
     /// Caps how many wallets load (rebuild their Merkle tree from the checkpoint /
     /// pruning point — tens of thousands of Sinsemilla hashes, synchronous on the async
     /// worker) at once. Without it, a daemon restart makes every reconnecting browser
@@ -5003,6 +5008,7 @@ impl AppState {
     /// Mark a token active so the sync loop keeps it current (idle wallets are parked).
     async fn touch(&self, token: &str) {
         self.last_touch.lock().await.insert(token.to_string(), std::time::Instant::now());
+        self.activity.lock().await.insert(token.to_string(), now_unix());
     }
 
     /// The wallet if it is already loaded in memory — never loads. For the request path,
@@ -5280,6 +5286,7 @@ impl AppState {
         // Mark the wallet active so the sync loop keeps it current; idle wallets are
         // parked (see `sync_loop`).
         self.last_touch.lock().await.insert(token.to_string(), std::time::Instant::now());
+        self.activity.lock().await.insert(token.to_string(), now_unix());
         {
             let map = self.wallets.lock().await;
             if let Some(w) = map.get(token) {
@@ -9780,22 +9787,53 @@ fn tier_admits(tier: usize, budget_pct: u64) -> bool {
 }
 
 /// Every sweep candidate paired with its tier, hottest first.
-fn sweep_candidates_tiered(dir: &str) -> Vec<(String, usize)> {
-    let mut v: Vec<(String, usize)> = sweep_candidates(dir)
+fn sweep_candidates_tiered(dir: &str, activity: &HashMap<String, u64>) -> Vec<(String, usize)> {
+    let now = now_unix();
+    let mut v: Vec<(String, usize, u64)> = sweep_candidates(dir)
         .into_iter()
         .map(|t| {
-            let age = std::fs::metadata(scan_path(dir, &t))
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|m| m.elapsed().ok())
-                .map(|d| d.as_secs())
-                .unwrap_or(u64::MAX);
-            (t, warm_tier(age))
+            // When a PERSON last asked for this wallet. That is the only thing that
+            // predicts whether they are coming back.
+            //
+            // The fallback is the checkpoint's mtime, which is what this used to rank by
+            // exclusively — and it is a poor signal, because the daemon rewrites that file
+            // for every wallet it syncs. "Freshest mtime" therefore meant "the sync loop
+            // reached it", not "somebody opened it", so maintenance held near-arbitrary
+            // wallets. It is kept only for wallets the ledger has never seen.
+            let age = match activity.get(&t) {
+                Some(at) => now.saturating_sub(*at),
+                None => {
+                    // No evidence a person has ever asked for this wallet. Checkpoint mtime
+                    // is the only thing left, and it is a POOR substitute: the daemon
+                    // rewrites that file every time the sync loop advances the wallet, so a
+                    // freshly-synced wallet nobody has opened looks newer than one somebody
+                    // opened half an hour ago.
+                    //
+                    // So it is floored into the `week` tier and can never claim a hot or
+                    // recent slot. It still orders the cache-building sweep sensibly, which
+                    // is all mtime was ever good for, but it cannot take a maintenance pin
+                    // away from a wallet with a real request behind it.
+                    let mtime = std::fs::metadata(scan_path(dir, &t))
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|m| m.elapsed().ok())
+                        .map(|d| d.as_secs())
+                        .unwrap_or(u64::MAX);
+                    mtime.max(WARM_TIERS[WARM_TIER_RECENT].1 + 1)
+                }
+            };
+            (t, warm_tier(age), age)
         })
         .collect();
-    // Tier first, then token, so the order is total and a pass is reproducible.
-    v.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
-    v
+    // Tier first, then AGE, then token.
+    //
+    // Sorting by token within a tier looked harmless and was not: the maintenance pin takes
+    // the first N, so among equally-hot wallets it chose alphabetically — a wallet opened
+    // ten seconds ago lost its slot to one opened fifty minutes ago because of its name.
+    // Age is the whole point of the ordering; the token is only a tiebreak so a pass stays
+    // reproducible.
+    v.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.2.cmp(&b.2)).then_with(|| a.0.cmp(&b.0)));
+    v.into_iter().map(|(t, tier, _)| (t, tier)).collect()
 }
 
 /// The coldest tier that maintenance will hold resident and at the tip. Anything colder
@@ -9803,10 +9841,71 @@ fn sweep_candidates_tiered(dir: &str) -> Vec<(String, usize)> {
 /// being kept live on the chance its owner returns.
 const WARM_TIER_RECENT: usize = 1;
 
+/// Where the daemon records WHEN A PERSON last asked for each wallet.
+///
+/// The tiering used to rank wallets by `.scan` mtime, which is wrong: the daemon rewrites
+/// that file for every wallet it syncs, so "freshest mtime" means "the daemon touched it",
+/// not "somebody opened it". Maintenance was therefore holding ~10 near-arbitrary wallets
+/// and a returning user's wallet was in that set only by luck.
+///
+/// `last_touch` IS the right signal, but it is an in-memory map and dies with the process
+/// — so after every restart the daemon knows nothing about who was active, which is
+/// exactly when it most needs to. This file is that map, made durable: one line per
+/// wallet, `token unix_seconds`, rewritten periodically and read once at startup.
+///
+/// It holds no key material and no balance — only which tokens were asked for and when.
+const ACTIVITY_FILE: &str = ".activity";
+
+/// How often the ledger is flushed. A user's recency does not need second precision, and
+/// this must never become a write per request.
+const ACTIVITY_FLUSH_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn activity_path(dir: &str) -> String {
+    format!("{dir}/{ACTIVITY_FILE}")
+}
+
+/// Read the durable request-recency ledger. Missing or damaged entries are simply absent;
+/// a wallet with no entry falls back to its checkpoint mtime, which is what the tiering
+/// used before this existed.
+fn load_activity(dir: &str) -> HashMap<String, u64> {
+    let mut out = HashMap::new();
+    let Ok(text) = std::fs::read_to_string(activity_path(dir)) else { return out };
+    for line in text.lines() {
+        let mut it = line.split_whitespace();
+        if let (Some(tok), Some(at)) = (it.next(), it.next()) {
+            if let Ok(at) = at.parse::<u64>() {
+                if !tok.is_empty() && tok.len() <= 64 {
+                    out.insert(tok.to_string(), at);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Write it back. Whole-file rewrite through a temp + rename: the ledger is a few tens of
+/// kB, and a half-written one that survived a crash would mis-rank every wallet.
+fn save_activity(dir: &str, map: &HashMap<String, u64>) {
+    let mut body = String::with_capacity(map.len() * 48);
+    for (tok, at) in map {
+        body.push_str(tok);
+        body.push(' ');
+        body.push_str(&at.to_string());
+        body.push('\n');
+    }
+    let tmp = format!("{}.tmp", activity_path(dir));
+    if std::fs::write(&tmp, body).is_ok() {
+        let _ = std::fs::rename(&tmp, activity_path(dir));
+    }
+}
+
 /// Free memory below which maintenance will not pull a COLD wallet back in. Refreshing a
 /// resident one is unaffected — that costs a map write, and giving it up under pressure
 /// is what lets the evictor undo the whole point.
 const MAINTAIN_LOAD_FLOOR_MB: u64 = 6_000;
+
+/// Cold wallets maintenance may pull back per tick while filling the pin.
+const MAINTAIN_PULL_PER_TICK: usize = 3;
 
 /// Maintenance runs every tick; say so at most this often.
 const WARM_MAINTAIN_RELOG: std::time::Duration = std::time::Duration::from_secs(300);
@@ -9875,11 +9974,22 @@ async fn warm_sweep_loop(state: Arc<AppState>) {
     let mut deferred: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut last_tier_log: Option<usize> = None;
     let mut last_maintain_log = std::time::Instant::now() - WARM_MAINTAIN_RELOG;
+    let mut last_activity_flush = std::time::Instant::now();
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(WARM_SWEEP_TICK_SECS)).await;
+        // Persist request-recency so a restart does not forget who was active.
+        if last_activity_flush.elapsed() >= ACTIVITY_FLUSH_EVERY {
+            last_activity_flush = std::time::Instant::now();
+            let snapshot = state.activity.lock().await.clone();
+            let dir = state.wallet_dir.clone();
+            tokio::task::spawn_blocking(move || save_activity(&dir, &snapshot)).await.ok();
+        }
         // Tiering first: maintenance below needs it, and it must not sit behind the
         // build gates.
-        let candidates = sweep_candidates_tiered(&state.wallet_dir);
+        let candidates = {
+            let act = state.activity.lock().await;
+            sweep_candidates_tiered(&state.wallet_dir, &act)
+        };
         if proving_now() || CONSOLIDATING.load(std::sync::atomic::Ordering::Relaxed) > 0 {
             continue;
         }
@@ -9940,9 +10050,17 @@ async fn warm_sweep_loop(state: Arc<AppState>) {
             let mut pulled = 0usize;
             let headroom = mem_available_mb().unwrap_or(u64::MAX);
             if headroom > MAINTAIN_LOAD_FLOOR_MB && !proving_now() {
-                if let Some(token) = hot.iter().find(|t| !resident.contains(*t)) {
+                // After a restart NOTHING is resident, so one per tick meant the pin took
+                // `warm_always` x WARM_SWEEP_TICK_SECS to fill — five minutes of every
+                // returning user paying a cold restore, which is the worst possible moment
+                // to be slow. Pull a few at a time, still bounded, and re-check headroom
+                // between each so a cohort of 500 MB restores cannot run the box out.
+                for token in hot.iter().filter(|t| !resident.contains(*t)).take(MAINTAIN_PULL_PER_TICK) {
+                    if mem_available_mb().unwrap_or(u64::MAX) <= MAINTAIN_LOAD_FLOOR_MB {
+                        break;
+                    }
                     if state.get_wallet(token).await.is_some() {
-                        pulled = 1;
+                        pulled += 1;
                     }
                 }
             }
@@ -10120,8 +10238,10 @@ mod warm_overlap_tests {
 #[cfg(test)]
 mod warm_sweep_tests {
     use super::{
-        scan_path, sweep_candidates, sweep_candidates_tiered, tier_admits, warm_tier, WARM_TIERS, WARM_TIER_BUDGET_SCALE,
+        load_activity, save_activity, scan_path, sweep_candidates, sweep_candidates_tiered, tier_admits, warm_tier,
+        WARM_TIERS, WARM_TIER_BUDGET_SCALE,
     };
+    use std::collections::HashMap;
 
     #[test]
     fn warm_tiers_are_ordered_and_total() {
@@ -10156,6 +10276,54 @@ mod warm_sweep_tests {
         assert!(WARM_TIER_BUDGET_SCALE[1..].iter().all(|s| s.is_finite() && *s > 0.0));
     }
 
+    /// Request recency beats checkpoint mtime.
+    ///
+    /// The daemon rewrites a wallet's `.scan` every time the sync loop advances it, so
+    /// mtime ranks by "the daemon reached it", not "a person opened it". Ranking by mtime
+    /// meant maintenance pinned near-arbitrary wallets and a returning user's wallet was in
+    /// that set only by luck. The ledger records who actually asked.
+    #[test]
+    fn a_wallet_a_person_asked_for_outranks_one_the_daemon_merely_synced() {
+        let dir = std::env::temp_dir().join(format!("act-rank-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_str().unwrap().to_string();
+        // Both files written NOW, so mtime cannot separate them.
+        for t in ["aaa", "zzz"] {
+            std::fs::write(scan_path(&d, t), b"x").unwrap();
+        }
+        // ...but only "zzz" was asked for by a person, an hour ago; "aaa" never was.
+        let mut act = HashMap::new();
+        act.insert("zzz".to_string(), super::now_unix().saturating_sub(1800));
+        let got: Vec<String> = sweep_candidates_tiered(&d, &act).into_iter().map(|(t, _)| t).collect();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(got.first().map(String::as_str), Some("zzz"), "the wallet a person opened must rank first");
+    }
+
+    /// The ledger has to survive a restart — that is its entire reason for existing, since
+    /// `last_touch` is in memory and dies with the process, exactly when the daemon most
+    /// needs to know who was active.
+    #[test]
+    fn the_activity_ledger_round_trips() {
+        let dir = std::env::temp_dir().join(format!("act-rt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_str().unwrap().to_string();
+        assert!(load_activity(&d).is_empty(), "absent ledger reads as empty, never as an error");
+
+        let mut m = HashMap::new();
+        m.insert("aabb".to_string(), 1_700_000_000u64);
+        m.insert("ccdd".to_string(), 1_700_000_042u64);
+        save_activity(&d, &m);
+        assert_eq!(load_activity(&d), m);
+
+        // A damaged line is skipped, not fatal: a mis-ranked wallet is a slow open, but a
+        // daemon that refuses to start is an outage.
+        std::fs::write(format!("{d}/.activity"), "aabb 1700000000\ngarbage\nccdd notanumber\n").unwrap();
+        let got = load_activity(&d);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got.get("aabb"), Some(&1_700_000_000));
+    }
+
     #[test]
     fn sweep_orders_hot_wallets_before_cold_ones() {
         let dir = std::env::temp_dir().join(format!("sweep-tier-{}", std::process::id()));
@@ -10170,7 +10338,7 @@ mod warm_sweep_tests {
             let when = now - std::time::Duration::from_secs(age_secs);
             std::fs::File::options().write(true).open(&path).unwrap().set_modified(when).unwrap();
         }
-        let got: Vec<String> = sweep_candidates_tiered(&dir_s).into_iter().map(|(t, _)| t).collect();
+        let got: Vec<String> = sweep_candidates_tiered(&dir_s, &HashMap::new()).into_iter().map(|(t, _)| t).collect();
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(got, vec!["zzz", "mmm", "aaa"], "hottest first, not alphabetical");
     }
@@ -10208,6 +10376,8 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
     // Must happen before the first connect below.
     kaspa_grpc_client::set_node_socks_proxy(cfg.node_socks_proxy.clone());
     let wallet_dir = cfg.wallet_dir;
+    // Read before `wallet_dir` is moved into the state below.
+    let activity_seed = load_activity(&wallet_dir);
     let _ = std::fs::create_dir_all(&wallet_dir);
 
     // Two node connections: one for the request path, one for the background sync loop,
@@ -10306,6 +10476,7 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
         genesis,
         page_cache: Mutex::new(PageCache::new(&resources)),
         last_touch: Mutex::new(HashMap::new()),
+        activity: Mutex::new(activity_seed),
         load_gate: tokio::sync::Semaphore::new(resources.load_wallets.max(1)),
         loading: Mutex::new(HashMap::new()),
         // Concurrent preparations are capped by config (`--max-concurrent-proves`):
