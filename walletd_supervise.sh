@@ -30,7 +30,11 @@ backoff=2
 while true; do
   # shellcheck disable=SC1090
   . "$FLAGS_FILE"
+  # Everything the flags file sets as an env var has to be EXPORTED, not just assigned -
+  # sourcing puts it in the shell, not in the child. Missing this is how the allocator
+  # tuning would have silently done nothing.
   export ZKAS_GPU
+  export MALLOC_ARENA_MAX MALLOC_MMAP_THRESHOLD_ MALLOC_TRIM_THRESHOLD_
   echo "$(date -Is) starting walletd"
   started=$(date +%s)
   # shellcheck disable=SC2086

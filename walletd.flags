@@ -2,7 +2,26 @@
 # changing a knob needs only a SIGTERM to the daemon — not a second supervisor, which is
 # what put two multi-gigabyte daemons on the box at once and drove it to 1 GB free.
 #
-# ZKAS_GPU=off: measured 2026-09-23, the device path's MEDIAN was 8948 us/action against
+# ZKAS_GPU=off
+
+# glibc allocator, tuned for a daemon that churns multi-hundred-MB Vecs across 66 threads.
+#
+# Symptom: VmData 104.9 GB against RssAnon 49.1 GB, and OOM kills at ~55 GB anon-rss on a
+# 62 GB box even with --max-resident-wallets 40. Three kills so far; two on 2026-09-27,
+# the second only 75 minutes after the first.
+#
+# Two glibc behaviours cause it. Arenas: unset means 8 x ncores = 96 per-thread heaps,
+# each holding its own free pool that is never handed back. And the mmap threshold is
+# DYNAMIC - it ratchets upward as large blocks are freed, after which a 340 MB leaf-stream
+# allocation comes from the heap instead of mmap and is never returned to the OS.
+#
+# Pinning the threshold keeps big allocations on mmap, where free() really does give the
+# pages back; capping arenas stops 96 separate free pools accumulating. Env-only, no
+# rebuild, revert by deleting these three lines.
+MALLOC_ARENA_MAX=4
+MALLOC_MMAP_THRESHOLD_=131072
+MALLOC_TRIM_THRESHOLD_=131072
+: measured 2026-09-23, the device path's MEDIAN was 8948 us/action against
 # 211.9 for the CPU. The submit gate in zkas-gpu is committed; the filter path still needs
 # profiling before this goes back on.
 ZKAS_GPU=off
