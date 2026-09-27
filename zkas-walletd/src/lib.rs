@@ -6464,7 +6464,29 @@ async fn sync_loop(state: Arc<AppState>) {
     let sync_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(tip_slots));
     let cold_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(cold_slots));
     log::info!("sync lanes: {tip_slots} tip slot(s) + {cold_slots} cold slot(s) (cold = at least {CATCHUP_BURST_MIN_BEHIND} DAA behind)");
+    // On a SINGLE-wallet daemon, stand the scan down while a payment is proving.
+    //
+    // Every other background job already does this — cache builds, consolidation, the
+    // warm sweep, maintenance — all under the same rule: never take cores from a payment
+    // somebody is waiting on. The scan itself was the exception, and on a server that is
+    // correct: `--proof-threads` reserves a slice, hundreds of other wallets still need
+    // advancing, and stalling all of them for one user's send would be absurd.
+    //
+    // A phone is the opposite case. `page_decode_threads` is every core (one wallet owns
+    // the machine) and Halo 2 takes rayon's global pool, which is also every core — so a
+    // send and a scan fight over the same CPU, and the person staring at a spinner loses
+    // to background work they did not ask for. Proving is the dominant cost of a payment
+    // (~0.33 s per note spent, up to 38 per transaction); the scan advancing a few hundred
+    // blocks meanwhile is worth nothing to them.
+    //
+    // Keyed on `sync_wallets == 1`, which is exactly the on-device profile, so the hosted
+    // daemon is unaffected.
+    let single_wallet = state.resources.sync_wallets <= 1;
     loop {
+        if single_wallet && proving_now() {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            continue;
+        }
         // Snapshot token names, not Wallet Arcs. Holding an Arc for every resident
         // wallet across the whole cohort kept evicted multi-hundred-MiB checkpoints
         // alive until the slowest scan finished, making the resident cap appear to
@@ -10499,6 +10521,37 @@ mod warm_sweep_tests {
 /// forever). Returns once the HTTP server has stopped and the background loops are
 /// aborted, so an embedding process (the desktop app) can call `serve` again with a
 /// new config — e.g. after the user switches nodes.
+/// A weak handle to the running daemon, so an embedder can reach it without owning it.
+///
+/// Exists for one caller: Android's `onTrimMemory`. The system warns before it starts
+/// killing, and an on-device engine that ignores that warning is the one that gets killed
+/// — taking the user's scan progress with it. Weak on purpose: this must never be the
+/// reference that keeps a stopped daemon alive.
+static LIVE_STATE: std::sync::Mutex<Option<std::sync::Weak<AppState>>> = std::sync::Mutex::new(None);
+
+/// Drop everything the resident wallets can rebuild, and report how many decoded leaves
+/// went. Safe to call from any thread at any time, including none-running.
+///
+/// Entirely `try_lock`: a wallet mid-scan is skipped rather than waited on. This is called
+/// while the system is deciding whether to kill the process — blocking on a scan lock is
+/// the one thing that must not happen here, and a partial reclaim beats a stall.
+pub fn release_memory() -> usize {
+    let Some(state) = LIVE_STATE.lock().ok().and_then(|g| g.as_ref().and_then(|w| w.upgrade())) else {
+        return 0;
+    };
+    let Ok(map) = state.wallets.try_lock() else { return 0 };
+    let mut freed = 0usize;
+    for w in map.values() {
+        if let Ok(mut e) = w.try_lock() {
+            freed += e.db.release_reclaimable();
+        }
+    }
+    if freed > 0 {
+        log::info!("release_memory: dropped {freed} decoded leaves (~{} MiB); they rebuild on the next witness climb", freed * 32 / 1_048_576);
+    }
+    freed
+}
+
 pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>) -> Result<(), String> {
     let listen = cfg.listen;
     // Route node gRPC through Tor/SOCKS when the embedder asked for it, and CLEAR it
@@ -10644,6 +10697,11 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
         allow_custodial: cfg.allow_custodial,
         resources,
     });
+    // Publish a weak handle so an embedder (Android onTrimMemory) can reclaim memory
+    // without owning the daemon. See `release_memory`.
+    if let Ok(mut g) = LIVE_STATE.lock() {
+        *g = Some(Arc::downgrade(&state));
+    }
 
     // Register the chain tree as an ordinary resident wallet so the ordinary sync loop
     // advances it and the ordinary checkpoint path persists it. Same `Arc` as

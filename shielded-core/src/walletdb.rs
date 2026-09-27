@@ -2428,6 +2428,25 @@ impl WalletDb {
         }
     }
 
+    /// Give back every byte this wallet is holding that it can rebuild.
+    ///
+    /// Only the decoded leaf cache qualifies: it mirrors `leaves` index-for-index and
+    /// `decoded_leaves()` recreates it on demand, so dropping it costs one re-decode the
+    /// next time a witness is climbed and nothing else. At ~32 bytes per leaf it is the
+    /// largest reclaimable allocation a wallet has — tens to hundreds of MB — and until
+    /// now it was released in exactly one place (base compaction) and otherwise held for
+    /// the life of the process.
+    ///
+    /// That is affordable on a server and is not on a phone, where the engine owns one
+    /// wallet, Android sends `onTrimMemory` before it starts killing, and the app is the
+    /// biggest thing on the device. Returns the number of decoded leaves dropped so a
+    /// caller can log what it actually reclaimed.
+    pub fn release_reclaimable(&mut self) -> usize {
+        let n = self.decoded.get().map(|d| d.len()).unwrap_or(0);
+        self.decoded = OnceCell::new();
+        n
+    }
+
     /// Where this wallet's scan CPU has gone so far — see [`ScanCost`].
     pub fn scan_cost(&self) -> ScanCost {
         self.scan_cost
