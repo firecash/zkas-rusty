@@ -2155,12 +2155,43 @@ fn decode_block(b: &kaspa_rpc_core::RpcShieldedChainBlock) -> DecodedBlock {
 
 /// Chunk a node's concatenated compact-action bytes into [`CompactActionRecord`]s.
 /// `None` if the length is not a whole number of 148-byte records.
-/// The full shielded bundle of `txid`, which chain block `chain` ACCEPTED. The tx body lives
-/// in `chain` itself or in one of its mergeset blocks, so fetch those with transactions and
-/// match on the id. `None` when the node no longer holds the block bodies (pruned) or the
-/// tx carries no shielded bundle.
+/// The txids chain block `chain` ACCEPTED, from the same `GetShieldedBlocks` stream the
+/// sync loop ingests — the node's own acceptance record, not an inference from where a
+/// transaction body happens to sit.
+///
+/// `GetShieldedBlocks` resumes strictly *after* its cursor, so this asks from the chain
+/// block below `chain` and takes the one block that follows. `None` means the node could
+/// not answer (pruned, or too old to carry `accepted_txids`) — which callers must treat as
+/// "unknown", never as "accepted".
+async fn accepted_txids_at(client: &GrpcClient, chain: RpcHash, daa: u64) -> Option<Vec<[u8; 32]>> {
+    let req = kaspa_rpc_core::GetShieldedTreeStateRequest { block_hash: None, below_daa_score: Some(daa) };
+    let prev = tokio::time::timeout(SYNC_RPC_TIMEOUT, client.get_shielded_tree_state_call(None, req)).await.ok()?.ok()?;
+    let page = tokio::time::timeout(SYNC_RPC_TIMEOUT, client.get_shielded_blocks(prev.block_hash, 1)).await.ok()?.ok()?;
+    let b = page.blocks.into_iter().find(|b| b.hash == chain)?;
+    // A pre-v2 node returns no txids at all; that is "unknown", not "accepted nothing".
+    if b.accepted_txids.is_empty() {
+        return None;
+    }
+    Some(b.accepted_txids.iter().map(|h| h.as_bytes()).collect())
+}
+
+/// The full shielded bundle of `txid`, **which chain block `chain` accepted**.
+///
+/// The body can sit in `chain` or in any of its mergeset blocks, so those are searched —
+/// but sitting in one of them is not acceptance. A mergeset RED block is disqualified
+/// outright, and even a blue block's transaction can be rejected (a double spend). Reading
+/// a bundle out of either and reporting it as a payment is how `/api/proof/verify` could
+/// be made to attest a transfer the ledger never applied. So acceptance is checked first,
+/// against the node's `accepted_txids` for `chain`, and the body is only then located.
+///
+/// `None` when the node cannot confirm acceptance, when it no longer holds the block
+/// bodies (pruned), or when the transaction carries no shielded bundle.
 async fn fetch_bundle_for_tx(client: &GrpcClient, chain: RpcHash, txid: &[u8; 32]) -> Option<ShieldedBundle> {
     let first = tokio::time::timeout(SYNC_RPC_TIMEOUT, client.get_block(chain, true)).await.ok()?.ok()?;
+    // Acceptance gate. Fails closed: no answer means we do not claim the payment happened.
+    if !accepted_txids_at(client, chain, first.header.daa_score).await?.iter().any(|a| a == txid) {
+        return None;
+    }
     let mut candidates = vec![chain];
     if let Some(v) = &first.verbose_data {
         candidates.extend(v.merge_set_blues_hashes.iter().copied());
@@ -2170,6 +2201,9 @@ async fn fetch_bundle_for_tx(client: &GrpcClient, chain: RpcHash, txid: &[u8; 32
         b.transactions
             .iter()
             .find(|t| t.verbose_data.as_ref().is_some_and(|v| v.transaction_id.as_bytes() == *txid))
+            // A transparent transaction's payload is arbitrary bytes that may well parse
+            // as a bundle; only version 2 carries one that consensus verified.
+            .filter(|t| t.version == TX_VERSION_SHIELDED)
             .and_then(|t| ShieldedBundle::from_bytes(&t.payload).ok())
     };
     if let Some(b) = find(&first) {
@@ -4078,6 +4112,15 @@ struct AppState {
     prefix: Prefix,
     network: String,
     wallets: Mutex<HashMap<String, Wallet>>,
+    /// One in-flight spend per wallet, held from note selection through submit.
+    ///
+    /// The entry lock is released between planning and proving — it has to be, proving
+    /// takes minutes and holding it would freeze the wallet's balance and status. But
+    /// that gap let two concurrent sends on the same wallet both select the same
+    /// value-descending notes, pay full Halo 2 proving cost twice, and have the second
+    /// transaction rejected for reusing a nullifier. An exchange driving withdrawals
+    /// from one hot wallet hits this on its first concurrent pair.
+    send_gates: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// The shared public commitment stream — see [`CHAIN_TREE_TOKEN`]. The SAME `Arc`
     /// is also in `wallets` under that token, so the ordinary sync loop advances it and
     /// the ordinary checkpoint path persists it; this handle just saves readers a map
@@ -4519,6 +4562,18 @@ impl Drop for PreparingGuard {
 }
 
 impl AppState {
+    /// The spend gate for one wallet (see [`AppState::send_gates`]). Only ever called
+    /// for a token that already resolved to a loaded wallet, so the map is bounded by
+    /// the wallets this daemon holds.
+    async fn send_gate(&self, token: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.send_gates
+            .lock()
+            .await
+            .entry(token.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
     /// The request-path channel, or `None` while the node is unreachable.
     ///
     /// Every caller already tolerates an RPC failure, so "no node yet" travels the
@@ -7454,6 +7509,13 @@ struct SendReq {
     amount_sompi: Option<u64>,
     amount_fc: Option<f64>,
     fee: Option<u64>,
+    /// Refuse the send if the *total* fee across every transaction it takes would exceed
+    /// this. `fee` is per transaction, and a fragmented wallet silently splits one
+    /// payment into many — 38 spends per transaction, so a treasury paying from hundreds
+    /// of small coinbase notes pays `fee` many times over. The ceiling is checked against
+    /// the finished plan, before the first proof, so an over-budget send costs
+    /// milliseconds instead of minutes. Omitted = no ceiling (unchanged behaviour).
+    max_total_fee: Option<u64>,
     /// Optional memo (max 512 bytes UTF-8) carried inside the recipient's
     /// encrypted note — readable only by them (and, with recoverable history,
     /// by this wallet's own OVK).
@@ -7664,6 +7726,19 @@ async fn wallet_history(
                     "feeKnown": h.fee_known,
                     "recipient": h.recipient.map(|r| String::from(&Address::new(state.prefix, Version::ShieldedOrchard, &r))),
                     "memo": (!h.memo.is_empty()).then(|| String::from_utf8_lossy(&h.memo).into_owned()),
+                    // Per-output breakdown. `recipient`/`amountSompi` stay exactly
+                    // as they were for every existing client; a caller that must
+                    // attribute a payment to one of its own addresses reads this
+                    // instead of assuming the row had a single destination. Empty
+                    // means no breakdown was recorded (coinbase, compact-only, or a
+                    // row written before this daemon version) — not zero received.
+                    "credits": h.credits.iter().map(|c| serde_json::json!({
+                        "recipient": String::from(&Address::new(state.prefix, Version::ShieldedOrchard, &c.recipient)),
+                        "amountSompi": c.value,
+                        "amountSompiExact": c.value.to_string(),
+                        "amountZkas": c.value as f64 / SOMPI_PER_ZKAS as f64,
+                        "memo": (!c.memo.is_empty()).then(|| String::from_utf8_lossy(&c.memo).into_owned()),
+                    })).collect::<Vec<_>>(),
                 })
             })
             .collect();
@@ -8044,6 +8119,10 @@ async fn wallet_send(
     require_custodial(&state)?;
     let token = token_from(&headers, state.allow_default_token)?;
     let w = state.get_wallet(&token).await.ok_or_else(|| err(StatusCode::NOT_FOUND, "no wallet loaded"))?;
+    // Serialise this wallet's spends end to end: selection through submit. Taken before
+    // anything is planned, so the loser waits rather than racing us to the same notes.
+    let gate = state.send_gate(&token).await;
+    let _spending = gate.lock().await;
     ensure_canonical_checkpoint(&state, &w).await?;
     // Don't select notes a background merge is already proving over, and — for as long
     // as this send runs — keep background CPU work (merges, cache builds) off the box.
@@ -8220,6 +8299,21 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
         }
     };
 
+    // The whole plan's fee, known before any proving starts.
+    let planned_fee: u64 = chunks.iter().map(|c| c.3).sum();
+    if let Some(cap) = req.max_total_fee {
+        if planned_fee > cap {
+            return Err(err(
+                StatusCode::CONFLICT,
+                format!(
+                    "this send needs {} transactions and would pay {planned_fee} sompi in fees, over the {cap} sompi ceiling; \
+                     consolidate first or raise max_total_fee",
+                    chunks.len()
+                ),
+            ));
+        }
+    }
+
     // Prove + submit each chunk sequentially. Proving runs on a blocking thread so
     // the daemon (status/balance endpoints, other wallets) stays responsive; each
     // accepted chunk's notes are marked spent immediately so a concurrent or
@@ -8349,11 +8443,29 @@ struct SendManyReq {
     payees: Vec<Payee>,
     /// Fee floor per transaction; raised to the node's byte-proportional minimum.
     fee: Option<JsonU64>,
+    /// Refuse the payout if the total fee across every transaction would exceed this.
+    /// See [`SendReq::max_total_fee`]; a payout run splits by payee count *and* by how
+    /// many notes it must spend, so the multiplier is even less obvious here.
+    max_total_fee: Option<JsonU64>,
+}
+
+/// Which transaction paid one payee. A payout run splits across transactions, and a run
+/// that fails halfway leaves some payees paid and some not — without this the caller is
+/// left to guess which, from a list of txids and a total.
+#[derive(Serialize, Clone)]
+struct PayeeTxid {
+    address: String,
+    amount_sompi: u64,
+    amount_sompi_exact: String,
+    /// `None` for a payee whose transaction was never accepted.
+    txid: Option<String>,
 }
 
 #[derive(Serialize)]
 struct SendManyResp {
     txids: Vec<String>,
+    /// One entry per payee, in request order, naming the transaction that paid it.
+    payee_txids: Vec<PayeeTxid>,
     tx_count: usize,
     payees: usize,
     paid_sompi: u64,
@@ -8383,6 +8495,10 @@ async fn wallet_send_many(
     require_custodial(&state)?;
     let token = token_from(&headers, state.allow_default_token)?;
     let w = state.get_wallet(&token).await.ok_or_else(|| err(StatusCode::NOT_FOUND, "no wallet loaded"))?;
+    // Same end-to-end spend gate as `wallet_send` — a payout run and a withdrawal must
+    // not select the same notes.
+    let gate = state.send_gate(&token).await;
+    let _spending = gate.lock().await;
     ensure_canonical_checkpoint(&state, &w).await?;
     // Same span guard as `wallet_send`: no merge selects the notes this batch is
     // about to spend, and no background CPU work runs while the batch is proving.
@@ -8523,13 +8639,41 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
         }
     }
 
+    // The whole run's fee, known before the first proof.
+    let planned_fee: u64 = batches.iter().map(|b| b.fee).sum();
+    if let Some(cap) = req.max_total_fee.as_ref() {
+        let cap = cap.parse("max_total_fee")?;
+        if planned_fee > cap {
+            return Err(err(
+                StatusCode::CONFLICT,
+                format!(
+                    "this payout needs {} transactions and would pay {planned_fee} sompi in fees, over the {cap} sompi \
+                     ceiling; consolidate first or raise max_total_fee",
+                    batches.len()
+                ),
+            ));
+        }
+    }
+
     let ctx = payment_tx_context();
     let tx_count = batches.len();
     let mut txids: Vec<String> = Vec::with_capacity(tx_count);
+    // Every payee starts unpaid and is stamped with its transaction as each batch is
+    // accepted, so the mapping is correct at every exit — including the partial failure.
+    let mut payee_txids: Vec<PayeeTxid> = resolved
+        .iter()
+        .map(|(r, a, _)| PayeeTxid {
+            address: String::from(&Address::new(state.prefix, Version::ShieldedOrchard, r)),
+            amount_sompi: *a,
+            amount_sompi_exact: a.to_string(),
+            txid: None,
+        })
+        .collect();
     let mut paid = 0u64;
     let mut total_fee = 0u64;
     for (bi, b) in batches.into_iter().enumerate() {
         let group_pay: u64 = b.payees.iter().map(|(_, a, _)| *a).sum();
+        let n_payees = b.payees.len();
         log::info!(
             "send_many: building Orchard proof for tx {}/{tx_count} ({} payees, {} spends, {group_pay} sompi + {} fee)...",
             bi + 1,
@@ -8553,6 +8697,14 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
         match client.submit_transaction(RpcTransaction::from(&tx), false).await {
             Ok(accepted) => {
                 txids.push(accepted.to_string());
+                // `groups` was built by `resolved.chunks(per_tx)`, so batch `bi` is
+                // exactly payees [bi*per_tx .. bi*per_tx + len).
+                let base = bi * per_tx;
+                for k in 0..n_payees {
+                    if let Some(p) = payee_txids.get_mut(base + k) {
+                        p.txid = Some(accepted.to_string());
+                    }
+                }
                 paid += group_pay;
                 total_fee += fee;
                 let mut e = w.lock().await;
@@ -8572,6 +8724,10 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
                         "error": format!("payout partially sent: {}/{tx_count} txs accepted, then the node rejected: {e}", txids.len()),
                         "txids": txids,
                         "paid_sompi": paid,
+                        // Which payees actually got paid. Without this a caller recovering
+                        // from a half-finished run can only re-send everything (paying
+                        // twice) or nothing (paying nobody).
+                        "payee_txids": payee_txids,
                     })),
                 ));
             }
@@ -8580,6 +8736,7 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
 
     Ok(Json(SendManyResp {
         tx_count: txids.len(),
+        payee_txids,
         payees: resolved.len(),
         paid_sompi: paid,
         fee_sompi: total_fee,
@@ -8641,7 +8798,7 @@ async fn wallet_consolidate(
 /// particular they share the anchor-maturity check, the pending-spend-aware
 /// candidate selection, and the byte-proportional fee floor.
 async fn consolidate_once(
-    state: &AppState,
+    state: &Arc<AppState>,
     w: &Wallet,
     base_fee: u64,
     heal: bool,
@@ -8649,6 +8806,17 @@ async fn consolidate_once(
     // Held until this returns: a payment arriving mid-merge waits rather than
     // selecting the same notes (see `CONSOLIDATING`).
     let _merging = ConsolidateGuard::new();
+    // A merge is a spend, so it takes the same two guards a send does. Without the
+    // canonical-checkpoint check it was the one spend path that could build on a
+    // divergent tree; without the reorg check it could merge notes while the wallet's
+    // own checkpoint was being repaired underneath it.
+    ensure_canonical_checkpoint(state, w).await?;
+    {
+        let e = w.lock().await;
+        if e.reorged_strikes > 0 {
+            return Err(err(StatusCode::CONFLICT, "wallet checkpoint is being repaired after a reorg; retry shortly"));
+        }
+    }
     // A consolidation pays this wallet itself, so there is no recipient to disclose to
     // anyone: `private_sends` does not apply here, and the row keeps the wallet's own
     // merge history readable after a restore.
@@ -10732,6 +10900,7 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
         prefix: prefix_from(&cfg.network),
         network: cfg.network,
         wallets: Mutex::new(HashMap::new()),
+        send_gates: Mutex::new(HashMap::new()),
         allow_default_token: cfg.allow_default_token,
         wallet_secret,
         genesis,
