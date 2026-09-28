@@ -115,6 +115,24 @@ pub enum HistoryKind {
     Sent = 2,
 }
 
+/// One output of a history row: which address was paid, how much, and its memo.
+///
+/// A single shielded transaction routinely touches this wallet more than once — a
+/// payer settling two invoices to two of our diversified addresses, or a
+/// `send_many` paying several payees. The row's `amount` is their sum and
+/// `recipient` is only the first, which is why a merchant reconciling by address
+/// needs this breakdown: `sum(credits.value) == amount`, and each entry names the
+/// address that actually received its share.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Credit {
+    /// Raw Orchard address: ours (Received rows) or the payee's (Sent rows).
+    pub recipient: [u8; 43],
+    /// Value delivered to that address by this transaction.
+    pub value: u64,
+    /// Trimmed memo attached to that output (empty = none).
+    pub memo: Vec<u8>,
+}
+
 /// One row of the wallet's chain-derived transaction history, recorded during
 /// ingest and persisted in the checkpoint (v6 section) — so it survives restarts
 /// and, unlike the browser-local 0-conf list, a seed restore (for everything the
@@ -154,6 +172,14 @@ pub struct HistoryEntry {
     pub recipient: Option<[u8; 43]>,
     /// Trimmed memo bytes (empty = no memo).
     pub memo: Vec<u8>,
+    /// Per-output breakdown of `amount` (v10). Received rows: one entry per note
+    /// this transaction paid us, so two invoices settled by one transaction are two
+    /// entries rather than one summed row attributed to whichever address happened
+    /// to come first. Sent rows: one entry per OVK-recovered payee. Empty for
+    /// coinbase rows, for compact-only rows, and for rows restored from a
+    /// pre-v10 checkpoint — an empty vector means "no breakdown available", never
+    /// "nothing was received", so a client falls back to `amount`/`recipient`.
+    pub credits: Vec<Credit>,
 }
 
 /// Chain-block metadata for dating history rows, from the v2 `GetShieldedBlocks`
@@ -1222,6 +1248,9 @@ impl WalletDb {
                 fee_known: false,
                 recipient: None,
                 memo: Vec::new(),
+                // Compact records carry no out_ciphertext, so there is nothing to
+                // attribute the outflow to.
+                credits: Vec::new(),
             });
             return;
         }
@@ -1239,6 +1268,7 @@ impl WalletDb {
             fee_known: true,
             recipient: received.first().map(|note| note.note.recipient().to_raw_address_bytes()),
             memo: Vec::new(),
+            credits: credits_from_received(received),
         };
         self.push_history(entry);
     }
@@ -1269,6 +1299,7 @@ impl WalletDb {
             fee_known: true,
             recipient: None,
             memo: Vec::new(),
+            credits: Vec::new(),
         });
     }
 
@@ -1301,6 +1332,7 @@ impl WalletDb {
             let mut recipient = None;
             let mut memo = Vec::new();
             let mut recovered_paid = 0u64;
+            let mut credits = Vec::new();
             for a in &bundle.actions {
                 let Some(action) = reconstruct_action(a) else { continue };
                 let domain = OrchardDomain::for_action(&action);
@@ -1313,11 +1345,15 @@ impl WalletDb {
                 if addr_bytes == self.my_address {
                     continue; // our own change
                 }
+                let m = trim_memo(&m);
                 recovered_paid = recovered_paid.saturating_add(note.value().inner());
                 if recipient.is_none() {
                     recipient = Some(addr_bytes);
-                    memo = trim_memo(&m);
+                    memo = m.clone();
                 }
+                // One entry per payee, so a send_many is not collapsed into its
+                // first recipient.
+                credits.push(Credit { recipient: addr_bytes, value: note.value().inner(), memo: m });
             }
             HistoryEntry {
                 kind: HistoryKind::Sent,
@@ -1330,6 +1366,7 @@ impl WalletDb {
                 fee_known: true,
                 recipient,
                 memo,
+                credits,
             }
         } else {
             HistoryEntry {
@@ -1346,6 +1383,7 @@ impl WalletDb {
                 // reconcile one unique invoice address without amount matching.
                 recipient: received.first().map(|note| note.note.recipient().to_raw_address_bytes()),
                 memo: received.iter().find(|r| !r.memo.is_empty()).map(|r| r.memo.clone()).unwrap_or_default(),
+                credits: credits_from_received(received),
             }
         };
         self.push_history(entry);
@@ -1380,6 +1418,7 @@ impl WalletDb {
         let mut recipient = None;
         let mut memo = Vec::new();
         let mut recovered_paid = 0u64;
+        let mut credits = Vec::new();
         for a in &bundle.actions {
             let Some(action) = reconstruct_action(a) else { continue };
             let domain = OrchardDomain::for_action(&action);
@@ -1392,11 +1431,13 @@ impl WalletDb {
             if addr_bytes == self.my_address {
                 continue; // our own change
             }
+            let m = trim_memo(&m);
             recovered_paid = recovered_paid.saturating_add(note.value().inner());
             if recipient.is_none() {
                 recipient = Some(addr_bytes);
-                memo = trim_memo(&m);
+                memo = m.clone();
             }
+            credits.push(Credit { recipient: addr_bytes, value: note.value().inner(), memo: m });
         }
         let h = &mut self.history[pos];
         let net_out = if h.amount_is_net_outflow { h.amount } else { h.amount.saturating_add(h.fee) };
@@ -1407,6 +1448,7 @@ impl WalletDb {
             h.amount = recovered_paid;
             h.recipient = recipient;
             h.memo = memo;
+            h.credits = credits;
             true
         } else {
             h.amount = net_out.saturating_sub(fee);
@@ -2973,6 +3015,17 @@ impl WalletDb {
             let memo_len = h.memo.len().min(u16::MAX as usize) as u16;
             hsec.extend_from_slice(&memo_len.to_le_bytes());
             hsec.extend_from_slice(&h.memo[..memo_len as usize]);
+            // v10: the per-output breakdown, written inside the row (not as a
+            // trailing section) so a row and its credits cannot drift apart.
+            let ncred = h.credits.len().min(CREDITS_CAP) as u16;
+            hsec.extend_from_slice(&ncred.to_le_bytes());
+            for c in h.credits.iter().take(ncred as usize) {
+                hsec.extend_from_slice(&c.recipient);
+                hsec.extend_from_slice(&c.value.to_le_bytes());
+                let cm = c.memo.len().min(u16::MAX as usize) as u16;
+                hsec.extend_from_slice(&cm.to_le_bytes());
+                hsec.extend_from_slice(&c.memo[..cm as usize]);
+            }
         }
         out.extend_from_slice(&(hsec.len() as u64).to_le_bytes());
         out.extend_from_slice(&hsec);
@@ -3136,7 +3189,12 @@ impl WalletDb {
         if version >= CHECKPOINT_VERSION_V6 {
             if let Some(hlen) = r.u64() {
                 if let Some(hbuf) = r.take(hlen as usize) {
-                    Self::read_history_section(&mut db, hbuf, version >= CHECKPOINT_VERSION_V9);
+                    Self::read_history_section(
+                        &mut db,
+                        hbuf,
+                        version >= CHECKPOINT_VERSION_V9,
+                        version >= CHECKPOINT_VERSION_V10,
+                    );
                 }
             }
         }
@@ -3261,7 +3319,7 @@ impl WalletDb {
     /// Best-effort restore of the v6 history section. v9 adds compact-send flags.
     /// Any malformed row drops the
     /// whole section (history restarts from here on) — never fails the restore.
-    fn read_history_section(db: &mut Self, buf: &[u8], has_compact_flags: bool) {
+    fn read_history_section(db: &mut Self, buf: &[u8], has_compact_flags: bool, has_credits: bool) {
         let mut r = Cursor { buf, pos: 0 };
         let parse = |r: &mut Cursor<'_>| -> Option<Vec<HistoryEntry>> {
             let n = (r.u64()? as usize).min(HISTORY_CAP);
@@ -3294,6 +3352,20 @@ impl WalletDb {
                 };
                 let memo_len = u16::from_le_bytes(r.arr::<2>()?) as usize;
                 let memo = r.take(memo_len)?.to_vec();
+                // A pre-v10 row has no breakdown; it restores with an empty vector
+                // and the client falls back to `amount`/`recipient` as before.
+                let mut credits = Vec::new();
+                if has_credits {
+                    let n = (u16::from_le_bytes(r.arr::<2>()?) as usize).min(CREDITS_CAP);
+                    credits.reserve(n);
+                    for _ in 0..n {
+                        let recipient = r.arr::<43>()?;
+                        let value = r.u64()?;
+                        let cm = u16::from_le_bytes(r.arr::<2>()?) as usize;
+                        let cmemo = r.take(cm)?.to_vec();
+                        credits.push(Credit { recipient, value, memo: cmemo });
+                    }
+                }
                 out.push(HistoryEntry {
                     kind,
                     txid,
@@ -3305,6 +3377,7 @@ impl WalletDb {
                     fee_known,
                     recipient,
                     memo,
+                    credits,
                 });
             }
             r.done().then_some(out)
@@ -3494,7 +3567,13 @@ fn read_witness(r: &mut Cursor<'_>) -> Option<IncrementalWitness<MerkleHashOrcha
 /// rebuild after every daemon eviction/restart. It contains public chain state only.
 /// v9 annotates history rows reconstructed from compact scan data, so clients never
 /// mistake their net outflow or placeholder fee for exact payment details.
-const CHECKPOINT_VERSION: u8 = 9;
+const CHECKPOINT_VERSION: u8 = 10;
+/// v10 adds each history row's per-output breakdown ([`Credit`]). Gate it on THIS
+/// constant, never on `CHECKPOINT_VERSION` — see the v8 note below for what that
+/// mistake costs. The credits are written *inside* each row, so a v9 reader cannot
+/// parse a v10 section; that is contained, because the whole-blob version gate
+/// rejects v10 on an older binary and the section itself is best-effort.
+const CHECKPOINT_VERSION_V10: u8 = 10;
 const CHECKPOINT_VERSION_V9: u8 = 9;
 /// v8 introduced the persisted complete-subtree index. Gate its section on THIS
 /// constant, never on `CHECKPOINT_VERSION`: when v9 was added the gate silently moved to
@@ -3512,6 +3591,26 @@ const CHECKPOINT_VERSION_V4: u8 = 4;
 /// tree rebuild once). Reading them is what lets a newer binary deploy without forcing
 /// every live wallet into a full rescan from birthday.
 const CHECKPOINT_VERSION_V3: u8 = 3;
+
+/// Upper bound on the per-row [`Credit`] entries written or parsed. A bundle cannot
+/// carry more outputs than this and still fit a block, so the cap only bounds what a
+/// corrupt blob can make us allocate.
+const CREDITS_CAP: usize = 256;
+
+/// One [`Credit`] per note this transaction paid us, in ingest order — the
+/// breakdown a payer's single transaction to several of our diversified addresses
+/// needs in order to be reconciled per address.
+fn credits_from_received(received: &[ReceivedNote]) -> Vec<Credit> {
+    received
+        .iter()
+        .take(CREDITS_CAP)
+        .map(|r| Credit {
+            recipient: r.note.recipient().to_raw_address_bytes(),
+            value: r.value(),
+            memo: r.memo.clone(),
+        })
+        .collect()
+}
 
 /// A minimal forward byte-reader for [`WalletDb::from_checkpoint`]: every read is
 /// bounds-checked and returns `None` past the end, so a truncated or corrupt blob
@@ -5408,6 +5507,76 @@ mod circuit_tests {
         db.ingest_block(&[], &[&wire]);
         assert_eq!(db.notes().len(), 1, "only the change note remains");
         assert_eq!(db.balance(), (8_000 - paid_total - fee) as u128, "change = in - paid - fee");
+    }
+
+    /// The deposit-attribution bug exactly as an exchange reported it: ONE transaction
+    /// paying TWO of the same wallet's diversified addresses.
+    ///
+    /// Such a transaction is a single row — there is one txid — and the row's `amount`
+    /// was the sum while its `recipient` was whichever note decrypted first. An exchange
+    /// crediting customers by invoice address therefore credited one customer with both
+    /// deposits and the other with none, and no amount of re-reading the history could
+    /// recover the split: the daemon had thrown it away. `credits` is that split, and it
+    /// has to survive a restart or the next checkpoint load loses it again.
+    #[test]
+    fn two_diversified_deposits_in_one_tx_are_attributed_separately() {
+        let payer = [51u8; 32];
+        let exchange = [52u8; 32];
+        let net = [0x7au8; 32];
+        let ctx = b"zkas-walletdb-credits";
+
+        let mut p = WalletDb::from_seed(payer).unwrap();
+        let mut x = WalletDb::from_seed(exchange).unwrap();
+
+        // Two customers, two invoice addresses, one wallet and one balance.
+        let alice = x.address_bytes_at(1);
+        let bob = x.address_bytes_at(2);
+        assert_ne!(alice, bob, "diversified addresses differ");
+
+        let mine = cb(address_bytes_from_seed(payer).unwrap(), b"credits||0", 20_000);
+        let meta1 = BlockMeta { coinbase_txid: [0xa1; 32], txids: vec![], timestamp_ms: 1_000, daa_score: 10 };
+        p.ingest_block_with_meta(&[mine.clone()], &[], Some(&meta1));
+        x.ingest_block_with_meta(&[mine], &[], Some(&meta1));
+
+        // One transaction, both invoices.
+        let inputs = vec![(p.notes()[0].note.clone(), p.witness_path(p.notes()[0].position).unwrap())];
+        let payload = crate::wallet::build::build_wallet_payment_multi(
+            payer,
+            inputs,
+            &[(alice, 3_000, [0u8; 512]), (bob, 7_000, [0u8; 512])],
+            1_000,
+            &net,
+            ctx,
+            true,
+        )
+        .expect("two-payee payment builds");
+        let wire = ShieldedBundle::from_bytes(&payload).unwrap();
+
+        let meta2 = BlockMeta { coinbase_txid: [0xb1; 32], txids: vec![[0xd1; 32]], timestamp_ms: 2_000, daa_score: 20 };
+        x.ingest_block_with_meta(&[], &[&wire], Some(&meta2));
+
+        assert_eq!(x.balance(), 10_000, "both deposits land in the one balance");
+        assert_eq!(x.history().len(), 1, "one transaction is still one row");
+        let row = &x.history()[0];
+        assert_eq!(row.kind, HistoryKind::Received);
+        assert_eq!(row.amount, 10_000, "the row still totals the transaction");
+
+        // What was lost before: which address got what.
+        let mut got: Vec<([u8; 43], u64)> = row.credits.iter().map(|c| (c.recipient, c.value)).collect();
+        got.sort_by_key(|&(_, v)| v);
+        assert_eq!(
+            got,
+            vec![(alice, 3_000), (bob, 7_000)],
+            "each diversified address is credited with its own deposit, not the sum"
+        );
+        assert_eq!(row.credits.iter().map(|c| c.value).sum::<u64>(), row.amount, "credits account for the whole row");
+
+        // v10 round-trip: a restart must not throw the breakdown away again.
+        let blob = x.to_checkpoint();
+        assert_eq!(blob[0], CHECKPOINT_VERSION, "written at the current checkpoint version");
+        let back = WalletDb::from_checkpoint(exchange, &blob).expect("v10 checkpoint restores");
+        assert_eq!(back.history().len(), 1);
+        assert_eq!(back.history()[0].credits, row.credits, "credits survive the checkpoint");
     }
 
     /// End-to-end chain-derived history: mint → OVK send with a memo → receive.
