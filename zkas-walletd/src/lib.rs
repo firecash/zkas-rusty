@@ -180,6 +180,13 @@ const LAP_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 /// restoring wallet crawled at ~140 blocks/s — exactly 4,000 blocks per 30 s lap — because
 /// every lap ran to `LAP_BUDGET` on a few note-heavy wallets and the fast ones idled.
 /// The lock is still dropped between chunks, so status keeps interleaving.
+/// How long a request naming a nonexistent wallet is held before it is answered.
+///
+/// Long enough that guessing tokens is impractical (200 ms caps a single connection at
+/// 5 tries/second), short enough that a genuine 404 — a cleared browser, a mistyped token
+/// in an integration — still feels like an error rather than a hang.
+const UNKNOWN_TOKEN_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
+
 const CATCHUP_BURST_MIN_BEHIND: u64 = 20_000;
 
 /// How far behind the tip a wallet may be and still have `warm_priority` buy it the
@@ -5390,7 +5397,29 @@ impl AppState {
                 return Some(w.clone());
             }
         }
-        let (key, birthday, recoverable_history) = load_wallet_meta(&self.wallet_dir, token, self.wallet_secret.as_deref())?;
+        let Some((key, birthday, recoverable_history)) = load_wallet_meta(&self.wallet_dir, token, self.wallet_secret.as_deref())
+        else {
+            // This token names no wallet. Make that answer cost time.
+            //
+            // A wallet token is a bearer credential — it reaches `/api/wallet/reveal`, which
+            // returns the seed — and the daemon imposes no entropy floor: `sanitize_token`
+            // accepts any 1-128 character string. The official app uses 128 random bits, but
+            // the hosted daemon holds wallets whose tokens are short and patterned, which an
+            // integrator can produce without realising it is choosing a password.
+            //
+            // Nothing here previously cost an attacker anything, so tokens could be tried as
+            // fast as the network allowed. A per-IP limit is the usual answer and is the
+            // wrong one behind a reverse proxy, where the peer address is nginx and
+            // X-Forwarded-For is whatever the client wrote. A delay on the MISS cannot be
+            // spoofed or parallelised away per-key, and it is paid by nobody legitimate: a
+            // real client presents a token whose file exists, and wallet creation writes the
+            // file before anything reads it.
+            //
+            // This buys time; it is not the fix. Weak tokens need rotating and the seed
+            // endpoint needs a second factor.
+            tokio::time::sleep(UNKNOWN_TOKEN_DELAY).await;
+            return None;
+        };
         let t_meta = t_load0.elapsed();
         let genesis = self.genesis;
         // Resume from a persisted checkpoint when one is present and version/genesis
@@ -6776,6 +6805,18 @@ async fn health() -> Json<serde_json::Value> {
 struct NoteInfo {
     position: u64,
     value: u64,
+    /// Which of this wallet's addresses this note was paid to.
+    ///
+    /// A wallet hands out many diversified addresses — one per invoice, one per customer —
+    /// and they are indistinguishable on-chain but perfectly visible to its own viewing
+    /// key. The daemon has always stored this per note; it simply never sent it, so a
+    /// caller received `{position, value}` and could not tell WHICH address a note paid.
+    ///
+    /// That is the difference between an exchange crediting the right customer and the
+    /// wrong one. Reported live 2026-09-28: a single transaction paid 345,000 to one
+    /// deposit address and 250,000 to another of the same wallet, and with only amounts
+    /// to go on there was no way to split them.
+    recipient: String,
 }
 
 #[derive(Serialize)]
@@ -7377,7 +7418,16 @@ async fn wallet_balance(
     let e = w.lock().await;
     let want_notes = matches!(query.notes.as_deref(), Some("1" | "true" | "yes"));
     let note_count = e.db.notes().len();
-    let notes = want_notes.then(|| e.db.notes().iter().map(|n| NoteInfo { position: n.position, value: n.value() }).collect());
+    let notes = want_notes.then(|| {
+        e.db.notes()
+            .iter()
+            .map(|n| NoteInfo {
+                position: n.position,
+                value: n.value(),
+                recipient: String::from(&Address::new(state.prefix, Version::ShieldedOrchard, &n.note.recipient().to_raw_address_bytes())),
+            })
+            .collect()
+    });
     Ok(Json(BalanceResp {
         balance_sompi: e.db.balance().to_string(),
         balance_fc: fmt_fc(e.db.balance()),
@@ -7552,7 +7602,12 @@ async fn proof_verify(
             "amountSompiExact": proof.value.to_string(),
             "amountZkas": proof.value as f64 / SOMPI_PER_ZKAS as f64,
             "recipient": proof.recipient_bytes().map(|r| String::from(&Address::new(state.prefix, Version::ShieldedOrchard, &r))),
-            "memo": (!proof.memo.is_empty()).then(|| String::from_utf8_lossy(&proof.memo).into_owned()),
+            // NOT verified, and labelled so. The Orchard note commitment binds
+            // (recipient, value, rho, rseed) — the memo lives in `enc_ciphertext`, which
+            // `payproof::verify` never reads. Anyone can take a genuine proof, rewrite this
+            // string, and it still verifies. Returning it beside `"valid": true` under the
+            // same name as the bound fields invited it to be read as attested.
+            "memoUnverified": (!proof.memo.is_empty()).then(|| String::from_utf8_lossy(&proof.memo).into_owned()),
         }))),
         Err(e) => Ok(Json(serde_json::json!({
             "valid": false,
@@ -8825,7 +8880,15 @@ async fn wallet_prepare(
     // happening, how long it has been going, and that waiting is the only option.
     let _preparing = {
         let mut set = state.preparing.lock().map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "prepare tracker poisoned"))?;
-        if let Some((since, was_self)) = set.get(&req.fvk_hex) {
+        // Key on the DECODED key, never the text that carried it.
+        //
+        // `unhex` trims and is case-insensitive, so "AABB…", "aabb…" and " aabb… " are the
+        // same 96-byte viewing key but three different strings. Keyed on the string, two
+        // concurrent prepares for one wallet both passed this guard, both selected the same
+        // value-descending notes, and one of the two transactions was then rejected for
+        // reusing a nullifier — after paying full Halo 2 proving cost.
+        let guard_key = hex(&fvk_bytes);
+        if let Some((since, was_self)) = set.get(&guard_key) {
             let secs = since.elapsed().as_secs();
             let elapsed = if secs >= 60 { format!("{}m {}s", secs / 60, secs % 60) } else { format!("{secs}s") };
             // If what it is waiting on is the one-time subtree-cache build, say how far
@@ -8849,7 +8912,7 @@ async fn wallet_prepare(
                 },
             ));
         }
-        set.insert(req.fvk_hex.clone(), (std::time::Instant::now(), self_payment));
+        set.insert(guard_key.clone(), (std::time::Instant::now(), self_payment));
         PreparingGuard { state: state.clone(), key: req.fvk_hex.clone() }
     };
 
@@ -9346,11 +9409,24 @@ async fn wallet_submit(
     let PreparedSession { payment, amount, fee, token, positions, .. } =
         session.ok_or_else(|| err(StatusCode::NOT_FOUND, "no such prepared session (expired or already submitted)"))?;
 
+    // How many actions this transaction actually has, so a client-supplied index cannot
+    // reach `actions_mut()[i]` out of range.
+    let action_count = payment.effects.actions.len();
     let mut device_sigs: Vec<(usize, [u8; SIG_LEN])> = Vec::with_capacity(req.sigs.len());
     for s in &req.sigs {
         let sig = unhex(&s.sig)
             .and_then(|b| <[u8; SIG_LEN]>::try_from(b.as_slice()).ok())
             .ok_or_else(|| err(StatusCode::BAD_REQUEST, "each sig must be 64 bytes of hex"))?;
+        // Bounds-check before it reaches `actions_mut()[i]`, which is an unchecked index:
+        // an out-of-range value from a client panics the handler task. The SDK signer
+        // already refuses this (`MissingAction`); walletd must not trust that its caller
+        // is the SDK.
+        if s.index >= action_count {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                format!("signature names action {} but this transaction has {action_count}", s.index),
+            ));
+        }
         device_sigs.push((s.index, sig));
     }
 
