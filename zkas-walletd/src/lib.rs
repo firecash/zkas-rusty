@@ -7860,36 +7860,24 @@ async fn wallet_scan_receipt_export(
     let w = state.get_wallet(&token).await.ok_or_else(|| err(StatusCode::NOT_FOUND, "no wallet loaded"))?;
     let shared_covers = state.chain_tree_size.load(std::sync::atomic::Ordering::Relaxed);
     let shared_base = state.chain_tree_base.load(std::sync::atomic::Ordering::Relaxed);
-    let shared_tip = state.chain_tree_frontier.lock().await.clone();
 
     let mut e = w.lock().await;
-    // Every note must carry a witness at the same anchor, because the importer has no
-    // leaf stream to rebuild one from. Top them up first.
+    // Every note must carry a witness at the anchor, because the importer has no leaf
+    // stream to rebuild one from. Top them up first; the export refuses if they still lag.
     tokio::task::block_in_place(|| e.advance_spend_witnesses_bounded(shared_covers, shared_base));
-    // A hosted wallet usually borrows the shared chain tree and has no valid mirror of
-    // its own; the shared tree's frontier is that same tree.
-    let tip = match e.db.tip_frontier_state() {
-        Some(fs) => fs,
-        None => shared_tip.ok_or_else(|| {
-            err(StatusCode::CONFLICT, "the shared chain tree has no frontier yet; retry once this daemon has synced")
-        })?,
-    };
     let scanned = e.scanned as u64;
-    let bytes = e.db.to_scan_receipt(state.genesis.as_bytes(), scanned, &tip).ok_or_else(|| {
-        err(
-            StatusCode::CONFLICT,
-            "this wallet cannot be exported as a receipt yet: its witnesses are not caught up to what it has \
-             scanned, or it holds more notes than a receipt carries. Let it finish syncing, or consolidate.",
-        )
+    let bytes = e.db.to_scan_receipt(state.genesis.as_bytes(), scanned).map_err(|why| {
+        err(StatusCode::CONFLICT, format!("this wallet cannot be exported as a receipt yet: {why}"))
     })?;
     let notes = e.db.notes().len();
+    let anchor = e.db.size();
     drop(e);
     Ok(Json(serde_json::json!({
         "receipt": hex(&bytes),
         "bytes": bytes.len(),
         "notes": notes,
         "scannedDaa": scanned,
-        "anchorLeaves": tip.size,
+        "anchorLeaves": anchor,
         "genesis": state.genesis.to_string(),
     })))
 }

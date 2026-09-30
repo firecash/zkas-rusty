@@ -2948,23 +2948,55 @@ impl WalletDb {
     /// tree, witnesses not advanced to the tip of what was scanned, a note with no live
     /// witness (the importer has no leaf stream to rebuild one from), or more notes than
     /// [`RECEIPT_MAX_NOTES`]. The caller should fall back to an ordinary scan and say so.
-    /// `tip` is the frontier the witnesses root to. It is a parameter rather than
-    /// `self.tip_frontier_state()` because a hosted wallet usually *borrows* the shared
-    /// chain tree and has no valid mirror of its own; its caller does hold the shared
-    /// tree's frontier, and that is the same tree. Supplying one that does not match
-    /// this wallet's leaf count is refused.
-    pub fn to_scan_receipt(&self, genesis: [u8; 32], scanned_daa: u64, tip: &FrontierState) -> Option<Vec<u8>> {
-        if self.witnessed_upto != self.size || self.notes.len() > RECEIPT_MAX_NOTES || tip.size != self.size {
-            return None;
+    /// The anchor is taken from `lag_tree`, which is by definition the tree at exactly
+    /// `witnessed_upto` and the thing every live witness roots to. An earlier version
+    /// asked the caller for the tip frontier instead; that was wrong, and wrong in a way
+    /// that made the whole feature inert: a hosted wallet normally *borrows* the shared
+    /// chain tree, so its own mirror is invalid and the shared frontier sits at a
+    /// different leaf count, which the size check then rejected. Every real wallet
+    /// answered 409. Deriving the anchor from the witnesses themselves cannot disagree
+    /// with them.
+    ///
+    /// `witnessed_upto` must equal `size` all the same, for a different reason: the
+    /// receipt resumes the importer at `scanned_daa`, which is where `size` reached. If
+    /// the witnesses lagged, the importer would start its tree at `witnessed_upto` and
+    /// then skip the leaves between there and `scanned_daa` — a silently wrong tree, and
+    /// unspendable notes. Refusing is the only safe answer; the caller advances the
+    /// witnesses and retries.
+    ///
+    /// The `Err` says which condition failed, because "cannot export" with no reason is
+    /// what made this take a production round trip to diagnose.
+    pub fn to_scan_receipt(&self, genesis: [u8; 32], scanned_daa: u64) -> Result<Vec<u8>, String> {
+        if self.notes.len() > RECEIPT_MAX_NOTES {
+            return Err(format!("holds {} notes, more than a receipt carries ({RECEIPT_MAX_NOTES})", self.notes.len()));
         }
-        let fs = tip.clone();
-        // Every owned note needs a witness at this anchor or the import is lossy, and a
-        // silently short balance is the one failure mode worth refusing outright.
-        let witnessed: HashSet<u64> = self.witnesses.iter().map(|(p, _)| *p).collect();
-        if !self.notes.iter().all(|n| witnessed.contains(&n.position)) {
-            return None;
+        if self.witnessed_upto != self.size {
+            return Err(format!(
+                "witnesses are at leaf {} but the wallet has scanned to {} ({} behind); retry once they catch up",
+                self.witnessed_upto,
+                self.size,
+                self.size.saturating_sub(self.witnessed_upto),
+            ));
         }
-
+        let unwitnessed = self.notes.iter().filter(|n| !self.witnesses.iter().any(|(p, _)| *p == n.position)).count();
+        if unwitnessed > 0 {
+            return Err(format!(
+                "{unwitnessed} of {} notes have no live witness, and the importer has no leaf stream to rebuild one from",
+                self.notes.len()
+            ));
+        }
+        // The tree the witnesses actually root to.
+        let f = self.lag_tree.to_frontier();
+        let fs = match f.value() {
+            None => {
+                return Err("this wallet has witnessed nothing yet".to_string());
+            }
+            Some(nef) => FrontierState {
+                size: self.witnessed_upto,
+                leaf: Some(nef.leaf().to_bytes()),
+                ommers: nef.ommers().iter().map(|o| o.to_bytes()).collect(),
+            },
+        };
         let mut out = Vec::with_capacity(96 + self.notes.len() * 1200);
         out.extend_from_slice(RECEIPT_MAGIC);
         out.push(RECEIPT_VERSION);
@@ -3000,7 +3032,7 @@ impl WalletDb {
             out.extend_from_slice(&pos.to_le_bytes());
             write_witness(&mut out, w);
         }
-        Some(out)
+        Ok(out)
     }
 
     /// Rebuild a wallet from a [`scan receipt`](Self::to_scan_receipt) and the viewing
@@ -5760,8 +5792,7 @@ mod circuit_tests {
         assert_eq!(hosted.balance(), 12_000);
         let pos = hosted.notes()[0].position;
 
-        let tip = hosted.tip_frontier_state().expect("tip frontier");
-        let receipt = hosted.to_scan_receipt(genesis, 105, &tip).expect("a fully witnessed wallet exports");
+        let receipt = hosted.to_scan_receipt(genesis, 105).expect("a fully witnessed wallet exports");
         assert!(receipt.len() < 8_000, "a one-note receipt is kilobytes, got {}", receipt.len());
 
         // The phone: same key, no leaf stream, no scan.
