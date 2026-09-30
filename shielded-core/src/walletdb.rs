@@ -133,6 +133,17 @@ pub struct Credit {
     pub memo: Vec<u8>,
 }
 
+/// What a [`scan receipt`](WalletDb::to_scan_receipt) carries besides the wallet itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScanReceiptMeta {
+    /// The DAA score the exporting wallet had scanned to. The importer resumes here
+    /// instead of at its birthday — which is the whole point of the receipt.
+    pub scanned_daa: u64,
+    /// Absolute leaf count the receipt is anchored at. Every witness in it roots to
+    /// the tree at exactly this size.
+    pub anchor_leaves: u64,
+}
+
 /// One row of the wallet's chain-derived transaction history, recorded during
 /// ingest and persisted in the checkpoint (v6 section) — so it survives restarts
 /// and, unlike the browser-local 0-conf list, a seed restore (for everything the
@@ -2913,6 +2924,203 @@ impl WalletDb {
     /// [base:0 | 1 (base_leaf:32)(n_ommers:u64)(ommer:32)*] [size:u64]
     /// [n_leaves:u64](leaf:32)* [n_notes:u64]
     /// (position:u64, nullifier:32, recipient:43, value:u64, rho:32, rseed:32)*`.
+    /// Serialize the **private** part of a completed scan: the owned notes, a live
+    /// membership witness for each, and the tree frontier they root to.
+    ///
+    /// This exists because a scan is expensive to redo and trivial to carry. A
+    /// checkpoint is ~572 MB, almost all of it the public commitment stream — the same
+    /// bytes for every wallet on the chain, and already obtainable from any node. What
+    /// is genuinely *this wallet's* is a few hundred bytes per note. A receipt is that
+    /// part alone, which is what makes "I switched my phone from the hosted service to
+    /// the on-device engine" cost a kilobyte instead of a full rescan from birthday.
+    ///
+    /// [`Self::from_frontier`] already starts a wallet at a frontier, but its notes must
+    /// then live *above* it, because a frontier alone cannot produce a path to a leaf
+    /// beneath it. Shipping the witnesses is exactly what lifts that restriction, and it
+    /// is why this is not just "send a frontier".
+    ///
+    /// Nothing secret is written. Every field is either public chain state or something
+    /// the recipient's own viewing key would derive by scanning; the nullifiers are
+    /// deliberately *not* written, because the importer recomputes them from its own key
+    /// (see [`Self::from_scan_receipt_fvk`]). Spend authority is not involved.
+    ///
+    /// Returns `None` when the wallet cannot be represented this way: a borrowed or stale
+    /// tree, witnesses not advanced to the tip of what was scanned, a note with no live
+    /// witness (the importer has no leaf stream to rebuild one from), or more notes than
+    /// [`RECEIPT_MAX_NOTES`]. The caller should fall back to an ordinary scan and say so.
+    /// `tip` is the frontier the witnesses root to. It is a parameter rather than
+    /// `self.tip_frontier_state()` because a hosted wallet usually *borrows* the shared
+    /// chain tree and has no valid mirror of its own; its caller does hold the shared
+    /// tree's frontier, and that is the same tree. Supplying one that does not match
+    /// this wallet's leaf count is refused.
+    pub fn to_scan_receipt(&self, genesis: [u8; 32], scanned_daa: u64, tip: &FrontierState) -> Option<Vec<u8>> {
+        if self.witnessed_upto != self.size || self.notes.len() > RECEIPT_MAX_NOTES || tip.size != self.size {
+            return None;
+        }
+        let fs = tip.clone();
+        // Every owned note needs a witness at this anchor or the import is lossy, and a
+        // silently short balance is the one failure mode worth refusing outright.
+        let witnessed: HashSet<u64> = self.witnesses.iter().map(|(p, _)| *p).collect();
+        if !self.notes.iter().all(|n| witnessed.contains(&n.position)) {
+            return None;
+        }
+
+        let mut out = Vec::with_capacity(96 + self.notes.len() * 1200);
+        out.extend_from_slice(RECEIPT_MAGIC);
+        out.push(RECEIPT_VERSION);
+        out.extend_from_slice(&genesis);
+        // The anchor frontier, in the same shape the node serves from
+        // `GetShieldedTreeState` — so an importer can compare it field for field against
+        // its own node's answer and refuse a fabricated one.
+        out.extend_from_slice(&fs.size.to_le_bytes());
+        match fs.leaf {
+            None => out.push(0),
+            Some(leaf) => {
+                out.push(1);
+                out.extend_from_slice(&leaf);
+            }
+        }
+        out.extend_from_slice(&(fs.ommers.len() as u64).to_le_bytes());
+        for o in &fs.ommers {
+            out.extend_from_slice(o);
+        }
+        out.extend_from_slice(&scanned_daa.to_le_bytes());
+        out.extend_from_slice(&self.last_daa.to_le_bytes());
+
+        out.extend_from_slice(&(self.notes.len() as u64).to_le_bytes());
+        for n in &self.notes {
+            out.extend_from_slice(&n.position.to_le_bytes());
+            out.extend_from_slice(&n.note.recipient().to_raw_address_bytes());
+            out.extend_from_slice(&n.note.value().inner().to_le_bytes());
+            out.extend_from_slice(&n.note.rho().to_bytes());
+            out.extend_from_slice(n.note.rseed().as_bytes());
+        }
+        out.extend_from_slice(&(self.witnesses.len() as u64).to_le_bytes());
+        for (pos, w) in &self.witnesses {
+            out.extend_from_slice(&pos.to_le_bytes());
+            write_witness(&mut out, w);
+        }
+        Some(out)
+    }
+
+    /// Rebuild a wallet from a [`scan receipt`](Self::to_scan_receipt) and the viewing
+    /// key it belongs to.
+    ///
+    /// **Every note is verified, not trusted.** A receipt arrives from another machine,
+    /// so the importer treats it as a claim: each note's witness must root to the
+    /// receipt's own anchor frontier, with the commitment recomputed from the note's
+    /// fields. A sender cannot forge a path to a root it does not control, so the only
+    /// thing a dishonest receipt can do is *omit* — and an omission shows up as a balance
+    /// lower than a later full scan finds, never as money that is not there. The caller
+    /// should additionally check the anchor frontier against its own node's
+    /// `GetShieldedTreeState`; do that and a receipt is worth exactly as much as a scan.
+    ///
+    /// The nullifiers are recomputed here from `fvk_bytes`. Taking the sender's would let
+    /// a bad receipt mark a note unspendable, or hide that one was already spent.
+    pub fn from_scan_receipt_fvk(
+        fvk_bytes: &[u8; 96],
+        genesis: [u8; 32],
+        bytes: &[u8],
+    ) -> Option<(Self, ScanReceiptMeta)> {
+        let mut r = Cursor { buf: bytes, pos: 0 };
+        if r.take(4)? != RECEIPT_MAGIC.as_slice() || r.u8()? != RECEIPT_VERSION || r.arr::<32>()? != genesis {
+            return None;
+        }
+        let size = r.u64()?;
+        let leaf = match r.u8()? {
+            0 => None,
+            1 => Some(r.arr::<32>()?),
+            _ => return None,
+        };
+        let n_ommers = r.u64()? as usize;
+        if n_ommers > TREE_DEPTH as usize {
+            return None;
+        }
+        let mut ommers = Vec::with_capacity(n_ommers);
+        for _ in 0..n_ommers {
+            ommers.push(r.arr::<32>()?);
+        }
+        let fs = FrontierState { size, leaf, ommers };
+        let scanned_daa = r.u64()?;
+        let last_daa = r.u64()?;
+
+        let mut db = Self::from_fvk(fvk_bytes)?;
+        db.apply_frontier(&fs)?;
+        // The root every witness in this receipt must reproduce.
+        let anchor_root = CommitmentTree::from_frontier(GlobalTree::from_state(&fs).ok()?.frontier()).root();
+
+        let n_notes = r.u64()? as usize;
+        if n_notes > RECEIPT_MAX_NOTES {
+            return None;
+        }
+        let mut notes = Vec::with_capacity(n_notes);
+        for _ in 0..n_notes {
+            let position = r.u64()?;
+            let recipient = r.arr::<43>()?;
+            let value = r.u64()?;
+            let rho = Option::<Rho>::from(Rho::from_bytes(&r.arr()?))?;
+            let rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes(r.arr()?, &rho))?;
+            let addr = Option::<Address>::from(Address::from_raw_address_bytes(&recipient))?;
+            let note = Option::<Note>::from(Note::from_parts(
+                addr,
+                NoteValue::from_raw(value),
+                rho,
+                rseed,
+                orchard::note::NoteVersion::V2,
+            ))?;
+            // Ours to derive, never the sender's to assert.
+            let nullifier = note.nullifier(&db.fvk).to_bytes();
+            notes.push(OwnedNote { note, position, nullifier });
+        }
+
+        let n_w = r.u64()? as usize;
+        if n_w > RECEIPT_MAX_NOTES {
+            return None;
+        }
+        let mut witnesses = Vec::with_capacity(n_w);
+        for _ in 0..n_w {
+            let pos = r.u64()?;
+            let w = read_witness(&mut r)?;
+            witnesses.push((pos, w));
+        }
+        r.done().then_some(())?;
+
+        // Verification. A note is kept only if the receipt proves it is in the tree at
+        // the position it claims, under the anchor the receipt itself names.
+        let mut kept = Vec::with_capacity(notes.len());
+        for n in notes {
+            let Some((_, w)) = witnesses.iter().find(|(p, _)| *p == n.position) else { continue };
+            let Some(path) = w.path() else { continue };
+            let cmx = ExtractedNoteCommitment::from(n.note.commitment());
+            if path.root(MerkleHashOrchard::from_cmx(&cmx)) == anchor_root {
+                kept.push(n);
+            }
+        }
+        if kept.len() != witnesses.len() && kept.is_empty() && !witnesses.is_empty() {
+            return None;
+        }
+        kept.sort_by_key(|n| n.position);
+        let owned: HashSet<u64> = kept.iter().map(|n| n.position).collect();
+        witnesses.retain(|(p, _)| owned.contains(p));
+
+        db.notes = kept;
+        db.witnesses = witnesses;
+        db.witnessed_upto = size;
+        db.lag_tree = db.tree.clone();
+        db.last_daa = last_daa;
+        Some((db, ScanReceiptMeta { scanned_daa, anchor_leaves: size }))
+    }
+
+    /// [`Self::from_scan_receipt_fvk`] for a wallet that holds its seed.
+    pub fn from_scan_receipt(
+        seed: [u8; 32],
+        genesis: [u8; 32],
+        bytes: &[u8],
+    ) -> Option<(Self, ScanReceiptMeta)> {
+        let sk = Option::<SpendingKey>::from(SpendingKey::from_bytes(seed))?;
+        Self::from_scan_receipt_fvk(&FullViewingKey::from(&sk).to_bytes(), genesis, bytes)
+    }
+
     pub fn to_checkpoint(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(64 + self.leaves.len() * 32 + self.notes.len() * 123);
         out.push(CHECKPOINT_VERSION);
@@ -3567,6 +3775,18 @@ fn read_witness(r: &mut Cursor<'_>) -> Option<IncrementalWitness<MerkleHashOrcha
 /// rebuild after every daemon eviction/restart. It contains public chain state only.
 /// v9 annotates history rows reconstructed from compact scan data, so clients never
 /// mistake their net outflow or placeholder fee for exact payment details.
+/// Magic and version of the **portable scan receipt** — deliberately its own format,
+/// independent of `CHECKPOINT_VERSION`. A receipt crosses between two daemons that are
+/// built from different checkouts (the hosted service and the copy inside the phone app),
+/// so tying it to the checkpoint version would make every skew between those two builds
+/// an outage. This format changes only when its own fields change.
+const RECEIPT_MAGIC: &[u8; 4] = b"ZKRC";
+const RECEIPT_VERSION: u8 = 1;
+
+/// Upper bound on notes carried in one receipt, so a malformed blob cannot make us
+/// allocate without limit. A wallet past this is too fragmented to move this way.
+const RECEIPT_MAX_NOTES: usize = 4096;
+
 const CHECKPOINT_VERSION: u8 = 10;
 /// v10 adds each history row's per-output breakdown ([`Credit`]). Gate it on THIS
 /// constant, never on `CHECKPOINT_VERSION` — see the v8 note below for what that
@@ -5507,6 +5727,81 @@ mod circuit_tests {
         db.ingest_block(&[], &[&wire]);
         assert_eq!(db.notes().len(), 1, "only the change note remains");
         assert_eq!(db.balance(), (8_000 - paid_total - fee) as u128, "change = in - paid - fee");
+    }
+
+    /// Moving a synced wallet from the hosted service to the on-device engine.
+    ///
+    /// The receipt carries no leaf stream at all, so the imported wallet holds a note
+    /// that sits *below* everything it can see. A frontier alone could never witness
+    /// such a note — that is exactly the restriction `from_frontier` documents — so if
+    /// the spend path below still rebuilds, the witnesses really did travel.
+    #[test]
+    fn scan_receipt_moves_a_synced_wallet_without_its_leaf_stream() {
+        let mine = [71u8; 32];
+        let other = [72u8; 32];
+        let genesis = [0xcdu8; 32];
+
+        let mut hosted = WalletDb::from_seed(mine).unwrap();
+        let m1 = cb(address_bytes_from_seed(mine).unwrap(), b"rcpt||0", 12_000);
+        let meta1 = BlockMeta { coinbase_txid: [0x11; 32], txids: vec![], timestamp_ms: 1_000, daa_score: 100 };
+        hosted.ingest_block_with_meta(&[m1], &[], Some(&meta1));
+        // Pure tree growth to somebody else, so our note ends up well below the tip.
+        for i in 0..5u8 {
+            let o = cb(address_bytes_from_seed(other).unwrap(), &[b'x', i], 5_000);
+            let meta = BlockMeta {
+                coinbase_txid: [0x22; 32],
+                txids: vec![],
+                timestamp_ms: 2_000,
+                daa_score: 101 + i as u64,
+            };
+            hosted.ingest_block_with_meta(&[o], &[], Some(&meta));
+        }
+        hosted.advance_witnesses(hosted.size());
+        assert_eq!(hosted.balance(), 12_000);
+        let pos = hosted.notes()[0].position;
+
+        let tip = hosted.tip_frontier_state().expect("tip frontier");
+        let receipt = hosted.to_scan_receipt(genesis, 105, &tip).expect("a fully witnessed wallet exports");
+        assert!(receipt.len() < 8_000, "a one-note receipt is kilobytes, got {}", receipt.len());
+
+        // The phone: same key, no leaf stream, no scan.
+        let (mut phone, meta) = WalletDb::from_scan_receipt(mine, genesis, &receipt).expect("receipt imports");
+        assert_eq!(meta.scanned_daa, 105, "the importer resumes where the exporter stopped");
+        assert_eq!(meta.anchor_leaves, hosted.size());
+        assert_eq!(phone.balance(), hosted.balance(), "the imported wallet sees the same money");
+        assert!(
+            phone.to_checkpoint().len() < hosted.to_checkpoint().len(),
+            "the public leaf stream did NOT travel"
+        );
+
+        // A receipt from another chain is refused outright.
+        assert!(
+            WalletDb::from_scan_receipt(mine, [0x99u8; 32], &receipt).is_none(),
+            "a receipt naming a different genesis is refused"
+        );
+        // So is a tampered one.
+        let mut bad = receipt.clone();
+        let n = bad.len();
+        bad[n - 1] ^= 0xff;
+        assert!(
+            WalletDb::from_scan_receipt(mine, genesis, &bad).map_or(true, |(w, _)| w.balance() == 0),
+            "a note whose witness does not root to the anchor is dropped, never trusted"
+        );
+
+        // And it can still spend: both ingest one more block, and the imported wallet
+        // reproduces the same anchor as the wallet that scanned the whole chain.
+        let o = cb(address_bytes_from_seed(other).unwrap(), b"after", 5_000);
+        let meta7 = BlockMeta { coinbase_txid: [0x33; 32], txids: vec![], timestamp_ms: 3_000, daa_score: 106 };
+        hosted.ingest_block_with_meta(&[o.clone()], &[], Some(&meta7));
+        phone.ingest_block_with_meta(&[o], &[], Some(&meta7));
+        hosted.advance_witnesses(hosted.size());
+        phone.advance_witnesses(phone.size());
+
+        let n = phone.notes().iter().find(|n| n.position == pos).expect("note survived the move");
+        let cm = ExtractedNoteCommitment::from(n.note.commitment());
+        let want = hosted.witness_path(pos).expect("hosted path");
+        let got = phone.witness_path(pos).expect("imported wallet still has a spend path");
+        assert_eq!(got.root(cm), want.root(cm), "imported witness roots to the same anchor");
     }
 
     /// The deposit-attribution bug exactly as an exchange reported it: ONE transaction

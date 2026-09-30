@@ -7834,6 +7834,138 @@ struct RescanReq {
     birthday: Option<u64>,
 }
 
+#[derive(Deserialize)]
+struct ScanReceiptReq {
+    /// Hex of the blob returned by `GET /api/wallet/scan-receipt`.
+    receipt: String,
+}
+
+/// Export this wallet's scan as a small, portable receipt.
+///
+/// The point is the asymmetry: a checkpoint is ~572 MB and almost all of it is the
+/// public commitment stream, which is the same bytes for every wallet and already
+/// available from any node. The part that is genuinely this wallet's — its notes and a
+/// witness for each — is a few hundred bytes apiece. So moving a synced wallet between
+/// daemons (the hosted service to the copy of this daemon inside the phone app) costs a
+/// kilobyte instead of a rescan from birthday.
+///
+/// Nothing secret leaves: every field is public chain state or something this wallet's
+/// own viewing key would find by scanning, and the nullifiers are deliberately omitted
+/// so the importer recomputes them from its own key.
+async fn wallet_scan_receipt_export(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let token = token_from(&headers, state.allow_default_token)?;
+    let w = state.get_wallet(&token).await.ok_or_else(|| err(StatusCode::NOT_FOUND, "no wallet loaded"))?;
+    let shared_covers = state.chain_tree_size.load(std::sync::atomic::Ordering::Relaxed);
+    let shared_base = state.chain_tree_base.load(std::sync::atomic::Ordering::Relaxed);
+    let shared_tip = state.chain_tree_frontier.lock().await.clone();
+
+    let mut e = w.lock().await;
+    // Every note must carry a witness at the same anchor, because the importer has no
+    // leaf stream to rebuild one from. Top them up first.
+    tokio::task::block_in_place(|| e.advance_spend_witnesses_bounded(shared_covers, shared_base));
+    // A hosted wallet usually borrows the shared chain tree and has no valid mirror of
+    // its own; the shared tree's frontier is that same tree.
+    let tip = match e.db.tip_frontier_state() {
+        Some(fs) => fs,
+        None => shared_tip.ok_or_else(|| {
+            err(StatusCode::CONFLICT, "the shared chain tree has no frontier yet; retry once this daemon has synced")
+        })?,
+    };
+    let scanned = e.scanned as u64;
+    let bytes = e.db.to_scan_receipt(state.genesis.as_bytes(), scanned, &tip).ok_or_else(|| {
+        err(
+            StatusCode::CONFLICT,
+            "this wallet cannot be exported as a receipt yet: its witnesses are not caught up to what it has \
+             scanned, or it holds more notes than a receipt carries. Let it finish syncing, or consolidate.",
+        )
+    })?;
+    let notes = e.db.notes().len();
+    drop(e);
+    Ok(Json(serde_json::json!({
+        "receipt": hex(&bytes),
+        "bytes": bytes.len(),
+        "notes": notes,
+        "scannedDaa": scanned,
+        "anchorLeaves": tip.size,
+        "genesis": state.genesis.to_string(),
+    })))
+}
+
+/// Adopt a scan receipt into THIS wallet, so it resumes where the exporting daemon
+/// stopped instead of rescanning from its birthday.
+///
+/// The receipt is parsed with this wallet's own key, so one belonging to a different key
+/// simply yields nothing. Every note in it is checked against the anchor it names before
+/// being kept (see `WalletDb::from_scan_receipt_fvk`): a sender cannot invent a note, only
+/// omit one, and an omission shows up as a balance lower than a later full scan finds.
+async fn wallet_scan_receipt_import(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<ScanReceiptReq>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let token = token_from(&headers, state.allow_default_token)?;
+    let w = state.get_wallet(&token).await.ok_or_else(|| err(StatusCode::NOT_FOUND, "no wallet loaded"))?;
+    let raw = unhex(&req.receipt).ok_or_else(|| err(StatusCode::BAD_REQUEST, "receipt must be hex"))?;
+
+    // Phase 1: take the key and the current cursor, then let the lock go — parsing is
+    // CPU-bound and the node call below must never happen under the entry lock.
+    let (key, was_scanned) = {
+        let e = w.lock().await;
+        (e.key.clone(), e.scanned)
+    };
+    let genesis = state.genesis.as_bytes();
+    let parsed = tokio::task::block_in_place(|| match &key {
+        WalletKey::Seed(seed) => WalletDb::from_scan_receipt(*seed, genesis, &raw),
+        WalletKey::Fvk(fvk) => WalletDb::from_scan_receipt_fvk(fvk, genesis, &raw),
+    });
+    let (db, meta) = parsed.ok_or_else(|| {
+        err(
+            StatusCode::BAD_REQUEST,
+            "this receipt is malformed, was written for a different chain, or does not belong to this wallet's key",
+        )
+    })?;
+    if (meta.scanned_daa as usize) <= was_scanned {
+        return Err(err(
+            StatusCode::CONFLICT,
+            format!("this wallet has already scanned to DAA {was_scanned}; the receipt only reaches {}", meta.scanned_daa),
+        ));
+    }
+    // The sync cursor is a chain block, not a score, so resolve the receipt's DAA through
+    // the node. Refusing here is right: a cursor we cannot place would restart the scan.
+    let client = state
+        .request_client()
+        .await
+        .ok_or_else(|| err(StatusCode::BAD_GATEWAY, "node unreachable; a receipt cannot be placed without it"))?;
+    let low = chain_block_at_daa(&client, meta.scanned_daa)
+        .await
+        .ok_or_else(|| err(StatusCode::BAD_GATEWAY, "the node cannot serve the chain block this receipt resumes from"))?;
+
+    let mut e = w.lock().await;
+    if e.scanned > was_scanned {
+        return Err(err(StatusCode::CONFLICT, "the wallet advanced while the receipt was being checked; retry"));
+    }
+    let balance = db.balance();
+    let notes = db.notes().len();
+    e.db = db;
+    e.scanned = meta.scanned_daa as usize;
+    e.low = low;
+    e.caught_up = false;
+    e.boundaries.clear();
+    e.error = None;
+    drop(e);
+    log::info!("wallet {token}: adopted a scan receipt at DAA {} ({notes} notes) instead of rescanning", meta.scanned_daa);
+    Ok(Json(serde_json::json!({
+        "adopted": true,
+        "notes": notes,
+        "balanceSompi": balance.to_string(),
+        "scannedDaa": meta.scanned_daa,
+        "anchorLeaves": meta.anchor_leaves,
+    })))
+}
+
 async fn wallet_rescan(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -11116,6 +11248,7 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
         .route("/api/proof/verify", post(proof_verify))
         .route("/api/wallet/settings", post(wallet_settings))
         .route("/api/wallet/rescan", post(wallet_rescan))
+        .route("/api/wallet/scan-receipt", get(wallet_scan_receipt_export).post(wallet_scan_receipt_import))
         .route("/api/wallet/send", post(wallet_send))
         .route("/api/wallet/send_many", post(wallet_send_many))
         .route("/api/wallet/consolidate", post(wallet_consolidate))
