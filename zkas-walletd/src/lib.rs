@@ -6187,6 +6187,16 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
                 c.leaves,
                 c.tree_ns as f64 / 1000.0 / c.leaves.max(1) as f64,
             );
+            // Which half of the tree work, because they need opposite remedies: the
+            // mirror is public and can be borrowed away entirely, the subtree cache is
+            // what a fast spend is made of.
+            log::info!(
+                "  tree split: mirror {} ms ({:.1} us/leaf, borrowable) | subtree cache {} ms ({:.1} us/leaf, buys spend speed)",
+                c.mirror_ns / 1_000_000,
+                c.mirror_ns as f64 / 1000.0 / c.leaves.max(1) as f64,
+                c.subtree_ns / 1_000_000,
+                c.subtree_ns as f64 / 1000.0 / c.leaves.max(1) as f64,
+            );
             // The percentages above are shares of decrypt+tree, NOT of the sync. Report
             // the page pipeline next to them so the two can never again be confused: a
             // 1.8x on decryption moved ~2% of a wallet's sync time, and the counters as

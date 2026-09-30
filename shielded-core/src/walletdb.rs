@@ -237,8 +237,19 @@ impl Preview {
 pub struct ScanCost {
     /// Nanoseconds inside `scan_compact_prepared` / `scan_bundle_prepared`.
     pub decrypt_ns: u128,
-    /// Nanoseconds inside `append_leaf` — the Sinsemilla tree work.
+    /// Nanoseconds inside `append_leaf` — all of the Sinsemilla tree work.
     pub tree_ns: u128,
+    /// Of `tree_ns`, the part spent appending this wallet's own MIRROR tree.
+    ///
+    /// Split out because the two halves have opposite answers. The mirror tree is
+    /// public — every wallet on the chain computes the identical thing, so it can be
+    /// borrowed from a shared tree or adopted from a node frontier and the work simply
+    /// disappears. The subtree cache is this wallet's own index and is what makes its
+    /// spends fast; paying it is a trade, not waste. A phone measured 44.5 us/leaf
+    /// across both and there was no way to tell which one to attack.
+    pub mirror_ns: u128,
+    /// Of `tree_ns`, the part spent keeping the complete-subtree cache in step.
+    pub subtree_ns: u128,
     /// Actions offered to trial decryption.
     pub actions: u64,
     /// Leaves appended to the commitment tree.
@@ -2065,18 +2076,22 @@ impl WalletDb {
         // tree is building the identical thing. A borrowing wallet skips it and adopts
         // that frontier instead (see `adopt_tip_frontier`), which is sound because the
         // frontier at N leaves depends only on leaves 0..N.
+        let t_mirror = std::time::Instant::now();
         if self.borrow_tree {
             self.tree_valid = false;
         } else {
             // `append` only errors when the tree is full (2^32 leaves) — unreachable.
             let _ = self.tree.append(leaf);
         }
+        self.scan_cost.mirror_ns += t_mirror.elapsed().as_nanos();
+        let t_subtree = std::time::Instant::now();
         // Keep the complete-subtree cache in step: one combine per leaf, amortized. If
         // the mountain range ever refuses a leaf the cache is dropped, not patched — a
         // half-updated cache must never be consulted.
         if self.subtree.active && self.subtree.upto == self.size && !self.subtree.push_leaf(self.size, leaf) {
             self.subtree = SubtreeCache { failed: true, ..Default::default() };
         }
+        self.scan_cost.subtree_ns += t_subtree.elapsed().as_nanos();
         if let Some(note) = owned {
             let nullifier = note.nullifier(&self.fvk).to_bytes();
             self.notes.push(OwnedNote { note, position: self.size, nullifier });
