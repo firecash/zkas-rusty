@@ -2231,6 +2231,19 @@ struct PageCache {
     /// Pages being fetched right now, so simultaneous askers wait for one answer
     /// instead of each fetching and decoding the same page. See `fetch_shielded_page`.
     in_flight: HashMap<(RpcHash, u64), Arc<tokio::sync::Semaphore>>,
+    /// Where the page starting at a cursor ENDS: cursor -> the next page's cursor.
+    ///
+    /// A page is addressed by its start hash, so to ask for the page after this one you
+    /// need the hash of the block 1000 further on. The read-ahead used to buy that with
+    /// `get_shielded_block_metadata` — 2000 blocks per call, four serial calls to scout
+    /// eight pages, re-run from the current cursor on EVERY chunk iteration, on the same
+    /// connection that is fetching the real pages. Half of it was re-walking ground it
+    /// had already walked.
+    ///
+    /// It never had to be bought at all: a page that has been fetched already names its
+    /// own last block, which is exactly that cursor. Recording it turns the read-ahead
+    /// into map lookups over known ground, and leaves scouting for the frontier only.
+    next: HashMap<RpcHash, RpcHash>,
     pool: Arc<rayon::ThreadPool>,
     ttl: std::time::Duration,
     cap: usize,
@@ -2258,6 +2271,7 @@ impl PageCache {
             map: HashMap::new(),
             order: VecDeque::new(),
             in_flight: HashMap::new(),
+            next: HashMap::new(),
             pool: Arc::new(pool),
             ttl: std::time::Duration::from_secs(resources.page_cache_ttl_secs.max(1)),
             cap: resources.page_cache_entries.max(1),
@@ -2305,6 +2319,21 @@ async fn deep_prefetch(state: std::sync::Arc<AppState>, client: GrpcClient, star
     warm(start);
     let mut warmed = 1usize;
     let mut anchor = start; // exclusive cursor of the page we scout past
+    // Walk boundaries we already know before spending a single scout call. On a
+    // re-entry over ground the loop has covered this is the whole read-ahead, which is
+    // the common case: the prefetch is re-spawned every chunk iteration and used to
+    // re-scout the same pages each time.
+    loop {
+        let known = { state.page_cache.lock().await.next.get(&anchor).copied() };
+        match known {
+            Some(nxt) if warmed < depth => {
+                warm(nxt);
+                warmed += 1;
+                anchor = nxt;
+            }
+            _ => break,
+        }
+    }
     while warmed < depth {
         let meta = match tokio::time::timeout(
             SYNC_RPC_TIMEOUT,
@@ -2439,6 +2468,13 @@ async fn fetch_shielded_page(
     // entry, so `order` counted it twice: the queue hit `cap` early, and popping the
     // stale first copy deleted the freshly inserted page from `map` — evicting a hot
     // entry and leaving the cache holding fewer pages than it was configured for.
+    // Free boundary: this page's last block is the next page's cursor.
+    if let Some(last) = decoded.blocks.last() {
+        if c.next.len() > 64_000 {
+            c.next.clear(); // bounded; it refills from the pages actually walked
+        }
+        c.next.insert(low, last.hash);
+    }
     if c.map.insert(key, (std::time::Instant::now(), decoded.clone())).is_some() {
         if let Some(pos) = c.order.iter().position(|k| *k == key) {
             c.order.remove(pos);
