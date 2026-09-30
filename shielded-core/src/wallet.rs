@@ -1368,6 +1368,249 @@ pub mod build {
         ))
     }
 
+
+    /// One party's contribution to a **shared** bundle: a note it owns, that note's
+    /// path, and the VIEWING key the prover needs to build the circuit witness. The
+    /// spend authorizing key is never part of this — the owner keeps it and signs
+    /// afterwards, exactly as in the single-party [`prepare_payment`] split.
+    #[derive(Clone)]
+    pub struct MultiSpend {
+        pub fvk: FullViewingKey,
+        pub note: Note,
+        pub path: MerklePath,
+    }
+
+    /// One output of a shared bundle. Every output is stated explicitly, including
+    /// change: on a two-party bundle "change" belongs to a specific party, so it
+    /// cannot be inferred the way [`prepare_payment`] infers a single sender's.
+    #[derive(Clone)]
+    pub struct MultiOutput {
+        /// Supplied only by a party that wants its own send recoverable later.
+        pub ovk: Option<orchard::keys::OutgoingViewingKey>,
+        pub recipient: [u8; 43],
+        pub value: u64,
+        pub memo: [u8; 512],
+    }
+
+    /// A proved, unsigned bundle whose spends belong to **different owners**.
+    pub struct PreparedMultiparty {
+        /// The bundle itself. Sign with [`sign_spend_auth`] and complete with
+        /// [`finalize_payment`], which applies `(action_index, signature)` pairs
+        /// without caring which key produced each one.
+        pub payment: PreparedPayment,
+        /// `(action_index, spend_index)` for every real spend: which entry of the
+        /// `spends` argument each action authorizes. A party uses this to find its
+        /// own actions and check their value *before* signing, instead of trial-
+        /// signing everything and trusting whatever succeeded.
+        pub spend_owners: Vec<(usize, usize)>,
+    }
+
+    /// COORDINATOR role. Build and prove ONE bundle whose spends belong to different
+    /// owners — the construction behind an atomic sale, swap or escrow, where both
+    /// sides move or neither does.
+    ///
+    /// Atomicity is a property of the bundle, not of a protocol on top of it: one
+    /// sighash covers every action (including each output's `enc_ciphertext`, so a
+    /// memo recording the trade is signed by everyone), one proof covers every spend,
+    /// and the binding signature only verifies if the whole bundle's net value equals
+    /// its declared `value_balance`. No party can be made to move value unless the
+    /// entire bundle confirms.
+    ///
+    /// **What the caller must still check.** The fee is taken as given and only checked
+    /// for conservation; the node's byte-proportional minimum relay fee and the ~38-action
+    /// standardness budget are enforced above this layer, as they are for
+    /// [`prepare_payment`].
+    ///
+    /// **What the coordinator learns.** Proving requires each spender's *viewing* key,
+    /// so whoever calls this sees both sides' notes. It never needs a spend key and so
+    /// can never move the funds, but this is real disclosure: parties should contribute
+    /// from a key scoped to the trade rather than from their main wallet.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_multiparty(
+        spends: Vec<MultiSpend>,
+        outputs: Vec<MultiOutput>,
+        fee: u64,
+        network_domain: &[u8; 32],
+        tx_context: &[u8],
+    ) -> Result<PreparedMultiparty, BuildError> {
+        use group::ff::PrimeField;
+
+        if spends.is_empty() || outputs.is_empty() {
+            return Err(BuildError::Empty);
+        }
+
+        // The hard wire cap is enforced here, before any work is done. The tighter
+        // STANDARDNESS budget — a standard transaction must fit 124,744 bytes, so
+        // roughly 38 actions — is deliberately left to the caller: it is a consensus
+        // and mempool constant rather than a circuit one, and `prepare_payment` treats
+        // it the same way. It matters more on a shared bundle than on a single-party
+        // payment, because no individual party can see the combined total, so whoever
+        // coordinates must check it or the bundle dies at relay with every party
+        // believing their own contribution was fine.
+        let actions = spends.len().max(outputs.len());
+        if actions > crate::bundle::MAX_ACTIONS_PER_BUNDLE {
+            return Err(BuildError::Builder(format!(
+                "{actions} actions exceeds the {} this wire format can carry",
+                crate::bundle::MAX_ACTIONS_PER_BUNDLE
+            )));
+        }
+
+        // Every spend must witness to ONE anchor. Orchard's builder carries a single
+        // anchor for the bundle, so a path rooting anywhere else yields a proof that
+        // cannot verify. Checking it here turns a late, opaque proof failure into an
+        // early error that names the offending party.
+        let anchor_of = |s: &MultiSpend| s.path.root(ExtractedNoteCommitment::from(s.note.commitment()));
+        let anchor = anchor_of(&spends[0]);
+        for (i, s) in spends.iter().enumerate().skip(1) {
+            if anchor_of(s) != anchor {
+                return Err(BuildError::Builder(format!(
+                    "spend {i} witnesses to a different anchor; every party must witness at the same one"
+                )));
+            }
+        }
+
+        // Value is conserved by the binding signature at verification time regardless.
+        // Checking it up front means a caller that mis-sums is told which side is short,
+        // instead of being handed a bundle that silently fails to verify later.
+        let total_in: u64 = spends.iter().map(|s| s.note.value().inner()).sum();
+        let total_out: u64 = outputs.iter().map(|o| o.value).sum();
+        let owed = total_out.checked_add(fee).ok_or_else(|| BuildError::Builder("outputs + fee overflow".into()))?;
+        if total_in != owed {
+            return Err(BuildError::Builder(format!(
+                "value not conserved: spends total {total_in}, outputs {total_out} + fee {fee} = {owed}"
+            )));
+        }
+
+        let mut builder = Builder::new(BundleType::DEFAULT, crate::verify::BUNDLE_VERSION, orchard::bundle::Flags::ENABLED, anchor)
+            .expect("orchard v2 ENABLED flags are always representable");
+        for s in &spends {
+            builder
+                .add_spend(s.fvk.clone(), s.note, s.path.clone())
+                .map_err(|e| BuildError::Builder(format!("{e:?}")))?;
+        }
+        for o in &outputs {
+            let recipient = Option::<Address>::from(Address::from_raw_address_bytes(&o.recipient))
+                .ok_or_else(|| BuildError::Builder("output recipient is not a valid Orchard address".into()))?;
+            builder
+                .add_output(o.ovk.clone(), recipient, NoteValue::from_raw(o.value), o.memo)
+                .map_err(|e| BuildError::Builder(format!("{e:?}")))?;
+        }
+
+        let pk = proving_key();
+        let mut rng = rand::rng();
+        let (mut pczt, meta) = builder.build_for_pczt(&mut rng).map_err(|e| BuildError::Builder(format!("{e:?}")))?;
+        pczt.create_proof(pk, &mut rng).map_err(|e| BuildError::Proof(format!("{e:?}")))?;
+
+        let effects = pczt.extract_effects::<i64>().map_err(|e| BuildError::Proof(format!("{e:?}")))?.ok_or(BuildError::Empty)?;
+        let value_balance = *effects.value_balance();
+        let effects_wire = to_wire(&effects, |_| [0u8; 64], Vec::new(), [0u8; 64]);
+        let sighash = crate::verify::sighash(&effects_wire, network_domain, tx_context);
+
+        // Which action carries which party's spend. The builder shuffles inputs into
+        // actions and pads with dummies, so the mapping has to come from the builder
+        // rather than from input order.
+        let mut spend_owners: Vec<(usize, usize)> = Vec::with_capacity(spends.len());
+        for i in 0..spends.len() {
+            let action = meta
+                .spend_action_index(i)
+                .ok_or_else(|| BuildError::Builder(format!("builder lost spend {i}")))?;
+            spend_owners.push((action, i));
+        }
+        spend_owners.sort_unstable();
+
+        // Padding dummies carry no owner, so the coordinator signs them here; real
+        // spends are left for their owners.
+        let mut dummies: Vec<(usize, SpendingKey)> = Vec::new();
+        let mut spend_auth_requests: Vec<(usize, [u8; 32])> = Vec::new();
+        for (i, action) in pczt.actions().iter().enumerate() {
+            let spend = action.spend();
+            if let Some(sk) = spend.dummy_sk() {
+                dummies.push((i, sk.clone()));
+            } else if let Some(alpha) = spend.alpha() {
+                spend_auth_requests.push((i, alpha.to_repr()));
+            }
+        }
+        for (i, sk) in dummies {
+            let ask = SpendAuthorizingKey::from(&sk);
+            pczt.actions_mut()[i].sign(sighash, &ask, &mut rng).map_err(|e| BuildError::Proof(format!("{e:?}")))?;
+        }
+
+        let mut disclosure = Vec::with_capacity(pczt.actions().len());
+        for action in pczt.actions().iter() {
+            let out = action.output();
+            let spend = action.spend();
+            disclosure.push(ActionDisclosure {
+                spend_value: spend.value().map(|v| v.inner()).unwrap_or(0),
+                out_value: out.value().ok_or(BuildError::Empty)?.inner(),
+                out_recipient: out.recipient().ok_or(BuildError::Empty)?.to_raw_address_bytes(),
+                out_rseed: *out.rseed().ok_or(BuildError::Empty)?.as_bytes(),
+                rcv: action.rcv().clone().ok_or(BuildError::Empty)?.to_bytes(),
+            });
+        }
+
+        Ok(PreparedMultiparty {
+            payment: PreparedPayment { pczt, sighash, effects: effects_wire, value_balance, spend_auth_requests, disclosure },
+            spend_owners,
+        })
+    }
+
+
+    /// Wire size of one spend contribution: recipient 43 + value 8 + rho 32 +
+    /// rseed 32 + position 4 + 32 auth-path nodes of 32 bytes.
+    pub const SPEND_OFFER_LEN: usize = 43 + 8 + 32 + 32 + 4 + 32 * 32;
+
+    /// Serialize one party's contribution to a shared bundle — the note it is
+    /// putting in and that note's path — so it can be handed to whoever is
+    /// coordinating [`prepare_multiparty`].
+    ///
+    /// Field order matches the wallet checkpoint's note encoding, so the two stay
+    /// readable against each other. This carries **no** key material: a contribution
+    /// is useless without the viewing key sent alongside it, and neither can spend.
+    pub fn spend_offer_to_bytes(note: &Note, path: &MerklePath) -> Vec<u8> {
+        let mut out = Vec::with_capacity(SPEND_OFFER_LEN);
+        out.extend_from_slice(&note.recipient().to_raw_address_bytes());
+        out.extend_from_slice(&note.value().inner().to_le_bytes());
+        out.extend_from_slice(&note.rho().to_bytes());
+        out.extend_from_slice(note.rseed().as_bytes());
+        out.extend_from_slice(&path.position().to_le_bytes());
+        for node in path.auth_path() {
+            out.extend_from_slice(&node.to_bytes());
+        }
+        debug_assert_eq!(out.len(), SPEND_OFFER_LEN);
+        out
+    }
+
+    /// Inverse of [`spend_offer_to_bytes`]. Returns `None` on any malformed field
+    /// rather than panicking, because this parses input from a counterparty.
+    pub fn spend_offer_from_bytes(b: &[u8]) -> Option<(Note, MerklePath)> {
+        use orchard::note::{RandomSeed, Rho};
+        use orchard::tree::MerkleHashOrchard;
+        if b.len() != SPEND_OFFER_LEN {
+            return None;
+        }
+        let addr = Option::<Address>::from(Address::from_raw_address_bytes(&b[0..43].try_into().ok()?))?;
+        let value = u64::from_le_bytes(b[43..51].try_into().ok()?);
+        let rho = Option::<Rho>::from(Rho::from_bytes(&b[51..83].try_into().ok()?))?;
+        let rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes(b[83..115].try_into().ok()?, &rho))?;
+        let note = Option::<Note>::from(Note::from_parts(
+            addr,
+            NoteValue::from_raw(value),
+            rho,
+            rseed,
+            orchard::note::NoteVersion::V2,
+        ))?;
+        let position = u32::from_le_bytes(b[115..119].try_into().ok()?);
+        let mut auth: Vec<MerkleHashOrchard> = Vec::with_capacity(32);
+        for i in 0..32 {
+            let at = 119 + i * 32;
+            auth.push(Option::<MerkleHashOrchard>::from(MerkleHashOrchard::from_bytes(
+                &b[at..at + 32].try_into().ok()?,
+            ))?);
+        }
+        let auth: [MerkleHashOrchard; 32] = auth.try_into().ok()?;
+        Some((note, MerklePath::from_parts(position, auth)))
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -1835,6 +2078,323 @@ pub mod build {
             assert_eq!(wide.len(), via_cpu.len(), "a permissive mask changes nothing but speed");
             assert_eq!(wide[0].action_index, via_cpu[0].action_index);
         }
+
+        /// ATOMIC TWO-PARTY SETTLEMENT — the construction behind a marketplace sale.
+        ///
+        /// One bundle carries the seller's item note and the buyer's payment note. The
+        /// seller is paid, the buyer receives the item, and a value-0 note records the
+        /// sale in a public registry — all under ONE sighash, so neither side can sign
+        /// the trade and then disagree about what was traded. Each party signs only the
+        /// action spending its own note, and neither can complete the bundle alone.
+        #[test]
+        fn two_party_sale_verifies_with_each_party_signing_only_its_own_spend() {
+            use orchard::keys::SpendAuthorizingKey;
+            use orchard::value::NoteValue;
+
+            let seller = ShieldedKeys::from_seed([11u8; 32]).expect("valid seed");
+            let buyer = ShieldedKeys::from_seed([12u8; 32]).expect("valid seed");
+            let registry = ShieldedKeys::from_seed([13u8; 32]).expect("valid seed");
+            let ctx = b"zkas-two-party";
+            let net = [0x77u8; 32];
+
+            let mk = |owner: &ShieldedKeys, value: u64, a: u8, b: u8| {
+                let rho = Option::<Rho>::from(Rho::from_bytes(&canon(a))).unwrap();
+                let rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes(canon(b), &rho)).unwrap();
+                Option::<Note>::from(Note::from_parts(
+                    owner.address(),
+                    NoteValue::from_raw(value),
+                    rho,
+                    rseed,
+                    orchard::note::NoteVersion::V2,
+                ))
+                .unwrap()
+            };
+
+            // The item is a note the seller controls; the payment is a note the buyer
+            // controls. They sit side by side in a two-leaf tree, so both parties
+            // witness at the same anchor — which prepare_multiparty requires.
+            let item = mk(&seller, 1, 1, 2);
+            let payment = mk(&buyer, 10_000, 3, 4);
+            let cmx_item = ExtractedNoteCommitment::from(item.commitment());
+            let cmx_pay = ExtractedNoteCommitment::from(payment.commitment());
+            let leaf_item = MerkleHashOrchard::from_cmx(&cmx_item);
+            let leaf_pay = MerkleHashOrchard::from_cmx(&cmx_pay);
+            let empty = |i: usize| <MerkleHashOrchard as Hashable>::empty_root(Level::from(i as u8));
+            let path_item = MerklePath::from_parts(0, core::array::from_fn(|i| if i == 0 { leaf_pay } else { empty(i) }));
+            let path_pay = MerklePath::from_parts(1, core::array::from_fn(|i| if i == 0 { leaf_item } else { empty(i) }));
+            assert_eq!(path_item.root(cmx_item), path_pay.root(cmx_pay), "one anchor for both parties");
+
+            let mut memo = [0u8; 512];
+            memo[..21].copy_from_slice(b"ZRC721 sale 9000 item");
+
+            let prepared = prepare_multiparty(
+                vec![
+                    MultiSpend { fvk: seller.fvk.clone(), note: item, path: path_item },
+                    MultiSpend { fvk: buyer.fvk.clone(), note: payment, path: path_pay },
+                ],
+                vec![
+                    // the buyer's money reaches the seller
+                    MultiOutput { ovk: None, recipient: seller.address().to_raw_address_bytes(), value: 9_000, memo: [0u8; 512] },
+                    // the item reaches the buyer
+                    MultiOutput { ovk: None, recipient: buyer.address().to_raw_address_bytes(), value: 1, memo: [0u8; 512] },
+                    // and the sale is recorded publicly, in the same signed bundle
+                    MultiOutput { ovk: None, recipient: registry.address().to_raw_address_bytes(), value: 0, memo },
+                ],
+                1_000,
+                &net,
+                ctx,
+            )
+            .expect("a well-formed two-party bundle must prepare");
+
+            assert_eq!(prepared.spend_owners.len(), 2, "two real spends, one per party");
+
+            // Each party signs ONLY the action spending its own note.
+            let alpha_for = |action: usize| {
+                prepared.payment.spend_auth_requests.iter().find(|(i, _)| *i == action).expect("alpha for a real spend").1
+            };
+            let mut sigs = Vec::new();
+            for (action, owner) in prepared.spend_owners.iter().copied() {
+                let ask = if owner == 0 { SpendAuthorizingKey::from(&seller.sk) } else { SpendAuthorizingKey::from(&buyer.sk) };
+                sigs.push((action, sign_spend_auth(&ask, alpha_for(action), prepared.payment.sighash).expect("sign")));
+            }
+
+            let wire = finalize_payment(prepared.payment, sigs).expect("finalize");
+            let msg = sighash(&wire, &net, ctx);
+            crate::verify::verify_bundle(&wire, &msg).expect("the two-party bundle must verify");
+            assert_eq!(wire.value_balance, 1_000, "fee is the residual, and it is public");
+        }
+
+        /// Neither party can authorize the other's spend. Swapping the two signatures
+        /// does not merely produce a bundle that fails verification — it produces no
+        /// bundle at all, because each signature is checked against its action's `rk`
+        /// as it is applied. That is what makes this a trade rather than a way to
+        /// spend someone else's note.
+        #[test]
+        fn a_party_cannot_sign_the_other_partys_spend() {
+            use orchard::keys::SpendAuthorizingKey;
+            use orchard::value::NoteValue;
+
+            let seller = ShieldedKeys::from_seed([21u8; 32]).expect("valid seed");
+            let buyer = ShieldedKeys::from_seed([22u8; 32]).expect("valid seed");
+            let ctx = b"zkas-two-party-neg";
+            let net = [0x78u8; 32];
+
+            let mk = |owner: &ShieldedKeys, value: u64, a: u8, b: u8| {
+                let rho = Option::<Rho>::from(Rho::from_bytes(&canon(a))).unwrap();
+                let rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes(canon(b), &rho)).unwrap();
+                Option::<Note>::from(Note::from_parts(owner.address(), NoteValue::from_raw(value), rho, rseed, orchard::note::NoteVersion::V2)).unwrap()
+            };
+            let a_note = mk(&seller, 4_000, 5, 6);
+            let b_note = mk(&buyer, 6_000, 7, 8);
+            let cmx_a = ExtractedNoteCommitment::from(a_note.commitment());
+            let cmx_b = ExtractedNoteCommitment::from(b_note.commitment());
+            let leaf_a = MerkleHashOrchard::from_cmx(&cmx_a);
+            let leaf_b = MerkleHashOrchard::from_cmx(&cmx_b);
+            let empty = |i: usize| <MerkleHashOrchard as Hashable>::empty_root(Level::from(i as u8));
+            let path_a = MerklePath::from_parts(0, core::array::from_fn(|i| if i == 0 { leaf_b } else { empty(i) }));
+            let path_b = MerklePath::from_parts(1, core::array::from_fn(|i| if i == 0 { leaf_a } else { empty(i) }));
+
+            let prepared = prepare_multiparty(
+                vec![
+                    MultiSpend { fvk: seller.fvk.clone(), note: a_note, path: path_a },
+                    MultiSpend { fvk: buyer.fvk.clone(), note: b_note, path: path_b },
+                ],
+                vec![MultiOutput { ovk: None, recipient: buyer.address().to_raw_address_bytes(), value: 9_000, memo: [0u8; 512] }],
+                1_000,
+                &net,
+                ctx,
+            )
+            .expect("prepare");
+
+            let alpha_for = |action: usize| {
+                prepared.payment.spend_auth_requests.iter().find(|(i, _)| *i == action).expect("alpha").1
+            };
+            // Deliberately sign each action with the WRONG party's key.
+            let mut sigs = Vec::new();
+            for (action, owner) in prepared.spend_owners.iter().copied() {
+                let wrong = if owner == 0 { SpendAuthorizingKey::from(&buyer.sk) } else { SpendAuthorizingKey::from(&seller.sk) };
+                sigs.push((action, sign_spend_auth(&wrong, alpha_for(action), prepared.payment.sighash).expect("sign")));
+            }
+            // Assembly itself refuses it: the PCZT checks each signature against its
+            // action's `rk` as it applies it, so a bundle carrying the wrong party's
+            // signature is never produced. There is nothing to broadcast, and nothing
+            // for a verifier to have to catch later.
+            let err = match finalize_payment(prepared.payment, sigs) {
+                Err(e) => e,
+                Ok(_) => panic!("a bundle signed by the wrong party must not assemble"),
+            };
+            match err {
+                BuildError::Proof(m) => assert!(
+                    m.contains("InvalidExternalSignature"),
+                    "expected the signature to be refused against rk, got: {m}"
+                ),
+                other => panic!("expected a signature rejection, got {other:?}"),
+            }
+        }
+
+        /// Both parties must witness at the same anchor. A mismatch is caught up front
+        /// with a message that names the offending spend, rather than surfacing later
+        /// as an unverifiable proof.
+        #[test]
+        fn mismatched_anchors_are_rejected_before_proving() {
+            use orchard::value::NoteValue;
+
+            let a = ShieldedKeys::from_seed([31u8; 32]).expect("valid seed");
+            let b = ShieldedKeys::from_seed([32u8; 32]).expect("valid seed");
+            let mk = |owner: &ShieldedKeys, value: u64, x: u8, y: u8| {
+                let rho = Option::<Rho>::from(Rho::from_bytes(&canon(x))).unwrap();
+                let rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes(canon(y), &rho)).unwrap();
+                Option::<Note>::from(Note::from_parts(owner.address(), NoteValue::from_raw(value), rho, rseed, orchard::note::NoteVersion::V2)).unwrap()
+            };
+            let n1 = mk(&a, 5_000, 9, 10);
+            let n2 = mk(&b, 5_000, 11, 12);
+            // Two single-leaf trees: each roots to its own anchor.
+            let solo: [MerkleHashOrchard; 32] =
+                core::array::from_fn(|i| <MerkleHashOrchard as Hashable>::empty_root(Level::from(i as u8)));
+            let p1 = MerklePath::from_parts(0, solo);
+            let p2 = MerklePath::from_parts(0, solo);
+
+            let res = prepare_multiparty(
+                vec![
+                    MultiSpend { fvk: a.fvk.clone(), note: n1, path: p1 },
+                    MultiSpend { fvk: b.fvk.clone(), note: n2, path: p2 },
+                ],
+                vec![MultiOutput { ovk: None, recipient: b.address().to_raw_address_bytes(), value: 9_000, memo: [0u8; 512] }],
+                1_000,
+                &[0x79u8; 32],
+                b"zkas-anchor-mismatch",
+            );
+            let err = match res {
+                Err(e) => e,
+                Ok(_) => panic!("differing anchors must be refused"),
+            };
+            match err {
+                BuildError::Builder(m) => assert!(m.contains("different anchor"), "message names the problem: {m}"),
+                other => panic!("expected an anchor error, got {other:?}"),
+            }
+        }
+
+        /// Value must be conserved, and the caller is told which side is short instead
+        /// of being handed a bundle whose binding signature will fail later.
+        #[test]
+        fn unbalanced_value_is_refused_with_both_totals() {
+            use orchard::value::NoteValue;
+
+            let a = ShieldedKeys::from_seed([41u8; 32]).expect("valid seed");
+            let rho = Option::<Rho>::from(Rho::from_bytes(&canon(13))).unwrap();
+            let rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes(canon(14), &rho)).unwrap();
+            let note = Option::<Note>::from(Note::from_parts(a.address(), NoteValue::from_raw(1_000), rho, rseed, orchard::note::NoteVersion::V2)).unwrap();
+            let solo: [MerkleHashOrchard; 32] =
+                core::array::from_fn(|i| <MerkleHashOrchard as Hashable>::empty_root(Level::from(i as u8)));
+
+            let res = prepare_multiparty(
+                vec![MultiSpend { fvk: a.fvk.clone(), note, path: MerklePath::from_parts(0, solo) }],
+                vec![MultiOutput { ovk: None, recipient: a.address().to_raw_address_bytes(), value: 900, memo: [0u8; 512] }],
+                50, // 900 + 50 != 1000
+                &[0x7au8; 32],
+                b"zkas-unbalanced",
+            );
+            let err = match res {
+                Err(e) => e,
+                Ok(_) => panic!("an unbalanced bundle must be refused"),
+            };
+            match err {
+                BuildError::Builder(m) => assert!(m.contains("value not conserved"), "message explains: {m}"),
+                other => panic!("expected a value error, got {other:?}"),
+            }
+        }
+
+        /// A spend contribution survives the round trip a counterparty puts it
+        /// through, and a truncated or corrupt one is refused rather than
+        /// half-parsed — this parses bytes supplied by the other side of a trade.
+        #[test]
+        fn a_spend_offer_round_trips_and_rejects_garbage() {
+            use orchard::value::NoteValue;
+
+            let owner = ShieldedKeys::from_seed([51u8; 32]).expect("valid seed");
+            let rho = Option::<Rho>::from(Rho::from_bytes(&canon(15))).unwrap();
+            let rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes(canon(16), &rho)).unwrap();
+            let note = Option::<Note>::from(Note::from_parts(
+                owner.address(), NoteValue::from_raw(4_242), rho, rseed, orchard::note::NoteVersion::V2)).unwrap();
+            let auth: [MerkleHashOrchard; 32] =
+                core::array::from_fn(|i| <MerkleHashOrchard as Hashable>::empty_root(Level::from(i as u8)));
+            let path = MerklePath::from_parts(9, auth);
+
+            let bytes = spend_offer_to_bytes(&note, &path);
+            assert_eq!(bytes.len(), SPEND_OFFER_LEN);
+            let (n2, p2) = spend_offer_from_bytes(&bytes).expect("round trip");
+            assert_eq!(n2.value().inner(), 4_242);
+            assert_eq!(n2.recipient().to_raw_address_bytes(), owner.address().to_raw_address_bytes());
+            assert_eq!(p2.position(), 9);
+            assert_eq!(
+                p2.root(ExtractedNoteCommitment::from(n2.commitment())),
+                path.root(ExtractedNoteCommitment::from(note.commitment())),
+                "the decoded path roots to the same anchor"
+            );
+
+            assert!(spend_offer_from_bytes(&bytes[..bytes.len() - 1]).is_none(), "truncated is refused");
+
+            // A non-canonical field element is refused by the parser.
+            let mut bad = bytes.clone();
+            for b in &mut bad[51..83] {
+                *b = 0xff; // rho beyond the field modulus
+            }
+            assert!(spend_offer_from_bytes(&bad).is_none(), "a non-canonical rho is refused");
+
+            // A tampered DIVERSIFIER is NOT caught here, and does not need to be: any
+            // 11 bytes are a valid diversifier, so the parser has nothing to reject.
+            // What catches it is the note commitment — change the recipient and the
+            // commitment changes, so the supplied path no longer roots to the anchor
+            // the other parties are building against, and `prepare_multiparty` refuses
+            // the bundle. Integrity of a contribution comes from the anchor, not from
+            // the encoding.
+            let mut swapped = bytes.clone();
+            swapped[0] ^= 0xff;
+            let (tampered, tampered_path) = spend_offer_from_bytes(&swapped).expect("still parses");
+            assert_ne!(
+                tampered_path.root(ExtractedNoteCommitment::from(tampered.commitment())),
+                path.root(ExtractedNoteCommitment::from(note.commitment())),
+                "tampering with the recipient moves the anchor, which is what rejects it"
+            );
+        }
+
+
+        /// The wire cap is enforced before any proving happens, so an over-large
+        /// bundle costs a comparison rather than a Halo 2 proof.
+        #[test]
+        fn too_many_actions_is_refused_before_proving() {
+            use orchard::value::NoteValue;
+
+            let a = ShieldedKeys::from_seed([61u8; 32]).expect("valid seed");
+            let rho = Option::<Rho>::from(Rho::from_bytes(&canon(17))).unwrap();
+            let rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes(canon(18), &rho)).unwrap();
+            let note = Option::<Note>::from(Note::from_parts(
+                a.address(), NoteValue::from_raw(1_000), rho, rseed, orchard::note::NoteVersion::V2)).unwrap();
+            let solo: [MerkleHashOrchard; 32] =
+                core::array::from_fn(|i| <MerkleHashOrchard as Hashable>::empty_root(Level::from(i as u8)));
+
+            let over = crate::bundle::MAX_ACTIONS_PER_BUNDLE + 1;
+            let outputs: Vec<MultiOutput> = (0..over)
+                .map(|_| MultiOutput { ovk: None, recipient: a.address().to_raw_address_bytes(), value: 1, memo: [0u8; 512] })
+                .collect();
+
+            let res = prepare_multiparty(
+                vec![MultiSpend { fvk: a.fvk.clone(), note, path: MerklePath::from_parts(0, solo) }],
+                outputs,
+                0,
+                &[0x7bu8; 32],
+                b"zkas-too-many",
+            );
+            let err = match res {
+                Err(e) => e,
+                Ok(_) => panic!("an over-large bundle must be refused"),
+            };
+            match err {
+                BuildError::Builder(m) => assert!(m.contains("exceeds"), "message names the cap: {m}"),
+                other => panic!("expected a cap error, got {other:?}"),
+            }
+        }
+
     }
 }
 
