@@ -4440,8 +4440,20 @@ fn snap_from_entry(address: String, e: &WalletEntry, daa_score: u64) -> StatusSn
         //
         // Whatever the spend path enforces, this must state. If the two ever diverge
         // again, the card is lying rather than the daemon being strict.
+        //
+        // They did diverge, and this is the repair. The predicate used to add
+        // `caught_up || scanned + DEFAULT_ANCHOR_DEPTH >= tip`, a test `/prepare` does
+        // not make and `wallet_send` had already dropped because it "spuriously 409'd
+        // note-heavy / busy payout wallets". So the status became the stricter of the
+        // pair and refused wallets the daemon would have paid from. Users reported it,
+        // sent anyway, and were right: one such payment witnessed in 8 ms and proved in
+        // 1.3 s while the screen still read "getting ready".
+        //
+        // What remains below is `/prepare`'s own list and nothing else: a matured anchor,
+        // no reorg repair in flight, and a usable tree.
         spend_ready: tip > 0
-            && (e.caught_up || (e.scanned as u64) + DEFAULT_ANCHOR_DEPTH >= tip)
+            && e.reorged_strikes == 0
+            && e.matured_leaves().is_some()
             && (e.db.tree_is_valid() || e.db.is_borrowing()),
         blocks_behind: tip.saturating_sub(e.scanned as u64),
         caught_up: e.caught_up,
