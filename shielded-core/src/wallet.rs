@@ -1555,6 +1555,13 @@ pub mod build {
     }
 
 
+    /// Decode a 96-byte full viewing key. Exposed so a caller assembling a shared
+    /// bundle (walletd, an SDK) can turn a party's `fvk_hex` into a key without
+    /// taking a direct dependency on the Orchard crate.
+    pub fn fvk_from_bytes(b: &[u8; 96]) -> Option<FullViewingKey> {
+        FullViewingKey::from_bytes(b)
+    }
+
     /// Wire size of one spend contribution: recipient 43 + value 8 + rho 32 +
     /// rseed 32 + position 4 + 32 auth-path nodes of 32 bytes.
     pub const SPEND_OFFER_LEN: usize = 43 + 8 + 32 + 32 + 4 + 32 * 32;

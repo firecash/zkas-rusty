@@ -177,6 +177,7 @@ pub async fn run_selfhost(cfg: SelfHostConfig, shutdown: tokio::sync::oneshot::R
     print_pairing(&pairing_uri(&cfg, &token, fp.as_deref()));
 
     let daemon = crate::Config {
+        enable_multiparty: false,
         rpc_server: cfg.rpc_server,
         listen: cfg.listen,
         wallet_dir: cfg.wallet_dir,

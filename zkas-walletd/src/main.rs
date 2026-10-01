@@ -45,6 +45,13 @@ struct Cli {
     /// can't read the default wallet. Enable only for a trusted single-user localhost.
     #[arg(long, default_value_t = false)]
     allow_default_token: bool,
+    /// Serve the multi-party bundle endpoints (`/api/bundle/offer|prepare|submit`), so
+    /// two or more parties can settle atomically in ONE Orchard bundle — an NFT sale, a
+    /// swap, an escrow release. Off by default: the coordinator role sees every
+    /// participant's VIEWING key (enough to read their notes, never to spend them), so
+    /// this is a deliberate deployment choice.
+    #[arg(long, default_value_t = false)]
+    enable_multiparty: bool,
     /// Secret used to encrypt wallet seed files at rest (XChaCha20-Poly1305, Argon2
     /// key). May also be set via the `ZKAS_WALLET_SECRET` env var (the legacy
     /// `FIRECASH_WALLET_SECRET` is still honored). If unset, seeds are stored in
@@ -381,6 +388,7 @@ async fn run(cli: Cli) {
     }
 
     let cfg = Config {
+        enable_multiparty: cli.enable_multiparty,
         rpc_server: cli.rpc_server,
         listen,
         wallet_dir,

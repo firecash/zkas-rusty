@@ -70,7 +70,8 @@ use kaspa_shielded_core::tree::{FrontierState, GlobalTree, NoteCommitmentTree};
 use kaspa_shielded_core::wallet::CompactActionRecord;
 use kaspa_shielded_core::wallet::address_bytes_from_seed;
 use kaspa_shielded_core::wallet::build::{
-    PreparedPayment, build_wallet_payment, build_wallet_payment_multi, finalize_payment, prepare_payment, proving_key,
+    MultiOutput, MultiSpend, PreparedPayment, build_wallet_payment, build_wallet_payment_multi, finalize_payment,
+    fvk_from_bytes, prepare_multiparty, prepare_payment, proving_key, spend_offer_from_bytes, spend_offer_to_bytes,
 };
 use kaspa_shielded_core::walletdb::{BlockMeta, HistoryKind, OwnedNote, Preview, WalletDb};
 use kaspa_shielded_wallet::{payment_tx, payment_tx_context};
@@ -341,6 +342,10 @@ pub struct Config {
     pub allow_origin: Vec<String>,
     /// Permit the tokenless "default" wallet (trusted single-user localhost only).
     pub allow_default_token: bool,
+    /// Serve the multi-party bundle endpoints (`/api/bundle/*`). Off by default: the
+    /// coordinator role sees every participant's viewing key, so it is a deployment
+    /// decision rather than something a daemon should offer by accident.
+    pub enable_multiparty: bool,
     /// Secret encrypting wallet seed files at rest; None = plaintext (0600) + warning.
     pub wallet_secret: Option<String>,
     /// TLS identity to serve HTTPS with. `None` = plaintext HTTP (loopback / proxied /
@@ -4191,6 +4196,11 @@ struct AppState {
     /// When true, a missing `X-Wallet-Token` maps to the "default" wallet (trusted
     /// single-user localhost). Off by default → a token is required on every request.
     allow_default_token: bool,
+    /// Whether `/api/bundle/*` is served. See [`Config::enable_multiparty`].
+    enable_multiparty: bool,
+    /// In-flight multi-party bundles. Signatures arrive from different parties over
+    /// separate requests, so a bundle outlives any single one of them.
+    bundles: Mutex<HashMap<String, BundleSession>>,
     /// Secret for encrypting seed files at rest. `None` → seeds stored in plaintext.
     wallet_secret: Option<String>,
     /// The network genesis hash: the shielded sighash **network domain** (what
@@ -11068,6 +11078,8 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
     log::info!("wallet resource limits: {:?}", resources);
     let chain_tree = build_chain_tree(&wallet_dir, genesis);
     let state = Arc::new(AppState {
+        enable_multiparty: cfg.enable_multiparty,
+        bundles: Mutex::new(HashMap::new()),
         clients: node_clients.clone(),
         node_error: node_error.clone(),
         chain_tree: chain_tree.clone(),
@@ -11302,6 +11314,11 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
         .route("/api/wallet/submit", post(wallet_submit))
         .route("/api/wallet/sign", post(wallet_sign))
         .route("/api/verify", post(verify))
+        // Multi-party bundles: two or more parties settle atomically in ONE bundle.
+        // Served only with --enable-multiparty; each handler re-checks.
+        .route("/api/bundle/offer", get(bundle_offer))
+        .route("/api/bundle/prepare", post(bundle_prepare))
+        .route("/api/bundle/submit", post(bundle_submit))
         // Operator tools: force the shared tree / a wallet to the tip on demand, so a
         // restart's catch-up window can be closed by hand instead of waited out.
         .route("/api/admin/warm_chain_tree", post(warm_chain_tree))
@@ -11876,3 +11893,371 @@ mod sdk_api_tests {
         assert_eq!(select_coinbase_cmx(Some(wrong), &desc, value, true).unwrap().to_bytes(), wrong.to_bytes());
     }
 }
+
+/// A multi-party bundle between `/api/bundle/prepare` and the final submit.
+struct BundleSession {
+    payment: PreparedPayment,
+    /// `(action_index, spend_index)` for every real spend, from `prepare_multiparty`.
+    spend_owners: Vec<(usize, usize)>,
+    /// Signatures gathered so far, across however many parties and requests.
+    sigs: Vec<(usize, [u8; SIG_LEN])>,
+    created: std::time::Instant,
+}
+
+// ─────────────────────── multi-party bundles (opt-in) ───────────────────────
+//
+// Two or more parties settling atomically in ONE Orchard bundle: an NFT sale, a
+// swap, an escrow release. Either every leg moves or none does, because one
+// sighash covers every action and one binding signature covers the whole bundle.
+//
+// Off unless `--enable-multiparty`. The coordinator role sees each participant's
+// VIEWING key — enough to read every note that key ever received, never enough to
+// spend — so turning this on is a deployment decision, not a default.
+
+fn require_multiparty(state: &AppState) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if state.enable_multiparty {
+        Ok(())
+    } else {
+        Err(err(
+            StatusCode::NOT_FOUND,
+            "multi-party bundles are not enabled on this daemon (start it with --enable-multiparty)",
+        ))
+    }
+}
+
+/// Parse a `zkas:` address into the raw 43-byte Orchard recipient the builder wants.
+fn recipient_bytes(s: &str) -> Result<[u8; 43], (StatusCode, Json<serde_json::Value>)> {
+    let addr = Address::try_from(s).map_err(|e| err(StatusCode::BAD_REQUEST, format!("invalid address: {e}")))?;
+    if addr.version != Version::ShieldedOrchard {
+        return Err(err(StatusCode::BAD_REQUEST, "recipient is not a shielded (version 9) address"));
+    }
+    <[u8; 43]>::try_from(addr.payload.as_ref())
+        .map_err(|_| err(StatusCode::BAD_REQUEST, "shielded address payload must be 43 bytes"))
+}
+
+#[derive(Deserialize)]
+struct BundleOfferQuery {
+    /// How much this party is contributing, in sompi.
+    amount_sompi: u64,
+    /// Witness at this leaf count instead of this wallet's own matured frontier.
+    /// EVERY party in a bundle must witness at the SAME point or the anchors differ
+    /// and `prepare_multiparty` refuses the bundle. The first party omits it and
+    /// publishes the `at_leaves` it gets back; the others pass that value.
+    at_leaves: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct BundleOfferResp {
+    /// 96-byte full viewing key (hex). The coordinator needs it to PROVE this
+    /// party's spends. It can never move them.
+    fvk_hex: String,
+    /// One opaque contribution per selected note, for `/api/bundle/prepare`.
+    offers: Vec<String>,
+    /// Total value offered, which may exceed the amount asked for: notes are
+    /// indivisible, so the surplus must come back as an output to this party.
+    total_sompi: u64,
+    /// The leaf count every other party must witness at.
+    at_leaves: u64,
+    notes: usize,
+}
+
+/// PARTY role. Select this wallet's notes for a shared bundle and witness them at an
+/// agreed point, so the contribution can be handed to a coordinator.
+///
+/// This hands out a viewing key and specific notes. Contribute from a key scoped to
+/// the trade, not from a main wallet.
+///
+/// It also does NOT park the notes it offers. A bundle that is never submitted leaves
+/// them spendable, which is the right default — but it means a party that offers and
+/// then sends normally can spend the same note twice and have the bundle dropped as a
+/// double spend. Offer, then settle.
+async fn bundle_offer(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(q): Query<BundleOfferQuery>,
+) -> Result<Json<BundleOfferResp>, (StatusCode, Json<serde_json::Value>)> {
+    require_multiparty(&state)?;
+    let token = token_from(&headers, state.allow_default_token)?;
+    let w = state.get_wallet(&token).await.ok_or_else(|| err(StatusCode::NOT_FOUND, "no wallet loaded"))?;
+    let e = w.lock().await;
+
+    let mine = e
+        .matured_leaves()
+        .ok_or_else(|| err(StatusCode::CONFLICT, "wallet has no matured anchor yet; wait for initial sync"))?;
+    let at = q.at_leaves.unwrap_or(mine);
+    if at > mine {
+        return Err(err(
+            StatusCode::CONFLICT,
+            format!("asked to witness at leaf {at} but this wallet has only matured to {mine}; it cannot join this bundle yet"),
+        ));
+    }
+
+    // Value-descending, same order the single-party spend path uses, so a bundle
+    // costs as few notes (and therefore as little proving) as possible.
+    let mut owned: Vec<&OwnedNote> = e.db.notes().iter().filter(|n| n.position < at).collect();
+    owned.sort_by(|a, b| b.note.value().inner().cmp(&a.note.value().inner()));
+
+    let mut chosen: Vec<&OwnedNote> = Vec::new();
+    let mut total: u64 = 0;
+    for n in owned {
+        if total >= q.amount_sompi {
+            break;
+        }
+        total = total.saturating_add(n.note.value().inner());
+        chosen.push(n);
+    }
+    if total < q.amount_sompi {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            format!("this wallet has {total} sompi matured at leaf {at}, short of the {} asked for", q.amount_sompi),
+        ));
+    }
+    if chosen.len() > max_spends_per_tx() {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "{} notes would be needed, over the {} one transaction can spend; consolidate first",
+                chosen.len(),
+                max_spends_per_tx()
+            ),
+        ));
+    }
+
+    let positions: Vec<u64> = chosen.iter().map(|n| n.position).collect();
+    let paths = e.db.witness_paths_at(&positions, at);
+    let mut offers = Vec::with_capacity(chosen.len());
+    for (n, p) in chosen.iter().zip(paths.into_iter()) {
+        let path = p.ok_or_else(|| {
+            err(StatusCode::CONFLICT, format!("no witness path for the note at position {}; try again shortly", n.position))
+        })?;
+        offers.push(hex(&spend_offer_to_bytes(&n.note, &path)));
+    }
+
+    Ok(Json(BundleOfferResp {
+        fvk_hex: hex(&e.db.fvk().to_bytes()),
+        offers,
+        total_sompi: total,
+        at_leaves: at,
+        notes: chosen.len(),
+    }))
+}
+
+#[derive(Deserialize)]
+struct BundleSpendReq {
+    fvk_hex: String,
+    offer_hex: String,
+}
+
+#[derive(Deserialize)]
+struct BundleOutputReq {
+    to: String,
+    amount_sompi: u64,
+    memo: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct BundlePrepareReq {
+    spends: Vec<BundleSpendReq>,
+    outputs: Vec<BundleOutputReq>,
+    fee_sompi: u64,
+}
+
+#[derive(Serialize)]
+struct BundleAuthReq {
+    /// Action to sign.
+    index: usize,
+    /// Which entry of `spends` it authorizes, so a party knows which are its own.
+    owner: usize,
+    /// 32-byte randomizer; the holder signs `ask.randomize(alpha)` over `sighash`.
+    alpha: String,
+}
+
+#[derive(Serialize)]
+struct BundlePrepareResp {
+    session: String,
+    sighash: String,
+    bundle_hex: String,
+    value_balance: i64,
+    actions: usize,
+    spend_auth: Vec<BundleAuthReq>,
+    disclosure: Vec<ActionDisclosureJson>,
+}
+
+/// COORDINATOR role. Build and prove one bundle from every party's contribution.
+///
+/// Holds no spend authority and cannot complete the bundle alone: each party signs its
+/// own actions afterwards via `/api/bundle/submit`.
+async fn bundle_prepare(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<BundlePrepareReq>,
+) -> Result<Json<BundlePrepareResp>, (StatusCode, Json<serde_json::Value>)> {
+    require_multiparty(&state)?;
+    if req.spends.is_empty() || req.outputs.is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "a bundle needs at least one spend and one output"));
+    }
+
+    let mut spends = Vec::with_capacity(req.spends.len());
+    for (i, s) in req.spends.iter().enumerate() {
+        let fvk_bytes = unhex(&s.fvk_hex)
+            .and_then(|b| <[u8; FVK_LEN]>::try_from(b.as_slice()).ok())
+            .ok_or_else(|| err(StatusCode::BAD_REQUEST, format!("spend {i}: fvk_hex must be {FVK_LEN} bytes of hex")))?;
+        let fvk = fvk_from_bytes(&fvk_bytes)
+            .ok_or_else(|| err(StatusCode::BAD_REQUEST, format!("spend {i}: not a valid full viewing key")))?;
+        let raw = unhex(&s.offer_hex).ok_or_else(|| err(StatusCode::BAD_REQUEST, format!("spend {i}: offer_hex is not hex")))?;
+        let (note, path) = spend_offer_from_bytes(&raw)
+            .ok_or_else(|| err(StatusCode::BAD_REQUEST, format!("spend {i}: malformed contribution")))?;
+        spends.push(MultiSpend { fvk, note, path });
+    }
+
+    let mut outputs = Vec::with_capacity(req.outputs.len());
+    for o in &req.outputs {
+        outputs.push(MultiOutput {
+            ovk: None,
+            recipient: recipient_bytes(&o.to)?,
+            value: o.amount_sompi,
+            memo: memo_bytes(o.memo.as_deref())?,
+        });
+    }
+
+    let domain: [u8; 32] = state.genesis.as_bytes();
+    let ctx = payment_tx_context();
+    let prepared = tokio::task::spawn_blocking(move || prepare_multiparty(spends, outputs, req.fee_sompi, &domain, &ctx))
+        .await
+        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "bundle preparation panicked"))?
+        .map_err(|e| err(StatusCode::BAD_REQUEST, format!("could not build this bundle: {e:?}")))?;
+
+    let owner_of: std::collections::HashMap<usize, usize> = prepared.spend_owners.iter().copied().collect();
+    let spend_auth: Vec<BundleAuthReq> = prepared
+        .payment
+        .spend_auth_requests
+        .iter()
+        .map(|(index, alpha)| BundleAuthReq {
+            index: *index,
+            owner: owner_of.get(index).copied().unwrap_or(usize::MAX),
+            alpha: hex(alpha),
+        })
+        .collect();
+
+    let session: String = hex(&rand::random::<[u8; 16]>());
+    let resp = BundlePrepareResp {
+        session: session.clone(),
+        sighash: hex(&prepared.payment.sighash),
+        bundle_hex: hex(&prepared.payment.effects.to_bytes()),
+        value_balance: prepared.payment.value_balance,
+        actions: prepared.payment.disclosure.len(),
+        spend_auth,
+        disclosure: prepared
+            .payment
+            .disclosure
+            .iter()
+            .map(|d| ActionDisclosureJson {
+                spend_value: d.spend_value,
+                out_value: d.out_value,
+                out_recipient: hex(&d.out_recipient),
+                out_rseed: hex(&d.out_rseed),
+                rcv: hex(&d.rcv),
+            })
+            .collect(),
+    };
+
+    let mut map = state.bundles.lock().await;
+    let now = std::time::Instant::now();
+    map.retain(|_, s| now.duration_since(s.created) < PREPARED_TTL);
+    map.insert(
+        session,
+        BundleSession { payment: prepared.payment, spend_owners: prepared.spend_owners, sigs: Vec::new(), created: now },
+    );
+    Ok(Json(resp))
+}
+
+#[derive(Deserialize)]
+struct BundleSubmitReq {
+    session: String,
+    sigs: Vec<SubmitSig>,
+}
+
+/// An action still waiting to be authorized, and whose it is.
+#[derive(Serialize)]
+struct BundlePending {
+    index: usize,
+    /// Which entry of the original `spends` list owes this signature, so a caller
+    /// can say "waiting on the buyer" rather than "waiting on action 3".
+    owner: usize,
+}
+
+#[derive(Serialize)]
+struct BundleSubmitResp {
+    /// True once every real spend is signed and the bundle has been broadcast.
+    complete: bool,
+    /// Actions still waiting on their owner's signature.
+    pending: Vec<BundlePending>,
+    txid: Option<String>,
+}
+
+/// Add one party's signatures. Parties sign independently and in any order; the
+/// bundle is assembled and broadcast only once every real spend is authorized, so no
+/// partial state is ever published.
+async fn bundle_submit(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<BundleSubmitReq>,
+) -> Result<Json<BundleSubmitResp>, (StatusCode, Json<serde_json::Value>)> {
+    require_multiparty(&state)?;
+
+    let mut incoming: Vec<(usize, [u8; SIG_LEN])> = Vec::with_capacity(req.sigs.len());
+    for s in &req.sigs {
+        let sig = unhex(&s.sig)
+            .and_then(|b| <[u8; SIG_LEN]>::try_from(b.as_slice()).ok())
+            .ok_or_else(|| err(StatusCode::BAD_REQUEST, "each sig must be 64 bytes of hex"))?;
+        incoming.push((s.index, sig));
+    }
+
+    // Take the whole session out while deciding: a second caller must not race us
+    // into finalizing the same bundle twice.
+    let taken = {
+        let mut map = state.bundles.lock().await;
+        let now = std::time::Instant::now();
+        map.retain(|_, s| now.duration_since(s.created) < PREPARED_TTL);
+        let Some(mut sess) = map.remove(&req.session) else {
+            return Err(err(StatusCode::NOT_FOUND, "no such bundle session (expired, or already submitted)"));
+        };
+        for (i, sig) in incoming {
+            sess.sigs.retain(|(have, _)| *have != i);
+            sess.sigs.push((i, sig));
+        }
+        let owner_of: std::collections::HashMap<usize, usize> = sess.spend_owners.iter().copied().collect();
+        let pending: Vec<BundlePending> = sess
+            .payment
+            .spend_auth_requests
+            .iter()
+            .map(|(i, _)| *i)
+            .filter(|i| !sess.sigs.iter().any(|(s, _)| s == i))
+            .map(|index| BundlePending { index, owner: owner_of.get(&index).copied().unwrap_or(usize::MAX) })
+            .collect();
+        if !pending.is_empty() {
+            map.insert(req.session.clone(), sess);
+            return Ok(Json(BundleSubmitResp { complete: false, pending, txid: None }));
+        }
+        sess
+    };
+
+    let bundle = finalize_payment(taken.payment, taken.sigs).map_err(|e| {
+        log::error!("multiparty submit REJECTED for session {}: finalize_payment failed: {e:?}", req.session);
+        err(
+            StatusCode::BAD_REQUEST,
+            "the signatures did not match the prepared bundle. Nothing was sent and no coins moved.",
+        )
+    })?;
+    let tx: Transaction = payment_tx(bundle.to_bytes());
+    let node = state
+        .request_client()
+        .await
+        .ok_or_else(|| err(StatusCode::SERVICE_UNAVAILABLE, "cannot reach the node to broadcast; nothing was sent"))?;
+    match node.submit_transaction(RpcTransaction::from(&tx), false).await {
+        Ok(_) => Ok(Json(BundleSubmitResp { complete: true, pending: Vec::new(), txid: Some(tx.id().to_string()) })),
+        Err(e) => {
+            log::error!("multiparty broadcast failed for session {}: {e}", req.session);
+            Err(err(StatusCode::BAD_GATEWAY, format!("the node refused the bundle: {e}")))
+        }
+    }
+}
+
