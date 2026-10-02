@@ -11,6 +11,7 @@ use kaspa_consensus_core::{
     block::Block,
     config::params::{ForkActivation, Params},
     header::Header,
+    merkle::calc_hash_merkle_root,
     pruning::{PruningPointProof, PruningPointsList, PruningProofMetadata},
     trusted::TrustedBlock,
     tx::Transaction,
@@ -91,6 +92,13 @@ static SHIELDED_HISTORY_ASKED_PEERS: Mutex<Option<HashSet<PeerKey>>> = Mutex::ne
 
 /// Peer budget for the history backfill; see [`SHIELDED_HISTORY_ASKED_PEERS`].
 const SHIELDED_HISTORY_MAX_PEERS: usize = 8;
+
+/// Receiver-side ceiling on records in ONE shielded-history chunk.
+///
+/// Twice the server's own `HISTORY_CHUNK_BLOCKS` (4,000), so an honest peer — including a future one
+/// with a larger chunk size — is unaffected, while the unbounded case disappears. A hostile sender
+/// has no obligation to honour the server-side cap, and the ingest writes before it verifies.
+const MAX_HISTORY_CHUNK_RECORDS: usize = 8_000;
 
 pub enum IbdType {
     Sync {
@@ -1032,6 +1040,16 @@ impl IbdFlow {
                 info!("archival: peer has no further shielded history below {anchor}");
                 break;
             }
+            // The server caps its OWN output at `HISTORY_CHUNK_BLOCKS`, but a hostile sender ignores
+            // its own cap and the receiver imposed nothing: the only bound was the 1 GiB p2p message
+            // ceiling, on a channel that accepts gzip, with every record written to RocksDB before
+            // any verification runs and never reclaimed by the pruner.
+            if msg.entries.len() > MAX_HISTORY_CHUNK_RECORDS {
+                return Err(ProtocolError::OtherOwned(format!(
+                    "peer sent {} shielded history records in one chunk, above the {MAX_HISTORY_CHUNK_RECORDS} ceiling",
+                    msg.entries.len()
+                )));
+            }
 
             let mut records = Vec::with_capacity(msg.entries.len());
             for e in &msg.entries {
@@ -1183,7 +1201,25 @@ impl IbdFlow {
         // F-02: determine the PoW-committed shielded state root for this pruning point.
         let binding = self.shielded_pp_commitment(consensus, pruning_point).await?;
 
-        if let Some(&(child, committed)) = binding.as_ref() {
+        // Fail CLOSED when no proof-of-work binding can be determined.
+        //
+        // This used to warn and carry on, which dropped all three protections below at once — the
+        // "local root already matches, skip the import" short-circuit, the "descendants are already
+        // validated, refuse to clear" guard, and `verify_import_binding` itself (a `None` expected
+        // root means it is never called) — and then still wiped the global nullifier set
+        // unconditionally. Worse, the PEER chooses this branch: `extract_state_root` returns `None`
+        // for a coinbase payload shorter than 48 bytes, and the peer supplies that coinbase, so a
+        // ten-byte payload bought a fully unverified import on an otherwise healthy node.
+        //
+        // IBD now aborts and retries (possibly against another peer) rather than adopting a shielded
+        // state that nothing attests to.
+        let Some(&(child, committed)) = binding.as_ref() else {
+            return Err(ProtocolError::OtherOwned(format!(
+                "no PoW coinbase binding for pruning point {pruning_point} (the selected child's coinbase carries no state-root \
+                 commitment); refusing an unverified shielded import"
+            )));
+        };
+        {
             // F-15: if the locally held state root at the pruning point already equals the
             // PoW-committed root, the local state IS the committed state (the root binds the
             // frontier, supply totals, burns and the nullifier-set accumulator) — skip the
@@ -1222,14 +1258,6 @@ impl IbdFlow {
                      blocks above it are already validated; refusing to clear live shielded state — a full resync is required"
                 )));
             }
-        } else {
-            // The pruning point has no selected child in the local DAG yet (or its coinbase
-            // carries no commitment). This fallback exists only while the chain tip is within
-            // one block of the pruning point; the import then proceeds unverified, as before.
-            warn!(
-                "could not determine a PoW coinbase binding for pruning point {}; proceeding with an UNVERIFIED shielded import",
-                pruning_point
-            );
         }
 
         // F-15: the real clear (global nullifier set + pruning-point snapshots + stable flag,
@@ -1345,11 +1373,25 @@ impl IbdFlow {
         if block.is_header_only() {
             return Err(ProtocolError::OtherOwned(format!("sent header of {} where expected block with body", block.hash())));
         }
-        let local_header = consensus.async_get_header(child).await?;
-        if block.header.hash_merkle_root != local_header.hash_merkle_root {
+        // `Block::hash()` returns the header's own hash, recomputed from the wire fields, so the
+        // check above already pins EVERY header field — `hash_merkle_root` included. Comparing that
+        // field against the locally stored header was therefore a tautology: it compared the verified
+        // header against itself and bound nothing whatsoever about `block.transactions`.
+        //
+        // These transactions never pass through the body processor on this path, so the coinbase
+        // below — and with it the `state_root` that `verify_import_binding` checks the entire shielded
+        // import against — was the peer's free choice. A sync peer could serve the genuine header of
+        // `child` with a fabricated coinbase, and the import's whole defence collapsed into
+        // `md.state_root == md.state_root`.
+        //
+        // Recompute the root over the transactions, exactly as `check_hash_merkle_root` does, so the
+        // coinbase is bound to the proof-of-work that committed this header.
+        let calculated_merkle_root = calc_hash_merkle_root(block.transactions.iter());
+        if calculated_merkle_root != block.header.hash_merkle_root {
             return Err(ProtocolError::OtherOwned(format!(
-                "block {} hash_merkle_root does not match the locally stored header",
-                child
+                "block {child} transactions do not reproduce its hash_merkle_root (computed {calculated_merkle_root}, header commits \
+                 {})",
+                block.header.hash_merkle_root
             )));
         }
         let coinbase = block

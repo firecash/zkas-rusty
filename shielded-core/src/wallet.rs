@@ -1736,9 +1736,6 @@ pub mod build {
             assert_eq!(wire.value_balance, 2_000);
         }
 
-        /// The reusable non-custodial API end to end, WITH change (so the bundle carries
-        /// a padding dummy the server signs and a real spend the device signs).
-        #[test]
         /// THE ANTI-BLIND-SIGNING GUARD. A device must never sign a hash it cannot
         /// interpret: a malicious prover would simply hand back the sighash of a payment
         /// to *itself*. Here the prover is hostile — it prepares a payment to an attacker
@@ -1828,6 +1825,8 @@ pub mod build {
             ));
         }
 
+        /// The reusable non-custodial API end to end, WITH change (so the bundle carries
+        /// a padding dummy the server signs and a real spend the device signs).
         #[test]
         fn non_custodial_payment_api_roundtrip() {
             let keys = ShieldedKeys::from_seed([7u8; 32]).unwrap();

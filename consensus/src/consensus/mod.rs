@@ -971,6 +971,22 @@ impl ConsensusApi for Consensus {
             if *index > ours_from {
                 continue; // above the anchor is our own validated range; ours is authoritative
             }
+            // Every action blob must be a whole number of `CompactActionRecord`s. The frontier replay
+            // that is supposed to bind this data reads it with `chunks_exact`, which silently DROPS a
+            // short remainder — so arbitrary trailing padding on each blob was invisible to
+            // verification and was stored, served and never reclaimed. Reject it before any write.
+            if let Some(bad) = r
+                .accepted_actions
+                .iter()
+                .find(|a| a.len() % kaspa_shielded_core::wallet::CompactActionRecord::SERIALIZED_LEN != 0)
+            {
+                return Err(ConsensusError::GeneralOwned(format!(
+                    "backfilled block {} carries a {}-byte action blob, not a multiple of {}",
+                    r.hash,
+                    bad.len(),
+                    kaspa_shielded_core::wallet::CompactActionRecord::SERIALIZED_LEN
+                )));
+            }
             // The anchor's own record is the exception, and dropping it was a real bug. Its INDEX
             // entry we already hold, so we must not rewrite it — but its scan RECORD we may not
             // hold at all, because adopting a block as a pruning point seeds the tree, supply and
@@ -1031,6 +1047,16 @@ impl ConsensusApi for Consensus {
             Ok(f) => f,
             Err(e) => return Ok(ShieldedHistoryVerdict::Unverifiable { reason: format!("no anchored frontier at {base}: {e}") }),
         };
+        // `frontier_at` maps a MISSING key to the default (empty) frontier instead of an error, so
+        // "absent" and "legitimately empty" are indistinguishable here. Left alone, a peer whose
+        // records contribute no leaves reproduces the empty frontier exactly, earns a `Verified`
+        // verdict, gets `shielded_history_verified_base` written, and the node then reports
+        // `history_complete: true` for an archive that proves nothing at all.
+        if expected.size == 0 {
+            return Ok(ShieldedHistoryVerdict::Unverifiable {
+                reason: format!("no anchored frontier at {base}: the base holds an empty shielded tree, so a replay proves nothing"),
+            });
+        }
 
         // No pruning-lock acquisition, for the same reason as the ingest: the p2p caller runs
         // inside the IBD flow, which already holds the read side for its whole duration, and
@@ -2541,10 +2567,6 @@ mod tests {
         assert_eq!(from_daa, 0, "genesis is DAA 0, so there is no floor below which this node cannot answer");
     }
 
-    /// The index reaching genesis is NOT enough once any of it came from a peer: between the
-    /// backfill writing the entries and the replay verifying them, `complete` must be false —
-    /// that window was reported live as `history_complete: true` at 20% of the replay.
-    #[test]
     /// A malicious backfill peer must not be able to re-number our chain index with an
     /// absurd claimed anchor index: the wedge is that verification and the purge both walk
     /// 0..anchor_index densely. The bound is trustless - a chain index can never exceed
@@ -2578,6 +2600,13 @@ mod tests {
         assert!(msg.contains("can never exceed the DAA score"), "rejected for the right reason: {msg}");
     }
 
+    /// The index reaching genesis is NOT enough once any of it came from a peer: between the
+    /// backfill writing the entries and the replay verifying them, `complete` must be false —
+    /// that window was reported live as `history_complete: true` at 20% of the replay.
+    ///
+    /// This test had NO `#[test]` attribute: two were stacked on the function above it, which is a
+    /// warn-level lint rather than an error, so the suite compiled and this never ran once.
+    #[test]
     fn history_status_is_incomplete_after_a_backfill_until_verified() {
         let config = Config::new(MAINNET_PARAMS);
         let tc = TestConsensus::new(&config);

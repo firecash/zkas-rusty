@@ -4589,6 +4589,21 @@ struct PreparedSession {
 /// How long a prepared (unsigned) non-custodial payment lives before it is swept.
 const PREPARED_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// Largest action count `/api/bundle/prepare` will prove.
+///
+/// `shielded-core`'s `MAX_ACTIONS_PER_BUNDLE` (512) is a WIRE-format bound, not a cost bound: at
+/// ~2.4 core-seconds per spend, 512 actions is roughly twenty core-minutes of proving for one
+/// request. A bundle also has to fit a transaction, and the standardness budget allows 38 actions
+/// — where a bundle's action count is `max(spends, outputs)`, not their sum. Anything larger could
+/// never be mined, so there is no reason to prove it.
+const MAX_BUNDLE_ACTIONS: usize = 38;
+
+/// How many proved-but-unsubmitted bundle sessions may be open at once.
+///
+/// Each one pins a fully proved PCZT in memory for [`PREPARED_TTL`], so an unbounded count is a
+/// memory-exhaustion lever even with the TTL sweep in place.
+const MAX_OPEN_BUNDLE_SESSIONS: usize = 64;
+
 /// How long a prepare waits for the shared proving slot before giving up. Generous:
 /// a cold witness rebuild plus proof can run tens of seconds, and waiting behind one
 /// is a far better outcome for the user than being told to retry — which is what
@@ -12102,11 +12117,36 @@ struct BundlePrepareResp {
 /// own actions afterwards via `/api/bundle/submit`.
 async fn bundle_prepare(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(req): Json<BundlePrepareReq>,
 ) -> Result<Json<BundlePrepareResp>, (StatusCode, Json<serde_json::Value>)> {
     require_multiparty(&state)?;
+    // Proving is the most expensive thing this daemon does, so the caller must hold a wallet
+    // token. Unauthenticated, this endpoint let anyone on the network spend the daemon's entire
+    // CPU budget and starve the wallet that owns it — the single-party `/api/wallet/prepare` path
+    // has gone through both a token and an admission gate for exactly that reason.
+    let _token = token_from(&headers, state.allow_default_token)?;
     if req.spends.is_empty() || req.outputs.is_empty() {
         return Err(err(StatusCode::BAD_REQUEST, "a bundle needs at least one spend and one output"));
+    }
+    // Reject an unmineable bundle BEFORE proving it, not after.
+    let actions = req.spends.len().max(req.outputs.len());
+    if actions > MAX_BUNDLE_ACTIONS {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "a bundle may carry at most {MAX_BUNDLE_ACTIONS} actions (the greater of spends and outputs); this one needs {actions}"
+            ),
+        ));
+    }
+    {
+        // Cheap pre-check so a caller that is already at the session ceiling does not get to burn
+        // the prover first; the insert below re-checks under the lock.
+        let map = state.bundles.lock().await;
+        let now = std::time::Instant::now();
+        if map.values().filter(|s| now.duration_since(s.created) < PREPARED_TTL).count() >= MAX_OPEN_BUNDLE_SESSIONS {
+            return Err(err(StatusCode::SERVICE_UNAVAILABLE, "too many bundle sessions are open — please retry shortly"));
+        }
     }
 
     let mut spends = Vec::with_capacity(req.spends.len());
@@ -12134,10 +12174,21 @@ async fn bundle_prepare(
 
     let domain: [u8; 32] = state.genesis.as_bytes();
     let ctx = payment_tx_context();
-    let prepared = tokio::task::spawn_blocking(move || prepare_multiparty(spends, outputs, req.fee_sompi, &domain, &ctx))
+    // The same bounded-concurrency gate a single-party payment waits on, so a bundle cannot
+    // monopolise the prover, plus the ProvingGuard that makes background CPU work back off.
+    let _slot = tokio::time::timeout(PREPARE_QUEUE_WAIT, state.prepare_gate.acquire())
         .await
-        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "bundle preparation panicked"))?
-        .map_err(|e| err(StatusCode::BAD_REQUEST, format!("could not build this bundle: {e:?}")))?;
+        .map_err(|_| {
+            err(StatusCode::SERVICE_UNAVAILABLE, "The daemon is still preparing other payments — please try again in a moment.")
+        })?
+        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "prepare gate closed"))?;
+    let prepared = tokio::task::spawn_blocking(move || {
+        let _proving = ProvingGuard::new();
+        prepare_multiparty(spends, outputs, req.fee_sompi, &domain, &ctx)
+    })
+    .await
+    .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "bundle preparation panicked"))?
+    .map_err(|e| err(StatusCode::BAD_REQUEST, format!("could not build this bundle: {e:?}")))?;
 
     let owner_of: std::collections::HashMap<usize, usize> = prepared.spend_owners.iter().copied().collect();
     let spend_auth: Vec<BundleAuthReq> = prepared
@@ -12176,6 +12227,9 @@ async fn bundle_prepare(
     let mut map = state.bundles.lock().await;
     let now = std::time::Instant::now();
     map.retain(|_, s| now.duration_since(s.created) < PREPARED_TTL);
+    if map.len() >= MAX_OPEN_BUNDLE_SESSIONS {
+        return Err(err(StatusCode::SERVICE_UNAVAILABLE, "too many bundle sessions are open — please retry shortly"));
+    }
     map.insert(
         session,
         BundleSession { payment: prepared.payment, spend_owners: prepared.spend_owners, sigs: Vec::new(), created: now },
@@ -12212,9 +12266,13 @@ struct BundleSubmitResp {
 /// partial state is ever published.
 async fn bundle_submit(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(req): Json<BundleSubmitReq>,
 ) -> Result<Json<BundleSubmitResp>, (StatusCode, Json<serde_json::Value>)> {
     require_multiparty(&state)?;
+    // The session id is a 128-bit capability, but submission broadcasts a transaction, so it is
+    // gated on a wallet token as well rather than on secrecy alone.
+    let _token = token_from(&headers, state.allow_default_token)?;
 
     let mut incoming: Vec<(usize, [u8; SIG_LEN])> = Vec::with_capacity(req.sigs.len());
     for s in &req.sigs {

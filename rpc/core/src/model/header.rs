@@ -17,7 +17,15 @@ fn attach_aux_pow(header: Header, aux_pow_hex: &str) -> Result<Header, RpcError>
         return Ok(header);
     }
     let bytes = Vec::<u8>::from_rpc_hex(aux_pow_hex).map_err(|e| RpcError::General(format!("invalid auxPow hex: {e}")))?;
+    // `CompressedParents` validates itself while borsh-decoding, so an aux parent whose cumulative
+    // counts are not strictly increasing is rejected HERE. It previously reached header processing,
+    // where hashing the parent panics `expand_rle` and the panic hook calls `process::exit(1)` — a
+    // zero-work remote node kill through `submit_block`. The p2p edge guarded this (F-07); this one,
+    // which is the path `submit_block` and `get_block_template` use, did not.
     let aux: AuxPow = borsh::from_slice(&bytes).map_err(|e| RpcError::General(format!("invalid auxPow bytes: {e}")))?;
+    // Unlike a relayed witness, a submission is the caller's own work, so report the problem rather
+    // than silently discarding the witness and failing the block on native PoW alone.
+    aux.validate_structure().map_err(|reason| RpcError::General(format!("invalid auxPow: {reason}")))?;
     Ok(header.with_aux_pow(aux))
 }
 use kaspa_hashes::Hash;

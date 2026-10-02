@@ -106,6 +106,22 @@ pub fn sighash(bundle: &ShieldedBundle, network_domain: &[u8; 32], tx_context: &
         h.update(&a.out_ciphertext);
         // NB: spend_auth_sig is intentionally excluded — it signs this digest.
     }
+    // The bridge peg-out declaration, hashed ONLY when one is present.
+    //
+    // These 40 bytes (`value || kaspa_recipient`) were outside the sighash entirely, while the flag
+    // bit that gates them was inside it. Signatures and the Halo 2 proof therefore said nothing
+    // about them, so any party relaying a peg-out could rewrite the value and the recipient, keep
+    // every signature valid, and redirect up to the whole `value_balance` to themselves — the
+    // victim's nullifiers being spent either way, so the original could not be re-mined.
+    //
+    // Hashing it conditionally keeps the digest of every non-burn bundle byte-for-byte identical, so
+    // this needs no fork. No burn has ever been mined (`burn::BRIDGE_ENABLED` is false, and
+    // `verify_bundle` rejects the flag bit as non-canonical), so there is nothing to stay compatible
+    // with on the burn side either.
+    if let Some((value, recipient)) = bundle.burn.as_ref() {
+        h.update(&value.to_le_bytes());
+        h.update(recipient);
+    }
     h.update(&(tx_context.len() as u32).to_le_bytes());
     h.update(tx_context);
     let mut out = [0u8; 32];
@@ -425,7 +441,38 @@ mod e2e {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bundle::{ActionWire, sizes};
+    use crate::bundle::{ActionWire, ShieldedBundle, sizes};
+
+    /// The burn declaration carries a VALUE and a RECIPIENT, and it was outside the sighash while the
+    /// flag bit gating it was inside — so signatures and the proof said nothing about those 40 bytes
+    /// and any relaying party could redirect someone else's peg-out to themselves.
+    ///
+    /// Also pins the property that makes the fix deployable without a fork: a bundle with no burn
+    /// hashes to exactly what it hashed before, because the field is only folded in when present.
+    #[test]
+    fn the_sighash_covers_the_burn_declaration_without_disturbing_other_bundles() {
+        let domain = [7u8; 32];
+        let ctx = [1u8, 2, 3, 4];
+        let mut bundle = ShieldedBundle::sample_for_test(2);
+
+        assert!(bundle.burn.is_none());
+        let no_burn = sighash(&bundle, &domain, &ctx);
+
+        bundle.burn = Some((1_000, [9u8; sizes::FIELD]));
+        let declared = sighash(&bundle, &domain, &ctx);
+        assert_ne!(no_burn, declared, "declaring a burn must change the digest");
+
+        bundle.burn = Some((1_001, [9u8; sizes::FIELD]));
+        assert_ne!(declared, sighash(&bundle, &domain, &ctx), "rewriting the burn VALUE must change the digest");
+
+        bundle.burn = Some((1_000, [8u8; sizes::FIELD]));
+        assert_ne!(declared, sighash(&bundle, &domain, &ctx), "rewriting the burn RECIPIENT must change the digest");
+
+        // The compatibility half: removing the burn returns the digest to its original value, so no
+        // bundle that has ever existed on any ZKas chain has its signatures invalidated by this.
+        bundle.burn = None;
+        assert_eq!(no_burn, sighash(&bundle, &domain, &ctx), "a non-burn bundle's digest is unchanged");
+    }
 
     fn action(seed: u8) -> ActionWire {
         ActionWire {

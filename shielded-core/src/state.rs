@@ -67,6 +67,16 @@ pub enum BundleExtractError {
     /// `check_shielded_in_isolation`; this is the defense-in-depth guard at the extractor, so a
     /// burn can never become an applied effect even if it reached here.
     BridgeDisabled,
+    /// A bundle declared a burn larger than the value it proved is leaving the pool.
+    ///
+    /// Enforced at this constructor so the bound is an invariant of [`ShieldedTx`] rather than an
+    /// agreement between two crates: `check_shielded_in_isolation` compares against
+    /// `bundle.value_balance` while the state transition compares against `tx.fee`, and those
+    /// coincide only because `fee` is derived from `value_balance` right here. The state
+    /// transition's own check is block-FATAL — it disqualifies the block that MERGES the
+    /// transaction — so one future change to fee derivation would re-arm a one-transaction
+    /// permanent selected-chain halt.
+    BurnExceedsValueBalance,
 }
 
 impl ShieldedTx {
@@ -98,6 +108,11 @@ impl ShieldedTx {
             // extractor honest as a second line of defense (see [`crate::burn::BRIDGE_ENABLED`]).
             Some(_) if !crate::burn::BRIDGE_ENABLED => return Err(BundleExtractError::BridgeDisabled),
             Some((v, recipient)) => {
+                // The bound, established where the type is built and against the same quantity the
+                // context-free isolation rule uses. See `BurnExceedsValueBalance`.
+                if i128::from(v) > i128::from(bundle.value_balance) {
+                    return Err(BundleExtractError::BurnExceedsValueBalance);
+                }
                 let n = *bundle.nullifiers().next().ok_or(BundleExtractError::BurnWithoutSpend)?;
                 Some(crate::burn::ExitReceipt { v, recipient, n })
             }

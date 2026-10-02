@@ -63,7 +63,7 @@ pub const MAX_COINBASE_MERKLE_BRANCH: usize = 64;
 /// header hash `H_fc`, so the commitment stays stable). Derives borsh only, to
 /// match [`Transaction`] and be storable / wire-serializable.
 // `Header` implements neither `PartialEq` nor `Eq`, so `AuxPow` cannot derive them.
-#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuxPow {
     /// The parent block header carrying the real kHeavyHash proof-of-work. Its
@@ -83,7 +83,102 @@ pub struct AuxPow {
     pub coinbase_merkle_branch: Vec<Hash>,
 }
 
+/// How deeply `AuxPow` may nest before decoding gives up.
+///
+/// `AuxPow` holds a [`Header`], which holds an `Option<Box<AuxPow>>`, so the two types are mutually
+/// recursive with NO depth bound anywhere, against a 1 GiB message ceiling — roughly 250 bytes per
+/// level, so millions of levels. Derived borsh decoding recurses per level (stack overflow, which
+/// the panic hook cannot even log), and `MemSizeEstimator` and the `Box` drop chain walk the same
+/// chain afterwards.
+///
+/// Consensus never reads the nested field: `parent_pow` hashes only the parent's header fields
+/// (`hashing::header` does not touch `aux_pow`) and `verify_binding` reads only the coinbase, the
+/// branch and the merkle root. So it is pure attack surface.
+///
+/// This is a LIMIT rather than a flat rejection on purpose. Merged mining is active from genesis on
+/// mainnet, the witness is produced by an external bridge whose code is not in this repo, and
+/// nesting would have left no trace if it ever occurred — nothing reads it. Rejecting any nesting
+/// would therefore be a tightening on a consensus-active path with no way to confirm, from here,
+/// that no historical witness trips it; and because the witness is load-bearing for an aux-mined
+/// block's proof of work, getting that wrong does not fail cleanly — it silently stops a fresh sync
+/// at some block years back. A depth of 4 accepts anything a real producer could plausibly emit
+/// while bounding the recursion to a constant.
+pub const MAX_AUX_POW_NESTING: u32 = 4;
+
+thread_local! {
+    static AUX_POW_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Hand-written so the nesting depth above is enforced DURING decoding.
+///
+/// Stripping the nested field after the fact would not help: the stack overflow happens while borsh
+/// is still descending.
+/// Releases the nesting counter on EVERY exit path, an unwind included.
+///
+/// A bare decrement after the decode is skipped by a panic inside borsh — an allocation failure, or
+/// any future `.expect` in a nested `deserialize_reader`. The counter is thread-local and these
+/// decode on long-lived rayon workers, so one leak would permanently reject every later witness on
+/// that worker as "nested too deep", with nothing in the logs to explain it. Release builds unwind
+/// (no `panic` setting in `[profile.release]`), so that path is reachable. Same shape as walletd's
+/// `ProvingGuard`.
+struct AuxDepthGuard;
+
+impl AuxDepthGuard {
+    fn enter() -> (Self, u32) {
+        let depth = AUX_POW_DEPTH.with(|d| {
+            let next = d.get().saturating_add(1);
+            d.set(next);
+            next
+        });
+        (Self, depth)
+    }
+}
+
+impl Drop for AuxDepthGuard {
+    fn drop(&mut self) {
+        AUX_POW_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
+impl BorshDeserialize for AuxPow {
+    fn deserialize_reader<R: borsh::io::Read>(reader: &mut R) -> borsh::io::Result<Self> {
+        let (_depth_guard, depth) = AuxDepthGuard::enter();
+        if depth > MAX_AUX_POW_NESTING {
+            return Err(borsh::io::Error::new(
+                borsh::io::ErrorKind::InvalidData,
+                format!("aux witness nested deeper than {MAX_AUX_POW_NESTING}"),
+            ));
+        }
+        Ok(AuxPow {
+            parent_header: Header::deserialize_reader(reader)?,
+            parent_coinbase: Transaction::deserialize_reader(reader)?,
+            coinbase_merkle_branch: Vec::<Hash>::deserialize_reader(reader)?,
+        })
+    }
+}
+
 impl AuxPow {
+    /// Structural bounds that every decode edge must apply before a witness is stored, relayed or
+    /// hashed, so the rules live in one place instead of being re-derived per edge.
+    ///
+    /// `parents_by_level` is validated by [`CompressedParents`]' own borsh decoding and nesting
+    /// depth by [`MAX_AUX_POW_NESTING`], so neither is repeated here. What this adds is the Merkle
+    /// branch length: no honest parent needs more than [`MAX_COINBASE_MERKLE_BRANCH`] levels (the
+    /// branch is log2 of the parent block's transaction count), the field is otherwise bounded only
+    /// by the 1 GiB message ceiling, and the witness is stored with the header forever. The p2p edge
+    /// already enforced exactly this bound before the rule moved here, so no block carrying a longer
+    /// branch could ever have propagated.
+    pub fn validate_structure(&self) -> Result<(), String> {
+        if self.coinbase_merkle_branch.len() > MAX_COINBASE_MERKLE_BRANCH {
+            return Err(format!(
+                "coinbase merkle branch too long: {} > {}",
+                self.coinbase_merkle_branch.len(),
+                MAX_COINBASE_MERKLE_BRANCH
+            ));
+        }
+        Ok(())
+    }
+
     /// Extract the single commitment tagged by [`MERGE_MINE_MAGIC`] in the parent
     /// coinbase payload. Returns `None` unless the magic occurs **exactly once** and is
     /// followed by a full [`COMMITMENT_HEX_LEN`] lowercase-hex encoding of the 32-byte

@@ -254,18 +254,70 @@ impl Gateway {
         }
         events
     }
+
+    /// Withdraw recorded payments that the chain no longer shows.
+    ///
+    /// `paid_sompi` was previously only ever `checked_add`-ed and `seen_transactions` stopped a
+    /// txid being re-read, so a payment reorged out — or replaced by a double-spend — stayed
+    /// credited forever. `seen` is the set of txids the poller found in THIS cycle.
+    ///
+    /// Only payments that are still shallower than the invoice's own confirmation requirement are
+    /// withdrawn. That is both sufficient and necessary: a reorg cannot reach a payment that is
+    /// already deep, while a paged history view can legitimately omit old rows, and retracting on
+    /// that would invent a reversal that never happened.
+    pub fn retract_absent_shallow(
+        &mut self,
+        seen: &HashSet<[u8; 32]>,
+        sink_blue_score: u64,
+        now: u64,
+    ) -> Vec<WebhookEvent> {
+        let mut dropped: Vec<(String, [u8; 32])> = Vec::new();
+        for (id, invoice) in self.invoices.iter() {
+            for payment in &invoice.payments {
+                let deep = sink_blue_score.saturating_sub(payment.blue_score) >= invoice.required_blue_score;
+                if !deep && !seen.contains(&payment.transaction_id) {
+                    dropped.push((id.clone(), payment.transaction_id));
+                }
+            }
+        }
+        let mut events = Vec::new();
+        for (id, txid) in dropped {
+            // Forget it was seen, so an identical txid reappearing on the winning chain is
+            // credited again rather than silently ignored.
+            self.seen_transactions.remove(&(txid, id.clone()));
+            let Some(invoice) = self.invoices.get_mut(&id) else { continue };
+            invoice.payments.retain(|payment| payment.transaction_id != txid);
+            // Recompute rather than subtract: the sum is authoritative and cannot underflow.
+            invoice.paid_sompi = invoice.payments.iter().map(|payment| payment.amount_sompi).sum();
+            let old = invoice.status;
+            invoice.status = if invoice.paid_sompi == 0 {
+                if now >= invoice.expires_at { InvoiceStatus::Expired } else { InvoiceStatus::New }
+            } else {
+                payment_status(invoice, sink_blue_score)
+            };
+            if invoice.status != old {
+                events.push(event("invoice.updated", invoice.clone(), now));
+            }
+        }
+        events
+    }
 }
 
 fn payment_status(invoice: &Invoice, sink_blue_score: u64) -> InvoiceStatus {
     if invoice.paid_sompi < invoice.amount_sompi {
         return InvoiceStatus::Partial;
     }
-    if invoice.paid_sompi > invoice.amount_sompi {
-        return InvoiceStatus::Overpaid;
-    }
+    // Confirmation depth is decided BEFORE the over/exact split. `Overpaid` is terminal
+    // (`InvoiceStatus::terminal`), so returning it on sight let a merchant fulfil against a
+    // zero-confirmation overpayment that a reorg or double-spend could then withdraw — and the
+    // hosted checkout page redirected on it. A fully funded but still shallow invoice is `Paid`,
+    // which is NOT terminal; it becomes `Overpaid`/`Confirmed` only once every payment is deep.
     let confirmed =
         invoice.payments.iter().all(|payment| sink_blue_score.saturating_sub(payment.blue_score) >= invoice.required_blue_score);
-    if confirmed { InvoiceStatus::Confirmed } else { InvoiceStatus::Paid }
+    if !confirmed {
+        return InvoiceStatus::Paid;
+    }
+    if invoice.paid_sompi > invoice.amount_sompi { InvoiceStatus::Overpaid } else { InvoiceStatus::Confirmed }
 }
 
 fn event(kind: &str, invoice: Invoice, now: u64) -> WebhookEvent {
@@ -345,6 +397,50 @@ mod tests {
         gateway.observe_payment(raw, [2; 32], 60, 105, 105, 105, 1_100).unwrap();
         assert_eq!(gateway.invoice(&invoice.id).unwrap().status, InvoiceStatus::Paid);
         gateway.advance(1_100, 115);
+        assert_eq!(gateway.invoice(&invoice.id).unwrap().status, InvoiceStatus::Confirmed);
+    }
+
+    /// `Overpaid` is terminal and the hosted checkout redirects on it, so returning it before the
+    /// depth check let a merchant ship against a zero-confirmation overpayment.
+    #[test]
+    fn an_overpayment_is_not_terminal_until_it_is_deep() {
+        let mut gateway = gateway();
+        let invoice = gateway.create_invoice(request(None)).unwrap();
+        let raw: [u8; 43] = Address::try_from(invoice.address.as_str()).unwrap().payload.as_slice().try_into().unwrap();
+        // 150 against a 100 invoice, observed right at the tip: fully funded, zero depth.
+        gateway.observe_payment(raw, [3; 32], 150, 100, 100, 100, 1_100).unwrap();
+        let status = gateway.invoice(&invoice.id).unwrap().status;
+        assert_eq!(status, InvoiceStatus::Paid, "an unconfirmed overpayment must not read as Overpaid");
+        assert!(!status.terminal(), "and must not be terminal — merchants fulfil on terminal");
+        gateway.advance(1_100, 110);
+        assert_eq!(gateway.invoice(&invoice.id).unwrap().status, InvoiceStatus::Overpaid);
+    }
+
+    /// `paid_sompi` used to only ever grow, so a reorged-out or double-spent payment stayed
+    /// credited forever — and `seen_transactions` stopped the txid ever being re-read.
+    #[test]
+    fn a_shallow_payment_the_chain_dropped_is_withdrawn_but_a_deep_one_is_not() {
+        let mut gateway = gateway();
+        let invoice = gateway.create_invoice(request(None)).unwrap();
+        let raw: [u8; 43] = Address::try_from(invoice.address.as_str()).unwrap().payload.as_slice().try_into().unwrap();
+        gateway.observe_payment(raw, [4; 32], 100, 100, 100, 100, 1_100).unwrap();
+        assert_eq!(gateway.invoice(&invoice.id).unwrap().paid_sompi, 100);
+
+        // Tip has not moved, so the payment is still shallow — and it is gone from history.
+        let events = gateway.retract_absent_shallow(&HashSet::new(), 100, 1_200);
+        assert_eq!(gateway.invoice(&invoice.id).unwrap().paid_sompi, 0, "the credit is withdrawn");
+        assert_eq!(gateway.invoice(&invoice.id).unwrap().status, InvoiceStatus::New);
+        assert_eq!(events.len(), 1, "and the withdrawal is reported to the merchant");
+
+        // The same txid winning on the other chain must be credited again, not deduplicated away.
+        gateway.observe_payment(raw, [4; 32], 100, 100, 100, 100, 1_300).unwrap();
+        assert_eq!(gateway.invoice(&invoice.id).unwrap().paid_sompi, 100);
+
+        // Once deep, an absent row is a history-paging artefact, never a reversal.
+        gateway.advance(1_300, 120);
+        assert_eq!(gateway.invoice(&invoice.id).unwrap().status, InvoiceStatus::Confirmed);
+        gateway.retract_absent_shallow(&HashSet::new(), 120, 1_400);
+        assert_eq!(gateway.invoice(&invoice.id).unwrap().paid_sompi, 100, "a deep payment is never retracted");
         assert_eq!(gateway.invoice(&invoice.id).unwrap().status, InvoiceStatus::Confirmed);
     }
 

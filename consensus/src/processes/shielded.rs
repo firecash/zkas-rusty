@@ -31,6 +31,7 @@ use kaspa_shielded_core::wallet::CompactActionRecord;
 
 use rocksdb::WriteBatch;
 
+use kaspa_math::Uint3072;
 use kaspa_muhash::MuHash;
 
 use crate::model::stores::shielded::DbAnchorGcQueueStore;
@@ -42,6 +43,23 @@ use crate::model::stores::shielded::{
     NullifierSetStoreReader, ShieldedBurnStoreReader, ShieldedNullifierMuHashStoreReader, ShieldedScanBlockData,
     ShieldedScanBlockStoreReader, ShieldedSupplyStoreReader, ShieldedTreeStoreReader, SupplyTotals,
 };
+
+/// Receiver-side ceiling on the two peer-supplied anchor vectors in pruning-point metadata.
+///
+/// Neither had any bound: the only limit was the 1 GiB p2p message size, and each entry becomes two
+/// RocksDB rows staged into one in-memory `WriteBatch`, so a single metadata frame could exhaust
+/// memory and disk. The honest set is bounded by `max_shielded_anchor_age` — 27,000 blocks at 1 BPS
+/// — so this sits roughly 9x above any real value. It is a DoS ceiling, not a consensus rule; a
+/// network running at a far higher block rate would need it raised.
+pub const MAX_IMPORTED_IN_WINDOW_ANCHORS: usize = 1 << 18;
+
+/// Receiver-side ceiling on imported burn receipts.
+///
+/// `recompute_state_root` builds a Merkle accumulator over this vector *before* the root comparison
+/// can reject it, so an unbounded length is unbounded work. While the bridge is disabled the honest
+/// value is empty and any non-empty vector is rejected outright; this bound covers the case after it
+/// is enabled.
+pub const MAX_IMPORTED_BURN_RECEIPTS: usize = 1 << 20;
 
 /// A computed (not-yet-persisted) shielded transition for one chain block.
 ///
@@ -1162,6 +1180,55 @@ impl ShieldedStateManager {
     where
         I: IntoIterator<Item = &'a [u8; 32]>,
     {
+        // 0. The accumulator must arrive in NORMALIZED form (denominator == 1).
+        //
+        //    `MuHash` derives `Deserialize` straight over its (numerator, denominator) pair with no
+        //    validation, and `from_wire_bytes` is a plain bincode decode of the whole struct, so the
+        //    validating `MuHash::deserialize` never runs on peer data. A peer could therefore send
+        //    `{numerator: V*d, denominator: d}` for the honest accumulator V and any d != 1: every
+        //    check below operates on `.clone().finalize()`, which NORMALIZES a copy, so all of them
+        //    pass — and the un-normalized value then hit `try_into` inside the store writer, which
+        //    used to panic. By then `clear_pruning_shielded_stores` had already run, so the node was
+        //    left with no global nullifier set and retried against the same peer forever.
+        if Uint3072::try_from(md.nullifier_muhash.clone()).is_err() {
+            return Err("pruning-point nullifier accumulator is not in normalized form".to_owned());
+        }
+        // 0b. Structural ceilings, applied BEFORE any work proportional to these lengths.
+        //
+        //     None of these vectors had a receiver-side bound; the only limit was the 1 GiB p2p
+        //     message ceiling, on a gzip-capable channel. The two anchor vectors are staged into a
+        //     single in-memory `WriteBatch` (two rows each), and `md.burns` is turned into a Merkle
+        //     accumulator by `recompute_state_root` below — i.e. the work happens before the root
+        //     comparison can reject it. These are denial-of-service ceilings, not consensus rules:
+        //     they sit far above any honest value (the in-window anchor set is bounded by
+        //     `max_shielded_anchor_age`, 27,000 blocks at 1 BPS) and a network at a much higher
+        //     block rate would need them raised.
+        if md.in_window_anchors.len() > MAX_IMPORTED_IN_WINDOW_ANCHORS {
+            return Err(format!(
+                "pruning-point metadata carries {} in-window anchors, above the {MAX_IMPORTED_IN_WINDOW_ANCHORS} ceiling",
+                md.in_window_anchors.len()
+            ));
+        }
+        if md.in_window_anchor_source_scores.len() > MAX_IMPORTED_IN_WINDOW_ANCHORS {
+            return Err(format!(
+                "pruning-point metadata carries {} attested source scores, above the {MAX_IMPORTED_IN_WINDOW_ANCHORS} ceiling",
+                md.in_window_anchor_source_scores.len()
+            ));
+        }
+        //     Burns are additionally provable nonsense while the bridge is off: no burn can be
+        //     mined, so the honest value is empty and anything else is rejected on sight.
+        if !md.burns.receipts.is_empty() && !kaspa_shielded_core::burn::BRIDGE_ENABLED {
+            return Err(format!(
+                "pruning-point metadata carries {} burn receipts while the bridge is disabled; no burn can exist on this chain",
+                md.burns.receipts.len()
+            ));
+        }
+        if md.burns.receipts.len() > MAX_IMPORTED_BURN_RECEIPTS {
+            return Err(format!(
+                "pruning-point metadata carries {} burn receipts, above the {MAX_IMPORTED_BURN_RECEIPTS} ceiling",
+                md.burns.receipts.len()
+            ));
+        }
         // 1. The streamed set must reproduce the committed accumulator (MuHash is a
         //    multiset hash, so transfer order does not matter).
         let mut acc = MuHash::new();
@@ -1172,6 +1239,17 @@ impl ShieldedStateManager {
         }
         if acc.finalize() != md.nullifier_muhash.clone().finalize() {
             return Err(format!("streamed nullifier set ({count}) does not reproduce the committed accumulator"));
+        }
+        // A spent nullifier always corresponds to a note that was created, so the set can never be
+        // larger than the number of leaves in the note-commitment tree. The transfer-side cap
+        // (`MAX_SHIELDED_NULLIFIER_IMPORT_COUNT`, 2^26 ≈ 2 GiB of raw nullifiers) is far above the
+        // memory of the machines this runs on, while this bound is free and comes from the metadata
+        // the peer already committed to.
+        if count as u64 > md.frontier.size {
+            return Err(format!(
+                "streamed nullifier set ({count}) exceeds the committed note count ({}); a spend implies a note",
+                md.frontier.size
+            ));
         }
         // 2. The declared state root must be consistent with the transferred parts.
         //    The frontier is peer-controlled: propagate a rebuild failure as an Err
@@ -1245,12 +1323,18 @@ impl ShieldedStateManager {
         if md.nullifier_muhash.clone().finalize() != kaspa_muhash::EMPTY_MUHASH {
             self.nullifier_muhash.set_batch(batch, block, md.nullifier_muhash.clone())?;
         }
-        // Dev-fee accrual carried at the pruning point. Zero is the store's default for a
-        // missing key, so a pre-accrual chain (or a peer that predates the field) writes
-        // nothing and behaves exactly as before.
-        if md.dev_accrued > 0 {
-            self.dev_accrued_store.set_batch(batch, block, md.dev_accrued)?;
-        }
+        // Dev-fee accrual carried at the pruning point.
+        //
+        // Written UNCONDITIONALLY. Skipping the write when the value is zero relied on zero being
+        // the store's default for a missing key — true for a fresh import, but `clear_for_pruning_
+        // reimport` did not delete this row, so re-seeding the same pruning point with
+        // `dev_accrued == 0` (legitimately, or via the legacy wire layout, which hard-codes 0) left
+        // the PREVIOUS import's non-zero accrual in place. `dev_accrued_at` feeds
+        // `expected_coinbase_transaction`, so every child of the pruning point then computed a
+        // different coinbase and failed `BadCoinbaseTransaction` — the exact wedge the clear exists
+        // to escape, surviving the clear. The row is also deleted there now; this makes the write
+        // total so the two cannot drift apart again.
+        self.dev_accrued_store.set_batch(batch, block, md.dev_accrued)?;
         // The whole append-only global membership set (unbounded, PLAN §2.9).
         for nf in nullifiers {
             self.nullifiers.insert_batch(batch, *nf)?;
@@ -1308,6 +1392,12 @@ impl ShieldedStateManager {
         self.supply_store.delete_batch(batch, pruning_point)?;
         self.nullifier_muhash.delete_batch(batch, pruning_point)?;
         self.burn_store.delete_batch(batch, pruning_point)?;
+        // The dev-fee accrual too. Leaving it behind meant a stale non-zero accrual survived the very
+        // path built to clear state, and since the accrual is outside the PoW-committed state root
+        // neither `verify_pruning_point_shielded` nor `verify_import_binding` could notice. The
+        // pruner already deletes this row (`prune_block_snapshots`); the re-import clear was the
+        // inconsistency.
+        self.dev_accrued_store.delete_batch(batch, pruning_point)?;
         Ok(())
     }
 }
@@ -2203,13 +2293,6 @@ mod tests {
         assert_eq!(pool_after - pool_before, SUBSIDY as u128, "pool must grow by exactly the subsidy");
     }
 
-    /// The anchor→block index records a block's tree root so a spend can later be
-    /// resolved to its source block (finality/canonicality is then decided by the
-    /// virtual processor via reachability + depth, tested at that layer).
-    /// The backfill verifier must reproduce the exact frontier an honest range builds, and must
-    /// reject any tampering. Without this the whole history-backfill path would be "trust the
-    /// peer", which is precisely what it exists to avoid.
-    #[test]
     /// The capturing replay must emit a frontier for every labelled block, and each captured
     /// frontier must equal what a replay TRUNCATED at that block produces. That equality is the
     /// entire reason a checkpoint is trustworthy once the full replay verifies: a checkpoint is a
@@ -2280,6 +2363,13 @@ mod tests {
         assert!(captured <= 1, "must not capture past the failure point");
     }
 
+    /// The backfill verifier must reproduce the exact frontier an honest range builds, and must
+    /// reject any tampering. Without this the whole history-backfill path would be "trust the
+    /// peer", which is precisely what it exists to avoid.
+    ///
+    /// This test had NO `#[test]` attribute — two were stacked on an earlier function — so the one
+    /// assertion standing behind the backfill's trustlessness claim had never executed.
+    #[test]
     fn history_replay_reproduces_frontier_and_detects_tampering() {
         use kaspa_consensus_core::api::ShieldedChainBlockData;
 
@@ -2350,6 +2440,9 @@ mod tests {
         );
     }
 
+    /// The anchor→block index records a block's tree root so a spend can later be
+    /// resolved to its source block (finality/canonicality is then decided by the
+    /// virtual processor via reachability + depth, tested at that layer).
     #[test]
     fn records_anchor_source_block() {
         let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));

@@ -4,6 +4,17 @@ use crate::{
     ibd::{SHIELDED_CHUNK_SIZE, SMT_FLOW_CONTROL_WINDOW},
 };
 use kaspa_consensus_core::{api::ShieldedExportMetadata, errors::consensus::ConsensusError};
+
+/// Minimum wall-clock spacing between pruning-point shielded-state exports served to ONE peer.
+///
+/// `export_pruning_point_shielded` is not cached, and it is expensive: a `BlockHashSet` of up to
+/// `max_shielded_anchor_age` (27,000 at 1 BPS) chain-index lookups, then an end-to-end iteration of
+/// BOTH anchor indexes, then a ghostdag blue-score read per distinct source, then bincode over the
+/// result. The code's own comment records an earlier version overrunning the 120 s IBD timeout at
+/// 27,000 blocks, so this is a known-costly path — and its request loop had no rate limit at all, in
+/// deliberate contrast to the history flow beside it, which documents exactly why it needs one. An
+/// honest syncer makes this request once, so the spacing costs it nothing.
+const SHIELDED_STATE_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 use kaspa_core::{debug, info};
 use kaspa_hashes::Hash;
 use kaspa_p2p_lib::{
@@ -41,8 +52,18 @@ impl RequestPruningPointShieldedStateFlow {
     }
 
     async fn start_impl(&mut self) -> Result<(), ProtocolError> {
+        let mut last_served: Option<std::time::Instant> = None;
         loop {
             let expected_pp = dequeue!(self.incoming_route, Payload::RequestPruningPointShieldedState)?.try_into()?;
+            // Space out repeat exports from one peer. An honest syncer asks once, so this costs it
+            // nothing; the loop previously had no bound whatsoever.
+            if let Some(last) = last_served {
+                let elapsed = last.elapsed();
+                if elapsed < SHIELDED_STATE_MIN_INTERVAL {
+                    tokio::time::sleep(SHIELDED_STATE_MIN_INTERVAL - elapsed).await;
+                }
+            }
+            last_served = Some(std::time::Instant::now());
             self.handle_request(expected_pp).await?
         }
     }

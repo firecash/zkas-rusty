@@ -486,7 +486,15 @@ impl DbShieldedNullifierMuHashStore {
     }
 
     pub fn set_batch(&self, batch: &mut WriteBatch, block: Hash, muhash: MuHash) -> StoreResult<()> {
-        self.access.write(BatchDbWriter::new(batch), block, muhash.try_into().expect("nullifier muhash is add-only, so finalizes"))
+        // NOT an invariant that may be asserted. This value also arrives from an IBD peer, whose
+        // `MuHash` is deserialized field-by-field (`#[derive(Deserialize)]` over numerator and
+        // denominator) with no normalization check — the safe constructor `MuHash::deserialize` is
+        // not on that path. A non-normalized denominator must surface as a store error, because
+        // panicking here aborted the import AFTER the global nullifier set had already been cleared.
+        let normalized = muhash
+            .try_into()
+            .map_err(|_| StoreError::DataInconsistency("nullifier muhash is not in normalized form".to_owned()))?;
+        self.access.write(BatchDbWriter::new(batch), block, normalized)
     }
 
     pub fn delete_batch(&self, batch: &mut WriteBatch, block: Hash) -> StoreResult<()> {
@@ -959,19 +967,6 @@ mod tests {
     use kaspa_database::create_temp_db;
     use kaspa_database::prelude::ConnBuilder;
 
-    #[test]
-    /// `#[serde(default)]` does NOT give bincode forward/backward compatibility.
-    ///
-    /// bincode is non-self-describing: fields are read POSITIONALLY with no names, so a record
-    /// written before `coinbase_commitments` existed has no bytes for it and the reader consumes
-    /// the NEXT field's bytes as its length. The doc comment on that field claims serde(default)
-    /// "keeps pre-commitment archives readable" — this test exists because that is false, and the
-    /// same wrong assumption was made once before about `in_window_anchors`.
-    ///
-    /// Consequence if ignored: a node upgraded to a binary carrying this field can no longer read
-    /// the scan records IT ITSELF wrote earlier, so `GetShieldedBlocks` starts failing and wallet
-    /// history serving breaks on upgrade.
-    #[test]
     /// The repair for that incompatibility: one reader, both layouts.
     ///
     /// A node upgraded across the `coinbase_commitments` addition, wrote records at the
@@ -1029,6 +1024,21 @@ mod tests {
         assert_eq!(recovered.accepted[0].action_bytes, vec![9, 9]);
     }
 
+    /// `#[serde(default)]` does NOT give bincode forward/backward compatibility.
+    ///
+    /// bincode is non-self-describing: fields are read POSITIONALLY with no names, so a record
+    /// written before `coinbase_commitments` existed has no bytes for it and the reader consumes
+    /// the NEXT field's bytes as its length. The doc comment on that field claims serde(default)
+    /// "keeps pre-commitment archives readable" — this test exists because that is false, and the
+    /// same wrong assumption was made once before about `in_window_anchors`.
+    ///
+    /// Consequence if ignored: a node upgraded to a binary carrying this field can no longer read
+    /// the scan records IT ITSELF wrote earlier, so `GetShieldedBlocks` starts failing and wallet
+    /// history serving breaks on upgrade.
+    ///
+    /// This test had no `#[test]` attribute — three were stacked on a later function, so it never
+    /// ran once despite guarding an incident that was observed live.
+    #[test]
     fn serde_default_does_not_make_bincode_records_forward_compatible() {
         // Exactly `ShieldedScanBlockData` as it was BEFORE `coinbase_commitments` was added.
         #[derive(Serialize)]
@@ -1066,6 +1076,8 @@ mod tests {
         }
     }
 
+    /// Also lost to the stacked-attribute bug above: a plain store round-trip.
+    #[test]
     fn scan_block_store_roundtrip() {
         let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
         let store = DbShieldedScanBlockStore::new(db.clone(), CachePolicy::Count(16));

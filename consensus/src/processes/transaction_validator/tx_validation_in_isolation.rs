@@ -63,6 +63,24 @@ impl TransactionValidator {
         if bundle.burn.is_some() && !kaspa_shielded_core::burn::BRIDGE_ENABLED {
             return Err(TxRuleError::InvalidShieldedTransaction("bridge peg-out is disabled"));
         }
+        // A burn may never declare more than the bundle proved is leaving the pool.
+        //
+        // This bound existed in exactly one place — inside the state transition, as a block-FATAL
+        // `BurnExceedsValueBalance` that disqualifies the block which MERGES the transaction. Nothing
+        // context-free rejected it, so the carrying block entered the DAG and then permanently
+        // disqualified every candidate chain block that merged it: a one-transaction, permanent
+        // selected-chain halt, and precisely the liveness rule the virtual processor states at
+        // length ("a shielded transaction that is invalid in accepted-order context is DROPPED,
+        // never a reason to disqualify the block that merges it").
+        //
+        // Checked here, where it belongs: a pure function of the transaction bytes, so such a
+        // transaction never propagates and no block carrying one is ever accepted. A no-op today,
+        // since any burn at all is refused above — the point is that it stays safe once it is not.
+        if let Some((burn_value, _)) = bundle.burn {
+            if i128::from(burn_value) > i128::from(bundle.value_balance) {
+                return Err(TxRuleError::InvalidShieldedTransaction("declared burn exceeds the bundle's value balance"));
+            }
+        }
         Ok(())
     }
 

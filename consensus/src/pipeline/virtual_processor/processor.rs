@@ -797,7 +797,18 @@ impl VirtualStateProcessor {
         // producer's mapping, so the verdict follows from canonical data alone and is identical
         // on every node regardless of which reorgs it happened to witness.
         if self.shielded_anchor_multi_activation.is_active(block_daa_score) {
-            let producers = self.shielded_state_manager.anchor_producer_blocks(anchor).unwrap_or_default();
+            // An IO error must NOT be spelled the same way as a negative answer. `unwrap_or_default`
+            // collapsed a `StoreError` into an empty producer set, which is indistinguishable from
+            // "no block ever produced this root": a transient RocksDB read failure would drop a spend
+            // every other node kept, leaving this node's expected coinbase short by that spend's fee,
+            // disqualifying the merging block, and wedging every block after it. Failing closed on
+            // ABSENT data is correct (and is what the empty check below does); failing closed on an
+            // unreadable store is a node-local consensus divergence. Panic instead, matching the
+            // pre-activation sibling below and `LayeredNullifierSet::contains`.
+            let producers = self
+                .shielded_state_manager
+                .anchor_producer_blocks(anchor)
+                .expect("anchor producer store read failed; refusing to treat an IO error as an unknown anchor");
             if producers.is_empty() {
                 return AnchorVerdict { reject_reason: Some("anchor is not a known tree root"), ..Default::default() };
             }

@@ -1,9 +1,6 @@
 use crate::pb as protowire;
-use kaspa_consensus_core::{
-    BlueWorkType,
-    auxpow::AuxPow,
-    header::{CompressedParents, Header},
-};
+use kaspa_consensus_core::{BlueWorkType, auxpow::AuxPow, header::Header};
+use kaspa_core::debug;
 use kaspa_hashes::Hash;
 
 use super::error::ConversionError;
@@ -117,29 +114,35 @@ impl TryFrom<Versioned<protowire::BlockHeader>> for Header {
         // Reattach the merged-mining witness if present. It is not part of the header
         // hash, so `with_aux_pow` does not disturb the `H_fc` computed above.
         if item.aux_pow.is_empty() {
-            Ok(header)
-        } else {
-            let aux: AuxPow = borsh::from_slice(&item.aux_pow).map_err(|e| ConversionError::AuxPowDecodeError(e.to_string()))?;
-            // Drop an over-long Merkle branch at the edge, before it can be stored or
-            // relayed: no honest parent block needs more than MAX_COINBASE_MERKLE_BRANCH
-            // levels, and the field is otherwise bounded only by the p2p message size.
-            if aux.coinbase_merkle_branch.len() > kaspa_consensus_core::auxpow::MAX_COINBASE_MERKLE_BRANCH {
-                return Err(ConversionError::AuxPowDecodeError(format!(
-                    "coinbase merkle branch too long: {} > {}",
-                    aux.coinbase_merkle_branch.len(),
-                    kaspa_consensus_core::auxpow::MAX_COINBASE_MERKLE_BRANCH
-                )));
+            return Ok(header);
+        }
+        // An unusable witness DISCARDS the witness, never the header.
+        //
+        // The witness is deliberately outside `H_fc`, so any relay hop, MITM, or peer answering a
+        // block request can replace it with junk. `kaspa_pow` is built around the rule that the aux
+        // field "must never be able to invalidate a block that already clears the native target" —
+        // and returning an error here broke exactly that at the transport layer: a valid natively
+        // mined block was discarded and the connection dropped, and because an IBD `BlockHeaders`
+        // batch collects over a `Result`, one poisoned header aborted the whole batch and stalled
+        // sync from that peer. So the block is judged on its own native PoW; if it really was
+        // aux-mined, PoW simply fails, which is a transient rejection rather than a cached-invalid
+        // verdict that would never heal.
+        //
+        // F-07 is now closed inside the type: `CompressedParents` validates itself while borsh
+        // decoding, so an aux parent whose cumulative counts would panic `expand_rle` during
+        // `parent_pow` hashing fails below instead of reaching header processing.
+        match borsh::from_slice::<AuxPow>(&item.aux_pow) {
+            Ok(aux) => match aux.validate_structure() {
+                Ok(()) => Ok(header.with_aux_pow(aux)),
+                Err(reason) => {
+                    debug!("discarding unusable aux witness on header {}: {}", header.hash, reason);
+                    Ok(header)
+                }
+            },
+            Err(e) => {
+                debug!("discarding undecodable aux witness on header {}: {}", header.hash, e);
+                Ok(header)
             }
-            // F-07: borsh-decoding the aux witness bypasses the `TryFrom` validation
-            // the main header's parents went through above. The aux parent header is
-            // later hashed (`parent_pow` in kaspa_pow), and hashing expands
-            // `parents_by_level`, whose `expand_rle` PANICS on non-strictly-increasing
-            // cumulative counts — a remote zero-work panic in header processing.
-            // Re-run the same CompressedParents validation at the edge, before the
-            // witness can be stored or relayed.
-            CompressedParents::try_from(aux.parent_header.parents_by_level.raw().to_vec())
-                .map_err(|e| ConversionError::AuxPowDecodeError(format!("aux parent parents_by_level invalid: {e}")))?;
-            Ok(header.with_aux_pow(aux))
         }
     }
 }
@@ -190,40 +193,95 @@ mod tests {
         assert_eq!(back.hash, native.hash);
     }
 
-    /// F-07 regression: the aux witness is borsh-decoded, which bypasses the
-    /// `CompressedParents` validation the main header's parents go through. An aux
-    /// parent whose `parents_by_level` cumulative counts are not strictly increasing
-    /// later PANICS `expand_rle` during parent_pow hashing — a remote zero-work
-    /// panic. The p2p edge must reject it with a ConversionError instead.
+    /// F-07 regression. An aux parent whose `parents_by_level` cumulative counts are not strictly
+    /// increasing PANICS `expand_rle` when `parent_pow` hashes it, and the daemon's panic hook turns
+    /// that into `process::exit(1)`.
+    ///
+    /// The invariant now lives in `CompressedParents`' own borsh decoding (see
+    /// `kaspa_consensus_core::header`), so such a witness cannot even be constructed through borsh
+    /// any more — which is the point: no decode edge can forget it. Here we assert the transport
+    /// consequence, with raw bytes standing in for a hostile sender.
+    ///
+    /// Note the deliberate change of verdict: the witness is DISCARDED and the header is KEPT.
+    /// Returning an error discarded a possibly-valid natively-mined block and dropped the peer,
+    /// which contradicted `kaspa_pow`'s rule that the aux field must never be able to invalidate a
+    /// block that already clears the native target — and the field is outside `H_fc`, so anyone in
+    /// the path can staple junk onto someone else's valid block.
     #[test]
-    fn aux_parent_with_invalid_parents_by_level_is_rejected() {
+    fn an_unusable_aux_witness_is_discarded_and_the_header_survives() {
         let header = finalized(1);
+        let hfc = header.hash;
+
+        // Bytes that are not a decodable `AuxPow` at all, including the F-07 shapes, which now fail
+        // inside `CompressedParents`' borsh impl rather than at a hand-written edge check.
+        let mut cases: Vec<Vec<u8>> = vec![vec![0xff; 8], vec![], vec![0x01, 0x02, 0x03]];
         let h1 = Hash::from_bytes([7u8; 32]);
-        let h2 = Hash::from_bytes([8u8; 32]);
-
-        let cases: Vec<Vec<(u8, Vec<Hash>)>> = vec![
-            vec![(0, vec![h1])],                // first cumulative count is 0
-            vec![(5, vec![h1]), (2, vec![h1])], // decreasing cumulative counts
-            vec![(3, vec![h1]), (3, vec![h2])], // repeated cumulative count
-        ];
-        for raw in cases {
-            // Craft the invalid CompressedParents exactly the way the wire path
-            // receives it: borsh decode performs no validation.
-            let bad: CompressedParents = borsh::from_slice(&borsh::to_vec(&raw).unwrap()).unwrap();
-            let mut parent = finalized(9);
-            parent.parents_by_level = bad;
-            let cb =
-                Transaction::new(0, vec![], vec![], 0, SUBNETWORK_ID_COINBASE, 0, AuxPow::embed_commitment(&[], header.hash, &[]));
-            let aux = AuxPow { parent_header: parent, parent_coinbase: cb, coinbase_merkle_branch: vec![] };
-
-            let mut pb: protowire::BlockHeader = (HeaderFormat::Compressed, &header).into();
-            pb.aux_pow = borsh::to_vec(&aux).unwrap();
-
-            let res: Result<Header, ConversionError> = Versioned(HeaderFormat::Compressed, pb).try_into();
+        for raw in [
+            vec![(0u8, vec![h1])],                // first cumulative count is 0
+            vec![(5u8, vec![h1]), (2u8, vec![h1])], // decreasing cumulative counts
+            vec![(3u8, vec![h1]), (3u8, vec![h1])], // repeated cumulative count
+        ] {
             assert!(
-                matches!(res, Err(ConversionError::AuxPowDecodeError(_))),
-                "case {raw:?} must be rejected with AuxPowDecodeError, not accepted or panicked"
+                borsh::from_slice::<kaspa_consensus_core::header::CompressedParents>(&borsh::to_vec(&raw).unwrap()).is_err(),
+                "borsh decoding must reject {raw:?} — this is the panic that F-07 was"
             );
+            cases.push(borsh::to_vec(&raw).unwrap());
         }
+
+        for bytes in cases {
+            let mut pb: protowire::BlockHeader = (HeaderFormat::Compressed, &header).into();
+            pb.aux_pow = bytes;
+            // Must not panic, must not error, and must not keep the witness.
+            let back: Header = Versioned(HeaderFormat::Compressed, pb).try_into().expect("the header survives a junk witness");
+            assert_eq!(back.hash, hfc, "H_fc is untouched");
+            assert!(back.aux_pow.is_none(), "the unusable witness is dropped");
+        }
+    }
+
+    /// `AuxPow` holds a `Header`, which holds an `Option<Box<AuxPow>>`, so the two are mutually
+    /// recursive with no depth bound against a 1 GiB message ceiling — millions of levels of
+    /// recursive borsh decoding, then the same walk again in `MemSizeEstimator` and the `Box` drop
+    /// chain. Consensus never reads the nested field.
+    ///
+    /// Enforced as a LIMIT, deliberately, not as a ban. Merged mining is active from genesis, the
+    /// witness is built by an external producer, and nesting would have left no trace precisely
+    /// because nothing reads it — so refusing all of it would be a tightening on a consensus-active
+    /// path that cannot be confirmed safe from inside this repo, and the witness is load-bearing for
+    /// an aux-mined block's PoW, so being wrong would silently stall a fresh sync years back rather
+    /// than fail cleanly.
+    #[test]
+    fn aux_witness_nesting_is_bounded_but_shallow_nesting_still_decodes() {
+        let header = finalized(1);
+        let cb = Transaction::new(0, vec![], vec![], 0, SUBNETWORK_ID_COINBASE, 0, AuxPow::embed_commitment(&[], header.hash, &[]));
+
+        let base = AuxPow { parent_header: finalized(9), parent_coinbase: cb.clone(), coinbase_merkle_branch: vec![] };
+        let shallow = AuxPow {
+            parent_header: finalized(8).with_aux_pow(base.clone()),
+            parent_coinbase: cb.clone(),
+            coinbase_merkle_branch: vec![],
+        };
+        assert!(
+            borsh::from_slice::<AuxPow>(&borsh::to_vec(&shallow).unwrap()).is_ok(),
+            "a plausible amount of nesting must still decode — anything else is an unverifiable tightening"
+        );
+
+        let mut deep = base;
+        for _ in 0..(kaspa_consensus_core::auxpow::MAX_AUX_POW_NESTING + 2) {
+            deep = AuxPow {
+                parent_header: finalized(7).with_aux_pow(deep),
+                parent_coinbase: cb.clone(),
+                coinbase_merkle_branch: vec![],
+            };
+        }
+        assert!(
+            borsh::from_slice::<AuxPow>(&borsh::to_vec(&deep).unwrap()).is_err(),
+            "past the ceiling it must be refused DURING decoding, before the recursion runs away"
+        );
+
+        // And the header still survives such a witness on the p2p path: witness dropped, block kept.
+        let mut pb: protowire::BlockHeader = (HeaderFormat::Compressed, &header).into();
+        pb.aux_pow = borsh::to_vec(&deep).unwrap();
+        let back: Header = Versioned(HeaderFormat::Compressed, pb).try_into().expect("the header still survives");
+        assert!(back.aux_pow.is_none(), "the over-nested witness is dropped, not stored");
     }
 }

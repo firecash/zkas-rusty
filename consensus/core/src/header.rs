@@ -15,8 +15,35 @@ use std::mem::size_of;
 ///
 /// Example: `[(3, [A]), (5, [B])]` means levels 0-2 have parents `[A]`,
 /// and levels 3-4 have parents `[B]`.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+/// Upper bound on the TOTAL number of parent hashes a header's run-length encoding may expand to.
+///
+/// `cum` is a `u8`, so a header has at most 255 levels, and an honest level never carries more than
+/// `max_block_parents` (10 on mainnet) — an honest header therefore expands to ~2,550 hashes at
+/// most. Nothing bounded the *contents* of a run, though, and header hashing walks
+/// `expanded_iter()`, which repeats the same slice `count` times: one run of `(255, [30M hashes])`
+/// is ~255 GB of Blake3 input, reached in `validate_header_in_isolation` before any difficulty
+/// check and costing the sender no work at all. This bound is ~6x the honest maximum and keeps the
+/// hashing input well under a mebibyte.
+pub const MAX_EXPANDED_PARENT_HASHES: usize = 255 * 64;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, BorshSerialize)]
 pub struct CompressedParents(Vec<(u8, Vec<Hash>)>);
+
+/// Borsh decoding routes through the validating [`TryFrom`] rather than filling the inner `Vec`
+/// directly.
+///
+/// This is the aux-PoW witness path, and it is the whole of F-07: `expand_rle` PANICS on
+/// cumulative counts that are not strictly increasing (`kaspa_utils::iter`), and the daemon's panic
+/// hook turns any panic into `process::exit(1)`. The p2p edge re-ran this check by hand; the RPC
+/// edge that serves `submit_block` did not, which left a zero-work remote node kill reachable by
+/// anyone who could reach the RPC port. Enforcing the invariant in the type instead of at each edge
+/// means a future decode site cannot forget it.
+impl BorshDeserialize for CompressedParents {
+    fn deserialize_reader<R: borsh::io::Read>(reader: &mut R) -> borsh::io::Result<Self> {
+        let raw = Vec::<(u8, Vec<Hash>)>::deserialize_reader(reader)?;
+        Self::try_from(raw).map_err(|e| borsh::io::Error::new(borsh::io::ErrorKind::InvalidData, e.to_string()))
+    }
+}
 
 impl CompressedParents {
     pub fn expanded_len(&self) -> usize {
@@ -113,6 +140,19 @@ impl TryFrom<Vec<(u8, Vec<Hash>)>> for CompressedParents {
             if last_parents == parents {
                 return Err(CompressedParentsError::NotFullyCompressed);
             }
+        }
+
+        // Bound what this expands to, not just how many runs it has. A run is hashed once per level
+        // it covers, so `(255, [n hashes])` costs 255*n — see `MAX_EXPANDED_PARENT_HASHES`.
+        let mut expanded_hashes: usize = 0;
+        let mut previous_cumulative: usize = 0;
+        for (cumulative_level, level_parents) in parents.iter() {
+            let span = (*cumulative_level as usize).saturating_sub(previous_cumulative);
+            expanded_hashes = expanded_hashes.saturating_add(span.saturating_mul(level_parents.len()));
+            previous_cumulative = *cumulative_level as usize;
+        }
+        if expanded_hashes > MAX_EXPANDED_PARENT_HASHES {
+            return Err(CompressedParentsError::ExpandedParentsExceeded(expanded_hashes, MAX_EXPANDED_PARENT_HASHES));
         }
 
         Ok(Self(parents))
@@ -264,7 +304,11 @@ impl MemSizeEstimator for Header {
             + self.aux_pow.as_ref().map_or(0, |a| {
                 size_of::<AuxPow>()
                     + a.parent_header.estimate_mem_bytes()
-                    + a.parent_coinbase.payload.len()
+                    // The whole coinbase, not just its payload: `inputs` carry unbounded
+                    // signature scripts and `outputs` unbounded script_public_keys, and counting
+                    // them as zero let a witness hold far more RAM than the headers cache's byte
+                    // budget believed it was tracking.
+                    + a.parent_coinbase.estimate_mem_bytes()
                     + a.coinbase_merkle_branch.len() * size_of::<Hash>()
             })
     }
@@ -282,6 +326,48 @@ mod tests {
 
     fn vec_from(slice: &[u8]) -> Vec<Hash> {
         slice.iter().map(|&v| hash(v)).collect()
+    }
+
+    /// Borsh decoding must enforce the same invariant `TryFrom` does.
+    ///
+    /// This is F-07: the aux-PoW witness is borsh-decoded, and derived borsh filled the inner `Vec`
+    /// with no validation at all. `expand_rle` then PANICS on cumulative counts that are not strictly
+    /// increasing, and the daemon's panic hook turns a panic into `process::exit(1)` — so a witness
+    /// like this was a remote, zero-work node kill. The p2p edge re-checked by hand; the RPC edge
+    /// serving `submit_block` did not. Enforcing it in the type means no edge can forget.
+    #[test]
+    fn borsh_decoding_rejects_parents_that_would_panic_expand_rle() {
+        for raw in [
+            vec![(0u8, vec_from(&[1]))],                        // first cumulative count is 0
+            vec![(5u8, vec_from(&[1])), (2u8, vec_from(&[2]))], // decreasing
+            vec![(3u8, vec_from(&[1])), (3u8, vec_from(&[2]))], // repeated
+        ] {
+            let bytes = borsh::to_vec(&raw).unwrap();
+            assert!(
+                borsh::from_slice::<CompressedParents>(&bytes).is_err(),
+                "borsh must reject {raw:?} rather than hand back a value that panics when hashed"
+            );
+        }
+        // A well-formed encoding still round-trips.
+        let good = CompressedParents::try_from(vec![(1u8, vec_from(&[1])), (3u8, vec_from(&[2]))]).unwrap();
+        let back: CompressedParents = borsh::from_slice(&borsh::to_vec(&good).unwrap()).unwrap();
+        assert_eq!(good, back);
+    }
+
+    /// A run is hashed once per level it covers, so the bound has to be on what the encoding EXPANDS
+    /// to, not on how many runs it has: one run of `(255, [n hashes])` costs 255*n, which made a
+    /// single header worth hundreds of GB of Blake3 input before any difficulty check.
+    #[test]
+    fn borsh_decoding_bounds_what_the_encoding_expands_to() {
+        let wide = vec![hash(1); 70];
+        let over = vec![(255u8, wide)]; // 255 * 70 = 17,850 > MAX_EXPANDED_PARENT_HASHES
+        assert!(borsh::from_slice::<CompressedParents>(&borsh::to_vec(&over).unwrap()).is_err());
+        assert!(CompressedParents::try_from(over).is_err());
+
+        // An honest header is nowhere near the ceiling: 255 levels x max_block_parents (10) = 2,550.
+        let honest = vec![(255u8, vec![hash(1); 10])];
+        let decoded: CompressedParents = borsh::from_slice(&borsh::to_vec(&honest).unwrap()).unwrap();
+        assert_eq!(decoded.expanded_len(), 255);
     }
 
     fn serialize_parents(parents: &[Vec<Hash>]) -> Vec<u8> {
