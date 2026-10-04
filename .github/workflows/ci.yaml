@@ -22,7 +22,12 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Run cargo check
-        run: cargo check --tests --workspace --benches
+        # `-D duplicate_macro_attributes` is not cosmetic. Stacking two `#[test]` attributes on one
+        # function leaves the NEXT function with none, so it silently never runs — and because the
+        # lint is only warn-level by default, the suite stays green. Four tests in this repo were
+        # dead that way, including the single assertion behind the shielded-history backfill's
+        # trustlessness claim. Cargo caps lints for non-local crates, so this only binds our code.
+        run: RUSTFLAGS="-D duplicate_macro_attributes" cargo check --tests --workspace --benches
 
   test:
     name: Test Suite
@@ -101,6 +106,14 @@ jobs:
 
       - name: Run cargo test regular features
         run: cargo nextest run --workspace
+
+      # `shielded-core`'s `build` module — prepare_payment, prepare_multiparty, finalize_payment and
+      # every one of their tests — is behind the non-default `circuit` feature. The step above does
+      # not enable it, so a plain workspace run compiles and tests NONE of the payment-construction
+      # path and still exits 0. That is the most security-critical code in the tree, and it had no
+      # CI coverage at all.
+      - name: Run shielded-core tests with the circuit feature
+        run: cargo nextest run -p kaspa-shielded-core --features circuit
 
       - name: Run cargo doc tests
         run: cargo test --doc --workspace
