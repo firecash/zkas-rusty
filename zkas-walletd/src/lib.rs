@@ -2171,7 +2171,11 @@ fn select_coinbase_cmx(
 fn decode_block(b: &kaspa_rpc_core::RpcShieldedChainBlock) -> Result<DecodedBlock, String> {
     let mut coinbase = Vec::new();
     for (i, out) in b.coinbase_outputs.iter().enumerate() {
-        if out.script_public_key.len() != ORCHARD_SCRIPT_LEN {
+        // Mirror consensus exactly (`coinbase_notes_from_outputs`): a script shorter than 43 bytes
+        // makes the block invalid, so a node can never have applied it; a longer one is truncated
+        // to its first 43 bytes. Rejecting longer scripts would stall every wallet on a block
+        // consensus accepted.
+        if out.script_public_key.len() < ORCHARD_SCRIPT_LEN {
             return Err(format!("block {}: coinbase output {i} has a {}-byte script", b.hash, out.script_public_key.len()));
         }
         {
