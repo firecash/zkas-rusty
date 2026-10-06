@@ -50,7 +50,20 @@ impl TransactionValidator {
     ) -> TxResult<()> {
         self.check_tx_is_finalized(tx, lock_time_arg)?;
         self.check_transaction_version(tx, block_daa_score)?;
+        self.check_shielded_format_in_header_context(tx, block_daa_score)?;
         self.check_transaction_signature_scripts_in_header_context(tx, block_daa_score)
+    }
+
+    /// The shielded payload must decode in the format of the carrying block's DAA score: before the
+    /// security fork exactly as every node always parsed it (flag bit 3 carries no field), from it
+    /// with the anchor-block field. See `ShieldedBundle::from_bytes_at`.
+    fn check_shielded_format_in_header_context(&self, tx: &Transaction, block_daa_score: u64) -> TxResult<()> {
+        if !tx.is_shielded() {
+            return Ok(());
+        }
+        kaspa_shielded_core::bundle::ShieldedBundle::from_bytes_at(&tx.payload, self.security_fork_activation.is_active(block_daa_score))
+            .map(|_| ())
+            .map_err(|_| TxRuleError::InvalidShieldedTransaction("malformed Orchard bundle in payload"))
     }
 
     pub(crate) fn get_lock_time_type(tx: &Transaction) -> LockTimeType {

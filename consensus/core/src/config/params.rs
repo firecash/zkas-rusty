@@ -513,12 +513,16 @@ pub struct Params {
     /// The 2026-10 security fork. From this DAA score, all at once:
     /// - a shielded spend names its anchor block (`anchor_block`, sighash-covered) and the anchor
     ///   must be that block's own tree root, a matured selected-chain ancestor;
-    /// - the shielded state root is `zkas_state_root1`, which also commits `dev_accrued`,
-    ///   cumulative burns and the anchor window, so a syncing node can verify everything it imports;
-    /// - an aux parent commits the long, genesis-bound form over the nonce-free header hash, an
-    ///   aux-accepted block's nonce must equal the truncated parent hash, and a ZKas coinbase may not
-    ///   carry a merge-mining commitment;
-    /// - the coinbase output cap counts the dev note (k + 3).
+    /// - the shielded state root is `zkas_state_root1`: the v0 root plus `dev_accrued`, the anchor
+    ///   window and the miner accrual slot, so a syncing node can verify everything it imports;
+    /// - miner rewards accrue in one carried slot, paid out on a payout-script switch or every
+    ///   `miner_accrual_payout_interval` (shielded-coinbase networks only);
+    /// - an aux parent commits the long, genesis-bound form over the nonce-free header hash, carries
+    ///   no legacy commitment, and an aux-accepted block's nonce must equal the truncated parent
+    ///   hash; a ZKas coinbase may not carry a merge-mining commitment;
+    /// - the coinbase output size bound is k + 4 (k + 1 blues, a red reward, the slot payout, the
+    ///   dev note);
+    /// - a shielded bundle decodes in the anchor-block format (decided per carrying block's DAA).
     /// `never()` on mainnet until a score is chosen and announced.
     pub security_fork_activation: ForkActivation,
 

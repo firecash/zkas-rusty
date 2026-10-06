@@ -578,7 +578,8 @@ pub trait ConsensusApi: Send + Sync {
     /// The miner reward a chain block carries forward (security fork; empty before it). The sink's
     /// slot is what the next payout will pay, so callers that credit miners can show it as pending.
     fn get_miner_accrual(&self, _block: Hash) -> ConsensusResult<crate::coinbase::MinerAccrual> {
-        unimplemented!()
+        // No accrual is the honest answer for a consensus that does not track one.
+        Ok(Default::default())
     }
 
     /// The next `limit` selected-chain block hashes strictly after `low`, resolved

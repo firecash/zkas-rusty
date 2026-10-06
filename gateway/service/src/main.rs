@@ -194,7 +194,10 @@ async fn observer(state: AppState) {
 /// `required_blue_score` DAA beyond the paying transaction. Walletd's history
 /// exposes each payment's DAA score (not its blue score), so confirmations are
 /// measured in selected-chain DAA depth — monotonic and reorg-safe.
-async fn node_tip_daa(state: &AppState) -> Result<u64, String> {
+/// The node tip as walletd reports it, and whether walletd's view is complete enough to judge a
+/// payment's absence (synced and not reloading). A zero tip is no tip: walletd reports it while
+/// it starts, and using it would make every payment shallow.
+async fn node_tip_daa(state: &AppState) -> Result<(u64, bool), String> {
     let response = state
         .http
         .get(format!("{}/api/status", state.config.walletd_url.trim_end_matches('/')))
@@ -206,7 +209,13 @@ async fn node_tip_daa(state: &AppState) -> Result<u64, String> {
         return Err(format!("walletd status returned {}", response.status()));
     }
     let body: Value = response.json().await.map_err(|error| error.to_string())?;
-    body.get("daa_score").and_then(Value::as_u64).ok_or_else(|| "walletd status missing daa_score".to_string())
+    let tip = body.get("daa_score").and_then(Value::as_u64).ok_or_else(|| "walletd status missing daa_score".to_string())?;
+    if tip == 0 {
+        return Err("walletd reports no tip yet".to_string());
+    }
+    let synced = body.get("synced").and_then(Value::as_bool).unwrap_or(false)
+        && !body.get("loading").and_then(Value::as_bool).unwrap_or(true);
+    Ok((tip, synced))
 }
 
 async fn poll_wallet(state: &AppState) -> Result<(), String> {
@@ -214,7 +223,7 @@ async fn poll_wallet(state: &AppState) -> Result<(), String> {
     // instantly (the old code fabricated `daa + 10_000` / `u64::MAX` as the
     // sink), so a merchant would treat a 0-conf payment as final. On a failed
     // fetch we skip this cycle rather than over-confirm.
-    let tip_daa = node_tip_daa(state).await?;
+    let (tip_daa, wallet_synced) = node_tip_daa(state).await?;
     let response = state
         .http
         .get(format!("{}/api/wallet/history?limit=5000", state.config.walletd_url.trim_end_matches('/')))
@@ -267,8 +276,12 @@ async fn poll_wallet(state: &AppState) -> Result<(), String> {
         // Withdraw shallow payments the chain no longer shows (reorg / double-spend) BEFORE
         // re-evaluating, so `advance` recomputes against corrected totals rather than a credit
         // that has gone away.
-        for event in gateway.retract_absent_shallow(&seen_txids, tip_daa, now()) {
-            events.push(event);
+        // Only judge absence against a complete view: while walletd rescans or reloads, its
+        // history is empty or partial with a 200 and would reverse real payments.
+        if wallet_synced {
+            for event in gateway.retract_absent_shallow(&seen_txids, tip_daa, now()) {
+                events.push(event);
+            }
         }
         // Re-evaluate open invoices against the current tip so Paid -> Confirmed
         // fires as depth accrues, and unpaid invoices expire.

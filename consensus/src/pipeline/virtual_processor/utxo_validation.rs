@@ -198,11 +198,14 @@ impl VirtualStateProcessor {
             // context is not monotonic (the threshold can be crossed), but it is only used by script checks,
             // which we skip for selected-parent transactions.
             let validation_flags = if is_selected_parent { TxValidationFlags::SkipScriptChecks } else { TxValidationFlags::Full };
+            let merged_block_daa_score = self.headers_store.get_daa_score(merged_block).unwrap();
+            // The bundle format follows the carrying block's DAA score, as in validation.
+            let merged_format_post_fork = self.security_fork_activation.is_active(merged_block_daa_score);
             let (validated_transactions, inner_multiset) = self.validate_transactions_with_muhash_in_parallel(
                 &txs,
                 &composed_view,
                 pov_daa_score,
-                self.headers_store.get_daa_score(merged_block).unwrap(),
+                merged_block_daa_score,
                 validation_flags,
                 ctx.selected_parent(),
             );
@@ -224,7 +227,7 @@ impl VirtualStateProcessor {
                     // it somehow does not, we DROP that transaction rather than disqualify
                     // the merging block: a single unusable merged tx must never be able to
                     // halt the chain (see the accepted-order drop principle, PLAN §2.4).
-                    if let Some((stx, bundle)) = ShieldedBundle::from_bytes(&validated_tx.tx().payload)
+                    if let Some((stx, bundle)) = ShieldedBundle::from_bytes_at(&validated_tx.tx().payload, merged_format_post_fork)
                         .ok()
                         .and_then(|b| ShieldedTx::from_bundle(&b).ok().map(|stx| (stx, b)))
                     {
@@ -897,7 +900,9 @@ impl VirtualStateProcessor {
         blue_score: u64,
         pov_daa_score: u64,
     ) -> TxResult<()> {
-        let Ok(bundle) = kaspa_shielded_core::bundle::ShieldedBundle::from_bytes(&tx.payload) else {
+        let Ok(bundle) =
+            kaspa_shielded_core::bundle::ShieldedBundle::from_bytes_at(&tx.payload, self.security_fork_activation.is_active(pov_daa_score))
+        else {
             return Ok(());
         };
         let Ok(stx) = kaspa_shielded_core::state::ShieldedTx::from_bundle(&bundle) else {

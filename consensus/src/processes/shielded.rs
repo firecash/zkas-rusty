@@ -1046,7 +1046,13 @@ impl ShieldedStateManager {
     /// of the chain (~3.1M rows at 36 days old), and the IBD export pays a full-index
     /// scan per syncing peer. With it they stay bounded by the pruning window.
     pub fn gc_aged_anchors(&self, batch: &mut WriteBatch, pp_blue_score: u64, max_age: u64, cap: usize) -> StoreResult<usize> {
-        let limit = pp_blue_score.saturating_sub(max_age.saturating_mul(2));
+        // The window entries share this queue, and the pruning point's anchor window spans whole
+        // buckets: up to `(buckets_to_keep + 1) * BUCKET_SPAN` below it, which exceeds `2 * max_age`
+        // for a small anchor age. Keep the larger of the two, or the export loses entries the
+        // window commitment still covers and a post-fork pruning-point import fails.
+        use kaspa_shielded_core::anchor_window::{BUCKET_SPAN, buckets_to_keep};
+        let margin = max_age.saturating_mul(2).max((buckets_to_keep(max_age) + 1).saturating_mul(BUCKET_SPAN));
+        let limit = pp_blue_score.saturating_sub(margin);
         if limit == 0 {
             return Ok(0);
         }
@@ -1853,9 +1859,11 @@ mod tests {
         mgr.anchor_gc.enqueue_batch(&mut batch, 500, root, young_block).unwrap();
         db.write(batch).unwrap();
 
-        // pp_blue 130, max_age 10: limit = 110 -> only the blue-100 entry qualifies.
+        // max_age 10: the margin is the anchor window's span, (buckets_to_keep(10) + 1) * 1000 = 2000,
+        // not 2 * max_age. pp_blue 2110: limit = 110 -> only the blue-100 entry qualifies.
         let mut batch = WriteBatch::default();
-        let processed = mgr.gc_aged_anchors(&mut batch, 130, 10, 1000).unwrap();
+        assert_eq!(mgr.gc_aged_anchors(&mut batch, 130, 10, 1000).unwrap(), 0, "nothing inside the window span is collected");
+        let processed = mgr.gc_aged_anchors(&mut batch, 2110, 10, 1000).unwrap();
         db.write(batch).unwrap();
         assert_eq!(processed, 1, "only the aged entry is drained");
 

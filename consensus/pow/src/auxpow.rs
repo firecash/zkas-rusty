@@ -84,8 +84,13 @@ pub fn check_pow_gated(header: &Header, aux: Option<&AuxPow>, rule: impl Into<Au
                 // this block's nonce is the parent's hash. The full block hash covers the nonce, so
                 // it fixes the parent: one block, one witness, one level. And a ZKas block cannot
                 // be the parent, because its coinbase may carry no commitment (body rule).
+                //
+                // The parent must not ALSO carry a legacy `ZKMM` commitment: otherwise one solution
+                // could back a pre-fork block (legacy rule) and a post-fork block (this rule) for the
+                // blocks that straddle the activation score.
                 let nonce_free = kaspa_consensus_core::hashing::header::hash_override_nonce_time(header, 0, header.timestamp);
                 header.nonce == AuxPow::nonce_binding(&a.parent_header)
+                    && a.committed_hash().is_none()
                     && a.verify_binding_v1(genesis, nonce_free)
                     && parent_pow(a) <= target
             }
@@ -269,6 +274,20 @@ mod tests {
             let (lp, lb) = mine_parent(std::slice::from_ref(&legacy_cb), EASY_BITS);
             let legacy = AuxPow { parent_header: lp, parent_coinbase: legacy_cb, coinbase_merkle_branch: lb };
             assert!(!check_pow_gated(&fc, Some(&legacy), AuxRule::Bound(genesis)).0, "legacy form refused after the fork");
+
+            // A parent coinbase carrying BOTH tags cannot back a post-fork block (L-4: one solution,
+            // a pre-fork block and a post-fork block straddling the score).
+            let mut dual_payload = coinbase_committing_v1(AuxPow::bound_commitment(genesis, nonce_free)).payload;
+            dual_payload.extend_from_slice(&coinbase_committing(Hash::from_u64_word(seed ^ 0x55)).payload);
+            let dual_cb = Transaction::new(0, vec![], vec![], 0, SUBNETWORK_ID_COINBASE, 0, dual_payload);
+            let (dp, db) = mine_parent(std::slice::from_ref(&dual_cb), EASY_BITS);
+            let mut fc2 = fc.clone();
+            fc2.nonce = AuxPow::nonce_binding(&dp);
+            fc2.finalize();
+            if !State::new(&fc2).check_pow(fc2.nonce).0 {
+                let dual = AuxPow { parent_header: dp, parent_coinbase: dual_cb, coinbase_merkle_branch: db };
+                assert!(!check_pow_gated(&fc2, Some(&dual), AuxRule::Bound(genesis)).0, "a dual-tagged parent is refused");
+            }
 
             // The commitment detector sees both tags, which the coinbase ban relies on.
             assert!(AuxPow::payload_carries_commitment(&cb.payload));

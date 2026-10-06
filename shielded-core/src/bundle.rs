@@ -319,8 +319,27 @@ impl ShieldedBundle {
         w.buf
     }
 
-    /// Decode from canonical payload bytes. Rejects malformed and trailing input.
+    /// Decode from canonical payload bytes in the security-fork format (a set
+    /// [`BUNDLE_FLAG_ANCHOR_BLOCK`] carries a trailing 32-byte block hash). Rejects malformed and
+    /// trailing input. Consensus must use [`Self::from_bytes_at`], which picks the format by the
+    /// carrying block's DAA score.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, BundleDecodeError> {
+        Self::decode(bytes, true)
+    }
+
+    /// Decode in the format of the chain at a given point: the security-fork format when
+    /// `security_fork_active`, otherwise exactly the format every node parsed before the fork, in
+    /// which bit 3 of the flags is an unknown flag that carries no field (the bundle decodes and
+    /// is later refused by the verifier for non-canonical flags, as it always was).
+    ///
+    /// The difference matters before the activation: the parse runs in the context-free block-body
+    /// check, so a byte string the two formats judge differently would make old and new nodes
+    /// disagree about a block's validity.
+    pub fn from_bytes_at(bytes: &[u8], security_fork_active: bool) -> Result<Self, BundleDecodeError> {
+        Self::decode(bytes, security_fork_active)
+    }
+
+    fn decode(bytes: &[u8], anchor_block_field: bool) -> Result<Self, BundleDecodeError> {
         let mut r = Reader::new(bytes);
         let flags = r.u8()?;
         let value_balance = r.i64()?;
@@ -361,7 +380,7 @@ impl ShieldedBundle {
         } else {
             None
         };
-        let anchor_block = if flags & BUNDLE_FLAG_ANCHOR_BLOCK != 0 {
+        let anchor_block = if anchor_block_field && flags & BUNDLE_FLAG_ANCHOR_BLOCK != 0 {
             Some(r.array::<32>().map_err(|_| BundleDecodeError::UnexpectedEof)?)
         } else {
             None
@@ -455,6 +474,30 @@ mod tests {
             out_ciphertext: [seed.wrapping_add(6); sizes::OUT_CIPHERTEXT],
             spend_auth_sig: [seed.wrapping_add(7); sizes::SIG],
         }
+    }
+
+    /// The pre-fork and security-fork formats must judge the two bit-3 byte forms oppositely, and the
+    /// pre-fork judgement must be exactly the old parser's: bit 3 alone decodes (the verifier later
+    /// refuses it), bit 3 with a trailing block hash is trailing garbage. Otherwise old and new nodes
+    /// disagree about a block body before the activation.
+    #[test]
+    fn anchor_block_field_is_format_gated_and_pre_fork_parse_is_unchanged() {
+        let mut flag_only = sample_bundle(2);
+        flag_only.flags |= BUNDLE_FLAG_ANCHOR_BLOCK;
+        flag_only.anchor_block = None;
+        let flag_only = flag_only.to_bytes();
+        let mut named = sample_bundle(2);
+        named.set_anchor_block([0xAB; 32]);
+        let named = named.to_bytes();
+
+        let pre = ShieldedBundle::from_bytes_at(&flag_only, false).expect("pre-fork: an unknown flag bit decodes, as it always did");
+        assert!(pre.anchor_block.is_none() && pre.flags & BUNDLE_FLAG_ANCHOR_BLOCK != 0);
+        assert_eq!(ShieldedBundle::from_bytes_at(&named, false), Err(BundleDecodeError::TrailingBytes), "pre-fork: the field is trailing bytes");
+        assert_eq!(ShieldedBundle::from_bytes_at(&flag_only, true), Err(BundleDecodeError::UnexpectedEof), "post-fork: the field is required");
+        assert_eq!(ShieldedBundle::from_bytes_at(&named, true).unwrap().anchor_block, Some([0xAB; 32]));
+        // A bundle without the bit is the same in both formats.
+        let plain = sample_bundle(2).to_bytes();
+        assert_eq!(ShieldedBundle::from_bytes_at(&plain, false), ShieldedBundle::from_bytes_at(&plain, true));
     }
 
     fn sample_bundle(n: u8) -> ShieldedBundle {

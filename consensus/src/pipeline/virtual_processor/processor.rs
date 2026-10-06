@@ -585,6 +585,12 @@ impl VirtualStateProcessor {
             ShieldedStateManager::verify_import_binding(md, committed)?;
             return Ok(None);
         }
+        // A window holds at most one entry per chain block across its buckets; refuse anything larger
+        // before spending any hashing on it (the root comparison would refuse it anyway, later).
+        let max_entries = (self.anchor_window_keep() + 2).saturating_mul(kaspa_shielded_core::anchor_window::BUCKET_SPAN) as usize;
+        if md.window_entries.len() > max_entries {
+            return Err(format!("pruning-point anchor window has {} entries, more than a window can hold ({max_entries})", md.window_entries.len()));
+        }
         let window = kaspa_shielded_core::anchor_window::AnchorWindow::from_entries(md.window_entries.iter(), self.anchor_window_keep())
             .map_err(|e| format!("pruning-point anchor window: {e}"))?;
         if md.window_entries.last().map(|e| e.block) != Some(pp.as_bytes()) {

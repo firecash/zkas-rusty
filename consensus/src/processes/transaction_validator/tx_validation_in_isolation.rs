@@ -45,7 +45,13 @@ impl TransactionValidator {
         if !tx.outputs.is_empty() {
             return Err(TxRuleError::InvalidShieldedTransaction("shielded transaction must have no transparent outputs"));
         }
-        let bundle = ShieldedBundle::from_bytes(&tx.payload)
+        // DAA-independent on purpose (this stage has no context): accept a bundle that decodes in
+        // either the pre-fork or the security-fork format. The exact format for the carrying
+        // block's DAA score is enforced in header context (`check_shielded_format_in_header_context`),
+        // so for every byte string a block's validity is what the pre-fork code decided until the
+        // activation score, and the new format's decision from it.
+        let bundle = ShieldedBundle::from_bytes_at(&tx.payload, true)
+            .or_else(|_| ShieldedBundle::from_bytes_at(&tx.payload, false))
             .map_err(|_| TxRuleError::InvalidShieldedTransaction("malformed Orchard bundle in payload"))?;
         if bundle.actions.is_empty() {
             return Err(TxRuleError::InvalidShieldedTransaction("shielded bundle has no actions"));
@@ -534,6 +540,69 @@ mod tests {
         } else {
             assert_match!(res, Err(TxRuleError::InvalidShieldedTransaction("bridge peg-out is disabled")));
         }
+    }
+
+    /// H-1 (final consensus review): the anchor-block format is judged by the carrying block's DAA
+    /// score, never in isolation. Before the activation a block's validity for both bit-3 byte forms
+    /// must be what the pre-fork parser decided (flag alone: body-valid, refused later by the
+    /// verifier; flag plus field: malformed), and the opposite from the activation.
+    #[test]
+    fn anchor_block_format_is_decided_in_header_context_by_daa() {
+        use crate::processes::transaction_validator::tx_validation_in_header_context::LockTimeArg;
+        use kaspa_consensus_core::config::params::ForkActivation;
+        use kaspa_shielded_core::bundle::{ActionWire, BUNDLE_FLAG_ANCHOR_BLOCK, ShieldedBundle, sizes};
+        let sample = || ShieldedBundle {
+            actions: vec![ActionWire {
+                nullifier: [1u8; sizes::FIELD],
+                rk: [0u8; sizes::FIELD],
+                cmx: [0u8; sizes::FIELD],
+                cv_net: [0u8; sizes::FIELD],
+                ephemeral_key: [0u8; sizes::FIELD],
+                enc_ciphertext: [0u8; sizes::ENC_CIPHERTEXT],
+                out_ciphertext: [0u8; sizes::OUT_CIPHERTEXT],
+                spend_auth_sig: [0u8; sizes::SIG],
+            }],
+            flags: 0b11,
+            value_balance: 0,
+            anchor: [0u8; sizes::FIELD],
+            proof: vec![0u8; 8],
+            binding_sig: [0u8; sizes::SIG],
+            burn: None,
+            anchor_block: None,
+        };
+
+        let params = MAINNET_PARAMS.clone();
+        let tv = |fork: ForkActivation| {
+            TransactionValidator::new_for_tests(
+                params.max_tx_inputs,
+                params.max_tx_outputs,
+                params.max_signature_script_len(),
+                params.max_script_public_key_len,
+                params.coinbase_payload_script_public_key_max_len,
+                params.coinbase_maturity(),
+                params.ghostdag_k(),
+                Default::default(),
+            )
+            .with_security_fork_activation(fork)
+        };
+        let tx_of = |b: &ShieldedBundle| Transaction::new(TX_VERSION_SHIELDED, vec![], vec![], 0, SUBNETWORK_ID_NATIVE, 0, b.to_bytes());
+        let mut flag_only = sample();
+        flag_only.flags |= BUNDLE_FLAG_ANCHOR_BLOCK;
+        let flag_only = tx_of(&flag_only);
+        let mut named = sample();
+        named.set_anchor_block([7u8; 32]);
+        let named = tx_of(&named);
+
+        let fork_at_100 = tv(ForkActivation::new(100));
+        // The context-free stage accepts both shapes and decides nothing about the format.
+        for t in [&flag_only, &named] {
+            assert!(fork_at_100.check_shielded_in_isolation(t).is_ok());
+        }
+        let ctx = |v: &TransactionValidator, t: &Transaction, daa: u64| v.validate_tx_in_header_context(t, LockTimeArg::Finalized, daa);
+        assert!(ctx(&fork_at_100, &flag_only, 99).is_ok(), "pre-fork: flag alone is body-valid, exactly as before");
+        assert!(ctx(&fork_at_100, &named, 99).is_err(), "pre-fork: flag plus field is malformed, exactly as before");
+        assert!(ctx(&fork_at_100, &flag_only, 100).is_err(), "post-fork: the field is required");
+        assert!(ctx(&fork_at_100, &named, 100).is_ok(), "post-fork: the field is the format");
     }
 
     #[test]

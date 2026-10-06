@@ -273,6 +273,12 @@ impl Gateway {
     ) -> Vec<WebhookEvent> {
         let mut dropped: Vec<(String, [u8; 32])> = Vec::new();
         for (id, invoice) in self.invoices.iter() {
+            // A confirmed invoice is never reopened by an absence: its payments were deep when it
+            // confirmed, so a missing row is a history artefact, not a reversal. (Other states can
+            // still hold shallow payments and must stay retractable on a genuine reorg.)
+            if invoice.status == InvoiceStatus::Confirmed {
+                continue;
+            }
             for payment in &invoice.payments {
                 let deep = sink_blue_score.saturating_sub(payment.blue_score) >= invoice.required_blue_score;
                 if !deep && !seen.contains(&payment.transaction_id) {

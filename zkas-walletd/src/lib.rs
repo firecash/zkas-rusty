@@ -523,7 +523,10 @@ const ANCHOR_AGE_HEADROOM: u64 = 60;
 /// of the checkpoint format on purpose, so adding it needs no CHECKPOINT_VERSION bump (which would
 /// force every wallet to rescan).
 fn anchor_blocks_path(dir: &str, token: &str) -> String {
-    format!("{dir}/{token}.anchors")
+    // `.anchors2`: keyed by the boundary's blue score. The first format (`.anchors`, never
+    // released) was keyed by leaf count, which several consecutive blocks share once miner rewards
+    // accrue; reading it as blue scores would name wrong blocks, so it is simply not read.
+    format!("{dir}/{token}.anchors2")
 }
 
 fn save_anchor_blocks(dir: &str, token: &str, blocks: &HashMap<u64, [u8; 32]>) {
@@ -2650,9 +2653,9 @@ struct WalletEntry {
     /// at a matured, canonical chain-block anchor without a rescan. Persisted in
     /// the v2 checkpoint, so it survives restarts.
     boundaries: VecDeque<(u64, u64)>,
-    /// Block hash at each ring boundary, keyed by leaf count (the boundary's anchor is that block's
-    /// own tree root). Needed after the security fork, when a spend must name its anchor block.
-    /// Persisted in a sidecar (`anchor_blocks_path`), not in the checkpoint.
+    /// Block hash at each ring boundary, keyed by the boundary's blue score (the boundary's anchor is
+    /// that block's own tree root). Needed after the security fork, when a spend must name its
+    /// anchor block. Persisted in a sidecar (`anchor_blocks_path`), not in the checkpoint.
     boundary_blocks: HashMap<u64, [u8; 32]>,
     /// The sink's blue score from the latest sync response — the reference the
     /// matured cutoff is measured against.
@@ -3373,11 +3376,14 @@ impl WalletEntry {
                     self.low = b.hash;
                     self.scanned = b.daa_score as usize;
                     self.boundaries.push_back((b.blue_score, self.db.size()));
-                    self.boundary_blocks.insert(self.db.size(), b.hash.as_bytes());
+                    // Keyed by blue score, which is unique per chain block. Leaf count is not: a block
+                    // that mints nothing (miner reward accrued) leaves it unchanged, and keying by it
+                    // overwrote an old boundary's block with a much younger one.
+                    self.boundary_blocks.insert(b.blue_score, b.hash.as_bytes());
                     if self.boundaries.len() > MATURED_RING {
                         self.boundaries.pop_front();
-                        if let Some(&(_, oldest)) = self.boundaries.front() {
-                            self.boundary_blocks.retain(|leaves, _| *leaves >= oldest);
+                        if let Some(&(oldest_blue, _)) = self.boundaries.front() {
+                            self.boundary_blocks.retain(|blue, _| *blue >= oldest_blue);
                         }
                     }
                     advanced = true;
@@ -3906,7 +3912,17 @@ impl WalletEntry {
         if !self.sink_live {
             return Err(err(StatusCode::CONFLICT, "wallet is reconnecting to its node; retry in a few seconds"));
         }
-        let anchor_blue = self.boundaries.iter().rev().find(|(_, leaves)| *leaves == matured).map(|&(bs, _)| bs);
+        // The exact boundary every send path selects: the newest one at or below the maturity
+        // cutoff. Its leaf count is `matured`; its blue score names its block. Matching on leaf count
+        // alone would pick the NEWEST block with that count, which can be far younger than the cutoff
+        // (several blocks share a leaf count when rewards accrue) and fail the anchor depth.
+        let cutoff_blue = self.sink_blue.saturating_sub(DEFAULT_ANCHOR_DEPTH + ANCHOR_SLACK);
+        let anchor_blue = self
+            .boundaries
+            .iter()
+            .rev()
+            .find(|(bs, leaves)| *bs <= cutoff_blue && *leaves == matured)
+            .map(|&(bs, _)| bs);
         let budget = MAX_ANCHOR_AGE.get().copied().unwrap_or(u64::MAX).saturating_sub(ANCHOR_AGE_HEADROOM);
         if anchor_blue.is_none_or(|bs| self.sink_blue.saturating_sub(bs) > budget) {
             return Err(err(
@@ -3917,7 +3933,7 @@ impl WalletEntry {
         if !security_fork_active(self.chain_len.max(self.scanned as u64)) {
             return Ok(None);
         }
-        self.boundary_blocks.get(&matured).copied().map(Some).ok_or_else(|| {
+        anchor_blue.and_then(|bs| self.boundary_blocks.get(&bs)).copied().map(Some).ok_or_else(|| {
             err(
                 StatusCode::CONFLICT,
                 "this wallet has not yet recorded the block its spend anchor belongs to (needed since the security fork); retry after a few minutes of sync",
@@ -8434,6 +8450,12 @@ async fn shared_tree_audit_loop(state: Arc<AppState>) {
         };
         let Some(node) = state.request_client().await else { continue };
         let Ok(Ok(ts)) = tokio::time::timeout(SYNC_RPC_TIMEOUT, node.get_shielded_tree_state(Some(cursor))).await else { continue };
+        // Below the pruning point only checkpoint blocks keep a frontier, and the node then answers
+        // with the nearest checkpoint AT OR AFTER the cursor. That is a different block; comparing
+        // against it would report a divergence that does not exist and halt a healthy tree.
+        if ts.block_hash != cursor {
+            continue;
+        }
         let fs = FrontierState {
             size: ts.size,
             leaf: (ts.size > 0).then(|| ts.leaf.as_bytes()),
@@ -9767,7 +9789,9 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
     if have_total.is_none() {
         // After the security fork a spend must name its anchor block, and this replay does not
         // track which block its tip belongs to. Refuse rather than build a bundle consensus rejects.
-        let tip_daa = state.chain_tree.lock().await.scanned as u64;
+        // Judged at the node's tip, like every other send path: the shared tree's scanned height
+        // trails it by the sync margin and would build unnamed spends for minutes after activation.
+        let tip_daa = (state.node_tip.lock().await.0).max(state.chain_tree.lock().await.scanned as u64);
         if security_fork_active(tip_daa) {
             return Err(err(
                 StatusCode::CONFLICT,
