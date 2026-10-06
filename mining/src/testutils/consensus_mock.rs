@@ -30,6 +30,7 @@ pub(crate) struct ConsensusMock {
     statuses: RwLock<HashMap<TransactionId, TxResult<()>>>,
     utxos: RwLock<UtxoCollection>,
     dev_fee_spk: Option<ScriptPublicKey>,
+    red_reward: bool,
 }
 
 impl ConsensusMock {
@@ -39,6 +40,7 @@ impl ConsensusMock {
             statuses: RwLock::new(HashMap::default()),
             utxos: RwLock::new(HashMap::default()),
             dev_fee_spk: None,
+            red_reward: false,
         }
     }
 
@@ -46,6 +48,12 @@ impl ConsensusMock {
     /// `ConsensusApi::dev_fee_spk`), for `modify_block_template` tests.
     pub(crate) fn set_dev_fee_spk(&mut self, dev_fee_spk: ScriptPublicKey) {
         self.dev_fee_spk = Some(dev_fee_spk);
+    }
+
+    /// Make every built coinbase carry a red reward (a trailing output paying the template's miner),
+    /// as a real coinbase does when the merged set has red blocks and no dev note is due.
+    pub(crate) fn set_red_reward(&mut self) {
+        self.red_reward = true;
     }
 
     pub(crate) fn set_status(&self, transaction_id: TransactionId, status: TxResult<()>) {
@@ -102,7 +110,11 @@ impl ConsensusApi for ConsensusMock {
     ) -> Result<BlockTemplate, RuleError> {
         let mut txs = tx_selector.select_transactions();
         let coinbase_manager = CoinbaseManagerMock::new();
-        let coinbase = coinbase_manager.expected_coinbase_transaction(miner_data.clone());
+        let mut coinbase = coinbase_manager.expected_coinbase_transaction(miner_data.clone());
+        if self.red_reward {
+            coinbase.tx.outputs.push(kaspa_consensus_core::tx::TransactionOutput::new(7 * kaspa_consensus_core::constants::SOMPI_PER_KASPA, miner_data.script_public_key.clone()));
+            coinbase.has_red_reward = true;
+        }
         txs.insert(0, coinbase.tx);
         let now = unix_now();
         let hash_merkle_root = self.calc_transaction_hash_merkle_root(&txs);

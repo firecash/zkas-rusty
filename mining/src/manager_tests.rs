@@ -1646,6 +1646,30 @@ mod tests {
         block_transactions
     }
 
+    /// A cached template whose coinbase carries a red reward and was built for the public dev-fee
+    /// address (anyone can request that) must still give a later miner a coinbase paying THAT miner.
+    /// With no dev note due (off a payout, and always after the dev-fee end) the red reward is the
+    /// last output and pays the dev script; patching it in place used to skip it.
+    #[test]
+    fn red_reward_template_cached_for_the_dev_address_is_rebuilt_for_the_next_miner() {
+        let dev = get_miner_data(Prefix::Testnet);
+        let mut consensus = ConsensusMock::new();
+        consensus.set_dev_fee_spk(dev.script_public_key.clone());
+        consensus.set_red_reward();
+        let consensus = Arc::new(consensus);
+        let mining_manager = default_mining_manager();
+        let first = mining_manager.get_block_template(consensus.as_ref(), &dev).expect("template for the dev address");
+        assert!(first.coinbase_has_red_reward);
+        let miner = get_miner_data(Prefix::Testnet);
+        let second = mining_manager.get_block_template(consensus.as_ref(), &miner).expect("template for the next miner");
+        let outs = &second.block.transactions[0].outputs;
+        assert_eq!(outs.len(), 2);
+        assert!(
+            outs.iter().all(|o| o.script_public_key == miner.script_public_key),
+            "every reward output, the red reward included, pays the requesting miner"
+        );
+    }
+
     fn get_miner_data(prefix: Prefix) -> MinerData {
         let secp = secp256k1::Secp256k1::new();
         let mut rng = rand::thread_rng();

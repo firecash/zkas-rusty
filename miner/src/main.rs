@@ -136,7 +136,8 @@ async fn main() {
                     _ => kaspa_consensus_core::network::NetworkType::Mainnet,
                 };
                 let params = kaspa_consensus_core::config::params::Params::from(net);
-                let bound = match args.security_fork_daa {
+                // The override is for test networks only; on mainnet the compiled score decides.
+                let bound = match args.security_fork_daa.filter(|_| net != kaspa_consensus_core::network::NetworkType::Mainnet) {
                     Some(d) => header.daa_score >= d,
                     None => params.security_fork_activation.is_active(header.daa_score),
                 };

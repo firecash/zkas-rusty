@@ -1753,6 +1753,59 @@ async fn security_fork_chain_commits_v1_roots_and_the_window_rebinds() {
     assert!(vp.verify_import_binding_versioned(pp, &tampered, committed).is_err(), "a different dev accrual is refused");
 }
 
+/// Before the security fork the v0 root does not cover the carried dev balance or the miner slot,
+/// so a lying peer could seed either at a pruning point. Where consensus fixes the value (no dev
+/// balance from the dev-fee end on; no slot before the fork) the import must refuse anything else,
+/// or the first ended block would demand a dev payout no honest block makes and the node wedges.
+#[tokio::test]
+async fn pre_fork_import_refuses_a_dev_balance_after_the_end_and_any_miner_slot() {
+    let mut params = MAINNET_PARAMS.clone();
+    params.shielded_coinbase = true;
+    params.security_fork_activation = ForkActivation::never();
+    params.dev_fee_accrual_activation = ForkActivation::always();
+    params.dev_fee_payout_interval = 1_000;
+    params.dev_fee_end_activation = ForkActivation::new(6);
+    let config = ConfigBuilder::new(params)
+        .edit_consensus_params(|p| {
+            p.genesis.bits = 0x207fffff;
+            p.blockrate.shielded_anchor_depth = 1;
+        })
+        .build();
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+    let miner_addr = kaspa_shielded_core::wallet::address_bytes_from_seed([9u8; 32]).expect("orchard address");
+    ctx.miner_data = MinerData::new(ScriptPublicKey::new(0, ScriptVec::from_slice(&miner_addr)), vec![]);
+    let mut chain = Vec::new();
+    for _ in 0..12 {
+        let b = ctx.mine_real_pow_block();
+        chain.push((b.header.hash, b.header.daa_score));
+        ctx.consensus.validate_and_insert_block(b).virtual_state_task.await.expect("valid");
+    }
+    let vp = ctx.consensus.virtual_processor();
+    let check = |pp: Hash| {
+        let committed = vp.shielded_state_root_at(pp).unwrap();
+        let wire = vp.export_pruning_point_shielded(pp).unwrap().expect("pp exports");
+        let md = crate::processes::shielded::PruningPointShieldedMetadata::from_wire_bytes(&wire.data).unwrap();
+        (md, committed)
+    };
+    // Before the end a balance is carried and the honest export re-binds.
+    let (before, _) = chain.iter().copied().find(|(_, d)| *d >= 3 && *d < 6).expect("a block before the end");
+    let (md, committed) = check(before);
+    assert!(md.dev_accrued > 0, "a dev balance is carried before the end");
+    vp.verify_import_binding_versioned(before, &md, committed).expect("honest pre-end export re-binds");
+    // After the end the honest value is 0; a lying 1 is refused although the v0 root cannot see it.
+    let (after, _) = *chain.last().unwrap();
+    let (md, committed) = check(after);
+    assert_eq!(md.dev_accrued, 0);
+    vp.verify_import_binding_versioned(after, &md, committed).expect("honest post-end export re-binds");
+    let mut lie = md.clone();
+    lie.dev_accrued = 1;
+    assert!(vp.verify_import_binding_versioned(after, &lie, committed).is_err(), "a dev balance after the end is refused");
+    // No slot exists before the fork.
+    let mut lie = md.clone();
+    lie.miner_accrual = kaspa_consensus_core::coinbase::MinerAccrual { script_public_key: ctx.miner_data.script_public_key.clone(), amount: 5 };
+    assert!(vp.verify_import_binding_versioned(after, &lie, committed).is_err(), "a pre-fork miner slot is refused");
+}
+
 /// Security fork, miner accrual end to end through real validated blocks: two miners, a switch and
 /// back, and a short payout interval. Every block must validate (the template and the validator
 /// build the same coinbase, and the pool-delta check accounts for the carried slot), far fewer miner

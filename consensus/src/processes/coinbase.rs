@@ -1428,21 +1428,21 @@ mod tests {
         assert_eq!(miner_value(&after), sub);
     }
 
-    /// The mainnet end score is the first halving, computed independently from the halving rule.
+    /// The mainnet end score is the second halving, computed independently from the halving rule.
     #[test]
-    fn mainnet_dev_fee_ends_at_the_first_halving() {
+    fn mainnet_dev_fee_ends_at_the_second_halving() {
         use kaspa_consensus_core::config::params::ZKAS_DEV_FEE_END_DAA;
         let p = MAINNET_PARAMS.clone();
         assert_eq!(p.deflationary_phase_daa_score, 0);
         assert_eq!(p.bps(), 1);
-        assert_eq!(ZKAS_DEV_FEE_END_DAA, SUBSIDY_HALVING_INTERVAL_MONTHS * SECONDS_PER_MONTH);
+        assert_eq!(ZKAS_DEV_FEE_END_DAA, 2 * SUBSIDY_HALVING_INTERVAL_MONTHS * SECONDS_PER_MONTH);
         assert_eq!(p.dev_fee_end_activation, ForkActivation::new(ZKAS_DEV_FEE_END_DAA));
         let cbm = create_manager(&p);
-        // The subsidy halves exactly there: the curve value one step later is half of genesis's
-        // (Kaspa's table decays by 2^(1/12) per step, 12 steps per halving here).
+        // The curve is at a quarter of genesis's there (two halvings; Kaspa's table decays by
+        // 2^(1/12) per step, 12 steps per halving here).
         let s0 = cbm.curve_subsidy(0);
         let s1 = cbm.curve_subsidy(ZKAS_DEV_FEE_END_DAA);
-        assert!((s1 as i128 - (s0 / 2) as i128).abs() <= (s0 / 1000) as i128, "{s0} -> {s1}");
+        assert!((s1 as i128 - (s0 / 4) as i128).abs() <= (s0 / 1000) as i128, "{s0} -> {s1}");
         assert!(cbm.curve_subsidy(ZKAS_DEV_FEE_END_DAA - 1) > s1, "the step happens at the end score");
     }
 

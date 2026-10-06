@@ -209,6 +209,10 @@ pub struct VirtualStateProcessor {
     pub(crate) shielded_anchor_multi_activation: ForkActivation,
     /// See `Params::security_fork_activation`.
     pub(crate) security_fork_activation: ForkActivation,
+    /// See `Params::dev_fee_accrual_activation` / `Params::dev_fee_end_activation`: outside the
+    /// window between them no dev fee is carried, so an imported pruning point must carry none.
+    dev_fee_accrual_activation: ForkActivation,
+    dev_fee_end_activation: ForkActivation,
     /// See `Params::shielded_coinbase_seed_activation` (F-02).
     pub(crate) shielded_coinbase_seed_activation: ForkActivation,
     pub(crate) toccata_logger: ForkLogger,
@@ -335,6 +339,8 @@ impl VirtualStateProcessor {
             toccata_activation: params.toccata_activation,
             shielded_anchor_multi_activation: params.shielded_anchor_multi_activation,
             security_fork_activation: params.security_fork_activation,
+            dev_fee_accrual_activation: params.dev_fee_accrual_activation,
+            dev_fee_end_activation: params.dev_fee_end_activation,
             shielded_coinbase_seed_activation: params.shielded_coinbase_seed_activation,
             shielded_coinbase: params.shielded_coinbase,
             toccata_logger: ForkLogger::new("virtual state processing rules", true),
@@ -581,7 +587,18 @@ impl VirtualStateProcessor {
         committed: [u8; 32],
     ) -> Result<Option<kaspa_shielded_core::anchor_window::AnchorWindow>, String> {
         use crate::processes::shielded::ShieldedStateManager;
-        if !self.is_post_security_fork(pp).map_err(|e| format!("pruning point header {pp}: {e}"))? {
+        let pp_daa = self.headers_store.get_daa_score(pp).map_err(|e| format!("pruning point header {pp}: {e}"))?;
+        // Values that consensus rules fix regardless of any root: no dev fee is carried before
+        // accrual starts or from the dev-fee end on. Before the security fork the v0 root does not
+        // cover `dev_accrued` (nor the miner slot), so without this a peer could seed a balance the
+        // first ended block would then have to pay out, and every honest block would be refused.
+        if md.dev_accrued != 0 && (!self.dev_fee_accrual_activation.is_active(pp_daa) || self.dev_fee_end_activation.is_active(pp_daa)) {
+            return Err(format!("pruning-point metadata carries a dev balance {} where none can exist", md.dev_accrued));
+        }
+        if !self.security_fork_activation.is_active(pp_daa) {
+            if !md.miner_accrual.is_empty() {
+                return Err("pruning-point metadata carries a miner accrual slot before the security fork".to_string());
+            }
             ShieldedStateManager::verify_import_binding(md, committed)?;
             return Ok(None);
         }

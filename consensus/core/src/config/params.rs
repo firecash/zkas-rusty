@@ -904,10 +904,12 @@ pub const ZKAS_DEV_FEE_RECIPIENT: [u8; 43] = [
 /// [`ZKAS_DEV_FEE_RECIPIENT`].
 pub const ZKAS_DEV_FEE_PERMILLE: u64 = 50;
 
-/// Mainnet DAA score from which the dev fee is zero: the first halving. The subsidy halves every
+/// Mainnet DAA score from which the dev fee is zero: the SECOND halving. The subsidy halves every
 /// `3 * SECONDS_PER_MONTH` (2,629,800 s) of DAA score from `deflationary_phase_daa_score` (0 on
-/// mainnet, 1 BPS), so halving `k` is at `k * 7_889_400`.
-pub const ZKAS_DEV_FEE_END_DAA: u64 = 7_889_400;
+/// mainnet, 1 BPS), so halving `k` is at `k * 7_889_400`. The first (7,889,400) was ~19 days away
+/// when this was set (mainnet DAA 6,238,072 on 2026-10-06), too soon for every node and pool to
+/// upgrade; the second is ~110 days out (late January 2027).
+pub const ZKAS_DEV_FEE_END_DAA: u64 = 2 * 7_889_400;
 
 pub const MAINNET_PARAMS: Params = Params {
     // ZKas is a distinct network with its own genesis; it MUST NOT advertise or
