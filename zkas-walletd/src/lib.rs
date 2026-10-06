@@ -70,9 +70,9 @@ use kaspa_shielded_core::tree::{FrontierState, GlobalTree, NoteCommitmentTree};
 use kaspa_shielded_core::wallet::CompactActionRecord;
 use kaspa_shielded_core::wallet::address_bytes_from_seed;
 use kaspa_shielded_core::wallet::build::{
-    MultiOutput, MultiSpend, PreparedPayment, build_wallet_payment, build_wallet_payment_anchored, build_wallet_payment_multi,
+    MultiOutput, MultiSpend, PreparedPayment, build_wallet_payment_anchored,
     build_wallet_payment_multi_anchored, finalize_payment,
-    fvk_from_bytes, prepare_multiparty, prepare_payment, proving_key, spend_offer_from_bytes, spend_offer_to_bytes,
+    fvk_from_bytes, prepare_multiparty, proving_key, spend_offer_from_bytes, spend_offer_to_bytes,
 };
 use kaspa_shielded_core::walletdb::{BlockMeta, HistoryKind, OwnedNote, Preview, WalletDb};
 use kaspa_shielded_wallet::{payment_tx, payment_tx_context};
@@ -1619,6 +1619,10 @@ fn save_checkpoint(
     sink_blue: u64,
     blind_below: u64,
 ) -> std::io::Result<()> {
+    // A database that ingested inconsistent data is never persisted: the last good checkpoint stays.
+    if db.poisoned() {
+        return Err(std::io::Error::other("refusing to checkpoint a wallet that ingested inconsistent data"));
+    }
     let buf = checkpoint_bytes(genesis, low, scanned, db, boundaries, sink_blue, blind_below);
     write_checkpoint_bytes(dir, token, &buf)?;
     save_anchor_blocks(dir, token, boundary_blocks);
@@ -3338,7 +3342,8 @@ impl WalletEntry {
                             b.hash
                         );
                         self.error = Some("inconsistent shielded data from the node (repeated nullifier); sync halted".into());
-                        return;
+                        // Leaves the blocking section; the pass returns right after it.
+                        break;
                     }
                     self.low = b.hash;
                     self.scanned = b.daa_score as usize;
@@ -3368,6 +3373,9 @@ impl WalletEntry {
                 (advanced, at_margin)
             });
             self.page_ingest_ns += t_ingest.elapsed().as_nanos();
+            if self.db.poisoned() {
+                return;
+            }
             // Own sends ingested from compact records have no recipient/memo/fee yet — fetch
             // the full transaction for each new Sent row and recover them with the OVK. Rare
             // per wallet (one fetch per own send), bounded, best-effort; async, so it lives

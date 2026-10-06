@@ -653,7 +653,7 @@ impl VirtualStateProcessor {
     /// already matches the PoW-committed root (F-02/F-15).
     pub fn shielded_state_root_at(&self, block: kaspa_hashes::Hash) -> Result<[u8; 32], kaspa_database::prelude::StoreError> {
         if self.is_post_security_fork(block)? {
-            self.shielded_state_manager.state_root_v1_at(block)
+            self.shielded_state_manager.state_root_v1_at(block, block == self.genesis.hash)
         } else {
             self.shielded_state_manager.state_root_at(block)
         }

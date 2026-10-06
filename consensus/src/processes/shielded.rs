@@ -628,11 +628,20 @@ impl ShieldedStateManager {
     /// The post-fork state root (`zkas_state_root1`) as of `block`. The caller decides the version
     /// from `block`'s own DAA score. A post-fork block without a window row is a store
     /// inconsistency and is reported as one rather than read as an empty window.
-    pub fn state_root_v1_at(&self, block: Hash) -> StoreResult<[u8; 32]> {
+    pub fn state_root_v1_at(&self, block: Hash, is_genesis: bool) -> StoreResult<[u8; 32]> {
         let root0 = self.state_root_at(block)?;
-        let window = self.anchor_window.window(block)?.ok_or_else(|| {
-            kaspa_database::prelude::StoreError::DataInconsistency(format!("post-fork block {block} has no anchor window"))
-        })?;
+        // Genesis never passes through block commit, so it has no window row; its window is the empty
+        // window, exactly as its frontier, supply and accumulator are the empty defaults. Any other
+        // post-fork block without a row is an inconsistency.
+        let window = match self.anchor_window.window(block)? {
+            Some(w) => w,
+            None if is_genesis => Default::default(),
+            None => {
+                return Err(kaspa_database::prelude::StoreError::DataInconsistency(format!(
+                    "post-fork block {block} has no anchor window"
+                )));
+            }
+        };
         Ok(kaspa_shielded_core::commitment::shielded_state_root_v1(&root0, self.dev_accrued_store.get(block)?, &window.commitment()))
     }
 
@@ -1619,8 +1628,8 @@ mod tests {
         // survive and it carries no window, which is the right value for a pre-fork pruning point.
         let pre_window = PruningPointShieldedMetadata { window_entries: Vec::new(), ..md.clone() };
         let pre_window_bytes = pre_window.to_wire_bytes();
-        let truncated = &pre_window_bytes[..pre_window_bytes.len() - std::mem::size_of::<u64>()];
-        let from_pre_window = PruningPointShieldedMetadata::from_wire_bytes(truncated).expect("pre-window layout decodes");
+        let truncated_pre_window = &pre_window_bytes[..pre_window_bytes.len() - std::mem::size_of::<u64>()];
+        let from_pre_window = PruningPointShieldedMetadata::from_wire_bytes(truncated_pre_window).expect("pre-window layout decodes");
         assert_eq!(from_pre_window.in_window_anchor_source_scores, md.in_window_anchor_source_scores);
         assert!(from_pre_window.window_entries.is_empty());
         assert_eq!(from_pre_scores.dev_accrued, 123_456, "the accrual before it still survives");
