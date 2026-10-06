@@ -8,8 +8,12 @@
 //! Chain blocks are what consensus enforced; non-chain blocks show what honest templates built.
 //!
 //! ```text
-//! cargo run --release -p zkas-api --example dev_fee_audit -- <node:port> <end_daa> <interval>
+//! cargo run --release -p zkas-api --example dev_fee_audit -- <node:port> <end_daa> <interval> [accrual_start]
 //! ```
+//!
+//! Before `accrual_start` (default 0) the dev fee is paid in every block, so those blocks are not
+//! judged. A block may legitimately carry more than one output to the dev script when a miner pays
+//! to that address; those are reported, not counted as violations.
 use std::{collections::HashMap, error::Error};
 
 use kaspa_consensus_core::config::params::ZKAS_DEV_FEE_RECIPIENT;
@@ -22,6 +26,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let rpc = args.next().unwrap_or_else(|| "127.0.0.1:16110".into());
     let end: u64 = args.next().and_then(|v| v.parse().ok()).expect("end_daa");
     let interval: u64 = args.next().and_then(|v| v.parse().ok()).expect("interval");
+    let accrual_start: u64 = args.next().and_then(|v| v.parse().ok()).unwrap_or(0);
     let client = GrpcClient::connect_with_args(
         NotificationMode::Direct,
         format!("grpc://{rpc}"),
@@ -39,6 +44,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     daa_of.insert(pp.header.hash, pp.header.daa_score);
 
     let mut low = info.pruning_point_hash;
+    // `get_blocks` pages overlap; judge and count each block once.
+    let mut seen = std::collections::HashSet::new();
     let (mut scanned, mut chain, mut violations) = (0usize, 0usize, 0usize);
     let (mut pre_notes, mut final_notes, mut post_blocks) = (0usize, 0usize, 0usize);
     let (mut dev_paid_chain, mut final_value) = (0u128, 0u64);
@@ -52,6 +59,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
             daa_of.insert(b.header.hash, b.header.daa_score);
         }
         for b in &new {
+            if !seen.insert(b.header.hash) {
+                continue;
+            }
             scanned += 1;
             let daa = b.header.daa_score;
             let Some(vd) = b.verbose_data.as_ref() else { continue };
@@ -62,8 +72,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 cb.outputs.iter().filter(|o| o.script_public_key.script() == ZKAS_DEV_FEE_RECIPIENT.as_slice()).map(|o| o.value).collect();
             let crossed = daa / interval > pdaa / interval;
             let first_ended = daa >= end && pdaa < end;
-            let ok = if dev.len() > 1 {
-                false
+            if dev.len() > 1 {
+                println!("NOTE block {} daa {daa}: {} outputs to the dev script {dev:?}", b.header.hash, dev.len());
+            }
+            let ok = if daa < accrual_start {
+                true
             } else if daa < end {
                 dev.is_empty() || crossed
             } else if first_ended {

@@ -707,7 +707,13 @@ impl VirtualStateProcessor {
         if !self.shielded_coinbase || !self.pruning_meta_stores.read().pruning_shielded_stable_flag() {
             return;
         }
-        let _guard = self.virtual_stores.read();
+        // UPGRADABLE read, not a plain read: `resolve_virtual` holds the upgradable lock while it
+        // persists new chain blocks' nullifiers into the global set, and moves the sink only later
+        // under the write lock. A plain read does not exclude that window, so a block resolved
+        // during this (multi-second) walk would make the set run ahead of the sink's snapshot and
+        // raise a false "diverged" that refuses templates until restart. Holding the upgradable lock
+        // pauses virtual resolution for the walk; header and body processing continue.
+        let _guard = self.virtual_stores.upgradable_read();
         let sink = self.lkg_virtual_state.load().ghostdag_data.selected_parent;
         let started = std::time::Instant::now();
         match self.shielded_state_manager.global_set_matches_snapshot(sink) {

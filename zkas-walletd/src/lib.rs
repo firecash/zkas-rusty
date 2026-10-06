@@ -504,11 +504,22 @@ fn require_custodial(state: &AppState) -> Result<(), (StatusCode, Json<serde_jso
 /// must name its anchor block (`kaspa_shielded_core::bundle::BUNDLE_FLAG_ANCHOR_BLOCK`).
 static SECURITY_FORK: std::sync::OnceLock<kaspa_consensus_core::config::params::ForkActivation> = std::sync::OnceLock::new();
 
-/// Whether a spend built now must name its anchor block, judged at the wallet's synced DAA score.
-/// Near the boundary a transaction can land on the other side; consensus then rejects it and the
-/// wallet re-proves, which costs time and never funds.
+/// The node's virtual DAA score as last seen by any sync pass (process-wide; a wallet's own
+/// `chain_len` is refreshed only when that wallet syncs, and a parked wallet can trail by minutes).
+static NODE_TIP_DAA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn note_node_tip(daa_score: u64) {
+    NODE_TIP_DAA.fetch_max(daa_score, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether a spend built now must name its anchor block. Judged at the highest DAA score known
+/// (the caller's, or the node tip seen by any sync pass), because the rule applies by the DAA of
+/// the block that includes the spend, which is at or above the tip. Near the boundary a
+/// transaction can still land on the other side; consensus then rejects it and the wallet
+/// re-proves, which costs time and never funds.
 fn security_fork_active(daa_score: u64) -> bool {
-    SECURITY_FORK.get().is_some_and(|f| f.is_active(daa_score))
+    let at = daa_score.max(NODE_TIP_DAA.load(std::sync::atomic::Ordering::Relaxed));
+    SECURITY_FORK.get().is_some_and(|f| f.is_active(at))
 }
 
 /// The network's maximum shielded anchor age (blue score): a spend whose anchor is older than this
@@ -6914,6 +6925,7 @@ async fn sync_loop(state: Arc<AppState>) {
             };
             if chain_len > 0 {
                 *state.node_tip.lock().await = (chain_len, std::time::Instant::now());
+                note_node_tip(chain_len);
             }
             // Advance the active wallets with BOUNDED CONCURRENCY across the idle cores.
             // A single sequential loop pinned exactly one core (the per-wallet scan and
@@ -11450,13 +11462,13 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
     // `ZKAS_SECURITY_FORK_DAA` overrides the activation for a test network started with an
     // override-params file (refused on mainnet, as the node refuses overrides there).
     let fork = match std::env::var("ZKAS_SECURITY_FORK_DAA").ok().and_then(|v| v.parse::<u64>().ok()) {
-        Some(d) if cfg.network != "mainnet" => kaspa_consensus_core::config::params::ForkActivation::new(d),
+        Some(d) if state_prefix_network(&cfg.network) != kaspa_consensus_core::network::NetworkType::Mainnet => kaspa_consensus_core::config::params::ForkActivation::new(d),
         _ => kaspa_consensus_core::config::params::Params::from(state_prefix_network(&cfg.network)).security_fork_activation,
     };
     let _ = SECURITY_FORK.set(fork);
     // `ZKAS_MAX_ANCHOR_AGE` likewise mirrors an override-params file on a test network.
     let max_anchor_age = match std::env::var("ZKAS_MAX_ANCHOR_AGE").ok().and_then(|v| v.parse::<u64>().ok()) {
-        Some(a) if cfg.network != "mainnet" => a,
+        Some(a) if state_prefix_network(&cfg.network) != kaspa_consensus_core::network::NetworkType::Mainnet => a,
         _ => kaspa_consensus_core::config::params::Params::from(state_prefix_network(&cfg.network)).max_shielded_anchor_age(),
     };
     let _ = MAX_ANCHOR_AGE.set(max_anchor_age);
@@ -11610,6 +11622,7 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
                             failures = 0;
                             *state.node_error.lock().unwrap_or_else(|p| p.into_inner()) = None;
                             *state.node_tip.lock().await = (d.virtual_daa_score, std::time::Instant::now());
+                            note_node_tip(d.virtual_daa_score);
                         }
                         Err(e) => {
                             failures += 1;
