@@ -114,8 +114,41 @@ pub fn chunk_fee(base_fee: u64, n_spends: usize) -> u64 {
     base_fee.max(min_relay_fee_for_spends(n_spends))
 }
 
-/// Find the number of value-descending notes needed for a single transaction.
-/// The note count and byte-priced fee are solved to a fixed point.
+/// The smallest a single note must be to pay `amount` on its own, fee included.
+pub fn single_note_target(amount: u64, base_fee: u64) -> u64 {
+    amount.saturating_add(chunk_fee(base_fee, 1))
+}
+
+/// The order notes are spent in, as a sort key (ascending).
+///
+/// A note that can pay the whole amount BY ITSELF comes first, smallest such note
+/// first; everything else follows largest-first.
+///
+/// The second half is the old rule, and on its own it is why a 100 ZKAS payment
+/// from a wallet holding 10 000 and 102 broke the 10 000: ordering was purely
+/// value-descending, and selection takes a prefix of that order. Spending the
+/// smallest note that covers the payment leaves the large note whole and keeps
+/// the change small.
+///
+/// Largest-first still governs everything else, deliberately: when no single note
+/// covers the payment, taking the largest reaches the amount in the FEWEST notes,
+/// and the note count sets both the fee (priced per action) and whether the
+/// payment fits one transaction at all.
+pub fn spend_order_key(value: u64, single_target: u64) -> (u8, u64) {
+    if value >= single_target { (0, value) } else { (1, u64::MAX - value) }
+}
+
+/// Put candidate notes in spend order. Callers holding the notes themselves must
+/// order with [`spend_order_key`] and the same target, or the note they witness
+/// will not be the note that was planned.
+pub fn sort_for_spend(values: &mut [u64], amount: u64, base_fee: u64) {
+    let target = single_note_target(amount, base_fee);
+    values.sort_unstable_by_key(|v| spend_order_key(*v, target));
+}
+
+/// Find the number of notes needed for a single transaction, taking them in the
+/// order given (see [`spend_order_key`]). The note count and byte-priced fee are
+/// solved to a fixed point.
 pub fn select_spend_count(values: &[u64], amount: u64, base_fee: u64, max_per_tx: usize) -> Result<(usize, u64), PlanError> {
     if amount == 0 {
         return Err(PlanError::ZeroAmount);
@@ -151,7 +184,7 @@ pub fn plan_payment(mut note_values: Vec<u64>, amount: u64, base_fee: u64, max_p
     if max_per_tx == 0 {
         return Err(PlanError::NoSpendCapacity);
     }
-    note_values.sort_unstable_by(|a, b| b.cmp(a));
+    sort_for_spend(&mut note_values, amount, base_fee);
 
     let mut chunks = Vec::new();
     let mut remaining = amount;
@@ -202,6 +235,67 @@ mod tests {
         assert!(min_relay_fee_for_spends(6) >= observed);
         assert_eq!(chunk_fee(DEFAULT_FEE_SOMPI, 1), DEFAULT_FEE_SOMPI);
         assert!(min_relay_fee_for_spends(4) > DEFAULT_FEE_SOMPI);
+    }
+
+    #[test]
+    fn spends_the_smallest_note_that_covers_the_payment() {
+        // The reported behaviour: a wallet holding 10 000 and 102 paid 100 by
+        // breaking the 10 000 note, because the order was purely value-descending
+        // and selection takes a prefix of it.
+        let fee = DEFAULT_FEE_SOMPI;
+        let plan = plan_payment(vec![10_000_000_000_000, 10_200_000_000], 10_000_000_000, fee, 38).unwrap();
+        assert_eq!(plan.chunks.len(), 1);
+        assert_eq!(plan.chunks[0].note_range, 0..1);
+        // The note actually spent is the small one, not the large one.
+        assert_eq!(plan.sorted_note_values[0], 10_200_000_000);
+    }
+
+    #[test]
+    fn picks_the_tightest_fit_among_several_that_would_do() {
+        let fee = DEFAULT_FEE_SOMPI;
+        let notes = vec![500_000_000_000, 11_000_000_000, 90_000_000_000, 10_500_000_000];
+        let plan = plan_payment(notes, 10_000_000_000, fee, 38).unwrap();
+        assert_eq!(plan.chunks[0].note_range, 0..1);
+        assert_eq!(plan.sorted_note_values[0], 10_500_000_000);
+    }
+
+    #[test]
+    fn a_note_that_covers_the_amount_but_not_the_fee_is_not_treated_as_enough() {
+        // Exactly the amount with nothing left for the fee is NOT a single-note
+        // payment: the target is amount + fee, and ignoring that would plan a
+        // transaction that cannot pay to be mined.
+        let fee = DEFAULT_FEE_SOMPI;
+        let amount = 10_000_000_000;
+        let plan = plan_payment(vec![amount, 40_000_000_000], amount, fee, 38).unwrap();
+        let spent: u64 = plan.sorted_note_values[plan.chunks[0].note_range.clone()].iter().sum();
+        assert!(spent >= amount + plan.chunks[0].fee, "planned {spent} for amount {amount} + fee");
+        assert_eq!(plan.sorted_note_values[0], 40_000_000_000);
+    }
+
+    #[test]
+    fn falls_back_to_largest_first_when_no_single_note_covers() {
+        // Unchanged from the old rule, and deliberately: the fewest notes means
+        // the smallest fee and the best chance of fitting one transaction.
+        let fee = DEFAULT_FEE_SOMPI;
+        let notes = vec![3_000_000_000, 9_000_000_000, 1_000_000_000, 8_000_000_000];
+        let plan = plan_payment(notes, 16_000_000_000, fee, 38).unwrap();
+        assert_eq!(plan.sorted_note_values, vec![9_000_000_000, 8_000_000_000, 3_000_000_000, 1_000_000_000]);
+        assert_eq!(plan.chunks[0].note_range, 0..2);
+    }
+
+    #[test]
+    fn the_order_is_total_and_agrees_with_itself() {
+        // walletd sorts the NOTES with this key while the engine sorts their
+        // VALUES; if the two disagreed, the note witnessed would not be the note
+        // planned. Same key, same target, same order.
+        let target = single_note_target(10_000_000_000, DEFAULT_FEE_SOMPI);
+        let mut values = vec![1, 10_200_000_000, 10_000_000_000_000, 7, 10_000_000_000];
+        let mut by_key = values.clone();
+        by_key.sort_unstable_by_key(|v| spend_order_key(*v, target));
+        sort_for_spend(&mut values, 10_000_000_000, DEFAULT_FEE_SOMPI);
+        assert_eq!(values, by_key);
+        // Covers-alone notes first (ascending), then the rest descending.
+        assert_eq!(values, vec![10_200_000_000, 10_000_000_000_000, 10_000_000_000, 7, 1]);
     }
 
     #[test]

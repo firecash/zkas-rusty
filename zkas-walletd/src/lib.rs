@@ -83,7 +83,7 @@ use zkas_sdk::{
 };
 use zkas_wallet_engine::{
     DEFAULT_FEE_SOMPI, chunk_fee, max_payees_per_tx, max_spends_per_tx, min_relay_fee_for_actions, plan_payment,
-    select_spend_count as engine_select_spend_count,
+    select_spend_count as engine_select_spend_count, single_note_target, spend_order_key,
 };
 
 /// 1 FC = 10^8 sompi.
@@ -8129,6 +8129,19 @@ fn memo_bytes(m: Option<&str>) -> Result<[u8; 512], (StatusCode, Json<serde_json
 /// even though every other note is spendable. Selection skips them; their value
 /// is returned so error messages can be honest about funds that exist on-chain
 /// but need a state graft (`--graft`) to spend. Unsorted — callers order.
+/// Put spend candidates in the engine's order (see `spend_order_key`): the
+/// smallest note that can pay the whole amount by itself first, otherwise
+/// largest-first.
+///
+/// This MUST agree with `plan_payment` / `select_spend_count`, which take a
+/// PREFIX of the order they are given. The engine sorts the values; this sorts
+/// the notes those values came from. If the two disagreed, the note witnessed
+/// and spent would not be the note that was planned.
+fn sort_candidates_for_spend<T: std::borrow::Borrow<OwnedNote>>(candidates: &mut [T], amount: u64, base_fee: u64) {
+    let target = single_note_target(amount, base_fee);
+    candidates.sort_unstable_by_key(|n| spend_order_key(n.borrow().value(), target));
+}
+
 fn matured_candidates(db: &WalletDb, matured: u64) -> (Vec<&OwnedNote>, u64) {
     let stranded = db.stranded_notes();
     let stranded_value: u64 = stranded.iter().map(|n| n.value()).sum();
@@ -8404,7 +8417,7 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
         let cutoff_blue = e.sink_blue.saturating_sub(DEFAULT_ANCHOR_DEPTH + ANCHOR_SLACK);
         if let Some(matured) = e.boundaries.iter().rev().find(|(bs, _)| *bs <= cutoff_blue).map(|&(_, lc)| lc) {
             let (mut candidates, stranded_value) = matured_candidates(&e.db, matured);
-            candidates.sort_by(|a, b| b.value().cmp(&a.value()));
+            sort_candidates_for_spend(&mut candidates, amount, fee);
             let values: Vec<u64> = candidates.iter().map(|n| n.value()).collect();
             let have: u64 = values.iter().sum();
             match plan_chunks(&values, amount, fee, max_per_tx) {
@@ -8455,7 +8468,7 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
             let fresh = WalletDb::from_seed(seed).ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "bad seed"))?;
             let db = replay_matured(client, state.genesis, fresh).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
             let mut candidates = db.notes().to_vec();
-            candidates.sort_by(|a, b| b.value().cmp(&a.value()));
+            sort_candidates_for_spend(&mut candidates, amount, fee);
             let values: Vec<u64> = candidates.iter().map(|n| n.value()).collect();
             let have: u64 = values.iter().sum();
             let plan = plan_chunks(&values, amount, fee, max_per_tx).ok_or_else(|| insufficient(have, 0))?;
@@ -8760,10 +8773,10 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
         tokio::task::block_in_place(|| e.advance_spend_witnesses_bounded(shared_covers, shared_base));
         let matured = e.matured_leaves().ok_or_else(|| err(StatusCode::CONFLICT, "wallet has no matured anchor yet"))?;
         let (mut candidates, stranded) = matured_candidates(&e.db, matured);
-        candidates.sort_by(|a, b| b.value().cmp(&a.value()));
+        sort_candidates_for_spend(&mut candidates, requested, base_fee);
         let have: u64 = candidates.iter().map(|n| n.value()).sum();
 
-        // Walk the groups, consuming value-descending notes as each is covered. The
+        // Walk the groups, consuming notes in spend order as each is covered. The
         // per-tx fee is priced on the bundle's ACTION count — `max(spends, payees+1)` —
         // because that, not the spend count alone, is what the node charges mass for.
         let mut taken = 0usize;
@@ -9374,7 +9387,7 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
                 let cutoff_blue = e.sink_blue.saturating_sub(DEFAULT_ANCHOR_DEPTH + ANCHOR_SLACK);
                 if let Some(matured) = e.boundaries.iter().rev().find(|(bs, _)| *bs <= cutoff_blue).map(|&(_, lc)| lc) {
                     let (mut candidates, _stranded) = matured_candidates(&e.db, matured);
-                    candidates.sort_by(|a, b| b.value().cmp(&a.value()));
+                    sort_candidates_for_spend(&mut candidates, amount, base_fee);
                     have_total = Some(candidates.iter().map(|n| n.value()).sum());
                     fast_path = true;
                     let values: Vec<u64> = candidates.iter().map(|n| n.value()).collect();
@@ -9447,7 +9460,7 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
         log::info!("non-custodial prepare: watch-only matured chain replay...");
         let db = replay_matured(client, state.genesis, db).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
         let mut candidates = db.notes().to_vec();
-        candidates.sort_by(|a, b| b.value().cmp(&a.value()));
+        sort_candidates_for_spend(&mut candidates, amount, base_fee);
         have_total = Some(candidates.iter().map(|n| n.value()).sum());
         let values: Vec<u64> = candidates.iter().map(|n| n.value()).collect();
         let (mut take, mut dyn_fee) = select_spend_count(&values, amount, base_fee, max_per_tx);
