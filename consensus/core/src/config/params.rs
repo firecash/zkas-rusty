@@ -1232,6 +1232,26 @@ pub const DEVNET_PARAMS: Params = Params {
 mod tests {
     use super::*;
 
+    /// kaspad refuses to start when `max_shielded_anchor_age >= finality_depth` (an anchor window
+    /// deeper than the chain segment a fast-synced node holds below its pruning point). Every shipped
+    /// network must pass that check, and the security fork must be off on mainnet until a score is set.
+    #[test]
+    fn shipped_networks_keep_the_anchor_window_inside_finality() {
+        for p in [MAINNET_PARAMS, TESTNET_PARAMS, SIMNET_PARAMS, DEVNET_PARAMS] {
+            assert!(p.max_shielded_anchor_age() < p.finality_depth(), "{:?}", p.net);
+            assert!(p.blockrate.shielded_anchor_depth < p.max_shielded_anchor_age(), "{:?}", p.net);
+        }
+        assert!(!MAINNET_PARAMS.security_fork_activation.is_active(u64::MAX - 1));
+    }
+
+    #[test]
+    fn override_params_deserializes_security_fork_activation() {
+        let o: OverrideParams = serde_json::from_str(r#"{"security_fork_activation":150}"#).unwrap();
+        let p = DEVNET_PARAMS.override_params(o);
+        assert!(!p.security_fork_activation.is_active(149));
+        assert!(p.security_fork_activation.is_active(150));
+    }
+
     #[test]
     fn override_params_deserializes_toccata_activation() {
         let override_params: OverrideParams = serde_json::from_str(r#"{"toccata_activation":42}"#).unwrap();
