@@ -19,6 +19,7 @@ workspace = true
 kaspa-addresses.workspace = true
 # gRPC transport to a running kaspad (ZKas) node.
 kaspa-grpc-client.workspace = true
+kaspa-pow.workspace = true
 kaspa-rpc-core.workspace = true
 kaspa-consensus-core.workspace = true
 # Circulating supply is read from the SAME emission schedule consensus uses to build
