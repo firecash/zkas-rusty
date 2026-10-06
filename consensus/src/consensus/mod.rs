@@ -2166,7 +2166,13 @@ impl ConsensusApi for Consensus {
             return Err(ConsensusError::BlockTooDeep(block_hash));
         }
 
-        let header = self.headers_store.get_header(block_hash).unwrap();
+        // Errors, not unwraps: this path is reachable by anonymous RPC, and a panic is a process
+        // exit. The pruner retains these headers today; a future retention change must not turn
+        // that into a remote kill.
+        let header = self
+            .headers_store
+            .get_header(block_hash)
+            .map_err(|_| ConsensusError::GeneralOwned(format!("header of {block_hash} is not available")))?;
 
         // KIP-21 activity_root only exists post-Toccata. Drop the gate after all
         // nets activate.
@@ -2175,7 +2181,10 @@ impl ConsensusApi for Consensus {
         }
 
         let selected_parent = header.post_toccata_chainblock_selected_parent();
-        let parent_header = self.headers_store.get_header(selected_parent).unwrap();
+        let parent_header = self
+            .headers_store
+            .get_header(selected_parent)
+            .map_err(|_| ConsensusError::BlockTooDeep(block_hash))?;
 
         let finality_depth = self.config.params.finality_depth();
         let current_bounds = SmtReadBounds::for_pov(header.blue_score, finality_depth);
@@ -2406,6 +2415,23 @@ impl ConsensusApi for Consensus {
                 kaspa_consensus_core::api::MAX_SHIELDED_NULLIFIER_IMPORT_COUNT
             )));
         }
+        // Bind the metadata to the PoW-committed root and bound the declared count by the committed
+        // note count BEFORE consuming a single chunk. Previously both ran after the whole stream was
+        // buffered (up to 2^26 entries), so a peer could force a multi-GiB allocation and minutes of
+        // MuHash work with metadata that was never going to pass.
+        {
+            use crate::processes::shielded::{PruningPointShieldedMetadata, ShieldedStateManager};
+            let md = PruningPointShieldedMetadata::from_wire_bytes(&metadata.data).map_err(PruningImportError::ShieldedStateError)?;
+            if let Some(committed) = expected_state_root {
+                ShieldedStateManager::verify_import_binding(&md, committed).map_err(PruningImportError::ShieldedStateError)?;
+            }
+            if metadata.nullifier_count > md.frontier.size {
+                return Err(PruningImportError::ShieldedStateError(format!(
+                    "declared nullifier count {} exceeds the committed note count {}; a spend implies a note",
+                    metadata.nullifier_count, md.frontier.size
+                )));
+            }
+        }
         let mut nullifiers: Vec<[u8; 32]> = Vec::new();
         for batch in nullifier_batches {
             nullifiers.extend(batch);
@@ -2416,9 +2442,16 @@ impl ConsensusApi for Consensus {
                 )));
             }
         }
-        self.virtual_processor
-            .seed_pruning_point_shielded(new_pruning_point, metadata, expected_state_root, nullifiers)
+        // One write: clear of the old state, seed of the verified new state, stable flag false
+        // (the flow sets it true after this returns). A failure anywhere above changes nothing.
+        let mut batch = rocksdb::WriteBatch::default();
+        let n = self
+            .virtual_processor
+            .seed_pruning_point_shielded(&mut batch, new_pruning_point, metadata, expected_state_root, nullifiers)
             .map_err(PruningImportError::ShieldedStateError)?;
+        self.pruning_meta_stores.write().set_pruning_shielded_stable_flag(&mut batch, false).unwrap();
+        self.db.write(batch).unwrap();
+        info!("Imported shielded state for pruning point {}: {} nullifiers imported", new_pruning_point, n);
         Ok(())
     }
 
@@ -2648,16 +2681,18 @@ mod tests {
             other => panic!("expected sanity-cap ShieldedStateError, got {other:?}"),
         }
 
-        // 2. Stream longer than declared: fail early as soon as the buffered
-        //    entries exceed the declared count (pre-fix: buffered everything first).
+        // 2. Metadata is decoded and bound BEFORE the stream is touched: with malformed metadata
+        //    not a single chunk may be consumed (pre-fix: the whole stream was buffered first and
+        //    the metadata checked afterwards). The early-overrun rule for VALID metadata is
+        //    covered by `imported_anchor_pairs_are_kept_only_for_provable_window_sources`.
         let metadata = ShieldedExportMetadata { data: vec![], nullifier_count: 1 };
-        let mut over = vec![vec![[7u8; 32]; 2]].into_iter();
-        match consensus.import_pruning_point_shielded(pp, metadata, None, &mut over) {
-            Err(PruningImportError::ShieldedStateError(msg)) => {
-                assert!(msg.contains("exceed the declared count"), "early-overrun error, got: {msg}")
-            }
-            other => panic!("expected early-overrun ShieldedStateError, got {other:?}"),
-        }
+        let polled = std::sync::atomic::AtomicBool::new(false);
+        let mut watched = std::iter::from_fn(|| {
+            polled.store(true, std::sync::atomic::Ordering::SeqCst);
+            Some(vec![[7u8; 32]; 2])
+        });
+        assert!(consensus.import_pruning_point_shielded(pp, metadata, None, &mut watched).is_err(), "malformed metadata is refused");
+        assert!(!polled.load(std::sync::atomic::Ordering::SeqCst), "no chunk may be read before the metadata is validated");
 
         // 3. The cap itself is not off-by-one hostile: a declared count within the
         //    cap passes the F-08 checks (it then fails later on malformed metadata —

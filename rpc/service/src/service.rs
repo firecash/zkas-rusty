@@ -977,8 +977,18 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         const DEFAULT_LIMIT: usize = 500;
         const MAX_LIMIT: usize = 2000;
 
+        // Every recipient is compared against every coinbase output of every scanned block, so
+        // an uncapped list made one anonymous call cost O(blocks x outputs x recipients).
+        const MAX_RECIPIENTS: usize = 256;
+
         if request.recipients.is_empty() {
             return Err(RpcError::General("at least one recipient is required".to_string()));
+        }
+        if request.recipients.len() > MAX_RECIPIENTS {
+            return Err(RpcError::General(format!(
+                "at most {MAX_RECIPIENTS} recipients per call; got {}",
+                request.recipients.len()
+            )));
         }
         if let Some(bad) = request.recipients.iter().find(|r| r.len() != RECIPIENT_LEN) {
             return Err(RpcError::General(format!(
@@ -1216,7 +1226,7 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         //
         // TODO: optimize using binary search over the samples to obtain O(m log n) complexity (which is an improvement assuming m << n)
         while header_idx < headers.len() && req_idx < request.daa_scores.len() {
-            let header = headers.get(header_idx).unwrap();
+            let header = &headers[header_idx];
             let curr_daa_score = requested_daa_scores[req_idx];
 
             // Found daa_score in range
@@ -1246,8 +1256,20 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
             }
         }
 
-        // Note: it is safe to assume all entries exist in the map since the first sampled header is expected to have daa_score=0
-        let timestamps = request.daa_scores.iter().map(|curr_daa_score| daa_score_timestamp_map[curr_daa_score]).collect();
+        // The oldest sample is genesis only on an archival node. On a pruned node a requested score
+        // can be older than every sample, and indexing the map for it panicked (= process exit,
+        // anonymous RPC). Extrapolate backwards from the oldest sample at the target block time.
+        let oldest = headers.last().ok_or_else(|| RpcError::General("no chain block samples available".to_string()))?;
+        let timestamps = request
+            .daa_scores
+            .iter()
+            .map(|curr_daa_score| match daa_score_timestamp_map.get(curr_daa_score) {
+                Some(ts) => *ts,
+                None => oldest.timestamp.saturating_sub(
+                    oldest.daa_score.saturating_sub(*curr_daa_score).saturating_mul(self.config.target_time_per_block()),
+                ),
+            })
+            .collect();
 
         Ok(GetDaaScoreTimestampEstimateResponse::new(timestamps))
     }

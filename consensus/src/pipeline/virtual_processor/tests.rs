@@ -1580,3 +1580,77 @@ async fn shielded_chain_range_is_fully_servable_from_the_retained_archive() {
     }
     assert!(minting >= 3, "expected several minting blocks in the range, got {minting}");
 }
+
+/// AUDIT 2026-10-05 B-1 / F-1 (ZK-01), ported from the lead auditor's proof of concept and
+/// extended. The import must refuse peer anchor pairs whose source is not a provable window
+/// block (future block, block that never existed), must not take the peer's blue score, and
+/// must still accept an honest in-window pair, or a fresh node wedges on its first spend.
+#[tokio::test]
+async fn imported_anchor_pairs_are_kept_only_for_provable_window_sources() {
+    let mut params = MAINNET_PARAMS.clone();
+    params.shielded_coinbase = true;
+    let config = ConfigBuilder::new(params)
+        .edit_consensus_params(|p| {
+            p.genesis.bits = 0x207fffff;
+            p.blockrate.shielded_anchor_depth = 1;
+        })
+        .build();
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+    let miner_addr = kaspa_shielded_core::wallet::address_bytes_from_seed([7u8; 32]).expect("orchard address");
+    ctx.miner_data = MinerData::new(ScriptPublicKey::new(0, ScriptVec::from_slice(&miner_addr)), vec![]);
+
+    let mut chain = Vec::new();
+    for _ in 0..8 {
+        let b = ctx.mine_real_pow_block();
+        let h = b.header.hash;
+        ctx.consensus.validate_and_insert_block(b).virtual_state_task.await.unwrap();
+        chain.push(h);
+    }
+    let vp = ctx.consensus.virtual_processor();
+    let blue_score = |h: Hash| ctx.consensus.get_header(h).unwrap().blue_score;
+    let (honest_src, pp, real_future_block, tip) = (chain[1], chain[2], chain[5], chain[7]);
+    let r_honest = [0x22u8; 32];
+    let r_future = [0x33u8; 32];
+    let r_ghost = [0x44u8; 32];
+    let s_ghost = Hash::from_bytes([0x55u8; 32]);
+
+    let mut md = vp.shielded_state_manager_ref().export_pruning_point_shielded(pp).unwrap().expect("pp has shielded state");
+    md.in_window_anchors.push((r_honest, honest_src));
+    md.in_window_anchors.push((r_future, real_future_block));
+    md.in_window_anchors.push((r_ghost, s_ghost));
+    md.in_window_anchor_source_scores.push((s_ghost, blue_score(tip).saturating_sub(10)));
+    // A lying score for a real source must be replaced by the header's own value.
+    md.in_window_anchor_source_scores.push((honest_src, 0));
+    let committed = md.state_root;
+    let wire = kaspa_consensus_core::api::ShieldedExportMetadata { data: md.to_wire_bytes(), nullifier_count: 0 };
+    let mut none = std::iter::empty::<Vec<[u8; 32]>>();
+    ctx.consensus.import_pruning_point_shielded(pp, wire, Some(committed), &mut none).expect("honest state imports");
+
+    assert!(
+        !vp.is_shielded_anchor_final(&r_future, tip, blue_score(tip)),
+        "a pair naming a block above the pruning point must not be seeded"
+    );
+    assert!(!vp.is_shielded_anchor_final(&r_ghost, tip, blue_score(tip)), "a pair naming a block with no header must not be seeded");
+    assert_eq!(
+        vp.shielded_state_manager_ref().attested_source_blue_score(honest_src).unwrap(),
+        Some(blue_score(honest_src)),
+        "the stored score is the header's, not the peer's"
+    );
+    assert_eq!(vp.shielded_state_manager_ref().attested_source_blue_score(s_ghost).unwrap(), None, "no score for a dropped source");
+    assert!(
+        vp.shielded_state_manager_ref().anchor_producer_blocks(&r_honest).unwrap().contains(&honest_src),
+        "an honest in-window pair is still seeded"
+    );
+
+    // Valid metadata, stream longer than declared: refused as soon as it overruns, and the
+    // previously imported state is left exactly as it was (nothing is cleared on failure).
+    let md = vp.shielded_state_manager_ref().export_pruning_point_shielded(pp).unwrap().expect("pp has shielded state");
+    let wire = kaspa_consensus_core::api::ShieldedExportMetadata { data: md.to_wire_bytes(), nullifier_count: 0 };
+    let mut over = vec![vec![[7u8; 32]; 2]].into_iter();
+    let err = ctx.consensus.import_pruning_point_shielded(pp, wire, Some(committed), &mut over).unwrap_err();
+    assert!(err.to_string().contains("exceed the declared count"), "early-overrun error, got: {err}");
+    assert!(
+        vp.shielded_state_manager_ref().anchor_producer_blocks(&r_honest).unwrap().contains(&honest_src),
+        "a failed import must not clear the state imported before it"
+    );
+}

@@ -1260,10 +1260,10 @@ impl IbdFlow {
             }
         }
 
-        // F-15: the real clear (global nullifier set + pruning-point snapshots + stable flag,
-        // atomically) — only here, immediately before the re-seed, and only after the
-        // no-validated-descendants check above.
-        consensus.async_clear_pruning_shielded_stores().await;
+        // The clear is no longer issued here. It is staged in the same write as the verified seed
+        // (Consensus::import_pruning_point_shielded), so a peer that stalls, lies or disconnects
+        // mid-transfer leaves the local state exactly as it was. Only the verified-empty path
+        // below clears on its own.
 
         info!("downloading the pruning point shielded state from {}", self.router);
 
@@ -1290,6 +1290,8 @@ impl IbdFlow {
                     )));
                 }
             }
+            // Verified empty: drop whatever stale local state brought us here, then mark stable.
+            consensus.async_clear_pruning_shielded_stores().await;
             consensus.async_set_pruning_shielded_stable().await;
             info!("pruning point {} has no shielded state to import", pruning_point);
             return Ok(());

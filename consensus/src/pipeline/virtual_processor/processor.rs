@@ -487,15 +487,61 @@ impl VirtualStateProcessor {
     /// declared state root must equal this PoW-committed value (the coinbase
     /// `shielded_commitment` of the pruning point's selected child) BEFORE anything
     /// is seeded — the import is otherwise entirely attacker-controlled.
+    /// The in-window anchor pairs and source scores are peer-supplied and outside the committed
+    /// state root. Keep a pair only if its source is a header this node holds (the PoW-verified
+    /// chain segment / trusted window), is a selected-chain ancestor of the pruning point, and lies
+    /// in [pp.blue_score - max_shielded_anchor_age, pp.blue_score]. Replace every source score with
+    /// the header's own blue score; the peer's integers are discarded.
+    ///
+    /// Nothing honest is lost: every block validated after the import has blue score above the
+    /// pruning point's, so a source older than the window can never be final for it, and every
+    /// honest in-window source is a chain ancestor of the pruning point whose header was synced.
+    /// What remains open until the fork binds roots to blocks is a fake root paired with a real
+    /// window block; this closes fake, future and out-of-window sources and the free score.
+    fn retain_provable_window_anchors(
+        &self,
+        pp: kaspa_hashes::Hash,
+        md: &mut crate::processes::shielded::PruningPointShieldedMetadata,
+    ) -> Result<(), String> {
+        let pp_bs = self.headers_store.get_blue_score(pp).map_err(|e| format!("pruning point header {pp}: {e}"))?;
+        let lo = pp_bs.saturating_sub(self.max_shielded_anchor_age);
+        let mut proven: kaspa_consensus_core::BlockHashMap<u64> = kaspa_consensus_core::BlockHashMap::new();
+        let before = md.in_window_anchors.len();
+        md.in_window_anchors.retain(|(_, source)| {
+            if let Some(bs) = proven.get(source) {
+                return *bs >= lo;
+            }
+            let Ok(bs) = self.headers_store.get_blue_score(*source) else { return false };
+            let ok = bs >= lo
+                && bs <= pp_bs
+                && matches!(self.reachability_service.try_is_chain_ancestor_of(*source, pp), Ok(true));
+            if ok {
+                proven.insert(*source, bs);
+            }
+            ok
+        });
+        md.in_window_anchor_source_scores = proven.into_iter().collect();
+        let dropped = before - md.in_window_anchors.len();
+        if dropped > 0 {
+            warn!("pruning-point import: dropped {dropped} of {before} peer anchor pairs whose source is not a provable window block");
+        }
+        Ok(())
+    }
+
+    /// Verifies the imported pruning-point state and stages, into `batch`, the clear of the old
+    /// state followed by the seed of the new one. Nothing is written here: the caller writes the
+    /// batch once, so there is no moment at which the node holds an empty nullifier set, and a
+    /// failed verification leaves the old state untouched.
     pub fn seed_pruning_point_shielded(
         &self,
+        batch: &mut WriteBatch,
         pp: kaspa_hashes::Hash,
         metadata: kaspa_consensus_core::api::ShieldedExportMetadata,
         expected_state_root: Option<[u8; 32]>,
         nullifiers: Vec<[u8; 32]>,
-    ) -> Result<(), String> {
+    ) -> Result<usize, String> {
         use crate::processes::shielded::{PruningPointShieldedMetadata, ShieldedStateManager};
-        let md = PruningPointShieldedMetadata::from_wire_bytes(&metadata.data)?;
+        let mut md = PruningPointShieldedMetadata::from_wire_bytes(&metadata.data)?;
         // F-02: reject the import before seeding if it does not match the
         // PoW-committed shielded state root (peer can be dropped; another syncer
         // can be tried).
@@ -503,16 +549,19 @@ impl VirtualStateProcessor {
             ShieldedStateManager::verify_import_binding(&md, committed)?;
         }
         let n = ShieldedStateManager::verify_pruning_point_shielded(&md, nullifiers.iter())?;
+        self.retain_provable_window_anchors(pp, &mut md)?;
         if n as u64 != metadata.nullifier_count {
             return Err(format!("nullifier count mismatch: metadata says {}, streamed {}", metadata.nullifier_count, n));
         }
-        let mut batch = WriteBatch::default();
+        // Clear first, then seed, in the same batch. Every seed write is an overwrite, and a
+        // WriteBatch applies in order, so a nullifier in both the old and the new set ends present.
         self.shielded_state_manager
-            .seed_pruning_point_shielded(&mut batch, pp, &md, nullifiers.iter())
+            .clear_for_pruning_reimport(batch, pp)
+            .map_err(|e| format!("staging the shielded clear failed: {e:?}"))?;
+        self.shielded_state_manager
+            .seed_pruning_point_shielded(batch, pp, &md, nullifiers.iter())
             .map_err(|e| format!("seeding shielded stores failed: {e:?}"))?;
-        self.db.write(batch).unwrap();
-        info!("Imported shielded state for pruning point {}: {} nullifiers imported", pp, n);
-        Ok(())
+        Ok(n)
     }
 
     /// The locally held shielded state root (PLAN §2.10) as of `block`, recomputed
@@ -1427,9 +1476,18 @@ impl VirtualStateProcessor {
             .get(pp)
             .map_err(|_| ConsensusError::GeneralOwned(format!("SMT metadata not found for pruning point {pp}")))?;
 
-        let pp_header = self.headers_store.get_header(pp).unwrap();
-        let parent = pp_header.direct_parents()[0];
-        let parent_header = self.headers_store.get_header(parent).unwrap();
+        let pp_header = self
+            .headers_store
+            .get_header(pp)
+            .map_err(|_| ConsensusError::GeneralOwned(format!("pruning point header {pp} is not available")))?;
+        let parent = *pp_header
+            .direct_parents()
+            .first()
+            .ok_or_else(|| ConsensusError::GeneralOwned(format!("pruning point {pp} has no parents")))?;
+        let parent_header = self
+            .headers_store
+            .get_header(parent)
+            .map_err(|_| ConsensusError::GeneralOwned(format!("header of the pruning point's selected parent {parent} is not available")))?;
         let parent_seq_commit = parent_header.accepted_id_merkle_root;
         let lanes_root = self
             .smt_stores

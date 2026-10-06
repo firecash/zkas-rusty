@@ -6,7 +6,7 @@ use std::{
 
 use itertools::Itertools;
 use kaspa_consensus_core::{
-    BlockHashMap, BlockHashSet, HashMapCustomHasher,
+    BlockHashMap, BlockHashSet, HashMapCustomHasher, KType,
     blockhash::{BlockHashes, ORIGIN},
     errors::pruning::{PruningImportError, PruningImportResult},
     header::Header,
@@ -68,7 +68,16 @@ impl PruningProofManager {
         // This loop expands the proof with the headers of the trusted set
         // and creates a hash to ghostdag data map of the trusted set
         for tb in trusted_set.iter() {
-            trusted_gd_map.insert(tb.block.hash(), tb.ghostdag.clone().into());
+            // The peer's ghostdag row is stored as if this node had computed it, and the next
+            // header's required blue work is read from it. Take blue score and blue work from the
+            // header (PoW-bound; honest rows always equal it) and refuse a structurally impossible
+            // mergeset before anything is written. Overlap used to panic in
+            // `descending_mergeset_without_selected_parent` (process exit) on the first child.
+            let mut gd: GhostdagData = tb.ghostdag.clone().into();
+            Self::check_trusted_ghostdag(tb.block.hash(), &gd, self.ghostdag_k)?;
+            gd.blue_score = tb.block.header.blue_score;
+            gd.blue_work = tb.block.header.blue_work;
+            trusted_gd_map.insert(tb.block.hash(), gd);
             trusted_header_map.insert(tb.block.hash(), tb.block.header.clone());
             let tb_block_level = kaspa_pow::calc_block_level_gated(
                 &tb.block.header,
@@ -370,5 +379,69 @@ impl PruningProofManager {
         }
 
         Ok(chain_segment_map)
+    }
+}
+
+impl PruningProofManager {
+    /// Structural checks that every honest trusted ghostdag row passes. Deliberately NOT
+    /// "selected_parent == mergeset_blues[0]": an honest pruned server rewrites the selected
+    /// parent of a kept block to ORIGIN when it lies outside the kept set
+    /// (`pruning_processor` keep_relations filtering), so that rule would reject honest proofs.
+    fn check_trusted_ghostdag(hash: Hash, gd: &GhostdagData, k: KType) -> PruningImportResult<()> {
+        let bad = |why: String| Err(PruningImportError::InvalidTrustedGhostdag(hash, why));
+        if gd.mergeset_blues.len() > k as usize + 1 {
+            return bad(format!("{} blues exceed k+1 = {}", gd.mergeset_blues.len(), k as usize + 1));
+        }
+        let mut seen = BlockHashSet::with_capacity(gd.mergeset_blues.len() + gd.mergeset_reds.len());
+        for h in gd.mergeset_blues.iter().chain(gd.mergeset_reds.iter()) {
+            if !seen.insert(*h) {
+                return bad(format!("{h} appears twice in the mergeset (blue/red overlap or duplicate)"));
+            }
+        }
+        if let Some((h, size)) = gd.blues_anticone_sizes.iter().find(|(_, size)| **size > k) {
+            return bad(format!("blue {h} has anticone size {size} above k = {k}"));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod trusted_ghostdag_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn h(n: u8) -> Hash {
+        Hash::from_bytes([n; 32])
+    }
+
+    fn gd(blues: &[u8], reds: &[u8], anticone: &[(u8, KType)]) -> GhostdagData {
+        GhostdagData {
+            blue_score: 1,
+            blue_work: 1u64.into(),
+            selected_parent: h(blues.first().copied().unwrap_or(0)),
+            mergeset_blues: Arc::new(blues.iter().map(|&b| h(b)).collect()),
+            mergeset_reds: Arc::new(reds.iter().map(|&r| h(r)).collect()),
+            blues_anticone_sizes: Arc::new(anticone.iter().map(|&(b, s)| (h(b), s)).collect()),
+        }
+    }
+
+    #[test]
+    fn honest_shaped_rows_pass_including_an_origin_selected_parent() {
+        let k: KType = 18;
+        PruningProofManager::check_trusted_ghostdag(h(9), &gd(&[1, 2], &[3], &[(1, 0), (2, 1)]), k).unwrap();
+        // An honest pruned server rewrites the selected parent to ORIGIN; that must still pass.
+        let mut row = gd(&[1, 2], &[], &[]);
+        row.selected_parent = ORIGIN;
+        PruningProofManager::check_trusted_ghostdag(h(9), &row, k).unwrap();
+    }
+
+    #[test]
+    fn malformed_rows_are_refused_not_panicked_on() {
+        let k: KType = 3;
+        let err = |g: GhostdagData| PruningProofManager::check_trusted_ghostdag(h(9), &g, k).is_err();
+        assert!(err(gd(&[1, 2], &[2], &[])), "blue/red overlap");
+        assert!(err(gd(&[1, 1], &[], &[])), "duplicate blue");
+        assert!(err(gd(&[1, 2, 3, 4, 5], &[], &[])), "more than k+1 blues");
+        assert!(err(gd(&[1], &[], &[(1, 4)])), "anticone size above k");
     }
 }

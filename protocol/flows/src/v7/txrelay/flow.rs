@@ -3,7 +3,10 @@ use crate::{
     flow_trait::Flow,
     flowcontext::transactions::MAX_INV_PER_TX_INV_MSG,
 };
-use kaspa_consensus_core::tx::{Transaction, TransactionId};
+use kaspa_consensus_core::{
+    errors::tx::TxRuleError,
+    tx::{Transaction, TransactionId},
+};
 use kaspa_consensusmanager::ConsensusProxy;
 use kaspa_core::{time::unix_now, warn};
 use kaspa_mining::{
@@ -229,6 +232,12 @@ impl RelayTransactionsFlow {
                 Err(MiningManagerError::MempoolError(RuleError::RejectInvalid(transaction_id))) => {
                     // TODO: discuss a banning process
                     return Err(ProtocolError::MisbehavingPeer(format!("rejected invalid transaction {}", transaction_id)));
+                }
+                Err(MiningManagerError::MempoolError(RuleError::RejectTxRule(TxRuleError::InvalidShieldedProof(reason)))) => {
+                    // A failed Halo 2 proof or signature is context-free: an honest peer verifies
+                    // before relaying, so it could not have sent this. Without this arm the peer
+                    // paid nothing for making us run proof verification on garbage.
+                    return Err(ProtocolError::MisbehavingPeer(format!("relayed a shielded transaction with an invalid proof: {reason}")));
                 }
                 Err(MiningManagerError::MempoolError(RuleError::RejectNonStandard(..))) => {
                     self.spam_counter += 1;

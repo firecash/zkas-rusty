@@ -24,6 +24,14 @@ pub enum TxRuleError {
     #[error("shielded bundle failed cryptographic verification: {0}")]
     InvalidShieldedBundle(String),
 
+    /// The Halo 2 proof, the binding signature or a spend-authorization signature failed.
+    /// Unlike every other shielded rejection this one is context-free and expensive to reach,
+    /// so a peer that relays it did not validate what it relayed: the relay flow treats it as
+    /// misbehaviour. Format and policy rejections stay `InvalidShieldedBundle` /
+    /// `InvalidShieldedTransaction`, because an honest peer on another version can send those.
+    #[error("shielded bundle proof or signature is invalid: {0}")]
+    InvalidShieldedProof(String),
+
     #[error("transaction has {0} inputs where the max allowed is {1}")]
     TooManyInputs(usize, usize),
 

@@ -2101,8 +2101,10 @@ fn select_coinbase_cmx(
             }
             Some(derived)
         }
-        // A well-formed coinbase output always derives; fall back rather than drop.
-        None => supplied,
+        // A well-formed coinbase output always derives (consensus only mints canonical
+        // 43-byte recipients). Not deriving means the data is wrong; the node's value is
+        // exactly what must not be trusted in that case.
+        None => None,
     }
 }
 
@@ -2110,10 +2112,19 @@ fn select_coinbase_cmx(
 /// and starve HTTP or kaspad while several wallets ingest concurrently. Two threads
 /// are used on a 4-core box; larger wallet hosts expand to `cores - 2`, capped at
 /// eight. This pool is shared by every wallet and never multiplies per scan.
-fn decode_block(b: &kaspa_rpc_core::RpcShieldedChainBlock) -> DecodedBlock {
+///
+/// Errors instead of skipping. The node serves only consensus-applied data, in which every
+/// coinbase output is a 43-byte recipient that derives a commitment and every action blob is a
+/// whole number of records. Anything else is a faulty or lying source; skipping it silently
+/// appended a different leaf sequence than the chain and forked the wallet tree. The caller
+/// rejects the whole page and retries.
+fn decode_block(b: &kaspa_rpc_core::RpcShieldedChainBlock) -> Result<DecodedBlock, String> {
     let mut coinbase = Vec::new();
     for (i, out) in b.coinbase_outputs.iter().enumerate() {
-        if out.script_public_key.len() >= ORCHARD_SCRIPT_LEN {
+        if out.script_public_key.len() != ORCHARD_SCRIPT_LEN {
+            return Err(format!("block {}: coinbase output {i} has a {}-byte script", b.hash, out.script_public_key.len()));
+        }
+        {
             let mut recipient = [0u8; ORCHARD_SCRIPT_LEN];
             recipient.copy_from_slice(&out.script_public_key[..ORCHARD_SCRIPT_LEN]);
             let mut note_seed = Vec::with_capacity(36);
@@ -2130,10 +2141,9 @@ fn decode_block(b: &kaspa_rpc_core::RpcShieldedChainBlock) -> DecodedBlock {
             // Never trust a coinbase leaf we cannot reproduce: derive it from the
             // PoW-committed block fields and reject a valid-but-wrong node value
             // (which would silently fork the wallet tree). See select_coinbase_cmx.
-            let cmx = select_coinbase_cmx(supplied, &desc, out.value, trust_node_cmx());
-            if let Some(cmx) = cmx {
-                coinbase.push((desc, out.value, cmx));
-            }
+            let cmx = select_coinbase_cmx(supplied, &desc, out.value, trust_node_cmx())
+                .ok_or_else(|| format!("block {}: coinbase output {i} does not derive a note commitment", b.hash))?;
+            coinbase.push((desc, out.value, cmx));
         }
     }
     // Chunk each accepted tx's compact bytes into 148-byte records; keep the txid
@@ -2141,12 +2151,12 @@ fn decode_block(b: &kaspa_rpc_core::RpcShieldedChainBlock) -> DecodedBlock {
     let mut compact = Vec::with_capacity(b.accepted_actions.len());
     let mut txids = Vec::with_capacity(b.accepted_actions.len());
     for (i, bytes) in b.accepted_actions.iter().enumerate() {
-        if let Some(records) = decode_compact_actions(bytes) {
-            compact.push(records);
-            txids.push(b.accepted_txids.get(i).map(|h| h.as_bytes()).unwrap_or([0u8; 32]));
-        }
+        let records = decode_compact_actions(bytes)
+            .ok_or_else(|| format!("block {}: accepted tx {i} carries a malformed action blob ({} bytes)", b.hash, bytes.len()))?;
+        compact.push(records);
+        txids.push(b.accepted_txids.get(i).map(|h| h.as_bytes()).unwrap_or([0u8; 32]));
     }
-    DecodedBlock {
+    Ok(DecodedBlock {
         hash: b.hash,
         blue_score: b.blue_score,
         daa_score: b.daa_score,
@@ -2155,7 +2165,7 @@ fn decode_block(b: &kaspa_rpc_core::RpcShieldedChainBlock) -> DecodedBlock {
         txids,
         coinbase_txid: b.coinbase_txid.as_bytes(),
         timestamp: b.timestamp,
-    }
+    })
 }
 
 /// Chunk a node's concatenated compact-action bytes into [`CompactActionRecord`]s.
@@ -2450,10 +2460,25 @@ async fn fetch_shielded_page(
     // single-thread ceiling), and each block decodes independently. `block_in_place`
     // moves this task off the async worker pool so the rayon fan-out doesn't stall other
     // tokio tasks; the decode is done once here and shared by every wallet via the cache.
+    let decoded_blocks = tokio::task::block_in_place(|| {
+        pool.install(|| {
+            use rayon::prelude::*;
+            raw.blocks.par_iter().map(decode_block).collect::<Result<Vec<_>, String>>()
+        })
+    });
+    let blocks = match decoded_blocks {
+        Ok(blocks) => blocks,
+        Err(why) => {
+            // Reject the whole page: never ingest a partial or inconsistent page. Release the
+            // in-flight slot so the next asker refetches instead of waiting on a dead leader.
+            cache.lock().await.in_flight.remove(&key);
+            log::warn!("rejecting shielded page from the node: {why}");
+            return Err(kaspa_rpc_core::RpcError::General(format!("inconsistent shielded page: {why}")));
+        }
+    };
     let (blocks, epks) = tokio::task::block_in_place(|| {
         pool.install(|| {
             use rayon::prelude::*;
-            let blocks = raw.blocks.par_iter().map(decode_block).collect::<Vec<_>>();
             // Decompress every ephemeral key once, here, on the same pool and in the
             // same flattening order `sync_chunk` uses to build `page_actions`. This is
             // the cohort's shared curve work; see `DecodedPage::epks`.
@@ -11875,7 +11900,7 @@ mod sdk_api_tests {
             accepted_txids: Vec::new(),
             timestamp: 0,
         };
-        let legacy = decode_block(&base);
+        let legacy = decode_block(&base).unwrap();
         assert_eq!(legacy.coinbase[0].2.to_bytes(), expected.to_bytes());
 
         let mut other_seed = seed;
@@ -11887,7 +11912,7 @@ mod sdk_api_tests {
         with_commitment.coinbase_outputs[0].commitment = Some(supplied_cmx.to_bytes());
         // Secure default: a supplied-but-wrong commitment is rejected in favour of
         // the locally-derived (PoW-committed-input) value.
-        let supplied = decode_block(&with_commitment);
+        let supplied = decode_block(&with_commitment).unwrap();
         assert_eq!(supplied.coinbase[0].2.to_bytes(), expected.to_bytes());
     }
 

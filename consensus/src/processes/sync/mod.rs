@@ -149,7 +149,9 @@ impl<
         let mut step = 1;
         let mut current_index = high_index;
         while current_index > low_index {
-            locator.push(sc_read.get_by_index(current_index).unwrap());
+            // A hole in the selected-chain index (e.g. a partly applied history backfill) must
+            // fail this request, not the process: any peer can ask for a locator.
+            locator.push(sc_read.get_by_index(current_index).map_err(|_| SyncManagerError::MissingChainData(high))?);
             if current_index < step {
                 break;
             }

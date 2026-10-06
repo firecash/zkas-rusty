@@ -38,12 +38,12 @@ pub struct TransactionValidator {
     /// version + subnetwork id + lock time + gas, every one of which is hashed into the
     /// id. Two transactions with the same id therefore verify identically, forever.
     ///
-    /// Failures are cached as well as successes. A rejected bundle re-offered by a peer is
-    /// the exact griefing pattern this defends against, and re-proving it is what makes
-    /// that griefing free (see the mempool nullifier/anchor checks, which stop most of it
-    /// arriving at all).
+    /// Only successes are cached. Caching failures let a stream of distinct garbage txids
+    /// evict the resident successes from this count-bounded, randomly evicting cache, so
+    /// every template build re-verified the mempool. Re-offers of one bad txid are stopped by
+    /// the relay flow's dedup and by the `InvalidShieldedProof` peer penalty instead.
     /// `u8` rather than `bool` only because the cache requires `MemSizeEstimator`, which is
-    /// implemented for the integer primitives and not for `bool`. 1 = verified, 0 = rejected.
+    /// implemented for the integer primitives and not for `bool`. Always 1.
     shielded_verify_cache: kaspa_database::prelude::Cache<kaspa_consensus_core::tx::TransactionId, u8>,
     toccata_activation: ForkActivation,
     mass_per_sig_op: u64,
