@@ -331,6 +331,20 @@ pub fn create_core_with_runtime(runtime: &Runtime, args: &Args, fd_total_budget:
         );
         exit(1);
     }
+    // After a reorg the reachability reindex root switches to the winning chain only once that chain
+    // is `DEFAULT_REINDEX_SLACK` taller. With a pruning depth below finality + that slack (possible
+    // only through an override file), pruning can delete a losing branch that still holds the reindex
+    // root, and the node then panics on every header. Shipped networks are far above this (mainnet
+    // 108,000 vs 43,200 + 16,384); warn so a test configuration does not get read as a code bug.
+    if params.pruning_depth() < params.finality_depth() + kaspa_consensus_core::config::constants::perf::DEFAULT_REINDEX_SLACK {
+        println!(
+            "WARNING: pruning_depth ({}) < finality_depth ({}) + reindex slack ({}): a deep reorg followed by pruning \
+             can corrupt reachability on this test configuration.",
+            params.pruning_depth(),
+            params.finality_depth(),
+            kaspa_consensus_core::config::constants::perf::DEFAULT_REINDEX_SLACK
+        );
+    }
 
     let config = Arc::new(
         ConfigBuilder::new(params).adjust_perf_params_to_consensus_params().apply_args(|config| args.apply_to_config(config)).build(),
