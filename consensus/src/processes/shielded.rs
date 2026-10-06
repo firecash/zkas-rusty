@@ -1859,11 +1859,11 @@ mod tests {
         mgr.anchor_gc.enqueue_batch(&mut batch, 500, root, young_block).unwrap();
         db.write(batch).unwrap();
 
-        // max_age 10: the margin is the anchor window's span, (buckets_to_keep(10) + 1) * 1000 = 2000,
-        // not 2 * max_age. pp_blue 2110: limit = 110 -> only the blue-100 entry qualifies.
+        // max_age 10: the margin is the anchor window's span, (buckets_to_keep(10) + 1) * 1000 = 3000,
+        // not 2 * max_age. pp_blue 3110: limit = 110 -> only the blue-100 entry qualifies.
         let mut batch = WriteBatch::default();
         assert_eq!(mgr.gc_aged_anchors(&mut batch, 130, 10, 1000).unwrap(), 0, "nothing inside the window span is collected");
-        let processed = mgr.gc_aged_anchors(&mut batch, 2110, 10, 1000).unwrap();
+        let processed = mgr.gc_aged_anchors(&mut batch, 3110, 10, 1000).unwrap();
         db.write(batch).unwrap();
         assert_eq!(processed, 1, "only the aged entry is drained");
 
