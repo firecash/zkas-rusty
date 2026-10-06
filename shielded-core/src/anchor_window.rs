@@ -53,9 +53,10 @@ pub fn buckets_to_keep(max_anchor_age: u64) -> u64 {
 }
 
 impl AnchorWindow {
-    /// The window after appending `entry`. Entries must arrive in strictly increasing blue score
-    /// (the selected chain guarantees it); a non-increasing score is refused so a syncing node can
-    /// never be fed an out-of-order list that happens to fold to the same value.
+    /// The window after appending `entry`. Entries must arrive in strictly increasing blue score.
+    /// Consensus appends selected-chain blocks, whose blue scores strictly increase; peer-supplied
+    /// lists go through [`Self::from_entries`], which refuses any non-increasing score. This method
+    /// itself only refuses an entry that goes back a whole bucket (it keeps no per-entry score).
     pub fn append(&self, entry: &WindowEntry, keep: u64) -> Result<Self, &'static str> {
         let idx = entry.blue_score / BUCKET_SPAN;
         let mut buckets = self.buckets.clone();
@@ -121,6 +122,79 @@ mod tests {
 
     fn e(n: u8, bs: u64) -> WindowEntry {
         WindowEntry { block: [n; 32], parent: [n.wrapping_sub(1); 32], root: [n.wrapping_add(100); 32], blue_score: bs }
+    }
+
+    /// Random windows (random retention, random blue-score jumps including jumps past the whole
+    /// window): the served tail always rebuilds the exact window, and every manipulation a lying peer
+    /// can make to that tail (change any field of any entry, drop, duplicate, reorder, drop the
+    /// oldest entries of the floor bucket, append a foreign entry) is either refused or produces a
+    /// different commitment.
+    #[test]
+    fn random_windows_rebuild_exactly_and_every_tampering_is_caught() {
+        let mut x: u64 = 0x0123_4567_89ab_cdef;
+        let mut rnd = move |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n.max(1)
+        };
+        for case in 0..200 {
+            let keep = 1 + rnd(5);
+            let mut bs = rnd(3_000);
+            let mut entries = vec![];
+            let mut w = AnchorWindow::default();
+            for i in 0..(5 + rnd(400)) {
+                bs += 1 + if rnd(20) == 0 { rnd(8_000) } else { rnd(300) };
+                let en = WindowEntry {
+                    block: [(i % 256) as u8; 32],
+                    parent: [(i % 256) as u8 ^ 0x5a; 32],
+                    root: [(rnd(256)) as u8; 32],
+                    blue_score: bs,
+                };
+                w = w.append(&en, keep).unwrap();
+                entries.push(en);
+            }
+            assert!(w.append(&WindowEntry { blue_score: bs.saturating_sub(BUCKET_SPAN), ..entries[0] }, keep).is_err() || bs < BUCKET_SPAN, "a bucket going backwards is refused");
+            let floor = w.floor_bucket().unwrap();
+            let tail: Vec<WindowEntry> = entries.iter().copied().filter(|e| e.blue_score / BUCKET_SPAN >= floor).collect();
+            let good = AnchorWindow::from_entries(tail.iter(), keep).unwrap();
+            assert_eq!(good, w, "case {case}: the served tail rebuilds the window");
+            let caught = |t: &[WindowEntry]| match AnchorWindow::from_entries(t.iter(), keep) {
+                Err(_) => true,
+                Ok(r) => r.commitment() != w.commitment(),
+            };
+            let n = tail.len();
+            let i = rnd(n as u64) as usize;
+            let mut t = tail.clone();
+            match rnd(4) {
+                0 => t[i].root[rnd(32) as usize] ^= 1,
+                1 => t[i].block[rnd(32) as usize] ^= 1,
+                2 => t[i].parent[rnd(32) as usize] ^= 1,
+                _ => t[i].blue_score ^= 1 + rnd(3),
+            }
+            // A blue-score edit that keeps strict order AND the bucket can only be caught by the fold.
+            assert!(caught(&t), "case {case}: field tampering of entry {i}/{n}");
+            let mut t = tail.clone();
+            t.remove(i);
+            assert!(n == 1 || caught(&t), "case {case}: dropped entry");
+            let mut t = tail.clone();
+            t.insert(i, tail[i]);
+            assert!(caught(&t), "case {case}: duplicated entry");
+            if n > 1 {
+                let mut t = tail.clone();
+                let j = (i + 1) % n;
+                t.swap(i, j);
+                assert!(caught(&t), "case {case}: reordered entries");
+                assert!(caught(&tail[1..]), "case {case}: oldest entry of the floor bucket dropped");
+            }
+            let mut t = tail.clone();
+            t.push(WindowEntry { blue_score: bs + 1, ..tail[n - 1] });
+            assert!(caught(&t), "case {case}: foreign entry appended");
+            // A peer list repeating a blue score is refused outright, wherever the repeat is.
+            let mut t = tail.clone();
+            t.insert(i + 1, WindowEntry { root: [0xee; 32], ..tail[i] });
+            assert!(AnchorWindow::from_entries(t.iter(), keep).is_err(), "case {case}: equal score in a peer list refused");
+        }
     }
 
     #[test]

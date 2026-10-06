@@ -194,6 +194,27 @@ impl TestContext {
     /// Build a valid empty template, then INJECT `txs` behind the template validator and recompute
     /// the merkle root — for testing that consensus itself rejects a transaction the template
     /// builder would never have included.
+    /// Build a valid template, let `tamper` rewrite its coinbase (a dishonest miner), then recompute
+    /// the merkle root and grind real PoW, so only consensus can refuse the result.
+    fn mine_real_pow_block_tampering_coinbase(&mut self, tamper: impl FnOnce(&mut Transaction)) -> Block {
+        self.simulated_time += self.consensus.params().target_time_per_block();
+        let mut t = self
+            .consensus
+            .build_block_template(self.miner_data.clone(), Box::new(OnetimeTxSelector::new(vec![])), TemplateBuildMode::Standard)
+            .unwrap();
+        tamper(&mut t.block.transactions[0]);
+        t.block.header.hash_merkle_root = kaspa_consensus_core::merkle::calc_hash_merkle_root(t.block.transactions.iter());
+        t.block.header.timestamp = self.simulated_time;
+        let state = kaspa_pow::State::new(&t.block.header);
+        let mut nonce = 0u64;
+        while !state.check_pow(nonce).0 {
+            nonce += 1;
+        }
+        t.block.header.nonce = nonce;
+        t.block.header.finalize();
+        t.block.to_immutable()
+    }
+
     fn mine_real_pow_block_injecting(&mut self, txs: Vec<Transaction>) -> Block {
         self.simulated_time += self.consensus.params().target_time_per_block();
         let mut t = self
@@ -1792,6 +1813,74 @@ async fn security_fork_miner_rewards_accrue_and_pay_out_end_to_end() {
     let mut tampered = md.clone();
     tampered.miner_accrual = Default::default();
     assert!(vp.verify_import_binding_versioned(pp, &tampered, committed).is_err(), "dropping the slot is refused");
+}
+
+/// Dev-fee end through real validated blocks, with dev accrual and the security fork active: before
+/// the end the dev fee is paid only on interval crossings; the first block at or past the end pays
+/// the carried balance once; afterwards no dev output exists. Every block passes the coinbase and
+/// pool-delta checks. Then dishonest miners: an extra dev payout after the end, and a miner reward
+/// paid out before its interval, are both refused by consensus.
+#[tokio::test]
+async fn dev_fee_end_and_forged_coinbases_through_real_blocks() {
+    let mut params = MAINNET_PARAMS.clone();
+    params.shielded_coinbase = true;
+    params.security_fork_activation = ForkActivation::always();
+    params.dev_fee_accrual_activation = ForkActivation::always();
+    params.dev_fee_payout_interval = 4;
+    params.miner_accrual_payout_interval = 1_000;
+    params.dev_fee_end_activation = ForkActivation::new(10);
+    let dev_spk = ScriptPublicKey::new(0, ScriptVec::from_slice(&params.dev_fee_recipient.unwrap()));
+    let config = ConfigBuilder::new(params)
+        .edit_consensus_params(|p| {
+            p.genesis.bits = 0x207fffff;
+            p.blockrate.shielded_anchor_depth = 1;
+        })
+        .build();
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+    let miner_addr = kaspa_shielded_core::wallet::address_bytes_from_seed([9u8; 32]).expect("orchard address");
+    let miner_spk = ScriptPublicKey::new(0, ScriptVec::from_slice(&miner_addr));
+    ctx.miner_data = MinerData::new(miner_spk.clone(), vec![]);
+
+    let mut dev_notes = Vec::new(); // (daa, value)
+    let mut prev_daa = 0u64;
+    for _ in 0..24 {
+        let b = ctx.mine_real_pow_block();
+        let daa = b.header.daa_score;
+        for o in b.transactions[0].outputs.iter().filter(|o| o.script_public_key == dev_spk) {
+            dev_notes.push((daa, prev_daa, o.value));
+        }
+        ctx.consensus.validate_and_insert_block(b).virtual_state_task.await.expect("every block validates across the dev-fee end");
+        prev_daa = daa;
+    }
+    assert!(!dev_notes.is_empty(), "the dev fee was paid before the end");
+    let at_or_after: Vec<_> = dev_notes.iter().filter(|(d, _, _)| *d >= 10).collect();
+    assert_eq!(at_or_after.len(), 1, "exactly one final dev note at or after the end: {dev_notes:?}");
+    assert!(at_or_after[0].1 < 10, "and it is in the first block past the end");
+    for (d, pd, _) in dev_notes.iter().filter(|(d, _, _)| *d < 10) {
+        assert!(d / 4 > pd / 4, "before the end, dev notes only on interval crossings (daa {d})");
+    }
+
+    // A dishonest miner adds a dev payout after the end (taking it from nowhere).
+    let forged = ctx.mine_real_pow_block_tampering_coinbase(|cb| {
+        cb.outputs.push(kaspa_consensus_core::tx::TransactionOutput::new(1_000, dev_spk.clone()));
+    });
+    let r = ctx.consensus.validate_and_insert_block(forged).virtual_state_task.await;
+    assert!(
+        r.is_err() || matches!(r, Ok(kaspa_consensus_core::blockstatus::BlockStatus::StatusDisqualifiedFromChain)),
+        "an extra dev payout after the end must be refused, got {r:?}"
+    );
+    // A dishonest miner pays itself its accrued reward early (the slot is not due until DAA 1,000).
+    let early = ctx.mine_real_pow_block_tampering_coinbase(|cb| {
+        cb.outputs.push(kaspa_consensus_core::tx::TransactionOutput::new(5_000_000, miner_spk.clone()));
+    });
+    let r = ctx.consensus.validate_and_insert_block(early).virtual_state_task.await;
+    assert!(
+        r.is_err() || matches!(r, Ok(kaspa_consensus_core::blockstatus::BlockStatus::StatusDisqualifiedFromChain)),
+        "an early miner payout must be refused, got {r:?}"
+    );
+    // And the honest chain keeps going.
+    let b = ctx.mine_real_pow_block();
+    ctx.consensus.validate_and_insert_block(b).virtual_state_task.await.expect("honest chain continues");
 }
 
 /// Security fork: a ZKas block whose coinbase carries a merge-mining commitment is invalid, so a

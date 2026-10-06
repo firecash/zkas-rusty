@@ -1649,6 +1649,62 @@ mod tests {
     /// shorter blob (falling back, accrual 0), and a legacy node must survive an upgraded
     /// peer's longer one (bincode allows trailing bytes). Get either wrong and IBD breaks
     /// during the upgrade window, which is exactly when nobody is watching for it.
+    /// The pruning-point metadata decoder takes peer bytes: it must never panic on any truncation,
+    /// extension or corruption of a real blob, and whatever it accepts must re-encode
+    /// deterministically (decode(encode(x)) == x for the decoded value).
+    #[test]
+    fn fuzz_pruning_point_metadata_decoder_never_panics() {
+        let md = PruningPointShieldedMetadata {
+            frontier: FrontierState::default(),
+            supply: SupplyTotals { cumulative_coinbase: 700, cumulative_fees: 25 },
+            nullifier_muhash: MuHash::new(),
+            burns: BurnReceipts::default(),
+            state_root: [7u8; 32],
+            in_window_anchors: vec![([3u8; 32], Hash::from_bytes([4u8; 32])); 3],
+            dev_accrued: 123_456,
+            in_window_anchor_source_scores: vec![(Hash::from_bytes([4u8; 32]), 990_606); 2],
+            window_entries: (0..5u8)
+                .map(|i| kaspa_shielded_core::anchor_window::WindowEntry { block: [i; 32], parent: [i; 32], root: [i; 32], blue_score: i as u64 })
+                .collect(),
+            miner_accrual: kaspa_consensus_core::coinbase::MinerAccrual {
+                script_public_key: kaspa_consensus_core::tx::ScriptPublicKey::from_vec(0, vec![9u8; 43]),
+                amount: 5,
+            },
+        };
+        let base = md.to_wire_bytes();
+        let mut x: u64 = 0xfeed_face_0bad_f00d;
+        let mut rnd = move |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n.max(1)
+        };
+        for _ in 0..20_000 {
+            let mut b = base.clone();
+            match rnd(4) {
+                0 => b.truncate(rnd(b.len() as u64) as usize),
+                1 => b.extend((0..1 + rnd(64)).map(|_| rnd(256) as u8)),
+                2 => {
+                    for _ in 0..1 + rnd(4) {
+                        let at = rnd(b.len() as u64) as usize;
+                        b[at] = rnd(256) as u8;
+                    }
+                }
+                _ => {
+                    // Corrupt a length prefix region near a vec boundary.
+                    let at = rnd(b.len() as u64) as usize;
+                    for k in at..(at + 8).min(b.len()) {
+                        b[k] = 0xff;
+                    }
+                }
+            }
+            if let Ok(d) = std::panic::catch_unwind(|| PruningPointShieldedMetadata::from_wire_bytes(&b)).expect("decoder must not panic") {
+                let again = PruningPointShieldedMetadata::from_wire_bytes(&d.to_wire_bytes()).expect("re-encoded value decodes");
+                assert_eq!(again.to_wire_bytes(), d.to_wire_bytes());
+            }
+        }
+    }
+
     #[test]
     fn pruning_point_metadata_wire_is_compatible_across_the_accrual_field() {
         let md = PruningPointShieldedMetadata {

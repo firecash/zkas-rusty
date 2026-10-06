@@ -500,6 +500,70 @@ mod tests {
         assert_eq!(ShieldedBundle::from_bytes_at(&plain, false), ShieldedBundle::from_bytes_at(&plain, true));
     }
 
+    /// Fuzz: random mutations (byte flips, truncations, extensions, flag rewrites, splices) of valid
+    /// bundles in both formats. The decoder must never panic; an accepted string must re-encode to
+    /// exactly itself (canonical, so a txid fixes the bundle); and when flag bit 3 is set the two
+    /// formats must never both accept the same bytes (that is what keeps pre- and post-fork nodes
+    /// from judging one body differently).
+    #[test]
+    fn fuzz_decode_is_total_canonical_and_format_exclusive() {
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut rnd = move |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n.max(1)
+        };
+        let mut seeds = vec![];
+        for n in 1..4u8 {
+            seeds.push(sample_bundle(n).to_bytes());
+            let mut named = sample_bundle(n);
+            named.set_anchor_block([n; 32]);
+            seeds.push(named.to_bytes());
+            let mut flag_only = sample_bundle(n);
+            flag_only.flags |= BUNDLE_FLAG_ANCHOR_BLOCK;
+            seeds.push(flag_only.to_bytes());
+        }
+        let mut accepted = [0usize; 2];
+        for i in 0..100_000 {
+            let mut b = seeds[i % seeds.len()].clone();
+            for _ in 0..1 + rnd(3) {
+                match rnd(6) {
+                    0 if !b.is_empty() => {
+                        let at = rnd(b.len() as u64) as usize;
+                        b[at] ^= 1 << rnd(8);
+                    }
+                    1 => b.truncate(rnd(b.len() as u64 + 1) as usize),
+                    2 => b.extend((0..rnd(40)).map(|_| rnd(256) as u8)),
+                    3 if !b.is_empty() => b[0] = rnd(256) as u8,
+                    4 if !b.is_empty() => b[0] ^= BUNDLE_FLAG_ANCHOR_BLOCK,
+                    _ => {
+                        let cut = rnd(b.len() as u64 + 1) as usize;
+                        let other = &seeds[rnd(seeds.len() as u64) as usize];
+                        let from = rnd(other.len() as u64 + 1) as usize;
+                        b.truncate(cut);
+                        b.extend_from_slice(&other[from..]);
+                    }
+                }
+            }
+            let pre = ShieldedBundle::from_bytes_at(&b, false);
+            let post = ShieldedBundle::from_bytes_at(&b, true);
+            for (k, r) in [&pre, &post].into_iter().enumerate() {
+                if let Ok(d) = r {
+                    accepted[k] += 1;
+                    assert_eq!(d.to_bytes(), b, "case {i}: an accepted bundle re-encodes to exactly its bytes");
+                    assert_eq!(d.anchor_block.is_some(), k == 1 && d.flags & BUNDLE_FLAG_ANCHOR_BLOCK != 0);
+                }
+            }
+            if !b.is_empty() && b[0] & BUNDLE_FLAG_ANCHOR_BLOCK != 0 {
+                assert!(!(pre.is_ok() && post.is_ok()), "case {i}: bit 3 set and both formats accept");
+            } else {
+                assert_eq!(pre.is_ok(), post.is_ok(), "case {i}: without bit 3 the formats agree");
+            }
+        }
+        assert!(accepted[0] > 100 && accepted[1] > 100, "the fuzz reached accepting inputs: {accepted:?}");
+    }
+
     fn sample_bundle(n: u8) -> ShieldedBundle {
         ShieldedBundle {
             actions: (0..n).map(sample_action).collect(),
