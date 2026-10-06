@@ -511,6 +511,14 @@ fn security_fork_active(daa_score: u64) -> bool {
     SECURITY_FORK.get().is_some_and(|f| f.is_active(daa_score))
 }
 
+/// The network's maximum shielded anchor age (blue score): a spend whose anchor is older than this
+/// at inclusion is rejected by every node.
+static MAX_ANCHOR_AGE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+/// Blue-score headroom kept below [`MAX_ANCHOR_AGE`] for the time between choosing an anchor and the
+/// spend landing in a block (proving, relay, mempool wait).
+const ANCHOR_AGE_HEADROOM: u64 = 60;
+
 /// Sidecar next to a wallet's checkpoint: `leaves -> block hash` for the matured-anchor ring. Kept out
 /// of the checkpoint format on purpose, so adding it needs no CHECKPOINT_VERSION bump (which would
 /// force every wallet to rescan).
@@ -526,9 +534,20 @@ fn save_anchor_blocks(dir: &str, token: &str, blocks: &HashMap<u64, [u8; 32]>) {
     for (leaves, hash) in blocks {
         out.push_str(&format!("{leaves} {}\n", hex::encode(hash)));
     }
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let path = anchor_blocks_path(dir, token);
-    let tmp = format!("{path}.tmp");
-    if std::fs::write(&tmp, out).and_then(|_| std::fs::rename(&tmp, &path)).is_err() {
+    // A unique temporary per write, as for checkpoints: two saves of one wallet may overlap.
+    let tmp = format!("{path}.{}.tmp", SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    let written = std::fs::write(&tmp, out).and_then(|_| {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+        }
+        std::fs::rename(&tmp, &path)
+    });
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
         log::warn!("wallet {token}: could not persist anchor-block sidecar (sends after a restart wait for sync)");
     }
 }
@@ -2638,6 +2657,10 @@ struct WalletEntry {
     /// The sink's blue score from the latest sync response — the reference the
     /// matured cutoff is measured against.
     sink_blue: u64,
+    /// Whether `sink_blue` came from a sync response in this process. A value restored from a
+    /// checkpoint can be arbitrarily old, and an anchor chosen against it can be past the network's
+    /// maximum age: the node would reject the spend after the user waited for the proof.
+    sink_live: bool,
     /// Consecutive sync passes that saw the cursor off the selected chain
     /// (deeper reorg than [`SYNC_TIP_MARGIN`]). Transient virtual flips clear on
     /// retry; at [`REORG_STRIKES`] the sync loop discards the checkpoint and
@@ -2842,6 +2865,7 @@ impl WalletEntry {
             boundaries,
             boundary_blocks: HashMap::new(),
             sink_blue,
+            sink_live: false,
             reorged_strikes: 0,
             preview: Preview::default(),
             mempool: Preview::default(),
@@ -3188,6 +3212,7 @@ impl WalletEntry {
             }
             self.reorged_strikes = 0;
             self.sink_blue = resp.sink_blue_score;
+            self.sink_live = true;
             // PREFETCH the next page while this one is being ingested below. The next
             // cursor is this page's LAST block hash - known right now, before any
             // ingest - and the result lands in the shared page cache, so this loop's
@@ -3874,7 +3899,22 @@ impl WalletEntry {
                 "this wallet received inconsistent data from its node and is halted; it resumes from its last good checkpoint after a restart",
             ));
         }
-        if !security_fork_active(self.scanned as u64) {
+        // The rule applies by the DAA score of the block that includes the spend, which is at or
+        // above the node's tip, not by the settled height this wallet has scanned (that trails the
+        // tip by the sync margin and would build unnamed spends for minutes after activation).
+        // Before and after the fork alike: never prove against an anchor the network will refuse.
+        if !self.sink_live {
+            return Err(err(StatusCode::CONFLICT, "wallet is reconnecting to its node; retry in a few seconds"));
+        }
+        let anchor_blue = self.boundaries.iter().rev().find(|(_, leaves)| *leaves == matured).map(|&(bs, _)| bs);
+        let budget = MAX_ANCHOR_AGE.get().copied().unwrap_or(u64::MAX).saturating_sub(ANCHOR_AGE_HEADROOM);
+        if anchor_blue.is_none_or(|bs| self.sink_blue.saturating_sub(bs) > budget) {
+            return Err(err(
+                StatusCode::CONFLICT,
+                "this wallet is too far behind the chain tip to build a spend the network accepts; retry once it has synced",
+            ));
+        }
+        if !security_fork_active(self.chain_len.max(self.scanned as u64)) {
             return Ok(None);
         }
         self.boundary_blocks.get(&matured).copied().map(Some).ok_or_else(|| {
@@ -6525,11 +6565,18 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
     // async worker stalled every other task and every status/history call on this
     // wallet for the duration. The flag is consumed here so a force that arrives while
     // the write is in flight is not lost; a failed write hands it back.
-    let pending_checkpoint = if e.error.is_none() && (due_by_blocks || (just_caught_up && advanced > 0) || force || overdue) {
+    // A poisoned database is never persisted (see `save_checkpoint`).
+    let pending_checkpoint = if e.error.is_none()
+        && !e.db.poisoned()
+        && (due_by_blocks || (just_caught_up && advanced > 0) || force || overdue)
+    {
         e.force_checkpoint = false;
         Some((
             checkpoint_bytes(&e.genesis, &e.low, e.scanned as u64, &e.db, &e.boundaries, e.sink_blue, e.blind_below),
             e.scanned,
+            // The anchor blocks of the boundaries just serialised, so a restarted daemon can
+            // name a spend's anchor block without waiting to re-sync the matured ring.
+            e.boundary_blocks.clone(),
         ))
     } else {
         None
@@ -6548,10 +6595,15 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
     drop(e);
     state.snapshots.lock().await.insert(token.clone(), snap.clone());
     state.persisted_snaps.lock().await.insert(token.clone(), snap);
-    if let Some((buf, scanned)) = pending_checkpoint {
+    if let Some((buf, scanned, blocks)) = pending_checkpoint {
         let dir = state.wallet_dir.clone();
         let who = token.clone();
-        let written = tokio::task::spawn_blocking(move || write_checkpoint_bytes(&dir, &who, &buf)).await;
+        let written = tokio::task::spawn_blocking(move || {
+            write_checkpoint_bytes(&dir, &who, &buf)?;
+            save_anchor_blocks(&dir, &who, &blocks);
+            Ok::<(), std::io::Error>(())
+        })
+        .await;
         let mut e = w.lock().await;
         match written {
             Ok(Ok(())) => {
@@ -8658,7 +8710,7 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
         let shared_base = state.chain_tree_base.load(std::sync::atomic::Ordering::Relaxed);
         tokio::task::block_in_place(|| e.advance_spend_witnesses_bounded(shared_covers, shared_base));
         let cutoff_blue = e.sink_blue.saturating_sub(DEFAULT_ANCHOR_DEPTH + ANCHOR_SLACK);
-        fork_now = security_fork_active(e.scanned as u64);
+        fork_now = security_fork_active(e.chain_len.max(e.scanned as u64));
         if let Some(matured) = e.boundaries.iter().rev().find(|(bs, _)| *bs <= cutoff_blue).map(|&(_, lc)| lc) {
             anchor_block = e.send_anchor_block(matured)?;
             let (mut candidates, stranded_value) = matured_candidates(&e.db, matured);
@@ -11378,6 +11430,12 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
         _ => kaspa_consensus_core::config::params::Params::from(state_prefix_network(&cfg.network)).security_fork_activation,
     };
     let _ = SECURITY_FORK.set(fork);
+    // `ZKAS_MAX_ANCHOR_AGE` likewise mirrors an override-params file on a test network.
+    let max_anchor_age = match std::env::var("ZKAS_MAX_ANCHOR_AGE").ok().and_then(|v| v.parse::<u64>().ok()) {
+        Some(a) if cfg.network != "mainnet" => a,
+        _ => kaspa_consensus_core::config::params::Params::from(state_prefix_network(&cfg.network)).max_shielded_anchor_age(),
+    };
+    let _ = MAX_ANCHOR_AGE.set(max_anchor_age);
 
     let resources = cfg.resources.clone();
     log::info!("wallet resource limits: {:?}", resources);
@@ -12455,7 +12513,8 @@ async fn bundle_prepare(
     let domain: [u8; 32] = state.genesis.as_bytes();
     // Multi-party bundles do not yet carry a named anchor block; after the security fork consensus
     // would reject them, so refuse up front instead of spending everyone's proving time.
-    if security_fork_active(state.chain_tree.lock().await.scanned as u64) {
+    let tip_daa = (state.node_tip.lock().await.0).max(state.chain_tree.lock().await.scanned as u64);
+    if security_fork_active(tip_daa) {
         return Err(err(StatusCode::CONFLICT, "multi-party bundles are not available after the security fork in this build"));
     }
     let ctx = payment_tx_context();

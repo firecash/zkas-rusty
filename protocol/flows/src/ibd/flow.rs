@@ -1254,11 +1254,17 @@ impl IbdFlow {
             // the seeded PP-time set into it, freezing spends of unspent notes), a crash
             // between seed and stable-flag write, and the default-true flag on a network with
             // no shielded activity.
-            let local_root = consensus
-                .async_get_shielded_state_root(pruning_point)
-                .await
-                .map_err(|e| ProtocolError::OtherOwned(format!("local shielded state root at pruning point {pruning_point}: {e}")))?;
-            if local_root == committed {
+            // A node that holds no shielded state at the pruning point yet (a fresh node after the
+            // security fork has no anchor window there, so the v1 root cannot be computed) simply
+            // does not match: it imports below, and the import is bound to `committed` regardless.
+            let local_root = match consensus.async_get_shielded_state_root(pruning_point).await {
+                Ok(root) => Some(root),
+                Err(e) => {
+                    info!("no local shielded state root at pruning point {pruning_point} ({e}); importing");
+                    None
+                }
+            };
+            if local_root == Some(committed) {
                 info!(
                     "local shielded state at pruning point {} already matches the PoW-committed root; skipping re-import",
                     pruning_point
