@@ -1000,6 +1000,7 @@ fn coinbase_manager() -> CoinbaseManager {
         // Same gating as consensus (`services.rs`); only the subsidy schedule is read here.
         if p.shielded_coinbase { p.security_fork_activation } else { kaspa_consensus_core::config::params::ForkActivation::never() },
         p.miner_accrual_payout_interval,
+        p.dev_fee_end_activation,
     )
 }
 

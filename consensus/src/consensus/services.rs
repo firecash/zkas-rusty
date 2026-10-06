@@ -142,6 +142,7 @@ impl ConsensusServices {
                 kaspa_consensus_core::config::params::ForkActivation::never()
             },
             params.miner_accrual_payout_interval,
+            params.dev_fee_end_activation,
         );
 
         let mass_calculator =
