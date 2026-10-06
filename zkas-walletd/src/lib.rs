@@ -12291,8 +12291,30 @@ async fn bundle_submit(
         let Some(mut sess) = map.remove(&req.session) else {
             return Err(err(StatusCode::NOT_FOUND, "no such bundle session (expired, or already submitted)"));
         };
+        // Every index must be one this bundle actually asked to have signed.
+        //
+        // `finalize_payment` indexes `actions_mut()[i]` directly, so an out-of-range index was a
+        // remote panic — and the panic hook turns any panic into `process::exit(1)`. The
+        // single-party `wallet_submit` has bounds-checked this for exactly that reason ("walletd
+        // must not trust that its caller is the SDK"); the multiparty path never carried it over.
+        //
+        // Refusing an index that is not in `spend_auth_requests` is the stronger check: a bundle
+        // session is shared with counterparties, so a participant must not be able to touch an
+        // action it was not asked to authorize.
+        for (i, _) in &incoming {
+            if !sess.payment.spend_auth_requests.iter().any(|(want, _)| want == i) {
+                // Put the session back: a bad submit must not destroy an in-flight settlement.
+                map.insert(req.session.clone(), sess);
+                return Err(err(StatusCode::BAD_REQUEST, format!("action {i} is not awaiting a signature in this bundle")));
+            }
+        }
         for (i, sig) in incoming {
-            sess.sigs.retain(|(have, _)| *have != i);
+            // Never overwrite a signature already gathered. A session id is held by every
+            // participant, including a hostile counterparty, so a later caller could otherwise
+            // replace an honest party's signature — or clear the bundle by replacing them all.
+            if sess.sigs.iter().any(|(have, _)| *have == i) {
+                continue;
+            }
             sess.sigs.push((i, sig));
         }
         let owner_of: std::collections::HashMap<usize, usize> = sess.spend_owners.iter().copied().collect();

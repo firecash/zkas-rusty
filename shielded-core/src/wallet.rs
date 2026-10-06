@@ -1355,7 +1355,16 @@ pub mod build {
         let mut rng = rand::rng();
         for (i, sig) in device_sigs {
             let sig = Signature::<SpendAuth>::from(sig);
-            prepared.pczt.actions_mut()[i].apply_signature(sighash, sig).map_err(|e| BuildError::Proof(format!("{e:?}")))?;
+            // Return an error rather than indexing. One caller is a daemon endpoint whose index
+            // arrives off the wire, and a panic there becomes `process::exit(1)` via the daemon's
+            // panic hook. That caller bounds-checks too; this makes it impossible for a future
+            // caller to reintroduce the hole.
+            let action = prepared
+                .pczt
+                .actions_mut()
+                .get_mut(i)
+                .ok_or_else(|| BuildError::Proof(format!("signature for action {i}, which this bundle does not have")))?;
+            action.apply_signature(sighash, sig).map_err(|e| BuildError::Proof(format!("{e:?}")))?;
         }
         prepared.pczt.finalize_io(sighash, &mut rng).map_err(|e| BuildError::Proof(format!("{e:?}")))?;
         let unbound = prepared.pczt.extract::<i64>().map_err(|e| BuildError::Proof(format!("{e:?}")))?.ok_or(BuildError::Empty)?;

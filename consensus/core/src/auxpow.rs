@@ -57,6 +57,27 @@ pub const MERGE_MINE_MAGIC: [u8; 4] = *b"ZKMM";
 /// it. Rejecting an over-long branch is free and cannot refuse an honest block.
 pub const MAX_COINBASE_MERKLE_BRANCH: usize = 64;
 
+/// Largest serialized aux witness a decode edge will accept.
+///
+/// Nothing bounded the witness's total size: not `parent_coinbase` (unbounded inputs with unbounded
+/// signature scripts, unbounded outputs), not the aux parent's parent hashes. The only ceiling was
+/// the ~1 GiB p2p/RPC message limit.
+///
+/// What makes that worse than an ordinary oversized-message problem is the native path.
+/// `check_pow_gated` tries native proof-of-work FIRST and returns the moment it passes, so for a
+/// natively mined block the witness is never looked at by consensus at all — yet it is stored
+/// verbatim with the header, kept forever, and re-serialized to every peer that requests the block.
+/// So a miner can attach hundreds of megabytes of junk to a block it is *paid* for, with no extra
+/// work and no consensus rule broken, and every node keeps it. The headers cache made that worse
+/// still by accounting the witness at a fraction of its real size (see `Header::estimate_mem_bytes`).
+///
+/// Enforced at the decode edges, where an unusable witness is DROPPED and the header kept, so this
+/// never costs a valid block: an honest natively mined block survives with its junk removed, and an
+/// aux-mined block that genuinely needs the witness simply fails proof-of-work and is retried. A real
+/// Kaspa coinbase plus a 64-deep branch is a few kilobytes, so this sits orders of magnitude above
+/// anything honest.
+pub const MAX_AUX_POW_SERIALIZED_LEN: usize = 256 * 1024;
+
 /// The proof that a ZKas block was mined on top of a parent kHeavyHash block.
 ///
 /// Travels alongside the ZKas header (it is deliberately *not* part of the
@@ -175,6 +196,17 @@ impl AuxPow {
                 self.coinbase_merkle_branch.len(),
                 MAX_COINBASE_MERKLE_BRANCH
             ));
+        }
+        // Total serialized size. The per-field caps above and the nesting bound in
+        // `BorshDeserialize` do not bound this: `parent_coinbase` alone can carry unbounded inputs,
+        // signature scripts and outputs. See `MAX_AUX_POW_SERIALIZED_LEN` for why a witness that
+        // consensus never even reads is still worth refusing.
+        match borsh::object_length(self) {
+            Ok(len) if len > MAX_AUX_POW_SERIALIZED_LEN => {
+                return Err(format!("aux witness too large: {len} > {MAX_AUX_POW_SERIALIZED_LEN} bytes"));
+            }
+            Ok(_) => {}
+            Err(e) => return Err(format!("aux witness is not serializable: {e}")),
         }
         Ok(())
     }

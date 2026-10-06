@@ -238,6 +238,34 @@ mod tests {
         }
     }
 
+    /// A witness over the size cap is DROPPED, and the block survives on its native proof-of-work.
+    ///
+    /// This is the shape that matters. `check_pow_gated` tries native PoW first and returns before it
+    /// ever looks at the witness, so for a natively mined block the witness is never read by
+    /// consensus — yet it was stored verbatim with the header forever and re-serialized to every peer
+    /// that asked. A miner could attach hundreds of megabytes to a block it is PAID for, breaking no
+    /// consensus rule, and every node would keep it.
+    ///
+    /// Rejecting the block instead would be the opposite mistake: the witness is outside `H_fc`, so
+    /// anyone in the relay path can staple junk onto someone else's honest block. Dropping is the only
+    /// answer that is right in both directions.
+    #[test]
+    fn an_oversized_witness_is_dropped_and_the_block_survives() {
+        let header = finalized(1);
+        let hfc = header.hash;
+        // A plausible-looking witness whose coinbase payload alone blows the cap.
+        let big = vec![0xabu8; kaspa_consensus_core::auxpow::MAX_AUX_POW_SERIALIZED_LEN + 1];
+        let cb = Transaction::new(0, vec![], vec![], 0, SUBNETWORK_ID_COINBASE, 0, big);
+        let aux = AuxPow { parent_header: finalized(9), parent_coinbase: cb, coinbase_merkle_branch: vec![] };
+        assert!(aux.validate_structure().is_err(), "the size cap is enforced by the shared structural check");
+
+        let mut pb: protowire::BlockHeader = (HeaderFormat::Compressed, &header).into();
+        pb.aux_pow = borsh::to_vec(&aux).unwrap();
+        let back: Header = Versioned(HeaderFormat::Compressed, pb).try_into().expect("the header survives");
+        assert_eq!(back.hash, hfc, "H_fc is untouched");
+        assert!(back.aux_pow.is_none(), "the oversized witness is not stored");
+    }
+
     /// `AuxPow` holds a `Header`, which holds an `Option<Box<AuxPow>>`, so the two are mutually
     /// recursive with no depth bound against a 1 GiB message ceiling — millions of levels of
     /// recursive borsh decoding, then the same walk again in `MemSizeEstimator` and the `Box` drop
