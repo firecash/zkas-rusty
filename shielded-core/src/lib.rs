@@ -25,6 +25,7 @@
 pub use pasta_curves;
 
 pub mod account;
+pub mod anchor_window;
 pub mod attestation;
 pub mod bundle;
 pub mod burn;

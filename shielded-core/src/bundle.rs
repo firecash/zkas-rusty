@@ -64,6 +64,14 @@ pub const MAX_ACTIONS_PER_BUNDLE: usize = 512;
 /// bundle without a burn is byte-identical to the pre-bridge format.
 pub const BUNDLE_FLAG_BURN: u8 = 0b100;
 
+/// Bundle flag bit marking a named **anchor block** (security fork, 2026-10).
+///
+/// Bit 3 says a trailing 32-byte block hash follows the burn declaration (if any): the block whose
+/// own note-commitment tree root is `anchor`. Consensus checks `root(anchor_block) == anchor` and
+/// that the block is a matured selected-chain ancestor, instead of searching an index for whichever
+/// block produced the root. Mandatory from the activation score, refused before it.
+pub const BUNDLE_FLAG_ANCHOR_BLOCK: u8 = 0b1000;
+
 /// Serialized length of a burn declaration: `value(8) | kaspa_recipient(32)`.
 pub const BURN_DECL_LEN: usize = 8 + 32;
 
@@ -166,6 +174,9 @@ pub struct ShieldedBundle {
     /// `value_balance` (see [`crate::state::ShieldedTx`]), so the binding signature already
     /// constrains it — a burn cannot move value the bundle did not prove is leaving the pool.
     pub burn: Option<(u64, [u8; sizes::FIELD])>,
+    /// The block whose tree root is `anchor`. Present iff [`BUNDLE_FLAG_ANCHOR_BLOCK`] is set.
+    /// Covered by the sighash, so a relayer cannot repoint it.
+    pub anchor_block: Option<[u8; 32]>,
 }
 
 /// Error attaching a burn declaration to a bundle.
@@ -302,6 +313,9 @@ impl ShieldedBundle {
             w.u64(*value);
             w.bytes(recipient);
         }
+        if let Some(block) = &self.anchor_block {
+            w.bytes(block);
+        }
         w.buf
     }
 
@@ -347,11 +361,23 @@ impl ShieldedBundle {
         } else {
             None
         };
+        let anchor_block = if flags & BUNDLE_FLAG_ANCHOR_BLOCK != 0 {
+            Some(r.array::<32>().map_err(|_| BundleDecodeError::UnexpectedEof)?)
+        } else {
+            None
+        };
         if !r.finished() {
             return Err(BundleDecodeError::TrailingBytes);
         }
 
-        Ok(Self { actions, flags, value_balance, anchor, proof, binding_sig, burn })
+        Ok(Self { actions, flags, value_balance, anchor, proof, binding_sig, burn, anchor_block })
+    }
+
+    /// Name the block whose tree root is `anchor`, setting the flag bit and the field together so
+    /// the encoding stays canonical. Must be done BEFORE the sighash is computed and signed.
+    pub fn set_anchor_block(&mut self, block: [u8; 32]) {
+        self.anchor_block = Some(block);
+        self.flags |= BUNDLE_FLAG_ANCHOR_BLOCK;
     }
 
     /// Attach a bridge peg-out declaration to a proven bundle.
@@ -404,6 +430,7 @@ impl ShieldedBundle {
             proof: vec![0xab; 32],
             binding_sig: [0xcd; sizes::SIG],
             burn: None,
+            anchor_block: None,
         }
     }
 
@@ -439,6 +466,7 @@ mod tests {
             proof: vec![0xab; 1000],
             binding_sig: [0xcd; sizes::SIG],
             burn: None,
+            anchor_block: None,
         }
     }
 
@@ -526,6 +554,7 @@ mod tests {
             proof: vec![],
             binding_sig: [0u8; sizes::SIG],
             burn: None,
+            anchor_block: None,
         };
         assert_eq!(ShieldedBundle::from_bytes(&at_cap.to_bytes()).map(|b| b.actions.len()), Ok(MAX_ACTIONS_PER_BUNDLE));
     }

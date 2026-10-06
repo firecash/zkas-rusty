@@ -2420,10 +2420,12 @@ impl ConsensusApi for Consensus {
         // buffered (up to 2^26 entries), so a peer could force a multi-GiB allocation and minutes of
         // MuHash work with metadata that was never going to pass.
         {
-            use crate::processes::shielded::{PruningPointShieldedMetadata, ShieldedStateManager};
+            use crate::processes::shielded::PruningPointShieldedMetadata;
             let md = PruningPointShieldedMetadata::from_wire_bytes(&metadata.data).map_err(PruningImportError::ShieldedStateError)?;
             if let Some(committed) = expected_state_root {
-                ShieldedStateManager::verify_import_binding(&md, committed).map_err(PruningImportError::ShieldedStateError)?;
+                self.virtual_processor
+                    .verify_import_binding_versioned(new_pruning_point, &md, committed)
+                    .map_err(PruningImportError::ShieldedStateError)?;
             }
             if metadata.nullifier_count > md.frontier.size {
                 return Err(PruningImportError::ShieldedStateError(format!(

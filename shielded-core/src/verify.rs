@@ -122,6 +122,11 @@ pub fn sighash(bundle: &ShieldedBundle, network_domain: &[u8; 32], tx_context: &
         h.update(&value.to_le_bytes());
         h.update(recipient);
     }
+    // The named anchor block (security fork), hashed only when present so every pre-fork digest
+    // is unchanged. The flags byte above already binds whether it is present.
+    if let Some(block) = bundle.anchor_block.as_ref() {
+        h.update(block);
+    }
     h.update(&(tx_context.len() as u32).to_le_bytes());
     h.update(tx_context);
     let mut out = [0u8; 32];
@@ -170,12 +175,17 @@ mod circuit_verify {
         }
 
         let anchor: Anchor = Option::from(Anchor::from_bytes(bundle.anchor)).ok_or(BundleVerifyError::NonCanonicalField("anchor"))?;
-        // Orchard flag bits: bit 0 = spends enabled, bit 1 = outputs enabled. Any
-        // other bit set is a non-canonical encoding (matches Orchard `Flags::from_byte`).
-        if bundle.flags & !0b11 != 0 {
+        // Orchard flag bits: bit 0 = spends enabled, bit 1 = outputs enabled. The only other bit
+        // this verifier admits is the ZKas anchor-block extension, which is not an Orchard flag and
+        // is masked off before Orchard sees the byte. Its presence must match the field exactly.
+        // WHEN it is allowed (only from the security fork) is a consensus-context rule, enforced
+        // by the transaction validator, not here.
+        let ext = crate::bundle::BUNDLE_FLAG_ANCHOR_BLOCK;
+        if bundle.flags & !(0b11 | ext) != 0 || ((bundle.flags & ext) != 0) != bundle.anchor_block.is_some() {
             return Err(BundleVerifyError::NonCanonicalFlags);
         }
-        let flags = Flags::from_byte(bundle.flags, crate::verify::BUNDLE_VERSION).ok_or(BundleVerifyError::NonCanonicalFlags)?;
+        let flags =
+            Flags::from_byte(bundle.flags & 0b11, crate::verify::BUNDLE_VERSION).ok_or(BundleVerifyError::NonCanonicalFlags)?;
 
         let mut instances = Vec::with_capacity(bundle.actions.len());
         let mut rks = Vec::with_capacity(bundle.actions.len());
@@ -355,6 +365,7 @@ mod e2e {
             proof,
             binding_sig,
             burn: None,
+            anchor_block: None,
         }
     }
 
@@ -496,6 +507,7 @@ mod tests {
             proof: vec![0u8; 100],
             binding_sig: [0u8; 64],
             burn: None,
+            anchor_block: None,
         }
     }
 

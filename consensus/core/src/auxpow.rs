@@ -46,6 +46,10 @@ use serde::{Deserialize, Serialize};
 /// coinbase payload. "ZKas Merged Mining".
 pub const MERGE_MINE_MAGIC: [u8; 4] = *b"ZKMM";
 
+/// Post-fork merge-mining tag (`Params::security_fork_activation`): followed by the hex of
+/// [`AuxPow::bound_commitment`], which binds the genesis and the nonce-free header hash.
+pub const MERGE_MINE_MAGIC_V1: [u8; 4] = *b"ZKM1";
+
 /// Hard cap on [`AuxPow::coinbase_merkle_branch`] length. The branch has one entry
 /// per level of the parent's transaction Merkle tree, so a parent with `n`
 /// transactions needs `ceil(log2(n))` entries: 64 admits a parent with 2^64
@@ -221,19 +225,74 @@ impl AuxPow {
     /// UTF-8. Real 32-byte block hashes are almost never valid UTF-8, so raw bytes
     /// cannot be carried there; the 64-char hex encoding always can.
     pub fn committed_hash(&self) -> Option<Hash> {
-        let payload = self.parent_coinbase.payload.as_slice();
+        Self::payload_commitment(self.parent_coinbase.payload.as_slice(), &MERGE_MINE_MAGIC)
+    }
+
+    /// The single post-fork (`ZKM1`) commitment in the parent coinbase, same uniqueness and
+    /// well-formedness rules as [`Self::committed_hash`].
+    pub fn committed_hash_v1(&self) -> Option<Hash> {
+        Self::payload_commitment(self.parent_coinbase.payload.as_slice(), &MERGE_MINE_MAGIC_V1)
+    }
+
+    /// Whether `payload` carries a well-formed, unique merge-mining commitment under EITHER tag,
+    /// i.e. whether a block with this coinbase could serve as somebody's aux parent. From the
+    /// security fork a ZKas coinbase must not: that is what stops one ZKas solution from also
+    /// counting as the proof-of-work of a second ZKas block. Uses the same scanner as the parent
+    /// check so the two can never drift apart.
+    pub fn payload_carries_commitment(payload: &[u8]) -> bool {
+        Self::payload_commitment(payload, &MERGE_MINE_MAGIC).is_some() || Self::payload_commitment(payload, &MERGE_MINE_MAGIC_V1).is_some()
+    }
+
+    /// The post-fork value an aux parent commits to: a hash binding this chain's genesis to the
+    /// header hash with the nonce zeroed (`hash_override_nonce_time(header, 0, header.timestamp)`).
+    /// The nonce is excluded so that it can afterwards be set to [`Self::nonce_binding`] of the
+    /// parent; every other header field, the timestamp included, stays bound.
+    pub fn bound_commitment(genesis: Hash, nonce_free_header_hash: Hash) -> Hash {
+        use kaspa_hashes::HasherBase;
+        let mut hasher = kaspa_hashes::BlockHash::new();
+        hasher.update(b"zkas_aux_bind1").update(genesis).update(nonce_free_header_hash);
+        hasher.finalize()
+    }
+
+    /// The nonce a post-fork aux-accepted block must carry: the first 8 bytes (LE) of its parent
+    /// header's hash. Recomputed from the parent's fields, never taken from a cached hash. Because
+    /// the full block hash covers the nonce, the block hash then fixes the parent, so one block has
+    /// exactly one witness and one level.
+    pub fn nonce_binding(parent_header: &Header) -> u64 {
+        let h = hashing::header::hash(parent_header).as_bytes();
+        u64::from_le_bytes(h[..8].try_into().expect("32-byte hash"))
+    }
+
+    /// Post-fork structural binding: the parent coinbase commits (`ZKM1`, exactly once) to
+    /// [`Self::bound_commitment`] and is Merkle-included under the parent header.
+    pub fn verify_binding_v1(&self, genesis: Hash, nonce_free_header_hash: Hash) -> bool {
+        self.committed_hash_v1() == Some(Self::bound_commitment(genesis, nonce_free_header_hash)) && self.verify_coinbase_inclusion()
+    }
+
+    /// Miner/test helper for the post-fork form: `prefix || ZKM1 || hex(commitment) || suffix`.
+    pub fn embed_commitment_v1(prefix: &[u8], commitment: Hash, suffix: &[u8]) -> Vec<u8> {
+        let hex = encode_hex32(&commitment.as_bytes());
+        let mut out = Vec::with_capacity(prefix.len() + MERGE_MINE_MAGIC_V1.len() + hex.len() + suffix.len());
+        out.extend_from_slice(prefix);
+        out.extend_from_slice(&MERGE_MINE_MAGIC_V1);
+        out.extend_from_slice(&hex);
+        out.extend_from_slice(suffix);
+        out
+    }
+
+    fn payload_commitment(payload: &[u8], magic: &[u8; 4]) -> Option<Hash> {
         let mut found: Option<Hash> = None;
         // Scan every position the 4-byte magic could start at. Requiring a unique
         // occurrence (across the whole payload) is what blocks the two-commitment
         // ambiguity attack, so we must count *all* magics, not stop at the first.
         let mut i = 0usize;
-        while i + MERGE_MINE_MAGIC.len() <= payload.len() {
-            if payload[i..i + MERGE_MINE_MAGIC.len()] == MERGE_MINE_MAGIC {
+        while i + magic.len() <= payload.len() {
+            if payload[i..i + magic.len()] == *magic {
                 // A second magic anywhere ⇒ ambiguous ⇒ reject.
                 if found.is_some() {
                     return None;
                 }
-                let start = i + MERGE_MINE_MAGIC.len();
+                let start = i + magic.len();
                 let end = start + COMMITMENT_HEX_LEN;
                 if end > payload.len() {
                     // Magic present but truncated commitment ⇒ malformed ⇒ reject.

@@ -58,6 +58,24 @@ pub fn shielded_state_root(
     root
 }
 
+/// Personalization of the post-fork state root. A different personalization from
+/// `zkas_state_root0`, so no v0 root can equal a v1 root.
+const STATE_ROOT_V1_PERSONAL: &[u8; 16] = b"zkas_state_root1";
+
+/// The shielded state root from the security fork on (`Params::security_fork_activation`):
+/// the v0 root plus the two values a syncing node previously had to take on trust, the dev-fee
+/// accrual and the anchor window commitment ([`crate::anchor_window`]). Selected by the DAA score
+/// of the block whose state it describes.
+pub fn shielded_state_root_v1(root_v0: &[u8; 32], dev_accrued: u64, anchor_window_commitment: &[u8; 32]) -> [u8; 32] {
+    let mut h = Params::new().hash_length(32).personal(STATE_ROOT_V1_PERSONAL).to_state();
+    h.update(root_v0);
+    h.update(&dev_accrued.to_le_bytes());
+    h.update(anchor_window_commitment);
+    let mut root = [0u8; 32];
+    root.copy_from_slice(h.finalize().as_bytes());
+    root
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -66,6 +84,17 @@ mod tests {
     const N: [u8; 32] = [0x22; 32];
     const B: [u8; 32] = [0x33; 32];
     const NO_BURNS: [u8; 32] = [0u8; 32];
+
+    #[test]
+    fn v1_binds_accrual_and_window_and_differs_from_v0() {
+        let r0 = shielded_state_root(&A, &N, 7, 3, &B);
+        let w = [0x44; 32];
+        let v1 = shielded_state_root_v1(&r0, 5, &w);
+        assert_ne!(v1, r0);
+        assert_ne!(v1, shielded_state_root_v1(&r0, 6, &w), "dev accrual must matter");
+        assert_ne!(v1, shielded_state_root_v1(&r0, 5, &[0x45; 32]), "anchor window must matter");
+        assert_ne!(v1, shielded_state_root_v1(&[0x01; 32], 5, &w), "the v0 root must matter");
+    }
 
     #[test]
     fn deterministic() {

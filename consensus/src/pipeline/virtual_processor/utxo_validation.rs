@@ -286,7 +286,7 @@ impl VirtualStateProcessor {
             // report describes the decision that was actually made rather than a re-derivation.
             let mut anchor_records: Vec<shielded_diag::AnchorResolution> = Vec::new();
             let outcomes = self.shielded_state_manager.partition_applied(&ctx.shielded_txs, |stx| {
-                let verdict = self.resolve_shielded_anchor(&stx.anchor, selected_parent, block_blue_score, pov_daa_score);
+                let verdict = self.resolve_shielded_anchor(&stx.anchor, stx.anchor_block, selected_parent, block_blue_score, pov_daa_score);
                 if diag && !anchor_records.iter().any(|a| a.anchor == shielded_diag::hex32(&stx.anchor)) {
                     // The sibling scan is the expensive part; only worth it for a resolved anchor.
                     let siblings =
@@ -618,7 +618,7 @@ impl VirtualStateProcessor {
         // The coinbase must commit to the shielded state root of this block's selected parent
         // (PLAN §2.10). Rebuilding the expected coinbase with that root means a wrong or missing
         // commitment fails the tx-hash comparison below as `BadCoinbaseTransaction`.
-        let shielded_commitment = self.shielded_state_manager.state_root_at(ghostdag_data.selected_parent).unwrap();
+        let shielded_commitment = self.shielded_state_root_at(ghostdag_data.selected_parent).unwrap();
         // Dev-fee accrual carries along the selected-parent chain, exactly like the
         // shielded state root above, and is read from the same block for the same
         // reason: the expected coinbase must be rebuilt from what THIS block's parent
@@ -898,7 +898,7 @@ impl VirtualStateProcessor {
         // will carry them; and a store error fell back to 0, which would have made every
         // anchor look immature and refused every shielded transaction on the node.
         let outcomes = self.shielded_state_manager.partition_applied(std::slice::from_ref(&stx), |stx| {
-            self.resolve_shielded_anchor(&stx.anchor, selected_parent, blue_score, pov_daa_score).is_final
+            self.resolve_shielded_anchor(&stx.anchor, stx.anchor_block, selected_parent, blue_score, pov_daa_score).is_final
         });
         match outcomes.first().and_then(|o| o.drop_reason()) {
             None => Ok(()),

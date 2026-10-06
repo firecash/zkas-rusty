@@ -918,6 +918,7 @@ pub mod build {
             proof,
             binding_sig,
             burn: None,
+            anchor_block: None,
         }
     }
 

@@ -112,8 +112,12 @@ impl HeaderProcessor {
         // on `header.daa_score` (the block's own claimed score) matches the other
         // header-stage fork gates; the score is re-derived and enforced in context, so a
         // block cannot lie about it to unlock aux acceptance early.
-        let merged_mining_active = self.merged_mining_activation.is_active(header.daa_score);
-        let (passed, pow) = kaspa_pow::auxpow::check_pow_gated(header, header.aux_pow.as_deref(), merged_mining_active);
+        let rule = kaspa_pow::auxpow::AuxRule::for_header(
+            self.merged_mining_activation.is_active(header.daa_score),
+            self.security_fork_activation.is_active(header.daa_score),
+            self.genesis.hash,
+        );
+        let (passed, pow) = kaspa_pow::auxpow::check_pow_gated(header, header.aux_pow.as_deref(), rule);
         if passed { Ok(calc_level_from_pow(pow, self.max_block_level)) } else { Err(RuleError::InvalidPoW) }
     }
 }

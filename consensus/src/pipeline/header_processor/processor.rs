@@ -119,6 +119,7 @@ pub struct HeaderProcessor {
     pub(super) block_version: ForkedParam<u16>,
     /// DAA score at which merged-mining (AuxPoW) PoW acceptance turns on.
     pub(super) merged_mining_activation: ForkActivation,
+    pub(super) security_fork_activation: ForkActivation,
 
     // DB
     db: Arc<DB>,
@@ -209,6 +210,7 @@ impl HeaderProcessor {
             toccata_logger: ForkLogger::new("header in context validation", false),
             block_version: params.block_version(),
             merged_mining_activation: params.merged_mining_activation,
+            security_fork_activation: params.security_fork_activation,
         }
     }
 

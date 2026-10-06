@@ -91,6 +91,23 @@ impl BlockBodyProcessor {
                     return Err(RuleError::BadShieldedCoinbasePayout);
                 }
 
+                if !self.security_fork_activation.is_active(block.header.daa_score)
+                    && block.transactions[0].outputs.len() as u64 > self.pre_fork_coinbase_outputs_limit
+                {
+                    return Err(RuleError::CoinbaseTooManyOutputsBeforeFork(
+                        block.transactions[0].outputs.len(),
+                        self.pre_fork_coinbase_outputs_limit,
+                    ));
+                }
+
+                // Security fork: our own coinbase may not commit to another block for merge mining.
+                // Same scanner the aux-parent check uses, so the two rules cannot drift apart.
+                if self.security_fork_activation.is_active(block.header.daa_score)
+                    && kaspa_consensus_core::auxpow::AuxPow::payload_carries_commitment(&block.transactions[0].payload)
+                {
+                    return Err(RuleError::CoinbaseCarriesMergeMiningCommitment);
+                }
+
                 Ok(())
             }
             Err(e) => Err(RuleError::BadCoinbasePayload(e)),

@@ -120,6 +120,7 @@ pub struct PruningProofManager {
     skip_proof_of_work: bool,
     toccata_activation: ForkActivation,
     merged_mining_activation: ForkActivation,
+    security_fork_activation: ForkActivation,
 
     is_consensus_exiting: Arc<AtomicBool>,
 }
@@ -143,6 +144,7 @@ impl PruningProofManager {
         skip_proof_of_work: bool,
         toccata_activation: ForkActivation,
         merged_mining_activation: ForkActivation,
+        security_fork_activation: ForkActivation,
         is_consensus_exiting: Arc<AtomicBool>,
     ) -> Self {
         Self {
@@ -180,6 +182,7 @@ impl PruningProofManager {
             skip_proof_of_work,
             toccata_activation,
             merged_mining_activation,
+            security_fork_activation,
 
             is_consensus_exiting,
         }
@@ -214,7 +217,7 @@ impl PruningProofManager {
                 header,
                 self.max_block_level,
                 self.skip_proof_of_work,
-                self.merged_mining_activation.is_active(header.daa_score),
+                self.aux_rule(header),
             );
             self.headers_store.insert(header.hash, header.clone(), block_level).unwrap();
         }
@@ -466,3 +469,14 @@ where
 }
 
 impl<T: GhostdagStoreReader> GhostdagReaderExt for T {}
+
+impl PruningProofManager {
+    /// The merge-mining rule for a header, from its own DAA score.
+    pub(crate) fn aux_rule(&self, header: &Header) -> kaspa_pow::auxpow::AuxRule {
+        kaspa_pow::auxpow::AuxRule::for_header(
+            self.merged_mining_activation.is_active(header.daa_score),
+            self.security_fork_activation.is_active(header.daa_score),
+            self.genesis_hash,
+        )
+    }
+}

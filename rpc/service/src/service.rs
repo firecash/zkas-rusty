@@ -404,6 +404,18 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         if block_template.block.transactions[COINBASE_TRANSACTION_INDEX].payload.len() > self.config.max_coinbase_payload_len {
             return Err(RpcError::CoinbasePayloadLengthAboveMax(self.config.max_coinbase_payload_len));
         }
+        // Security fork: a ZKas coinbase may not carry a merge-mining commitment. Refuse the template
+        // here with a clear message rather than hand a pool a block every node will reject.
+        if self.config.params.security_fork_activation.is_active(block_template.block.header.daa_score)
+            && kaspa_consensus_core::auxpow::AuxPow::payload_carries_commitment(
+                &block_template.block.transactions[COINBASE_TRANSACTION_INDEX].payload,
+            )
+        {
+            return Err(RpcError::General(
+                "extra_data carries a merge-mining commitment (ZKMM/ZKM1); that belongs in the Kaspa coinbase, not the ZKas one"
+                    .to_string(),
+            ));
+        }
 
         Ok(GetBlockTemplateResponse {
             block: block_template.block.into(),

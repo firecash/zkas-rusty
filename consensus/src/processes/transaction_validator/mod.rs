@@ -46,6 +46,9 @@ pub struct TransactionValidator {
     /// implemented for the integer primitives and not for `bool`. Always 1.
     shielded_verify_cache: kaspa_database::prelude::Cache<kaspa_consensus_core::tx::TransactionId, u8>,
     toccata_activation: ForkActivation,
+    /// See `Params::security_fork_activation`. Defaults to never; set via
+    /// [`TransactionValidator::with_security_fork_activation`].
+    security_fork_activation: ForkActivation,
     mass_per_sig_op: u64,
     /// Per-network domain separator bound into the shielded-transaction sighash
     /// (the genesis hash). Prevents a shielded bundle valid on one network from
@@ -86,9 +89,15 @@ impl TransactionValidator {
             shielded_verify_cache: kaspa_database::prelude::Cache::new(kaspa_database::prelude::CachePolicy::Count(2_000)),
             mass_calculator,
             toccata_activation,
+            security_fork_activation: ForkActivation::never(),
             mass_per_sig_op,
             shielded_network_domain,
         }
+    }
+
+    pub fn with_security_fork_activation(mut self, activation: ForkActivation) -> Self {
+        self.security_fork_activation = activation;
+        self
     }
 
     pub fn new_for_tests(
@@ -116,6 +125,7 @@ impl TransactionValidator {
             shielded_verify_cache: kaspa_database::prelude::Cache::new(kaspa_database::prelude::CachePolicy::Count(2_000)),
             mass_calculator: MassCalculator::new(0, 0, 0),
             toccata_activation: ForkActivation::never(),
+            security_fork_activation: ForkActivation::never(),
             mass_per_sig_op: 0,
             shielded_network_domain: [0u8; 32],
         }

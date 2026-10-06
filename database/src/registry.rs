@@ -151,6 +151,13 @@ pub enum DatabaseStorePrefixes {
     /// (see `gc_aged_anchors`). Without it the anchor indexes grow one row per chain
     /// block forever.
     ShieldedAnchorGcQueue = 94,
+    /// Security fork: the anchor window (retained bucket chain hashes) as of each chain block at or
+    /// after the activation. Pruned below the pruning point with the other per-block snapshots.
+    ShieldedAnchorWindow = 95,
+    /// Security fork: each post-activation chain block's window entry (its own tree root and blue
+    /// score). Kept below the pruning point so the window can be exported to a syncing node, and
+    /// garbage-collected with the anchor indexes.
+    ShieldedWindowEntry = 96,
 
     // ---- Separator ----
     /// Reserved as a separator

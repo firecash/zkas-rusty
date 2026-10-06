@@ -169,7 +169,7 @@ impl ProofContext {
             &proof_pp_header,
             ppm.max_block_level,
             ppm.skip_proof_of_work,
-            ppm.merged_mining_activation.is_active(proof_pp_header.daa_score),
+            ppm.aux_rule(&proof_pp_header),
         );
         let proof_pp = proof_pp_header.hash;
 
@@ -195,7 +195,7 @@ impl ProofContext {
                     header,
                     ppm.max_block_level,
                     ppm.skip_proof_of_work,
-                    ppm.merged_mining_activation.is_active(header.daa_score),
+                    ppm.aux_rule(header),
                 );
                 if header_level < level {
                     // A merged-mined block missing its aux witness here means the prover

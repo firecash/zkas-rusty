@@ -316,6 +316,10 @@ pub struct OverrideParams {
     /// AuxPoW proof (Option-2 dual acceptance).
     pub merged_mining_activation: Option<ForkActivation>,
 
+    /// See [`Params::security_fork_activation`]. Overridable so a private test network can choose
+    /// the score it crosses.
+    pub security_fork_activation: Option<ForkActivation>,
+
     /// Whether the coinbase mints its reward into the shielded pool (private-by-default
     /// networks) rather than as a transparent output. Overridable so tests can exercise
     /// the shielded pipeline on a small-pruning simnet base (which is otherwise
@@ -354,6 +358,7 @@ impl From<Params> for OverrideParams {
             crescendo_activation: Some(p.crescendo_activation),
             toccata_activation: Some(p.toccata_activation),
             merged_mining_activation: Some(p.merged_mining_activation),
+            security_fork_activation: Some(p.security_fork_activation),
             shielded_coinbase: Some(p.shielded_coinbase),
         }
     }
@@ -494,6 +499,18 @@ pub struct Params {
     /// clear the native kHeavyHash PoW; at/after it a block may instead carry a valid
     /// AuxPoW proof whose parent kHeavyHash clears our target (Option-2 dual acceptance).
     pub merged_mining_activation: ForkActivation,
+
+    /// The 2026-10 security fork. From this DAA score, all at once:
+    /// - a shielded spend names its anchor block (`anchor_block`, sighash-covered) and the anchor
+    ///   must be that block's own tree root, a matured selected-chain ancestor;
+    /// - the shielded state root is `zkas_state_root1`, which also commits `dev_accrued`,
+    ///   cumulative burns and the anchor window, so a syncing node can verify everything it imports;
+    /// - an aux parent commits the long, genesis-bound form over the nonce-free header hash, an
+    ///   aux-accepted block's nonce must equal the truncated parent hash, and a ZKas coinbase may not
+    ///   carry a merge-mining commitment;
+    /// - the coinbase output cap counts the dev note (k + 3).
+    /// `never()` on mainnet until a score is chosen and announced.
+    pub security_fork_activation: ForkActivation,
 
     /// ZKas launch difficulty schedule — number of blocks (blue-score units) at the
     /// start of the chain during which difficulty is **pinned** to the genesis target
@@ -794,6 +811,7 @@ impl Params {
             dev_fee_accrual_activation: self.dev_fee_accrual_activation,
             dev_fee_payout_interval: self.dev_fee_payout_interval,
             merged_mining_activation: overrides.merged_mining_activation.unwrap_or(self.merged_mining_activation),
+            security_fork_activation: overrides.security_fork_activation.unwrap_or(self.security_fork_activation),
 
             // Consensus-critical launch schedule; not exposed as a CLI override.
             low_difficulty_start_blocks: self.low_difficulty_start_blocks,
@@ -969,6 +987,7 @@ pub const MAINNET_PARAMS: Params = Params {
     // applies; since the July 2026 mainnet launch (fresh genesis), always() is the
     // intended, correct value. This is historical context, not a planned change.)
     merged_mining_activation: ForkActivation::always(),
+    security_fork_activation: ForkActivation::never(),
 
     // ZKas launch difficulty: the low-difficulty bootstrap schedule is DISABLED on mainnet
     // (both 0), so the chain launches under pure upstream KIP-0004 DAA from genesis — the
@@ -1057,6 +1076,7 @@ pub const TESTNET_PARAMS: Params = Params {
     dev_fee_payout_interval: 1_000,
     // On testnet, merged mining is available from genesis for testing.
     merged_mining_activation: ForkActivation::always(),
+    security_fork_activation: ForkActivation::never(),
 
     // Launch difficulty schedule disabled on testnet.
     low_difficulty_start_blocks: 0,
@@ -1119,6 +1139,7 @@ pub const SIMNET_PARAMS: Params = Params {
     // long enough to cut per-block dev notes by three orders of magnitude.
     dev_fee_payout_interval: 1_000,
     merged_mining_activation: ForkActivation::always(),
+    security_fork_activation: ForkActivation::always(),
 
     // Launch difficulty schedule disabled on simnet.
     low_difficulty_start_blocks: 0,
@@ -1190,6 +1211,7 @@ pub const DEVNET_PARAMS: Params = Params {
     // long enough to cut per-block dev notes by three orders of magnitude.
     dev_fee_payout_interval: 20,
     merged_mining_activation: ForkActivation::always(),
+    security_fork_activation: ForkActivation::new(1_500),
 
     // Pin difficulty to the (easy) genesis target for the first 50k blocks so the
     // short devnet demo chain stays CPU-mineable throughout (mirrors mainnet's launch

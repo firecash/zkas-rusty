@@ -152,7 +152,8 @@ impl ConsensusServices {
             params.toccata_activation,
             params.mass_per_sig_op,
             params.genesis.hash.as_bytes(),
-        );
+        )
+        .with_security_fork_activation(params.security_fork_activation);
 
         let pruning_point_manager = PruningPointManager::new(
             params.pruning_depth(),
@@ -191,6 +192,7 @@ impl ConsensusServices {
             params.skip_proof_of_work,
             params.toccata_activation,
             params.merged_mining_activation,
+            params.security_fork_activation,
             is_consensus_exiting,
         ));
 

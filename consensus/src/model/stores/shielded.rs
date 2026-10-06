@@ -209,6 +209,17 @@ impl DbShieldedTreeStore {
     pub fn delete_batch(&self, batch: &mut WriteBatch, block: Hash) -> StoreResult<()> {
         self.access.delete(BatchDbWriter::new(batch), block)
     }
+
+    /// The stored frontier, or `None` when this node holds no row for `block`. Unlike `get`, an
+    /// absent row is not reported as the empty tree, so callers can tell "never stored" from
+    /// "empty".
+    pub fn get_present(&self, block: Hash) -> StoreResult<Option<FrontierState>> {
+        match self.access.read(block) {
+            Ok(s) => Ok(Some(s.0)),
+            Err(StoreError::KeyNotFound(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
 }
 
 impl ShieldedTreeStoreReader for DbShieldedTreeStore {
@@ -372,6 +383,82 @@ impl DbShieldedAnchorSourceScoreStore {
             Err(StoreError::KeyNotFound(_)) => Ok(None),
             Err(e) => Err(e),
         }
+    }
+}
+
+// --------------------------- Anchor window (security fork) ---------------------------
+
+/// Per-block anchor window and per-block window entry (see `kaspa_shielded_core::anchor_window`).
+/// Both read an absent key as `None`, never as a default: a missing window at a post-fork block is
+/// a store inconsistency the caller must surface, not an empty window.
+#[derive(Clone)]
+pub struct DbAnchorWindowStore {
+    db: Arc<DB>,
+    windows: CachedDbAccess<Hash, StoredAnchorWindow, BlockHasher>,
+    entries: CachedDbAccess<Hash, StoredWindowEntry, BlockHasher>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct StoredAnchorWindow(pub kaspa_shielded_core::anchor_window::AnchorWindow);
+impl MemSizeEstimator for StoredAnchorWindow {}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct StoredWindowEntry(pub kaspa_shielded_core::anchor_window::WindowEntry);
+impl MemSizeEstimator for StoredWindowEntry {}
+
+impl DbAnchorWindowStore {
+    pub fn new(db: Arc<DB>, cache_policy: CachePolicy) -> Self {
+        Self {
+            db: Arc::clone(&db),
+            windows: CachedDbAccess::new(Arc::clone(&db), cache_policy, DatabaseStorePrefixes::ShieldedAnchorWindow.into()),
+            entries: CachedDbAccess::new(db, cache_policy, DatabaseStorePrefixes::ShieldedWindowEntry.into()),
+        }
+    }
+
+    pub fn clone_with_new_cache(&self, cache_policy: CachePolicy) -> Self {
+        Self::new(Arc::clone(&self.db), cache_policy)
+    }
+
+    pub fn set_window_batch(
+        &self,
+        batch: &mut WriteBatch,
+        block: Hash,
+        window: kaspa_shielded_core::anchor_window::AnchorWindow,
+    ) -> StoreResult<()> {
+        self.windows.write(BatchDbWriter::new(batch), block, StoredAnchorWindow(window))
+    }
+
+    pub fn window(&self, block: Hash) -> StoreResult<Option<kaspa_shielded_core::anchor_window::AnchorWindow>> {
+        match self.windows.read(block) {
+            Ok(v) => Ok(Some(v.0)),
+            Err(StoreError::KeyNotFound(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub fn delete_window_batch(&self, batch: &mut WriteBatch, block: Hash) -> StoreResult<()> {
+        self.windows.delete(BatchDbWriter::new(batch), block)
+    }
+
+    pub fn set_entry_batch(
+        &self,
+        batch: &mut WriteBatch,
+        block: Hash,
+        entry: kaspa_shielded_core::anchor_window::WindowEntry,
+    ) -> StoreResult<()> {
+        self.entries.write(BatchDbWriter::new(batch), block, StoredWindowEntry(entry))
+    }
+
+    pub fn entry(&self, block: Hash) -> StoreResult<Option<kaspa_shielded_core::anchor_window::WindowEntry>> {
+        match self.entries.read(block) {
+            Ok(v) => Ok(Some(v.0)),
+            Err(StoreError::KeyNotFound(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub fn delete_entry_batch(&self, batch: &mut WriteBatch, block: Hash) -> StoreResult<()> {
+        self.entries.delete(BatchDbWriter::new(batch), block)
     }
 }
 

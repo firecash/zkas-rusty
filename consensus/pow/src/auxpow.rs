@@ -69,20 +69,58 @@ pub fn check_pow_dual(header: &Header, aux: Option<&AuxPow>) -> (bool, Uint256) 
 ///
 /// Before activation the aux witness is ignored entirely. Returns `(passed, pow)` as
 /// in [`check_pow_dual`]; `pow` is the work value used for block-level math.
-pub fn check_pow_gated(header: &Header, aux: Option<&AuxPow>, merged_mining_active: bool) -> (bool, Uint256) {
+pub fn check_pow_gated(header: &Header, aux: Option<&AuxPow>, rule: impl Into<AuxRule>) -> (bool, Uint256) {
     let (native_ok, native_pow) = State::new(header).check_pow(header.nonce);
     if native_ok {
         return (true, native_pow);
     }
-    if merged_mining_active {
-        if let Some(a) = aux {
-            let target = Uint256::from_compact_target_bits(header.bits);
-            if verify_aux_pow(a, header.hash, target) {
-                return (true, parent_pow(a));
+    if let Some(a) = aux {
+        let target = Uint256::from_compact_target_bits(header.bits);
+        let accepted = match rule.into() {
+            AuxRule::Off => false,
+            AuxRule::Legacy => verify_aux_pow(a, header.hash, target),
+            AuxRule::Bound(genesis) => {
+                // Security fork: the parent commits the genesis-bound, nonce-free header hash, and
+                // this block's nonce is the parent's hash. The full block hash covers the nonce, so
+                // it fixes the parent: one block, one witness, one level. And a ZKas block cannot
+                // be the parent, because its coinbase may carry no commitment (body rule).
+                let nonce_free = kaspa_consensus_core::hashing::header::hash_override_nonce_time(header, 0, header.timestamp);
+                header.nonce == AuxPow::nonce_binding(&a.parent_header)
+                    && a.verify_binding_v1(genesis, nonce_free)
+                    && parent_pow(a) <= target
             }
+        };
+        if accepted {
+            return (true, parent_pow(a));
         }
     }
     (false, native_pow)
+}
+
+/// Which merge-mining rule applies to a header: none (before merged mining), the original
+/// `ZKMM‖hex(H_fc)` binding, or the security-fork binding bound to `genesis`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuxRule {
+    Off,
+    Legacy,
+    Bound(Hash),
+}
+
+impl From<bool> for AuxRule {
+    fn from(merged_mining_active: bool) -> Self {
+        if merged_mining_active { AuxRule::Legacy } else { AuxRule::Off }
+    }
+}
+
+impl AuxRule {
+    /// The rule for a header with DAA score `daa_score`.
+    pub fn for_header(merged_mining_active: bool, security_fork_active: bool, genesis: Hash) -> Self {
+        match (merged_mining_active, security_fork_active) {
+            (false, _) => AuxRule::Off,
+            (true, false) => AuxRule::Legacy,
+            (true, true) => AuxRule::Bound(genesis),
+        }
+    }
 }
 
 #[cfg(test)]

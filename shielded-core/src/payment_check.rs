@@ -256,6 +256,7 @@ mod tests {
                 proof: Vec::new(),
                 binding_sig: [0; 64],
                 burn: None,
+                anchor_block: None,
             },
             disc,
         )

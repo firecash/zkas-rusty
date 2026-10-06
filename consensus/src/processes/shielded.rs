@@ -34,7 +34,7 @@ use rocksdb::WriteBatch;
 use kaspa_math::Uint3072;
 use kaspa_muhash::MuHash;
 
-use crate::model::stores::shielded::DbAnchorGcQueueStore;
+use crate::model::stores::shielded::{DbAnchorGcQueueStore, DbAnchorWindowStore};
 use crate::model::stores::shielded::{
     AnchorBlockStoreReader, AnchorProducersStoreReader, BurnReceipts, DbAnchorBlockStore, DbAnchorProducersStore,
     DbNullifierDiffStore, DbNullifierSetStore, DbShieldedAnchorSourceScoreStore, DbShieldedBurnStore, DbShieldedDevAccruedStore,
@@ -211,6 +211,45 @@ pub struct PruningPointShieldedMetadata {
     /// `dev_accrued` needed. Empty means "peer cannot attest", which fails closed.
     #[serde(default)]
     pub in_window_anchor_source_scores: Vec<(Hash, u64)>,
+    /// Security fork: every window entry the pruning point's anchor window retains, ascending by
+    /// blue score. A syncing node re-folds them and must reproduce the window committed in
+    /// `zkas_state_root1`, so these pairs are proven, not trusted. Empty for a pre-fork pruning
+    /// point. Trailing, like every field added before it (see [`Self::from_wire_bytes`]).
+    #[serde(default)]
+    pub window_entries: Vec<kaspa_shielded_core::anchor_window::WindowEntry>,
+}
+
+/// The layout before `window_entries`: the current struct minus its trailing field.
+#[derive(serde::Deserialize)]
+struct PreWindowPruningPointShieldedMetadata {
+    frontier: FrontierState,
+    supply: SupplyTotals,
+    nullifier_muhash: MuHash,
+    #[serde(default)]
+    burns: BurnReceipts,
+    state_root: [u8; 32],
+    #[serde(default)]
+    in_window_anchors: Vec<([u8; 32], Hash)>,
+    #[serde(default)]
+    dev_accrued: u64,
+    #[serde(default)]
+    in_window_anchor_source_scores: Vec<(Hash, u64)>,
+}
+
+impl From<PreWindowPruningPointShieldedMetadata> for PruningPointShieldedMetadata {
+    fn from(v: PreWindowPruningPointShieldedMetadata) -> Self {
+        Self {
+            frontier: v.frontier,
+            supply: v.supply,
+            nullifier_muhash: v.nullifier_muhash,
+            burns: v.burns,
+            state_root: v.state_root,
+            in_window_anchors: v.in_window_anchors,
+            dev_accrued: v.dev_accrued,
+            in_window_anchor_source_scores: v.in_window_anchor_source_scores,
+            window_entries: Vec::new(),
+        }
+    }
 }
 
 /// The pre-accrual wire layout, kept only so [`PruningPointShieldedMetadata::from_wire_bytes`]
@@ -239,6 +278,7 @@ impl From<LegacyPruningPointShieldedMetadata> for PruningPointShieldedMetadata {
             in_window_anchors: v.in_window_anchors,
             dev_accrued: 0,
             in_window_anchor_source_scores: Vec::new(),
+            window_entries: Vec::new(),
         }
     }
 }
@@ -274,6 +314,7 @@ impl From<PreAnchorScoresPruningPointShieldedMetadata> for PruningPointShieldedM
             // Empty, not a guess: the peer never claimed any blue scores, so nothing is
             // attested and every in-window anchor keeps failing closed.
             in_window_anchor_source_scores: Vec::new(),
+            window_entries: Vec::new(),
         }
     }
 }
@@ -297,8 +338,9 @@ impl PruningPointShieldedMetadata {
         // succeed against a NEW blob and silently discard the fields it does not know.
         match bincode::deserialize::<Self>(bytes) {
             Ok(md) => Ok(md),
-            Err(primary) => bincode::deserialize::<PreAnchorScoresPruningPointShieldedMetadata>(bytes)
+            Err(primary) => bincode::deserialize::<PreWindowPruningPointShieldedMetadata>(bytes)
                 .map(Into::into)
+                .or_else(|_| bincode::deserialize::<PreAnchorScoresPruningPointShieldedMetadata>(bytes).map(Into::into))
                 .or_else(|_| bincode::deserialize::<LegacyPruningPointShieldedMetadata>(bytes).map(Into::into))
                 .map_err(|_: bincode::Error| format!("malformed shielded pruning-point metadata: {primary}")),
         }
@@ -513,6 +555,8 @@ pub struct ShieldedStateManager {
     burn_store: DbShieldedBurnStore,
     /// Peer-attested blue scores for in-window anchor sources below the pruning point.
     anchor_source_scores: DbShieldedAnchorSourceScoreStore,
+    /// Security fork: per-block anchor window and window entries.
+    anchor_window: DbAnchorWindowStore,
 }
 
 impl ShieldedStateManager {
@@ -533,8 +577,63 @@ impl ShieldedStateManager {
             anchor_producers: DbAnchorProducersStore::new(Arc::clone(&db), cache_policy),
             scan_block: DbShieldedScanBlockStore::new(Arc::clone(&db), cache_policy),
             burn_store: DbShieldedBurnStore::new(Arc::clone(&db), cache_policy),
-            anchor_source_scores: DbShieldedAnchorSourceScoreStore::new(db, cache_policy),
+            anchor_source_scores: DbShieldedAnchorSourceScoreStore::new(Arc::clone(&db), cache_policy),
+            anchor_window: DbAnchorWindowStore::new(db, cache_policy),
         }
+    }
+
+    /// The anchor window as of `block`, `None` if this node holds none (a pre-fork block, or a
+    /// post-fork block below the pruning point).
+    pub fn window_at(&self, block: Hash) -> StoreResult<Option<kaspa_shielded_core::anchor_window::AnchorWindow>> {
+        self.anchor_window.window(block)
+    }
+
+    /// A post-fork chain block's own window entry, `None` if absent.
+    pub fn window_entry(&self, block: Hash) -> StoreResult<Option<kaspa_shielded_core::anchor_window::WindowEntry>> {
+        self.anchor_window.entry(block)
+    }
+
+    /// Stage a post-fork block's window and entry in the block-commit batch.
+    pub fn persist_window(
+        &self,
+        batch: &mut WriteBatch,
+        block: Hash,
+        window: kaspa_shielded_core::anchor_window::AnchorWindow,
+        entry: kaspa_shielded_core::anchor_window::WindowEntry,
+    ) -> StoreResult<()> {
+        self.anchor_window.set_window_batch(batch, block, window)?;
+        self.anchor_window.set_entry_batch(batch, block, entry)
+    }
+
+    /// Stage only a window entry (used when seeding imported, PoW-verified entries).
+    pub fn persist_window_entry(
+        &self,
+        batch: &mut WriteBatch,
+        block: Hash,
+        entry: kaspa_shielded_core::anchor_window::WindowEntry,
+    ) -> StoreResult<()> {
+        self.anchor_window.set_entry_batch(batch, block, entry)
+    }
+
+    /// Stage only a window (used when seeding the pruning point's window on import).
+    pub fn persist_window_only(
+        &self,
+        batch: &mut WriteBatch,
+        block: Hash,
+        window: kaspa_shielded_core::anchor_window::AnchorWindow,
+    ) -> StoreResult<()> {
+        self.anchor_window.set_window_batch(batch, block, window)
+    }
+
+    /// The post-fork state root (`zkas_state_root1`) as of `block`. The caller decides the version
+    /// from `block`'s own DAA score. A post-fork block without a window row is a store
+    /// inconsistency and is reported as one rather than read as an empty window.
+    pub fn state_root_v1_at(&self, block: Hash) -> StoreResult<[u8; 32]> {
+        let root0 = self.state_root_at(block)?;
+        let window = self.anchor_window.window(block)?.ok_or_else(|| {
+            kaspa_database::prelude::StoreError::DataInconsistency(format!("post-fork block {block} has no anchor window"))
+        })?;
+        Ok(kaspa_shielded_core::commitment::shielded_state_root_v1(&root0, self.dev_accrued_store.get(block)?, &window.commitment()))
     }
 
     /// Peer-attested blue score of an in-window anchor source, or `None` if nothing was
@@ -746,6 +845,15 @@ impl ShieldedStateManager {
         Ok(self.load_tree(block)?.anchor().to_bytes())
     }
 
+    /// The tree root `block` itself produced, or `None` if this node holds no frontier for it
+    /// (below its pruning point on a fast-synced node, or never validated).
+    pub fn own_anchor_of(&self, block: Hash) -> StoreResult<Option<[u8; 32]>> {
+        Ok(self
+            .tree_store
+            .get_present(block)?
+            .map(|state| GlobalTree::from_state(&state).expect("persisted shielded frontier is corrupt").anchor().to_bytes()))
+    }
+
     /// The global note-commitment tree **frontier** as of a given chain block — the
     /// checkpoint a light wallet fast-syncs from (`WalletDb::from_frontier`): it scans
     /// only blocks after this block, yet still witnesses its notes against the live
@@ -869,6 +977,9 @@ impl ShieldedStateManager {
         self.nullifier_muhash.delete_batch(batch, block)?;
         self.burn_store.delete_batch(batch, block)?;
         self.dev_accrued_store.delete_batch(batch, block)?;
+        // The per-block window is a snapshot like the others; the ENTRY is kept (GC'd with the
+        // anchor indexes) because the export for a later pruning point still needs it.
+        self.anchor_window.delete_window_batch(batch, block)?;
         // Per-block nullifier diffs only exist to revert a reorg; below the pruning
         // point no reorg can reach them.
         self.nullifier_diffs.delete_batch(batch, block)?;
@@ -900,6 +1011,7 @@ impl ShieldedStateManager {
                 self.anchor_block.delete_batch(batch, anchor)?;
             }
             self.anchor_producers.remove_producer_batch(batch, anchor, block)?;
+            self.anchor_window.delete_entry_batch(batch, block)?;
             self.anchor_gc.delete_batch(batch, blue, anchor, block)?;
         }
         Ok(aged.len())
@@ -1137,6 +1249,8 @@ impl ShieldedStateManager {
             in_window_anchors: Vec::new(),
             dev_accrued,
             in_window_anchor_source_scores: Vec::new(),
+            // Filled by the caller for a post-fork pruning point (selected-chain walk).
+            window_entries: Vec::new(),
         }))
     }
 
@@ -1398,6 +1512,7 @@ impl ShieldedStateManager {
         // pruner already deletes this row (`prune_block_snapshots`); the re-import clear was the
         // inconsistency.
         self.dev_accrued_store.delete_batch(batch, pruning_point)?;
+        self.anchor_window.delete_window_batch(batch, pruning_point)?;
         Ok(())
     }
 }
@@ -1465,6 +1580,7 @@ mod tests {
             in_window_anchors: vec![([3u8; 32], Hash::from_bytes([4u8; 32]))],
             dev_accrued: 123_456,
             in_window_anchor_source_scores: vec![(Hash::from_bytes([4u8; 32]), 990_606)],
+            window_entries: Vec::new(),
         };
 
         // Round-trip through the current layout.
@@ -1481,12 +1597,23 @@ mod tests {
             in_window_anchor_source_scores: Vec::new(),
             nullifier_muhash: md.nullifier_muhash.clone(),
             burns: md.burns.clone(),
+            window_entries: Vec::new(),
             ..md.clone()
         };
         let pre_scores_bytes = pre_scores.to_wire_bytes();
-        let truncated = &pre_scores_bytes[..pre_scores_bytes.len() - std::mem::size_of::<u64>()];
+        // Strip BOTH trailing empty vectors (scores, then window entries): two u64 length prefixes.
+        let truncated = &pre_scores_bytes[..pre_scores_bytes.len() - 2 * std::mem::size_of::<u64>()];
         let from_pre_scores = PruningPointShieldedMetadata::from_wire_bytes(truncated).expect("pre-scores layout decodes");
         assert!(from_pre_scores.in_window_anchor_source_scores.is_empty(), "no scores claimed means none attested");
+
+        // A peer from before the security fork: our blob minus only the window entries. Its scores
+        // survive and it carries no window, which is the right value for a pre-fork pruning point.
+        let pre_window = PruningPointShieldedMetadata { window_entries: Vec::new(), ..md.clone() };
+        let pre_window_bytes = pre_window.to_wire_bytes();
+        let truncated = &pre_window_bytes[..pre_window_bytes.len() - std::mem::size_of::<u64>()];
+        let from_pre_window = PruningPointShieldedMetadata::from_wire_bytes(truncated).expect("pre-window layout decodes");
+        assert_eq!(from_pre_window.in_window_anchor_source_scores, md.in_window_anchor_source_scores);
+        assert!(from_pre_window.window_entries.is_empty());
         assert_eq!(from_pre_scores.dev_accrued, 123_456, "the accrual before it still survives");
         assert_eq!(from_pre_scores.in_window_anchors, md.in_window_anchors);
 
@@ -1536,6 +1663,7 @@ mod tests {
             in_window_anchors: vec![(anchor, source)],
             dev_accrued: 0,
             in_window_anchor_source_scores: vec![(source, 990_606)],
+            window_entries: Vec::new(),
         };
 
         let mut batch = WriteBatch::default();
@@ -1681,6 +1809,7 @@ mod tests {
     fn stx(nfs: &[u8], cmxs: &[u32], fee: u64) -> ShieldedTx {
         ShieldedTx {
             burn: None,
+            anchor_block: None,
             nullifiers: nfs.iter().map(|&n| nf(n)).collect(),
             commitments: cmxs.iter().map(|&c| cmx(c)).collect(),
             fee,
@@ -1751,6 +1880,7 @@ mod tests {
     fn burn_stx(nfs: &[u8], cmxs: &[u32], value_balance: u64, burn_v: u64, tag: u8) -> ShieldedTx {
         ShieldedTx {
             burn: Some(kaspa_shielded_core::burn::ExitReceipt { v: burn_v, recipient: [tag; 32], n: [tag.wrapping_add(0x90); 32] }),
+            anchor_block: None,
             nullifiers: nfs.iter().map(|&n| nf(n)).collect(),
             commitments: cmxs.iter().map(|&c| cmx(c)).collect(),
             fee: value_balance,
@@ -1822,6 +1952,7 @@ mod tests {
             in_window_anchors: vec![(hist_anchor, hist_source)],
             dev_accrued: 0,
             in_window_anchor_source_scores: Vec::new(),
+            window_entries: Vec::new(),
         };
 
         let mut batch = WriteBatch::default();

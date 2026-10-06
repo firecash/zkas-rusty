@@ -100,6 +100,16 @@ pub enum RuleError {
     #[error("coinbase payout address is not a canonical Orchard address (required on a shielded network)")]
     BadShieldedCoinbasePayout,
 
+    /// Security fork: a ZKas coinbase must not carry a merge-mining commitment, or the block could
+    /// serve as the proof-of-work of a second ZKas block (one solution, two blocks).
+    #[error("coinbase payload carries a merge-mining commitment, which a ZKas block may not")]
+    CoinbaseCarriesMergeMiningCommitment,
+
+    /// Before the security fork the coinbase output limit is k + 2 (kept so pre-fork validity is
+    /// unchanged); from it, k + 3.
+    #[error("coinbase has {0} outputs, above the pre-fork limit of {1}")]
+    CoinbaseTooManyOutputsBeforeFork(usize, u64),
+
     #[error("transaction in isolation validation failed for tx {0}: {1}")]
     TxInIsolationValidationFailed(TransactionId, TxRuleError),
 

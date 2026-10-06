@@ -83,7 +83,7 @@ impl PruningProofManager {
                 &tb.block.header,
                 self.max_block_level,
                 self.skip_proof_of_work,
-                self.merged_mining_activation.is_active(tb.block.header.daa_score),
+                self.aux_rule(&tb.block.header),
             );
 
             (0..=tb_block_level).for_each(|current_proof_level| {
@@ -214,7 +214,7 @@ impl PruningProofManager {
                     &header,
                     self.max_block_level,
                     self.skip_proof_of_work,
-                    self.merged_mining_activation.is_active(header.daa_score),
+                    self.aux_rule(&header),
                 );
                 self.headers_store.insert(header.hash, header.clone(), block_level).idempotent().unwrap();
 

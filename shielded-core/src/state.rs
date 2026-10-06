@@ -49,6 +49,8 @@ pub struct ShieldedTx {
     /// and the remaining `fee - burn.v` is paid to the miner as an ordinary fee. A burn may
     /// therefore never exceed `fee` — otherwise it would move value the bundle never authorised.
     pub burn: Option<crate::burn::ExitReceipt>,
+    /// The block the spend names as the producer of `anchor` (security fork); `None` before it.
+    pub anchor_block: Option<[u8; 32]>,
 }
 
 /// Error extracting a [`ShieldedTx`] from an on-wire [`ShieldedBundle`].
@@ -118,7 +120,7 @@ impl ShieldedTx {
             }
             None => None,
         };
-        Ok(ShieldedTx { nullifiers, commitments, fee: bundle.value_balance as u64, anchor: bundle.anchor, burn })
+        Ok(ShieldedTx { nullifiers, commitments, fee: bundle.value_balance as u64, anchor: bundle.anchor, burn, anchor_block: bundle.anchor_block })
     }
 }
 
@@ -392,6 +394,7 @@ mod tests {
     fn tx(nfs: &[u8], cmxs: &[u32], fee: u64) -> ShieldedTx {
         ShieldedTx {
             burn: None,
+            anchor_block: None,
             nullifiers: nfs.iter().map(|&n| nf(n)).collect(),
             commitments: cmxs.iter().map(|&c| cmx(c)).collect(),
             fee,
@@ -446,6 +449,7 @@ mod tests {
     fn burn_tx(nfs: &[u8], cmxs: &[u32], value_balance: u64, burn_v: u64, tag: u8) -> ShieldedTx {
         ShieldedTx {
             burn: Some(crate::burn::ExitReceipt { v: burn_v, recipient: [tag; 32], n: [tag.wrapping_add(0x90); 32] }),
+            anchor_block: None,
             nullifiers: nfs.iter().map(|&n| nf(n)).collect(),
             commitments: cmxs.iter().map(|&c| cmx(c)).collect(),
             fee: value_balance,
@@ -710,6 +714,7 @@ mod tests {
         let bundle = ShieldedBundle {
             actions: vec![action(1, 100), action(2, 101)],
             burn: None,
+            anchor_block: None,
             flags: 0b11,
             value_balance: 7,
             anchor: [0; 32],
@@ -732,6 +737,7 @@ mod tests {
             proof: vec![],
             binding_sig: [0; 64],
             burn: None,
+            anchor_block: None,
         };
         assert!(matches!(ShieldedTx::from_bundle(&bundle), Err(BundleExtractError::MintingValueBalance)));
     }
@@ -748,6 +754,7 @@ mod tests {
             proof: vec![],
             binding_sig: [0; 64],
             burn: None,
+            anchor_block: None,
         };
         assert!(matches!(ShieldedTx::from_bundle(&bundle), Err(BundleExtractError::NonCanonicalCommitment)));
     }

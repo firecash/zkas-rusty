@@ -110,6 +110,18 @@ impl TransactionValidator {
             if bundle.value_balance < 0 {
                 return Err(TxRuleError::InvalidShieldedTransaction("shielded fee (value balance) must be non-negative"));
             }
+            // Security fork: from the activation a spend must name its anchor block; before it the
+            // extension is not part of the format. Judged at the DAA score of the block that
+            // carries the transaction, so every node draws the line at the same block.
+            match (self.security_fork_activation.is_active(block_daa_score), bundle.anchor_block.is_some()) {
+                (true, false) => {
+                    return Err(TxRuleError::InvalidShieldedTransaction("shielded spend must name its anchor block after the security fork"));
+                }
+                (false, true) => {
+                    return Err(TxRuleError::InvalidShieldedTransaction("anchor block field is not valid before the security fork"));
+                }
+                _ => {}
+            }
             bundle.value_balance as u64
         } else {
             total_in - total_out
