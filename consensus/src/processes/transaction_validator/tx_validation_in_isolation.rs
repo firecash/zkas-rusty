@@ -106,12 +106,14 @@ impl TransactionValidator {
             return Err(TxRuleError::CoinbaseNonZeroMassCommitment);
         }
 
-        // k + 1 DAA blues, one aggregated red reward, and (on a network with a dev recipient) the
-        // dev note: k + 3. Before the security fork consensus still capped this at k + 2, which made
-        // a payout block of 19 blues + a red + the dev note unmineable; that pre-fork limit is kept,
-        // by DAA score, in body validation in context. This isolation bound is only a size bound:
-        // the coinbase must equal the expected coinbase exactly, so it can never carry an extra output.
-        let outputs_limit = self.ghostdag_k as u64 + 3;
+        // k + 1 DAA blues, one aggregated red reward, the miner accrual slot paid out on a payout
+        // block (security fork: a block whose every reward opens a new streak, on a payout boundary,
+        // emits one note per reward plus the carried slot), and (with a dev recipient) the dev note:
+        // k + 4. Before the security fork consensus still capped this at k + 2, which made a payout
+        // block of 19 blues + a red + the dev note unmineable; that pre-fork limit is kept, by DAA
+        // score, in body validation in context. This isolation bound is only a size bound: the
+        // coinbase must equal the expected coinbase exactly, so it can never carry an extra output.
+        let outputs_limit = self.ghostdag_k as u64 + 4;
         if tx.outputs.len() as u64 > outputs_limit {
             return Err(TxRuleError::CoinbaseTooManyOutputs(tx.outputs.len(), outputs_limit));
         }

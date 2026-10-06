@@ -306,6 +306,8 @@ from!(item: RpcResult<&kaspa_rpc_core::GetShieldedCoinbaseRewardsResponse>, prot
         scanned_blocks: item.scanned_blocks,
         reorged: item.reorged,
         sink_blue_score: item.sink_blue_score,
+        pending_recipient: item.pending_recipient.clone(),
+        pending_value: item.pending_value,
         error: None,
     }
 });
@@ -930,6 +932,8 @@ try_from!(item: &protowire::GetShieldedCoinbaseRewardsResponseMessage, RpcResult
         scanned_blocks: item.scanned_blocks,
         reorged: item.reorged,
         sink_blue_score: item.sink_blue_score,
+        pending_recipient: item.pending_recipient.clone(),
+        pending_value: item.pending_value,
     }
 });
 

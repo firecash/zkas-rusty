@@ -267,6 +267,11 @@ impl ConsensusSessionOwned {
         self.clone().spawn_blocking(move |c| c.get_shielded_chain_block_data(block)).await
     }
 
+    /// The miner reward carried by a chain block (security fork). See `ConsensusApi::get_miner_accrual`.
+    pub async fn async_get_miner_accrual(&self, block: Hash) -> ConsensusResult<kaspa_consensus_core::coinbase::MinerAccrual> {
+        self.clone().spawn_blocking(move |c| c.get_miner_accrual(block)).await
+    }
+
     /// The next `limit` selected-chain hashes after `low`, read from the retained chain
     /// index so a pruned node can still enumerate full history. `None` = re-anchor.
     pub async fn async_get_shielded_chain_range(&self, low: Hash, limit: usize) -> ConsensusResult<Option<Vec<Hash>>> {

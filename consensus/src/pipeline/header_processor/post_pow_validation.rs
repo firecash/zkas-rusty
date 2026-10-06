@@ -102,7 +102,7 @@ impl HeaderProcessor {
     }
 
     // TODO(post-toccata): Remove this and restore the context-free check_header_version.
-    fn check_header_version_in_context(&self, header: &Header) -> BlockProcessResult<()> {
+    pub(super) fn check_header_version_in_context(&self, header: &Header) -> BlockProcessResult<()> {
         let expected_version = self.block_version.get(header.daa_score);
         if header.version != expected_version {
             return Err(RuleError::WrongBlockVersion(header.version, expected_version));

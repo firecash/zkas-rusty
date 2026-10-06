@@ -134,6 +134,13 @@ impl ConsensusServices {
             params.dev_fee_recipient,
             params.dev_fee_accrual_activation,
             params.dev_fee_payout_interval,
+            // Miner accrual exists to stop one Orchard note per block; a transparent-coinbase network
+            // (simnet) keeps upstream's per-block outputs.
+            if params.shielded_coinbase {
+                params.security_fork_activation
+            } else {
+                kaspa_consensus_core::config::params::ForkActivation::never()
+            },
         );
 
         let mass_calculator =

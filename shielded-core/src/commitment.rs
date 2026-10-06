@@ -62,15 +62,35 @@ pub fn shielded_state_root(
 /// `zkas_state_root0`, so no v0 root can equal a v1 root.
 const STATE_ROOT_V1_PERSONAL: &[u8; 16] = b"zkas_state_root1";
 
+/// The miner-reward accrual slot as committed in [`shielded_state_root_v1`]: the payout script
+/// (version and bytes) and the carried amount. An empty slot is `(0, &[], 0)`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MinerAccrualRef<'a> {
+    pub script_version: u16,
+    pub script: &'a [u8],
+    pub amount: u64,
+}
+
 /// The shielded state root from the security fork on (`Params::security_fork_activation`):
-/// the v0 root plus the two values a syncing node previously had to take on trust, the dev-fee
-/// accrual and the anchor window commitment ([`crate::anchor_window`]). Selected by the DAA score
-/// of the block whose state it describes.
-pub fn shielded_state_root_v1(root_v0: &[u8; 32], dev_accrued: u64, anchor_window_commitment: &[u8; 32]) -> [u8; 32] {
+/// the v0 root plus the values a syncing node previously had to take on trust (the dev-fee
+/// accrual and the anchor window commitment, [`crate::anchor_window`]) and the miner-reward
+/// accrual slot, which exists only from the fork. Selected by the DAA score of the block whose
+/// state it describes.
+pub fn shielded_state_root_v1(
+    root_v0: &[u8; 32],
+    dev_accrued: u64,
+    anchor_window_commitment: &[u8; 32],
+    miner_accrual: MinerAccrualRef<'_>,
+) -> [u8; 32] {
     let mut h = Params::new().hash_length(32).personal(STATE_ROOT_V1_PERSONAL).to_state();
     h.update(root_v0);
     h.update(&dev_accrued.to_le_bytes());
     h.update(anchor_window_commitment);
+    // Length-prefixed, so no (script, amount) pair can be re-split into another.
+    h.update(&miner_accrual.script_version.to_le_bytes());
+    h.update(&(miner_accrual.script.len() as u32).to_le_bytes());
+    h.update(miner_accrual.script);
+    h.update(&miner_accrual.amount.to_le_bytes());
     let mut root = [0u8; 32];
     root.copy_from_slice(h.finalize().as_bytes());
     root
@@ -89,11 +109,22 @@ mod tests {
     fn v1_binds_accrual_and_window_and_differs_from_v0() {
         let r0 = shielded_state_root(&A, &N, 7, 3, &B);
         let w = [0x44; 32];
-        let v1 = shielded_state_root_v1(&r0, 5, &w);
+        let none = MinerAccrualRef::default();
+        let v1 = shielded_state_root_v1(&r0, 5, &w, none);
         assert_ne!(v1, r0);
-        assert_ne!(v1, shielded_state_root_v1(&r0, 6, &w), "dev accrual must matter");
-        assert_ne!(v1, shielded_state_root_v1(&r0, 5, &[0x45; 32]), "anchor window must matter");
-        assert_ne!(v1, shielded_state_root_v1(&[0x01; 32], 5, &w), "the v0 root must matter");
+        assert_ne!(v1, shielded_state_root_v1(&r0, 6, &w, none), "dev accrual must matter");
+        assert_ne!(v1, shielded_state_root_v1(&r0, 5, &[0x45; 32], none), "anchor window must matter");
+        assert_ne!(v1, shielded_state_root_v1(&[0x01; 32], 5, &w, none), "the v0 root must matter");
+
+        // The miner slot: amount, script bytes and script version each matter, and the length prefix
+        // stops a byte moving between script and amount.
+        let slot = MinerAccrualRef { script_version: 0, script: &[7u8; 43], amount: 100 };
+        let with_slot = shielded_state_root_v1(&r0, 5, &w, slot);
+        assert_ne!(with_slot, v1, "a carried reward must matter");
+        assert_ne!(with_slot, shielded_state_root_v1(&r0, 5, &w, MinerAccrualRef { amount: 101, ..slot }));
+        assert_ne!(with_slot, shielded_state_root_v1(&r0, 5, &w, MinerAccrualRef { script: &[8u8; 43], ..slot }));
+        assert_ne!(with_slot, shielded_state_root_v1(&r0, 5, &w, MinerAccrualRef { script_version: 1, ..slot }));
+        assert_ne!(with_slot, shielded_state_root_v1(&r0, 5, &w, MinerAccrualRef { script: &[7u8; 42], ..slot }));
     }
 
     #[test]

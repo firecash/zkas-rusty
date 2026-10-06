@@ -347,6 +347,8 @@ message GetShieldedCoinbaseRewardsResponseMessage {
   uint64 scannedBlocks = 3;             // chain blocks scanned by this call
   bool reorged = 4;                     // true: startHash reorged out; caller must rescan
   uint64 sinkBlueScore = 5;             // lets the caller hold back a maturity margin
+  bytes pendingRecipient = 6;           // security fork: requested recipient the sink's accrual slot pays, else empty
+  uint64 pendingValue = 7;              // amount carried in that slot
   RPCError error = 1000;
 }
 

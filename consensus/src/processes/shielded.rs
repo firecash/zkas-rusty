@@ -38,6 +38,7 @@ use crate::model::stores::shielded::{DbAnchorGcQueueStore, DbAnchorWindowStore};
 use crate::model::stores::shielded::{
     AnchorBlockStoreReader, AnchorProducersStoreReader, BurnReceipts, DbAnchorBlockStore, DbAnchorProducersStore,
     DbNullifierDiffStore, DbNullifierSetStore, DbShieldedAnchorSourceScoreStore, DbShieldedBurnStore, DbShieldedDevAccruedStore,
+    DbShieldedMinerAccrualStore,
     DbShieldedNullifierMuHashStore,
     DbShieldedScanBlockStore, DbShieldedSupplyStore, DbShieldedTreeStore, NullifierDiffStoreReader, NullifierSetStore,
     NullifierSetStoreReader, ShieldedBurnStoreReader, ShieldedNullifierMuHashStoreReader, ShieldedScanBlockData,
@@ -217,6 +218,11 @@ pub struct PruningPointShieldedMetadata {
     /// point. Trailing, like every field added before it (see [`Self::from_wire_bytes`]).
     #[serde(default)]
     pub window_entries: Vec<kaspa_shielded_core::anchor_window::WindowEntry>,
+    /// Security fork: the miner accrual slot carried by the pruning point, bound by
+    /// `zkas_state_root1`. Empty for a pre-fork pruning point. Same generation as
+    /// `window_entries` (both new with the fork), so the pre-window layout covers older peers.
+    #[serde(default)]
+    pub miner_accrual: kaspa_consensus_core::coinbase::MinerAccrual,
 }
 
 /// The layout before `window_entries`: the current struct minus its trailing field.
@@ -248,6 +254,7 @@ impl From<PreWindowPruningPointShieldedMetadata> for PruningPointShieldedMetadat
             dev_accrued: v.dev_accrued,
             in_window_anchor_source_scores: v.in_window_anchor_source_scores,
             window_entries: Vec::new(),
+            miner_accrual: Default::default(),
         }
     }
 }
@@ -279,6 +286,7 @@ impl From<LegacyPruningPointShieldedMetadata> for PruningPointShieldedMetadata {
             dev_accrued: 0,
             in_window_anchor_source_scores: Vec::new(),
             window_entries: Vec::new(),
+            miner_accrual: Default::default(),
         }
     }
 }
@@ -315,7 +323,17 @@ impl From<PreAnchorScoresPruningPointShieldedMetadata> for PruningPointShieldedM
             // attested and every in-window anchor keeps failing closed.
             in_window_anchor_source_scores: Vec::new(),
             window_entries: Vec::new(),
+            miner_accrual: Default::default(),
         }
+    }
+}
+
+/// The slot as the commitment function takes it.
+pub fn miner_accrual_ref(slot: &kaspa_consensus_core::coinbase::MinerAccrual) -> kaspa_shielded_core::commitment::MinerAccrualRef<'_> {
+    kaspa_shielded_core::commitment::MinerAccrualRef {
+        script_version: slot.script_public_key.version(),
+        script: slot.script_public_key.script(),
+        amount: slot.amount,
     }
 }
 
@@ -545,6 +563,7 @@ pub struct ShieldedStateManager {
     tree_store: DbShieldedTreeStore,
     supply_store: DbShieldedSupplyStore,
     dev_accrued_store: DbShieldedDevAccruedStore,
+    miner_accrual_store: DbShieldedMinerAccrualStore,
     nullifier_muhash: DbShieldedNullifierMuHashStore,
     anchor_block: DbAnchorBlockStore,
     /// Deferred age-based GC queue for the two anchor indexes; see [`Self::gc_aged_anchors`].
@@ -571,6 +590,7 @@ impl ShieldedStateManager {
             tree_store: DbShieldedTreeStore::new(Arc::clone(&db), cache_policy),
             supply_store: DbShieldedSupplyStore::new(Arc::clone(&db), cache_policy),
             dev_accrued_store: DbShieldedDevAccruedStore::new(Arc::clone(&db), cache_policy),
+            miner_accrual_store: DbShieldedMinerAccrualStore::new(Arc::clone(&db), cache_policy),
             nullifier_muhash: DbShieldedNullifierMuHashStore::new(Arc::clone(&db), cache_policy),
             anchor_block: DbAnchorBlockStore::new(Arc::clone(&db), cache_policy),
             anchor_gc: DbAnchorGcQueueStore::new(Arc::clone(&db), cache_policy),
@@ -642,7 +662,13 @@ impl ShieldedStateManager {
                 )));
             }
         };
-        Ok(kaspa_shielded_core::commitment::shielded_state_root_v1(&root0, self.dev_accrued_store.get(block)?, &window.commitment()))
+        let slot = self.miner_accrual_store.get(block)?;
+        Ok(kaspa_shielded_core::commitment::shielded_state_root_v1(
+            &root0,
+            self.dev_accrued_store.get(block)?,
+            &window.commitment(),
+            miner_accrual_ref(&slot),
+        ))
     }
 
     /// Peer-attested blue score of an in-window anchor source, or `None` if nothing was
@@ -995,6 +1021,7 @@ impl ShieldedStateManager {
         self.nullifier_muhash.delete_batch(batch, block)?;
         self.burn_store.delete_batch(batch, block)?;
         self.dev_accrued_store.delete_batch(batch, block)?;
+        self.miner_accrual_store.delete_batch(batch, block)?;
         // The per-block window is a snapshot like the others; the ENTRY is kept (GC'd with the
         // anchor indexes) because the export for a later pruning point still needs it.
         self.anchor_window.delete_window_batch(batch, block)?;
@@ -1046,6 +1073,26 @@ impl ShieldedStateManager {
     /// so accrual and the coinbase that consumed it commit together.
     pub fn set_dev_accrued(&self, batch: &mut WriteBatch, block: Hash, accrued: u64) -> StoreResult<()> {
         self.dev_accrued_store.set_batch(batch, block, accrued)
+    }
+
+    /// Miner reward carried by a chain block (security fork). Empty for every pre-fork block and
+    /// for every block that paid its slot out.
+    pub fn miner_accrual_at(&self, block: Hash) -> StoreResult<kaspa_consensus_core::coinbase::MinerAccrual> {
+        self.miner_accrual_store.get(block)
+    }
+
+    /// Record the miner reward a block carries forward, in the block-commit batch. An empty slot
+    /// is the store default and is not written.
+    pub fn set_miner_accrual(
+        &self,
+        batch: &mut WriteBatch,
+        block: Hash,
+        slot: kaspa_consensus_core::coinbase::MinerAccrual,
+    ) -> StoreResult<()> {
+        if slot.is_empty() {
+            return Ok(());
+        }
+        self.miner_accrual_store.set_batch(batch, block, slot)
     }
 
     /// Total value burned out of the pool (bridge peg-out) as of a chain block.
@@ -1256,6 +1303,7 @@ impl ShieldedStateManager {
         let state_root = PruningPointShieldedMetadata::recompute_state_root(&frontier, &supply, &nullifier_muhash, &burns)
             .map_err(|e| StoreError::DataInconsistency(format!("stored shielded frontier at {block} is corrupt: {e:?}")))?;
         let dev_accrued = self.dev_accrued_store.get(block)?;
+        let miner_accrual = self.miner_accrual_store.get(block)?;
         Ok(Some(PruningPointShieldedMetadata {
             frontier,
             supply,
@@ -1269,6 +1317,7 @@ impl ShieldedStateManager {
             in_window_anchor_source_scores: Vec::new(),
             // Filled by the caller for a post-fork pruning point (selected-chain walk).
             window_entries: Vec::new(),
+            miner_accrual,
         }))
     }
 
@@ -1467,6 +1516,12 @@ impl ShieldedStateManager {
         // to escape, surviving the clear. The row is also deleted there now; this makes the write
         // total so the two cannot drift apart again.
         self.dev_accrued_store.set_batch(batch, block, md.dev_accrued)?;
+        // The miner accrual slot, by the same rule: delete-then-write so a re-import cannot inherit a
+        // previous import's slot. Bound to `zkas_state_root1` by the caller before this runs.
+        self.miner_accrual_store.delete_batch(batch, block)?;
+        if !md.miner_accrual.is_empty() {
+            self.miner_accrual_store.set_batch(batch, block, md.miner_accrual.clone())?;
+        }
         // The whole append-only global membership set (unbounded, PLAN §2.9).
         for nf in nullifiers {
             self.nullifiers.insert_batch(batch, *nf)?;
@@ -1530,6 +1585,7 @@ impl ShieldedStateManager {
         // pruner already deletes this row (`prune_block_snapshots`); the re-import clear was the
         // inconsistency.
         self.dev_accrued_store.delete_batch(batch, pruning_point)?;
+        self.miner_accrual_store.delete_batch(batch, pruning_point)?;
         self.anchor_window.delete_window_batch(batch, pruning_point)?;
         Ok(())
     }
@@ -1599,7 +1655,13 @@ mod tests {
             dev_accrued: 123_456,
             in_window_anchor_source_scores: vec![(Hash::from_bytes([4u8; 32]), 990_606)],
             window_entries: Vec::new(),
+            miner_accrual: kaspa_consensus_core::coinbase::MinerAccrual {
+                script_public_key: kaspa_consensus_core::tx::ScriptPublicKey::from_vec(0, vec![9u8; 43]),
+                amount: 999,
+            },
         };
+        // What an empty trailing slot costs on the wire, so each older layout can be cut exactly.
+        let slot_len = bincode::serialized_size(&kaspa_consensus_core::coinbase::MinerAccrual::default()).unwrap() as usize;
 
         // Round-trip through the current layout.
         let bytes = md.to_wire_bytes();
@@ -1608,6 +1670,7 @@ mod tests {
         assert_eq!(back.supply, md.supply);
         assert_eq!(back.in_window_anchors, md.in_window_anchors);
         assert_eq!(back.in_window_anchor_source_scores, md.in_window_anchor_source_scores);
+        assert_eq!(back.miner_accrual, md.miner_accrual, "the carried miner slot survives the wire");
 
         // A peer that has the accrual but not the anchor scores: our blob minus the trailing
         // vec. Decodes, with no attested scores — which fails closed rather than inventing one.
@@ -1616,22 +1679,25 @@ mod tests {
             nullifier_muhash: md.nullifier_muhash.clone(),
             burns: md.burns.clone(),
             window_entries: Vec::new(),
+            miner_accrual: Default::default(),
             ..md.clone()
         };
         let pre_scores_bytes = pre_scores.to_wire_bytes();
-        // Strip BOTH trailing empty vectors (scores, then window entries): two u64 length prefixes.
-        let truncated = &pre_scores_bytes[..pre_scores_bytes.len() - 2 * std::mem::size_of::<u64>()];
+        // Strip the trailing empties (scores, window entries: two u64 length prefixes; then the slot).
+        let truncated = &pre_scores_bytes[..pre_scores_bytes.len() - 2 * std::mem::size_of::<u64>() - slot_len];
         let from_pre_scores = PruningPointShieldedMetadata::from_wire_bytes(truncated).expect("pre-scores layout decodes");
         assert!(from_pre_scores.in_window_anchor_source_scores.is_empty(), "no scores claimed means none attested");
 
         // A peer from before the security fork: our blob minus only the window entries. Its scores
         // survive and it carries no window, which is the right value for a pre-fork pruning point.
-        let pre_window = PruningPointShieldedMetadata { window_entries: Vec::new(), ..md.clone() };
+        let pre_window =
+            PruningPointShieldedMetadata { window_entries: Vec::new(), miner_accrual: Default::default(), ..md.clone() };
         let pre_window_bytes = pre_window.to_wire_bytes();
-        let truncated_pre_window = &pre_window_bytes[..pre_window_bytes.len() - std::mem::size_of::<u64>()];
+        let truncated_pre_window = &pre_window_bytes[..pre_window_bytes.len() - std::mem::size_of::<u64>() - slot_len];
         let from_pre_window = PruningPointShieldedMetadata::from_wire_bytes(truncated_pre_window).expect("pre-window layout decodes");
         assert_eq!(from_pre_window.in_window_anchor_source_scores, md.in_window_anchor_source_scores);
         assert!(from_pre_window.window_entries.is_empty());
+        assert!(from_pre_window.miner_accrual.is_empty(), "a pre-fork peer carries no miner slot");
         assert_eq!(from_pre_scores.dev_accrued, 123_456, "the accrual before it still survives");
         assert_eq!(from_pre_scores.in_window_anchors, md.in_window_anchors);
 
@@ -1682,6 +1748,7 @@ mod tests {
             dev_accrued: 0,
             in_window_anchor_source_scores: vec![(source, 990_606)],
             window_entries: Vec::new(),
+            miner_accrual: Default::default(),
         };
 
         let mut batch = WriteBatch::default();
@@ -1971,6 +2038,7 @@ mod tests {
             dev_accrued: 0,
             in_window_anchor_source_scores: Vec::new(),
             window_entries: Vec::new(),
+            miner_accrual: Default::default(),
         };
 
         let mut batch = WriteBatch::default();

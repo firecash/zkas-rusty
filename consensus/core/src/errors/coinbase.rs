@@ -15,6 +15,9 @@ pub enum CoinbaseError {
         "coinbase payload length is {0} bytes but it needs to be at least {1} bytes long in order to accommodate the script public key"
     )]
     PayloadCantContainScriptPublicKey(usize, usize),
+
+    #[error("miner reward accrual overflowed")]
+    AccrualOverflow,
 }
 
 pub type CoinbaseResult<T> = std::result::Result<T, CoinbaseError>;

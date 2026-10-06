@@ -339,6 +339,45 @@ impl DbShieldedDevAccruedStore {
     }
 }
 
+/// Security fork: the miner accrual slot carried by each chain block (see
+/// `kaspa_consensus_core::coinbase::MinerAccrual`). A missing key is the empty slot, which is the
+/// value of every pre-fork block, so only non-empty slots are written.
+#[derive(Clone)]
+pub struct DbShieldedMinerAccrualStore {
+    db: Arc<DB>,
+    access: CachedDbAccess<Hash, StoredMinerAccrual, BlockHasher>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct StoredMinerAccrual(pub kaspa_consensus_core::coinbase::MinerAccrual);
+impl MemSizeEstimator for StoredMinerAccrual {}
+
+impl DbShieldedMinerAccrualStore {
+    pub fn new(db: Arc<DB>, cache_policy: CachePolicy) -> Self {
+        Self { db: Arc::clone(&db), access: CachedDbAccess::new(db, cache_policy, DatabaseStorePrefixes::ShieldedMinerAccrual.into()) }
+    }
+
+    pub fn clone_with_new_cache(&self, cache_policy: CachePolicy) -> Self {
+        Self::new(Arc::clone(&self.db), cache_policy)
+    }
+
+    pub fn set_batch(&self, batch: &mut WriteBatch, block: Hash, slot: kaspa_consensus_core::coinbase::MinerAccrual) -> StoreResult<()> {
+        self.access.write(BatchDbWriter::new(batch), block, StoredMinerAccrual(slot))
+    }
+
+    pub fn delete_batch(&self, batch: &mut WriteBatch, block: Hash) -> StoreResult<()> {
+        self.access.delete(BatchDbWriter::new(batch), block)
+    }
+
+    pub fn get(&self, block: Hash) -> StoreResult<kaspa_consensus_core::coinbase::MinerAccrual> {
+        match self.access.read(block) {
+            Ok(v) => Ok(v.0),
+            Err(StoreError::KeyNotFound(_)) => Ok(Default::default()),
+            Err(e) => Err(e),
+        }
+    }
+}
+
 /// Blue score of a block that produced an anchor in the window below the pruning point, as
 /// attested by the peer that served the shielded IBD import.
 ///

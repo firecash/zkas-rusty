@@ -911,29 +911,42 @@ pub struct GetShieldedCoinbaseRewardsResponse {
     /// The sink's blue score at reply time, so a caller can hold back a maturity
     /// margin and ingest only payments a safe depth below the tip.
     pub sink_blue_score: u64,
+    /// Security fork: the recipient the sink's miner accrual slot will pay, if it is one of the
+    /// requested recipients; empty otherwise. Rewards accrue there instead of being minted per block
+    /// and arrive as one note at the next payout, so a caller crediting miners shows this as pending
+    /// rather than reading the gap as a missed reward.
+    #[serde(default)]
+    pub pending_recipient: Vec<u8>,
+    /// The amount carried in that slot (0 when `pending_recipient` is empty).
+    #[serde(default)]
+    pub pending_value: u64,
 }
 
 impl Serializer for GetShieldedCoinbaseRewardsResponse {
     fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        store!(u16, &1, writer)?;
+        store!(u16, &2, writer)?;
         serialize!(Vec<RpcShieldedCoinbaseReward>, &self.rewards, writer)?;
         store!(RpcHash, &self.next_cursor, writer)?;
         store!(u64, &self.scanned_blocks, writer)?;
         store!(bool, &self.reorged, writer)?;
         store!(u64, &self.sink_blue_score, writer)?;
+        store!(Vec<u8>, &self.pending_recipient, writer)?;
+        store!(u64, &self.pending_value, writer)?;
         Ok(())
     }
 }
 
 impl Deserializer for GetShieldedCoinbaseRewardsResponse {
     fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
-        let _version = load!(u16, reader)?;
+        let version = load!(u16, reader)?;
         let rewards = deserialize!(Vec<RpcShieldedCoinbaseReward>, reader)?;
         let next_cursor = load!(RpcHash, reader)?;
         let scanned_blocks = load!(u64, reader)?;
         let reorged = load!(bool, reader)?;
         let sink_blue_score = load!(u64, reader)?;
-        Ok(Self { rewards, next_cursor, scanned_blocks, reorged, sink_blue_score })
+        let (pending_recipient, pending_value) =
+            if version >= 2 { (load!(Vec<u8>, reader)?, load!(u64, reader)?) } else { (Vec::new(), 0) };
+        Ok(Self { rewards, next_cursor, scanned_blocks, reorged, sink_blue_score, pending_recipient, pending_value })
     }
 }
 

@@ -108,6 +108,9 @@ pub(super) struct UtxoProcessingContext<'a> {
     /// the per-block cuts are known — and persisted at commit alongside the shielded
     /// state. Always `0` before dev-fee accrual activates.
     pub dev_accrued: u64,
+    /// Miner reward this block carries forward (security fork; empty before it). Produced with
+    /// the expected coinbase and persisted at commit, like `dev_accrued`.
+    pub miner_accrual: kaspa_consensus_core::coinbase::MinerAccrual,
     /// Per-transaction keep/drop detail, populated only when `--consensus-diag` is on and
     /// read only if this block goes on to fail. Empty otherwise, so the cost is one atomic
     /// load per block with shielded activity.
@@ -133,6 +136,7 @@ impl<'a> UtxoProcessingContext<'a> {
             shielded_scan: Vec::new(),
             shielded_computed: None,
             dev_accrued: 0,
+            miner_accrual: Default::default(),
             diag_decisions: Vec::new(),
             diag_anchors: Vec::new(),
         }
@@ -409,7 +413,10 @@ impl VirtualStateProcessor {
         // so this enforces that the coinbase re-mints only fees the shielded
         // transition actually collects (PLAN §2.6).
         let mergeset_non_daa = self.daa_excluded_store.get_mergeset_non_daa(header.hash).unwrap();
-        ctx.dev_accrued = self.verify_coinbase_transaction(&txs[0], header.hash, header.daa_score, ctx, &mergeset_non_daa)?;
+        let (dev_accrued, miner_accrual) =
+            self.verify_coinbase_transaction(&txs[0], header.hash, header.daa_score, ctx, &mergeset_non_daa)?;
+        ctx.dev_accrued = dev_accrued;
+        ctx.miner_accrual = miner_accrual;
 
         // Verify the header pruning point
         let reply = self.verify_header_pruning_point(header, ctx.ghostdag_data.to_compact())?;
@@ -577,12 +584,16 @@ impl VirtualStateProcessor {
             let parent_accrued = self.shielded_state_manager.dev_accrued_at(ctx.selected_parent()).unwrap() as i128;
             let this_accrued = ctx.dev_accrued as i128;
             expected_delta -= this_accrued - parent_accrued;
+            // The miner slot defers and releases value the same way (security fork; both zero before).
+            let parent_slot = self.shielded_state_manager.miner_accrual_at(ctx.selected_parent()).unwrap().amount as i128;
+            let this_slot = ctx.miner_accrual.amount as i128;
+            expected_delta -= this_slot - parent_slot;
             if actual_delta != expected_delta {
                 return Err(InvalidShieldedState(
                     header.hash,
                     format!(
                         "shielded pool delta {actual_delta} != expected subsidy delta {expected_delta} \
-                         (dev accrual {parent_accrued} -> {this_accrued})"
+                         (dev accrual {parent_accrued} -> {this_accrued}, miner accrual {parent_slot} -> {this_slot})"
                     ),
                 ));
             }
@@ -610,7 +621,7 @@ impl VirtualStateProcessor {
         daa_score: u64,
         ctx: &UtxoProcessingContext,
         mergeset_non_daa: &BlockHashSet,
-    ) -> BlockProcessResult<u64> {
+    ) -> BlockProcessResult<(u64, kaspa_consensus_core::coinbase::MinerAccrual)> {
         let ghostdag_data: &GhostdagData = &ctx.ghostdag_data;
         let mergeset_rewards = &ctx.mergeset_rewards;
         // Extract only miner data from the provided coinbase
@@ -625,6 +636,7 @@ impl VirtualStateProcessor {
         // committed, not from the tip.
         let parent_daa_score = self.headers_store.get_daa_score(ghostdag_data.selected_parent).unwrap();
         let dev_accrued_parent = self.shielded_state_manager.dev_accrued_at(ghostdag_data.selected_parent).unwrap();
+        let miner_accrual_parent = self.shielded_state_manager.miner_accrual_at(ghostdag_data.selected_parent).unwrap();
         let expected = self
             .coinbase_manager
             .expected_coinbase_transaction(
@@ -636,6 +648,7 @@ impl VirtualStateProcessor {
                 shielded_commitment,
                 parent_daa_score,
                 dev_accrued_parent,
+                &miner_accrual_parent,
             )
             .unwrap();
         let expected_coinbase = expected.tx;
@@ -648,7 +661,7 @@ impl VirtualStateProcessor {
             self.emit_coinbase_divergence_report(coinbase, &expected_coinbase, block, daa_score, ctx, &shielded_commitment);
             Err(BadCoinbaseTransaction)
         } else {
-            Ok(expected.dev_accrued)
+            Ok((expected.dev_accrued, expected.miner_accrual))
         }
     }
 

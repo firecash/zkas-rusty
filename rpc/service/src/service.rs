@@ -1055,7 +1055,23 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
                 scanned_blocks += 1;
             }
         }
-        Ok(GetShieldedCoinbaseRewardsResponse { rewards, next_cursor, scanned_blocks, reorged, sink_blue_score })
+        // The sink's accrual slot, reported only to a caller that asked for its recipient: the
+        // script and amount are public in the coinbases anyway, this just saves summing them.
+        let slot = session.async_get_miner_accrual(sink).await?;
+        let (pending_recipient, pending_value) =
+            match match_coinbase_outputs(&[(slot.script_public_key.script().to_vec(), slot.amount)], &request.recipients).pop() {
+                Some(m) if !slot.is_empty() => (m.recipient, m.value),
+                _ => (Vec::new(), 0),
+            };
+        Ok(GetShieldedCoinbaseRewardsResponse {
+            rewards,
+            next_cursor,
+            scanned_blocks,
+            reorged,
+            sink_blue_score,
+            pending_recipient,
+            pending_value,
+        })
     }
 
     async fn get_sink_blue_score_call(

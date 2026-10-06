@@ -96,8 +96,14 @@ impl MiningManager {
         let mut cache_lock = self.block_template_cache.lock(virtual_state_approx_id);
         let immutable_template = cache_lock.get_immutable_cached_template();
 
-        // We first try and use a cached template if not expired
-        if let Some(immutable_template) = immutable_template {
+        // We first try and use a cached template if not expired. After the security fork a cached
+        // coinbase that carries a red reward depends on the requesting miner's script through the
+        // accrual slot rule, so it cannot be patched for another miner: build a fresh one instead.
+        let reusable = immutable_template.as_ref().filter(|t| {
+            t.miner_data == *miner_data
+                || !(t.coinbase_has_red_reward && consensus.miner_accrual_active(t.block.header.daa_score))
+        });
+        if let Some(immutable_template) = reusable.cloned() {
             drop(cache_lock);
             if immutable_template.miner_data == *miner_data {
                 return Ok(immutable_template.as_ref().clone());

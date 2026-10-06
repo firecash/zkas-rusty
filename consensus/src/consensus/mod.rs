@@ -771,6 +771,10 @@ impl ConsensusApi for Consensus {
         self.virtual_processor.shielded_chain_block_data(block).map_err(ConsensusError::GeneralOwned)
     }
 
+    fn get_miner_accrual(&self, block: Hash) -> ConsensusResult<kaspa_consensus_core::coinbase::MinerAccrual> {
+        self.virtual_processor.miner_accrual_at(block).map_err(|e| ConsensusError::GeneralOwned(e.to_string()))
+    }
+
     fn get_shielded_chain_range(&self, low: Hash, limit: usize) -> ConsensusResult<Option<Vec<Hash>>> {
         // Hold the pruning lock for the whole read so the index cannot be mutated between
         // resolving `low` and reading the range above it.
@@ -1759,6 +1763,10 @@ impl ConsensusApi for Consensus {
         use kaspa_consensus_core::tx::{ScriptPublicKey, ScriptVec};
         // Mirrors the dev-fee output construction in CoinbaseManager::expected_coinbase_transaction.
         self.config.params.dev_fee_recipient.map(|recipient| ScriptPublicKey::new(0, ScriptVec::from_slice(&recipient)))
+    }
+
+    fn miner_accrual_active(&self, daa_score: u64) -> bool {
+        self.config.params.shielded_coinbase && self.config.params.security_fork_activation.is_active(daa_score)
     }
 
     fn calc_transaction_hash_merkle_root(&self, txs: &[Transaction]) -> Hash {

@@ -1732,6 +1732,68 @@ async fn security_fork_chain_commits_v1_roots_and_the_window_rebinds() {
     assert!(vp.verify_import_binding_versioned(pp, &tampered, committed).is_err(), "a different dev accrual is refused");
 }
 
+/// Security fork, miner accrual end to end through real validated blocks: two miners, a switch and
+/// back, and a short payout interval. Every block must validate (the template and the validator
+/// build the same coinbase, and the pool-delta check accounts for the carried slot), far fewer miner
+/// notes are minted than blocks, and the slot exported at a pruning point re-binds to the committed
+/// root while a tampered slot does not.
+#[tokio::test]
+async fn security_fork_miner_rewards_accrue_and_pay_out_end_to_end() {
+    let mut params = MAINNET_PARAMS.clone();
+    params.shielded_coinbase = true;
+    params.security_fork_activation = ForkActivation::always();
+    params.dev_fee_payout_interval = 6;
+    let config = ConfigBuilder::new(params)
+        .edit_consensus_params(|p| {
+            p.genesis.bits = 0x207fffff;
+            p.blockrate.shielded_anchor_depth = 1;
+        })
+        .build();
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+    let script = |seed: u8| {
+        let addr = kaspa_shielded_core::wallet::address_bytes_from_seed([seed; 32]).expect("orchard address");
+        ScriptPublicKey::new(0, ScriptVec::from_slice(&addr))
+    };
+    let (a, b) = (script(9), script(10));
+    let mut chain = Vec::new();
+    let mut miner_notes = 0usize;
+    const BLOCKS: usize = 24;
+    for i in 0..BLOCKS {
+        ctx.miner_data = MinerData::new(if (6..10).contains(&i) { b.clone() } else { a.clone() }, vec![]);
+        let blk = ctx.mine_real_pow_block();
+        miner_notes += blk.transactions[0].outputs.iter().filter(|o| o.script_public_key == a || o.script_public_key == b).count();
+        let h = blk.header.hash;
+        ctx.consensus.validate_and_insert_block(blk).virtual_state_task.await.expect("every accrual block validates");
+        chain.push(h);
+    }
+    let vp = ctx.consensus.virtual_processor();
+    assert!(miner_notes > 0, "streaks are paid out");
+    assert!(miner_notes * 2 < BLOCKS, "far fewer miner notes than blocks ({miner_notes} for {BLOCKS})");
+
+    // A pruning point that carries a non-empty slot exports it, and the slot is bound by the root.
+    let pp = chain[..BLOCKS - 3]
+        .iter()
+        .rev()
+        .copied()
+        .find(|h| !vp.miner_accrual_at(*h).unwrap().is_empty())
+        .expect("some block carries a slot");
+    let slot = vp.miner_accrual_at(pp).unwrap();
+    let committed = vp.shielded_state_root_at(pp).unwrap();
+    let wire = vp.export_pruning_point_shielded(pp).unwrap().expect("pp exports");
+    let md = crate::processes::shielded::PruningPointShieldedMetadata::from_wire_bytes(&wire.data).unwrap();
+    assert_eq!(md.miner_accrual, slot, "the export carries the slot");
+    vp.verify_import_binding_versioned(pp, &md, committed).expect("honest export re-binds");
+    let mut tampered = md.clone();
+    tampered.miner_accrual.amount += 1;
+    assert!(vp.verify_import_binding_versioned(pp, &tampered, committed).is_err(), "a different carried amount is refused");
+    let mut tampered = md.clone();
+    tampered.miner_accrual.script_public_key = if slot.script_public_key == a { b.clone() } else { a.clone() };
+    assert!(vp.verify_import_binding_versioned(pp, &tampered, committed).is_err(), "a different payee is refused");
+    let mut tampered = md.clone();
+    tampered.miner_accrual = Default::default();
+    assert!(vp.verify_import_binding_versioned(pp, &tampered, committed).is_err(), "dropping the slot is refused");
+}
+
 /// Security fork: a ZKas block whose coinbase carries a merge-mining commitment is invalid, so a
 /// ZKas block can no longer serve as the aux parent of another ZKas block.
 #[tokio::test]
@@ -1767,6 +1829,10 @@ async fn security_fork_spends_must_name_their_anchor_block() {
     params.shielded_coinbase = true;
     params.dev_fee_recipient = None;
     params.security_fork_activation = ForkActivation::always();
+    // This test is about anchor naming and spends a block's own coinbase note. A payout interval of
+    // one flushes the miner accrual slot every block, so each block still mints its reward as one
+    // note exactly as before the fork (accrual itself is covered by its own end-to-end test).
+    params.dev_fee_payout_interval = 1;
     let config = ConfigBuilder::new(params)
         .edit_consensus_params(|p| {
             p.genesis.bits = 0x207fffff;

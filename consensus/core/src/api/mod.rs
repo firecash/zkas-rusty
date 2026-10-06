@@ -423,6 +423,13 @@ pub trait ConsensusApi: Send + Sync {
         None
     }
 
+    /// Whether a block at `daa_score` builds its coinbase through the miner accrual slot (security
+    /// fork). Then the red reward's script feeds the slot rule, so a cached template cannot be
+    /// re-pointed to another miner by rewriting one output; it has to be rebuilt.
+    fn miner_accrual_active(&self, _daa_score: u64) -> bool {
+        false
+    }
+
     fn calc_transaction_hash_merkle_root(&self, txs: &[Transaction]) -> Hash {
         unimplemented!()
     }
@@ -565,6 +572,12 @@ pub trait ConsensusApi: Send + Sync {
     /// blocks (e.g. via `get_blocks`) counts non-chain coinbases that never mint
     /// and mis-orders leaves once the DAG is wider than a chain.
     fn get_shielded_chain_block_data(&self, _block: Hash) -> ConsensusResult<ShieldedChainBlockData> {
+        unimplemented!()
+    }
+
+    /// The miner reward a chain block carries forward (security fork; empty before it). The sink's
+    /// slot is what the next payout will pay, so callers that credit miners can show it as pending.
+    fn get_miner_accrual(&self, _block: Hash) -> ConsensusResult<crate::coinbase::MinerAccrual> {
         unimplemented!()
     }
 

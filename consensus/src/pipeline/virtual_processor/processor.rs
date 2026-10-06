@@ -582,11 +582,16 @@ impl VirtualStateProcessor {
         if md.window_entries.last().map(|e| e.block) != Some(pp.as_bytes()) {
             return Err("pruning-point anchor window does not end at the pruning point".to_string());
         }
-        let expected = kaspa_shielded_core::commitment::shielded_state_root_v1(&md.state_root, md.dev_accrued, &window.commitment());
+        let expected = kaspa_shielded_core::commitment::shielded_state_root_v1(
+            &md.state_root,
+            md.dev_accrued,
+            &window.commitment(),
+            crate::processes::shielded::miner_accrual_ref(&md.miner_accrual),
+        );
         if expected != committed {
-            return Err(
-                "imported shielded state (with its dev accrual and anchor window) does not match the PoW-committed root".to_string()
-            );
+            return Err("imported shielded state (with its dev accrual, anchor window and miner accrual) does not match the \
+                 PoW-committed root"
+                .to_string());
         }
         Ok(Some(window))
     }
@@ -1346,6 +1351,7 @@ impl VirtualStateProcessor {
                             // Commit UTXO + SMT + shielded data for current chain block
                             let shielded_computed = ctx.shielded_computed.take();
                             let dev_accrued = ctx.dev_accrued;
+                            let miner_accrual = std::mem::take(&mut ctx.miner_accrual);
                             self.commit_utxo_state(
                                 current,
                                 ctx.mergeset_diff,
@@ -1356,6 +1362,7 @@ impl VirtualStateProcessor {
                                 header.blue_score,
                                 shielded_computed,
                                 dev_accrued,
+                                miner_accrual,
                             );
                             // Count the number of UTXO-processed chain blocks
                             chain_block_counter += 1;
@@ -1379,6 +1386,11 @@ impl VirtualStateProcessor {
         diff_point
     }
 
+    /// The miner accrual slot a chain block carries (security fork). See `MinerAccrual`.
+    pub fn miner_accrual_at(&self, block: Hash) -> kaspa_database::prelude::StoreResult<kaspa_consensus_core::coinbase::MinerAccrual> {
+        self.shielded_state_manager.miner_accrual_at(block)
+    }
+
     fn commit_utxo_state(
         &self,
         current: Hash,
@@ -1390,6 +1402,7 @@ impl VirtualStateProcessor {
         blue_score: u64,
         shielded_computed: Option<crate::processes::shielded::ComputedBlockShielded>,
         dev_accrued: u64,
+        miner_accrual: kaspa_consensus_core::coinbase::MinerAccrual,
     ) {
         let mut batch = WriteBatch::default();
         self.utxo_diffs_store.insert_batch(&mut batch, current, Arc::new(mergeset_diff)).unwrap();
@@ -1436,6 +1449,8 @@ impl VirtualStateProcessor {
         if dev_accrued > 0 {
             self.shielded_state_manager.set_dev_accrued(&mut batch, current, dev_accrued).unwrap();
         }
+        // The miner accrual slot rides the same batch for the same reason (empty slots write nothing).
+        self.shielded_state_manager.set_miner_accrual(&mut batch, current, miner_accrual).unwrap();
         let write_guard = self.statuses_store.set_batch(&mut batch, current, StatusUTXOValid).unwrap();
         self.db.write(batch).unwrap();
         // Calling the drops explicitly after the batch is written in order to avoid possible errors.
@@ -2381,6 +2396,8 @@ impl VirtualStateProcessor {
         let shielded_commitment = self.shielded_state_root_at(virtual_state.ghostdag_data.selected_parent).unwrap();
         let parent_daa_score = self.headers_store.get_daa_score(virtual_state.ghostdag_data.selected_parent).unwrap();
         let dev_accrued_parent = self.shielded_state_manager.dev_accrued_at(virtual_state.ghostdag_data.selected_parent).unwrap();
+        let miner_accrual_parent =
+            self.shielded_state_manager.miner_accrual_at(virtual_state.ghostdag_data.selected_parent).unwrap();
         let coinbase = self
             .coinbase_manager
             .expected_coinbase_transaction(
@@ -2392,6 +2409,7 @@ impl VirtualStateProcessor {
                 shielded_commitment,
                 parent_daa_score,
                 dev_accrued_parent,
+                &miner_accrual_parent,
             )
             .unwrap();
         txs.insert(0, coinbase.tx);
@@ -2475,6 +2493,7 @@ impl VirtualStateProcessor {
             0,
             None,
             0,
+            Default::default(),
         );
 
         // Init the virtual selected chain store

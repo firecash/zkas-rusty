@@ -158,6 +158,7 @@ pub enum DatabaseStorePrefixes {
     /// score). Kept below the pruning point so the window can be exported to a syncing node, and
     /// garbage-collected with the anchor indexes.
     ShieldedWindowEntry = 96,
+    ShieldedMinerAccrual = 97,
 
     // ---- Separator ----
     /// Reserved as a separator

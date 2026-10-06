@@ -40,6 +40,28 @@ impl BlockRewardData {
     }
 }
 
+/// Security fork: the miner reward a chain block carries forward instead of minting.
+///
+/// One slot, not a table. Walking a block's rewards in coinbase order, a reward to the slot's
+/// script is added to it; a reward to any other script first pays the slot out as one note and
+/// then becomes the slot. At every payout interval the slot is paid out and emptied. A stable
+/// payout script therefore appends one reward note per interval instead of one per block, while
+/// every amount and script stays exactly as public as it is in today's per-block coinbase.
+///
+/// `amount == 0` means the slot is empty, and the script is then always the default (empty) one,
+/// so equal states have one encoding (it is committed in `zkas_state_root1`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MinerAccrual {
+    pub script_public_key: ScriptPublicKey,
+    pub amount: u64,
+}
+
+impl MinerAccrual {
+    pub fn is_empty(&self) -> bool {
+        self.amount == 0
+    }
+}
+
 /// Holds a coinbase transaction along with meta-data obtained during creation
 pub struct CoinbaseTransactionTemplate {
     pub tx: Transaction,
@@ -49,4 +71,7 @@ pub struct CoinbaseTransactionTemplate {
     /// accrual activates (the fee is minted every block) and `0` on a payout block
     /// (the balance just went out as a note).
     pub dev_accrued: u64,
+    /// Miner reward carried forward by this block (security fork; empty before it and on a payout
+    /// block). See [`MinerAccrual`].
+    pub miner_accrual: MinerAccrual,
 }
