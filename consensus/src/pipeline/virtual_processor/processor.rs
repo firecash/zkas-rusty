@@ -268,6 +268,14 @@ impl VirtualStateProcessor {
              Orchard proofs; it must not run a shielded network (it would reject every shielded \
              transaction and fork). Rebuild with default features enabled."
         );
+        // The verifying key must be the chain's. A dependency bump that changed the circuit would
+        // otherwise verify a different statement than every other node and split consensus.
+        #[cfg(feature = "shielded-circuit")]
+        if params.shielded_coinbase {
+            if let Err(e) = kaspa_shielded_core::verify::check_verifying_key() {
+                panic!("refusing to start: {e}");
+            }
+        }
 
         // Reorg-safe driver over the shielded state stores. Anchor-finality
         // (maturity at `shielded_anchor_depth` + canonical ancestry, PLAN §2.5) is

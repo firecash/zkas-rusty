@@ -27,7 +27,7 @@ circuit = ["orchard/circuit", "orchard/multicore", "dep:nonempty"]
 # `build.rs` bakes the exact crate identity into `verify::ORCHARD_CRATE`. A caret range would let `cargo update`
 # silently move us onto an unaudited (or regressed) release. Bump deliberately,
 # reading the changelog, never incidentally.
-orchard = { package = "zakura-orchard", version = "=1.0.1", default-features = false, features = ["std", "weighted-merkle"] }
+orchard = { package = "zakura-orchard", version = "=2.2.0", default-features = false, features = ["std", "weighted-merkle"] }
 # Must match the incrementalmerkletree version Orchard links, so that
 # `MerkleHashOrchard: incrementalmerkletree::Hashable` is the same trait.
 # `legacy-api` provides CommitmentTree / IncrementalWitness, the wallet-side
@@ -39,7 +39,7 @@ serde = { workspace = true, features = ["derive"] }
 # Curve point handling for the encoding consensus rules (non-identity epk).
 # Versions are pinned to match what Orchard 0.14 links.
 group = "0.14"
-pasta_curves = { package = "zakura-pasta-curves", version = "=1.0.1" }
+pasta_curves = { package = "zakura-pasta-curves", version = "=2.2.0" }
 # Shielded-transaction sighash.
 blake2b_simd = { workspace = true }
 chacha20 = "0.9"
@@ -78,3 +78,7 @@ kaspa-addresses.workspace = true
 # Benchmarks only (`bench_concurrent_vs_sequential_proofs`): scoped rayon pools to
 # give each concurrent proof its own bounded thread count.
 rayon.workspace = true
+
+[[example]]
+name = "proof_corpus"
+required-features = ["circuit"]

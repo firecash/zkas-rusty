@@ -385,14 +385,24 @@ mod e2e {
     #[test]
     fn orchard_stack_is_pinned() {
         assert_eq!(crate::verify::CIRCUIT_VERSION, orchard::circuit::OrchardCircuitVersion::FixedPostNu6_2);
+        // 2.2.0 (2026-09-30): proving/verifier performance only; the pinned circuit description,
+        // the k=11 params and the proof test vectors are byte-identical to 1.0.1, and the key
+        // fingerprint below is unchanged.
         assert_eq!(
             crate::verify::ORCHARD_CRATE,
-            "zakura-orchard 1.0.1 79f40234883ea702da695f1cbf470a0ba3b9fe0ac51d24af588a058afc383d68"
+            "zakura-orchard 2.2.0 b460a562603ba2e9820cb988b5f873ef470bd007c6c2f86e50abaa91b45e241e"
         );
         assert_eq!(
             crate::verify::HALO2_GADGETS_CRATE,
-            "zakura-halo2-gadgets 1.0.1 c601160505e513507664516f16a38b8e875a31b48155a93964b6e97c1e07d315"
+            "zakura-halo2-gadgets 2.2.0 1ee6ebb179f9c77243d320b81f30216c5fc7f76244290a1c546762dd06e20702"
         );
+    }
+
+    /// The verifying key itself, not just the crate versions: a dependency that changes the circuit
+    /// changes this fingerprint and fails here (and the node refuses to start).
+    #[test]
+    fn verifying_key_fingerprint_is_pinned() {
+        crate::verify::check_verifying_key().expect("verifying key matches the chain's");
     }
 
     #[test]
@@ -575,6 +585,32 @@ pub const BUNDLE_VERSION: orchard::bundle::BundleVersion = orchard::bundle::Bund
 /// a DIFFERENT circuit: changing this constant is a hard fork.
 #[cfg(feature = "circuit")]
 pub const CIRCUIT_VERSION: orchard::circuit::OrchardCircuitVersion = orchard::circuit::OrchardCircuitVersion::FixedPostNu6_2;
+
+/// Fingerprint of the verifying key every proof on this chain is checked against:
+/// `VerifyingKey::fingerprint` (BLAKE2b-256, personal `Orchard-VkFprint`, over the pinned circuit
+/// description) of [`CIRCUIT_VERSION`]. The description file is byte-identical in zakura-orchard
+/// 1.0.1 and 2.2.0, so the key is the same across that upgrade. A node whose built key does not
+/// match refuses to start: a circuit change must be a deliberate hard fork, never a dependency bump.
+pub const VERIFYING_KEY_FINGERPRINT: [u8; 32] = [
+    0x1b, 0xee, 0x04, 0x9a, 0xd3, 0xff, 0x02, 0x7c, 0x8d, 0x44, 0x8e, 0x64, 0xb4, 0x41, 0x3b, 0x3c, 0x4a, 0x48, 0x3a, 0x74, 0x3b, 0x5f, 0x39,
+    0xbc, 0xfb, 0xb6, 0x10, 0x2f, 0x62, 0x65, 0x91, 0xfb,
+];
+
+/// Builds (and caches) the verifying key and checks it against [`VERIFYING_KEY_FINGERPRINT`].
+#[cfg(feature = "circuit")]
+pub fn check_verifying_key() -> Result<(), String> {
+    let got = verifying_key().fingerprint();
+    if got == VERIFYING_KEY_FINGERPRINT {
+        Ok(())
+    } else {
+        Err(format!(
+            "the Orchard verifying key this build constructs ({}) is not the chain's ({}); {}",
+            got.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+            VERIFYING_KEY_FINGERPRINT.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+            circuit_identity()
+        ))
+    }
+}
 
 /// The Orchard crate this build links, as `name version sha256` read from the
 /// workspace `Cargo.lock` at build time (see `build.rs`). With

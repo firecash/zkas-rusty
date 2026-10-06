@@ -9,7 +9,7 @@ name = "gpucheck"
 path = "src/main.rs"
 
 [dependencies]
-pasta_curves = { package = "zakura-pasta-curves", version = "=1.0.1" }
+pasta_curves = { package = "zakura-pasta-curves", version = "=2.2.0" }
 group = "0.14"
 rand = "0.10"
 
