@@ -1113,6 +1113,51 @@ pub mod build {
         Ok(wire.to_bytes())
     }
 
+    /// [`build_singleleaf_coinbase_spend`] that names `anchor_block` (security fork). Same note and
+    /// single-leaf witness, built through [`build_wallet_payment_multi_anchored`] so the name is
+    /// set before the sighash. The fee is `note_value - output_value`; no change is left over.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_singleleaf_coinbase_spend_anchored(
+        owner_seed: [u8; 32],
+        coinbase_txid: [u8; 32],
+        out_index: u32,
+        note_value: u64,
+        recipient_addr: [u8; 43],
+        output_value: u64,
+        network_domain: &[u8; 32],
+        tx_context: &[u8],
+        anchor_block: Option<[u8; 32]>,
+    ) -> Result<Vec<u8>, BuildError> {
+        use crate::coinbase::derive_coinbase_note_desc;
+        use incrementalmerkletree::{Hashable, Level};
+        use orchard::note::{RandomSeed, Rho};
+        use orchard::tree::MerkleHashOrchard;
+
+        let keys = ShieldedKeys::from_seed(owner_seed).ok_or(BuildError::Empty)?;
+        let mut seed = Vec::with_capacity(36);
+        seed.extend_from_slice(&coinbase_txid);
+        seed.extend_from_slice(&out_index.to_le_bytes());
+        let desc = derive_coinbase_note_desc(keys.address().to_raw_address_bytes(), &seed);
+        let rho = Option::<Rho>::from(Rho::from_bytes(&desc.rho)).ok_or(BuildError::Empty)?;
+        let rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes(desc.rseed, &rho)).ok_or(BuildError::Empty)?;
+        let note = Option::<Note>::from(Note::from_parts(keys.address(), NoteValue::from_raw(note_value), rho, rseed, orchard::note::NoteVersion::V2))
+            .ok_or(BuildError::Empty)?;
+        let auth_path: [MerkleHashOrchard; 32] =
+            core::array::from_fn(|i| <MerkleHashOrchard as Hashable>::empty_root(Level::from(i as u8)));
+        let merkle_path = MerklePath::from_parts(0, auth_path);
+        let fee = note_value.checked_sub(output_value).ok_or(BuildError::Empty)?;
+        build_wallet_payment_multi_anchored(
+            owner_seed,
+            vec![(note, merkle_path)],
+            &[(recipient_addr, output_value, [0u8; 512])],
+            fee,
+            network_domain,
+            tx_context,
+            false,
+            anchor_block,
+        )
+    }
+
     /// End-to-end wallet payment spending one or more **arbitrary** owned notes
     /// (PLAN §2.10): spend every `(note, merkle_path)` in `inputs`, pay `amount` to
     /// `recipient_addr`, return the remainder minus `fee` as change to the sender,
@@ -1170,6 +1215,25 @@ pub mod build {
         tx_context: &[u8],
         recoverable: bool,
     ) -> Result<Vec<u8>, BuildError> {
+        build_wallet_payment_multi_anchored(owner_seed, inputs, payees, fee, network_domain, tx_context, recoverable, None)
+    }
+
+    /// [`build_wallet_payment_multi`] that also names the block whose tree root the witnesses were
+    /// taken at (`anchor_block`). Mandatory from the security fork (see
+    /// `kaspa_shielded_core::bundle::BUNDLE_FLAG_ANCHOR_BLOCK`), refused before it, so callers pass
+    /// `Some` exactly when the network is past the activation score. It is set before the sighash
+    /// is computed, so the signatures cover it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_wallet_payment_multi_anchored(
+        owner_seed: [u8; 32],
+        inputs: Vec<(Note, MerklePath)>,
+        payees: &[([u8; 43], u64, [u8; 512])],
+        fee: u64,
+        network_domain: &[u8; 32],
+        tx_context: &[u8],
+        recoverable: bool,
+        anchor_block: Option<[u8; 32]>,
+    ) -> Result<Vec<u8>, BuildError> {
         let (first_note, first_path) = inputs.first().ok_or(BuildError::Empty)?;
         if payees.is_empty() {
             return Err(BuildError::Empty);
@@ -1212,19 +1276,52 @@ pub mod build {
             builder.build::<i64>(&mut rng).map_err(|e| BuildError::Builder(format!("{e:?}")))?.ok_or(BuildError::Empty)?;
         let proven = unauth.create_proof(pk, &mut rng).map_err(|e| BuildError::Proof(format!("{e:?}")))?;
 
-        let effects = to_wire(&proven, |_| [0u8; 64], Vec::new(), [0u8; 64]);
+        let mut effects = to_wire(&proven, |_| [0u8; 64], Vec::new(), [0u8; 64]);
+        if let Some(block) = anchor_block {
+            effects.set_anchor_block(block);
+        }
         let msg = sighash(&effects, network_domain, tx_context);
         let ask = SpendAuthorizingKey::from(&keys.sk);
         let authorized: Bundle<Authorized, i64> =
             proven.apply_signatures(&mut rng, msg, &[ask]).map_err(|e| BuildError::Proof(format!("{e:?}")))?;
 
-        Ok(to_wire(
+        let mut wire = to_wire(
             &authorized,
             |a| <[u8; 64]>::from(a.authorization()),
             authorized.authorization().proof().as_ref().to_vec(),
             <[u8; 64]>::from(authorized.authorization().binding_signature()),
+        );
+        if let Some(block) = anchor_block {
+            wire.set_anchor_block(block);
+        }
+        Ok(wire.to_bytes())
+    }
+
+    /// [`build_wallet_payment`] with an optional named anchor block; see
+    /// [`build_wallet_payment_multi_anchored`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_wallet_payment_anchored(
+        owner_seed: [u8; 32],
+        inputs: Vec<(Note, MerklePath)>,
+        recipient_addr: [u8; 43],
+        amount: u64,
+        fee: u64,
+        network_domain: &[u8; 32],
+        tx_context: &[u8],
+        recoverable: bool,
+        memo: [u8; 512],
+        anchor_block: Option<[u8; 32]>,
+    ) -> Result<Vec<u8>, BuildError> {
+        build_wallet_payment_multi_anchored(
+            owner_seed,
+            inputs,
+            &[(recipient_addr, amount, memo)],
+            fee,
+            network_domain,
+            tx_context,
+            recoverable,
+            anchor_block,
         )
-        .to_bytes())
     }
 
     // ============================================================================
@@ -1272,6 +1369,25 @@ pub mod build {
         recoverable: bool,
         memo: [u8; 512],
     ) -> Result<PreparedPayment, BuildError> {
+        prepare_payment_anchored(fvk, inputs, recipient_addr, amount, fee, network_domain, tx_context, recoverable, memo, None)
+    }
+
+    /// [`prepare_payment`] that names the anchor block (security fork). The block is set on the
+    /// effects BEFORE the sighash, travels in [`PreparedPayment::effects`], and is re-applied by
+    /// [`finalize_payment`], so the device, the server and consensus all hash the same bytes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_payment_anchored(
+        fvk: &FullViewingKey,
+        inputs: Vec<(Note, MerklePath)>,
+        recipient_addr: [u8; 43],
+        amount: u64,
+        fee: u64,
+        network_domain: &[u8; 32],
+        tx_context: &[u8],
+        recoverable: bool,
+        memo: [u8; 512],
+        anchor_block: Option<[u8; 32]>,
+    ) -> Result<PreparedPayment, BuildError> {
         use group::ff::PrimeField;
         let ovk = recoverable.then(|| fvk.to_ovk(Scope::External));
 
@@ -1302,7 +1418,10 @@ pub mod build {
 
         let effects = pczt.extract_effects::<i64>().map_err(|e| BuildError::Proof(format!("{e:?}")))?.ok_or(BuildError::Empty)?;
         let value_balance = *effects.value_balance();
-        let effects_wire = to_wire(&effects, |_| [0u8; 64], Vec::new(), [0u8; 64]);
+        let mut effects_wire = to_wire(&effects, |_| [0u8; 64], Vec::new(), [0u8; 64]);
+        if let Some(block) = anchor_block {
+            effects_wire.set_anchor_block(block);
+        }
         let sighash = crate::verify::sighash(&effects_wire, network_domain, tx_context);
 
         // Classify each action: throwaway dummy (server signs) vs real spend (device signs).
@@ -1370,12 +1489,17 @@ pub mod build {
         prepared.pczt.finalize_io(sighash, &mut rng).map_err(|e| BuildError::Proof(format!("{e:?}")))?;
         let unbound = prepared.pczt.extract::<i64>().map_err(|e| BuildError::Proof(format!("{e:?}")))?.ok_or(BuildError::Empty)?;
         let authorized = unbound.apply_binding_signature(sighash, &mut rng).ok_or_else(|| BuildError::Proof("binding".into()))?;
-        Ok(to_wire(
+        let mut wire = to_wire(
             &authorized,
             |a| <[u8; 64]>::from(a.authorization()),
             authorized.authorization().proof().as_ref().to_vec(),
             <[u8; 64]>::from(authorized.authorization().binding_signature()),
-        ))
+        );
+        // Carry the named anchor block the sighash was computed over (see `prepare_payment_anchored`).
+        if let Some(block) = prepared.effects.anchor_block {
+            wire.set_anchor_block(block);
+        }
+        Ok(wire)
     }
 
 

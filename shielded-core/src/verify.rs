@@ -89,6 +89,17 @@ pub enum BundleVerifyError {
 /// network (e.g. testnet) could be replayed verbatim on another (mainnet), since
 /// the anchor and nullifiers could coincide across a shared history. It is a
 /// mandatory, non-defaultable parameter so no caller can silently omit it.
+/// Whether `sig` is a valid spend-authorization signature by the randomized key `rk` over
+/// `sighash`. Lets a party that collects signatures (a multi-party bundle session) refuse a bad one
+/// on arrival instead of discovering it only when the whole bundle fails to finalize.
+pub fn verify_spend_auth_sig(rk: &[u8; 32], sighash: &[u8; 32], sig: &[u8; 64]) -> bool {
+    use orchard::primitives::redpallas::{Signature, SpendAuth, VerificationKey};
+    match VerificationKey::<SpendAuth>::try_from(*rk) {
+        Ok(vk) => vk.verify(sighash, &Signature::<SpendAuth>::from(*sig)).is_ok(),
+        Err(_) => false,
+    }
+}
+
 pub fn sighash(bundle: &ShieldedBundle, network_domain: &[u8; 32], tx_context: &[u8]) -> [u8; 32] {
     let mut h = Params::new().hash_length(32).personal(SIGHASH_PERSONALIZATION).to_state();
     h.update(network_domain);

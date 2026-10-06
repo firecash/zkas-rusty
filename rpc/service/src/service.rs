@@ -397,6 +397,11 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         }
         let script_public_key = kaspa_txscript::pay_to_address_script(&request.pay_address);
         let extra_data = version().as_bytes().iter().chain(once(&(b'/'))).chain(&request.extra_data).cloned().collect::<Vec<_>>();
+        if kaspa_consensus_core::SHIELDED_STATE_DIVERGED.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(RpcError::General(
+                "this node's shielded nullifier set failed its self-check; it refuses to build templates until resynced".to_string(),
+            ));
+        }
         let miner_data: MinerData = MinerData::new(script_public_key, extra_data);
         let block_template = self.mining_manager.clone().get_block_template(&session, miner_data).await?;
 

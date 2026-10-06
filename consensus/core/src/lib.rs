@@ -147,3 +147,8 @@ mod tests {
         assert_eq!(hasher.finish(), 4);
     }
 }
+
+/// Raised when this node's live nullifier set does not hash to the snapshot its committed state
+/// root covers (checked at startup). Such a node would judge double-spends differently from the
+/// network, so block templates are refused while it is set. Repair is a resync.
+pub static SHIELDED_STATE_DIVERGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);

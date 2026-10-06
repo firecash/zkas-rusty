@@ -829,6 +829,15 @@ impl ShieldedStateManager {
     /// the shielded state root still matches the chain (it reads the snapshot), while
     /// `partition_applied` — which consults the GLOBAL store — starts accepting spends whose
     /// nullifiers are already spent. That is exactly the observed failure, so measure it.
+    /// Whether `set` hashes to the nullifier accumulator snapshot committed at `block`.
+    pub fn set_matches_snapshot(&self, set: &[[u8; 32]], block: Hash) -> StoreResult<bool> {
+        let mut acc = MuHash::new();
+        for nf in set {
+            acc.add_element(nf);
+        }
+        Ok(acc.finalize() == self.load_nullifier_muhash(block)?.finalize())
+    }
+
     pub fn global_set_matches_snapshot(&self, block: Hash) -> StoreResult<(bool, usize)> {
         let mut acc = MuHash::new();
         let mut count = 0usize;

@@ -32,6 +32,10 @@ const COMMIT_PERSONAL: &[u8; 16] = b"zkas_anchor_cmt1";
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WindowEntry {
     pub block: [u8; 32],
+    /// The block's selected parent. Folded in, so the chain order of the entries is committed, and
+    /// it lets any node (including a fast-synced one with no chain index below its pruning point)
+    /// enumerate the window by following parent links.
+    pub parent: [u8; 32],
     pub root: [u8; 32],
     pub blue_score: u64,
 }
@@ -103,6 +107,7 @@ fn fold(prev: &[u8; 32], e: &WindowEntry) -> [u8; 32] {
     let mut h = Params::new().hash_length(32).personal(ENTRY_PERSONAL).to_state();
     h.update(prev);
     h.update(&e.block);
+    h.update(&e.parent);
     h.update(&e.root);
     h.update(&e.blue_score.to_le_bytes());
     let mut out = [0u8; 32];
@@ -115,7 +120,7 @@ mod tests {
     use super::*;
 
     fn e(n: u8, bs: u64) -> WindowEntry {
-        WindowEntry { block: [n; 32], root: [n.wrapping_add(100); 32], blue_score: bs }
+        WindowEntry { block: [n; 32], parent: [n.wrapping_sub(1); 32], root: [n.wrapping_add(100); 32], blue_score: bs }
     }
 
     #[test]
@@ -149,6 +154,9 @@ mod tests {
         let mut omitted = base.clone();
         omitted.remove(20);
         assert_ne!(AnchorWindow::from_entries(omitted.iter(), keep).unwrap().commitment(), c, "an omitted entry");
+        let mut reparented = base.clone();
+        reparented[20].parent = [0xEE; 32];
+        assert_ne!(AnchorWindow::from_entries(reparented.iter(), keep).unwrap().commitment(), c, "a changed parent link");
         let mut rescored = base.clone();
         rescored[20].blue_score += 1;
         assert_ne!(AnchorWindow::from_entries(rescored.iter(), keep).unwrap().commitment(), c, "a changed blue score");

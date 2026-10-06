@@ -448,6 +448,13 @@ impl Consensus {
             thread::Builder::new().name("body-processor".to_string()).spawn(move || body_processor.worker()).unwrap(),
             thread::Builder::new().name("virtual-processor".to_string()).spawn(move || virtual_processor.worker()).unwrap(),
             thread::Builder::new().name("pruning-processor".to_string()).spawn(move || pruning_processor.worker()).unwrap(),
+            {
+                let virtual_processor = self.virtual_processor.clone();
+                thread::Builder::new()
+                    .name("shielded-consistency".to_string())
+                    .spawn(move || virtual_processor.check_nullifier_set_consistency())
+                    .unwrap()
+            },
         ]
     }
 

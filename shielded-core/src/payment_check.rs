@@ -68,12 +68,17 @@ pub enum PaymentCheckError {
     UnexpectedRecipient(usize),
     /// A disclosed field is not a valid Orchard value.
     Malformed(usize),
+    /// A change output to this wallet does not decrypt under this wallet's viewing key to the
+    /// disclosed note. The commitment can be right while the ciphertext is garbage; such a note
+    /// exists on chain but no wallet can ever find it, so the change would be lost.
+    ChangeNotDecryptable(usize),
 }
 
 impl core::fmt::Display for PaymentCheckError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::ActionCountMismatch => write!(f, "prover disclosed the wrong number of actions"),
+            Self::ChangeNotDecryptable(i) => write!(f, "action {i}: the change note does not decrypt with this wallet's key"),
             Self::CommitmentMismatch(i) => write!(f, "action {i}: the note it creates is not the one disclosed"),
             Self::ValueCommitmentMismatch(i) => write!(f, "action {i}: value commitment does not match the disclosed amounts"),
             Self::ValueImbalance => write!(f, "spends minus outputs does not equal the bundle's value balance"),
@@ -194,6 +199,18 @@ pub fn check_prepared_payment(
     if paid_recipient > 1 {
         return Err(PaymentCheckError::RecipientPaidTwice { times: paid_recipient });
     }
+    // (6) Every non-zero change note decrypts, under this wallet's own viewing key, to exactly the
+    // disclosed value. Checks (1)-(2) pin the commitment and the amounts but say nothing about the
+    // ciphertext the sighash signs over, so a malicious prover could otherwise burn the change.
+    let received = crate::wallet::scan::scan_bundle(&fvk.to_ivk(Scope::External), wire);
+    for (i, d) in disclosure.iter().enumerate() {
+        if d.out_recipient == mine && d.out_value != 0 && !(d.out_recipient == *to && d.out_value == amount) {
+            let found = received.iter().any(|r| r.action_index == i && r.note.value().inner() == d.out_value);
+            if !found {
+                return Err(PaymentCheckError::ChangeNotDecryptable(i));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -310,8 +327,12 @@ mod tests {
         assert_eq!(check_prepared_payment(&b, &d, &fvk, &to, 1_000, 100), Err(PaymentCheckError::RecipientNotPaid));
     }
 
+    /// Change whose commitment and amount are right but whose ciphertext this wallet cannot decrypt
+    /// is refused: the note would exist on chain and be found by nobody, so the change is burned.
+    /// (Real, decryptable change is accepted; that path is exercised end to end by the
+    /// `prepare_payment` tests in `wallet.rs`, which build genuine Orchard ciphertexts.)
     #[test]
-    fn change_back_to_this_wallet_is_allowed_alongside_the_payment() {
+    fn change_that_does_not_decrypt_for_this_wallet_is_refused() {
         let fvk = fvk_for([1; 32]);
         let to = fvk_for([2; 32]).address_at(0u32, Scope::External).to_raw_address_bytes();
         let mine = fvk.address_at(0u32, Scope::External).to_raw_address_bytes();
@@ -319,7 +340,7 @@ mod tests {
             vec![action([9; 32], 1_100, 1_000, to), action([8; 32], 500, 400, mine)],
             200,
         );
-        assert_eq!(check_prepared_payment(&b, &d, &fvk, &to, 1_000, 200), Ok(()));
+        assert_eq!(check_prepared_payment(&b, &d, &fvk, &to, 1_000, 200), Err(PaymentCheckError::ChangeNotDecryptable(1)));
     }
 
     #[test]

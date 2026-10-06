@@ -400,6 +400,12 @@ pub struct WalletDb {
     /// not anything about the stream it holds, and a checkpoint written by a
     /// shared tree must stay loadable as an ordinary (if noteless) wallet.
     leaves_only: bool,
+    /// Set when an ingested page repeated a nullifier this database already appended a leaf for.
+    /// Consensus never applies a second spend of one nullifier, and the node serves only applied
+    /// transactions, so a repeat proves the data source is faulty or lying. The bundle is still
+    /// skipped (as before), but the caller must now treat this database as diverged: discard it and
+    /// reload from the last checkpoint rather than persist a forked tree. Not persisted.
+    poisoned: bool,
     /// Do not maintain this wallet's own mirror `tree` — the daemon-wide shared tree
     /// holds an identical one and will supply its frontier.
     ///
@@ -819,6 +825,7 @@ impl WalletDb {
             agree_scalar,
             predecrypted: None,
             leaves_only: false,
+            poisoned: false,
             borrow_tree: false,
             tree_valid: true,
             pending_spends: Vec::new(),
@@ -871,6 +878,7 @@ impl WalletDb {
             agree_scalar,
             predecrypted: None,
             leaves_only: false,
+            poisoned: false,
             borrow_tree: false,
             tree_valid: true,
             pending_spends: Vec::new(),
@@ -1096,6 +1104,7 @@ impl WalletDb {
     fn ingest_bundles(&mut self, txs: &[&ShieldedBundle], meta: Option<&BlockMeta>) {
         for (bi, bundle) in txs.iter().enumerate() {
             if bundle.actions.iter().any(|a| self.spent_nullifiers.contains(&a.nullifier)) {
+                self.poisoned = true;
                 continue;
             }
             // What this bundle takes from us — measured BEFORE the retain below
@@ -1197,6 +1206,7 @@ impl WalletDb {
     fn ingest_bundles_compact(&mut self, txs: &[Vec<CompactActionRecord>], meta: Option<&BlockMeta>) {
         for (bi, records) in txs.iter().enumerate() {
             if records.iter().any(|a| self.spent_nullifiers.contains(&a.nullifier)) {
+                self.poisoned = true;
                 continue;
             }
             let spent: u64 = records.iter().filter_map(|a| self.owned_note_value(&a.nullifier)).sum();
@@ -2246,6 +2256,17 @@ impl WalletDb {
     ///
     /// Such a wallet can never own a note, so `notes` stays empty and no balance,
     /// history or spend path is meaningful on it.
+    /// Whether ingest has seen data that consensus could never have applied (see `poisoned`).
+    pub fn poisoned(&self) -> bool {
+        self.poisoned
+    }
+
+    /// Mark this database diverged on evidence found outside ingest (e.g. its root disagrees with
+    /// the node's consensus frontier at the same block). Same consequences as `poisoned`.
+    pub fn mark_poisoned(&mut self) {
+        self.poisoned = true;
+    }
+
     pub fn set_leaves_only(&mut self, on: bool) {
         self.leaves_only = on;
     }

@@ -320,6 +320,17 @@ pub fn create_core_with_runtime(runtime: &Runtime, args: &Args, fd_total_budget:
             None => params,
         }
     };
+    // A fast-syncing node can prove an in-window anchor source only from headers it holds, and it
+    // holds the chain segment `finality_depth` deep below its pruning point. An anchor window deeper
+    // than that would drop honest anchors at import and wedge the node on its first such spend.
+    if params.max_shielded_anchor_age() >= params.finality_depth() {
+        println!(
+            "Invalid params: max_shielded_anchor_age ({}) must be below finality_depth ({}).",
+            params.max_shielded_anchor_age(),
+            params.finality_depth()
+        );
+        exit(1);
+    }
 
     let config = Arc::new(
         ConfigBuilder::new(params).adjust_perf_params_to_consensus_params().apply_args(|config| args.apply_to_config(config)).build(),

@@ -191,6 +191,28 @@ impl TestContext {
         t.block.to_immutable()
     }
 
+    /// Build a valid empty template, then INJECT `txs` behind the template validator and recompute
+    /// the merkle root — for testing that consensus itself rejects a transaction the template
+    /// builder would never have included.
+    fn mine_real_pow_block_injecting(&mut self, txs: Vec<Transaction>) -> Block {
+        self.simulated_time += self.consensus.params().target_time_per_block();
+        let mut t = self
+            .consensus
+            .build_block_template(self.miner_data.clone(), Box::new(OnetimeTxSelector::new(vec![])), TemplateBuildMode::Standard)
+            .unwrap();
+        t.block.transactions.extend(txs);
+        t.block.header.hash_merkle_root = kaspa_consensus_core::merkle::calc_hash_merkle_root(t.block.transactions.iter());
+        t.block.header.timestamp = self.simulated_time;
+        let state = kaspa_pow::State::new(&t.block.header);
+        let mut nonce = 0u64;
+        while !state.check_pow(nonce).0 {
+            nonce += 1;
+        }
+        t.block.header.nonce = nonce;
+        t.block.header.finalize();
+        t.block.to_immutable()
+    }
+
     /// As `mine_real_pow_block_with`, but with explicit parents — for building a
     /// competing branch that does not extend the current virtual tips. The block is
     /// only BUILT; the caller inserts it (parents must already be in consensus so the
@@ -1652,5 +1674,232 @@ async fn imported_anchor_pairs_are_kept_only_for_provable_window_sources() {
     assert!(
         vp.shielded_state_manager_ref().anchor_producer_blocks(&r_honest).unwrap().contains(&honest_src),
         "a failed import must not clear the state imported before it"
+    );
+}
+
+fn fork_config() -> kaspa_consensus_core::config::Config {
+    let mut params = MAINNET_PARAMS.clone();
+    params.shielded_coinbase = true;
+    params.security_fork_activation = ForkActivation::always();
+    ConfigBuilder::new(params)
+        .edit_consensus_params(|p| {
+            p.genesis.bits = 0x207fffff;
+            p.blockrate.shielded_anchor_depth = 1;
+        })
+        .build()
+}
+
+/// Security fork, self-consistency: with the fork active every block's coinbase commits
+/// `zkas_state_root1` of its selected parent, so the template and validation must compute the
+/// same versioned root and the same anchor window, block after block. Then the pruning-point
+/// export must re-bind to that committed root, and a tampered window entry or dev accrual must not.
+#[tokio::test]
+async fn security_fork_chain_commits_v1_roots_and_the_window_rebinds() {
+    let config = fork_config();
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+    let miner_addr = kaspa_shielded_core::wallet::address_bytes_from_seed([9u8; 32]).expect("orchard address");
+    ctx.miner_data = MinerData::new(ScriptPublicKey::new(0, ScriptVec::from_slice(&miner_addr)), vec![]);
+    let mut chain = Vec::new();
+    for _ in 0..12 {
+        let b = ctx.mine_real_pow_block();
+        let h = b.header.hash;
+        ctx.consensus.validate_and_insert_block(b).virtual_state_task.await.expect("every post-fork block validates");
+        chain.push(h);
+    }
+    let vp = ctx.consensus.virtual_processor();
+    let mgr = vp.shielded_state_manager_ref();
+    for h in &chain {
+        assert!(mgr.window_at(*h).unwrap().is_some(), "every post-fork chain block has a window");
+        assert!(mgr.window_entry(*h).unwrap().is_some(), "and an entry");
+    }
+    let pp = chain[8];
+    let committed = vp.shielded_state_root_at(pp).unwrap();
+    assert_ne!(committed, mgr.state_root_at(pp).unwrap(), "post-fork root is the v1 root, not v0");
+
+    let wire = vp.export_pruning_point_shielded(pp).unwrap().expect("pp exports");
+    let md = crate::processes::shielded::PruningPointShieldedMetadata::from_wire_bytes(&wire.data).unwrap();
+    assert!(!md.window_entries.is_empty(), "a post-fork pruning point exports its window entries");
+    vp.verify_import_binding_versioned(pp, &md, committed).expect("honest export re-binds to the committed root");
+
+    let mut tampered = md.clone();
+    tampered.window_entries[0].root = [0xEE; 32];
+    assert!(vp.verify_import_binding_versioned(pp, &tampered, committed).is_err(), "a substituted anchor root is refused");
+    let mut tampered = md.clone();
+    tampered.window_entries.remove(0);
+    assert!(vp.verify_import_binding_versioned(pp, &tampered, committed).is_err(), "an omitted window entry is refused");
+    let mut tampered = md.clone();
+    tampered.dev_accrued = tampered.dev_accrued.wrapping_add(1);
+    assert!(vp.verify_import_binding_versioned(pp, &tampered, committed).is_err(), "a different dev accrual is refused");
+}
+
+/// Security fork: a ZKas block whose coinbase carries a merge-mining commitment is invalid, so a
+/// ZKas block can no longer serve as the aux parent of another ZKas block.
+#[tokio::test]
+async fn security_fork_rejects_a_coinbase_carrying_a_merge_mining_commitment() {
+    use kaspa_consensus_core::auxpow::AuxPow;
+    let config = fork_config();
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+    let miner_addr = kaspa_shielded_core::wallet::address_bytes_from_seed([9u8; 32]).expect("orchard address");
+    let spk = ScriptPublicKey::new(0, ScriptVec::from_slice(&miner_addr));
+    ctx.miner_data = MinerData::new(spk.clone(), vec![]);
+    for _ in 0..3 {
+        let b = ctx.mine_real_pow_block();
+        ctx.consensus.validate_and_insert_block(b).virtual_state_task.await.unwrap();
+    }
+    for extra in [AuxPow::embed_commitment(&[], Hash::from_u64_word(7), &[]), AuxPow::embed_commitment_v1(&[], Hash::from_u64_word(7), &[])] {
+        ctx.miner_data = MinerData::new(spk.clone(), extra);
+        let p = ctx.mine_real_pow_block();
+        let verdict = ctx.consensus.validate_and_insert_block(p).virtual_state_task.await;
+        assert!(verdict.is_err(), "a post-fork ZKas coinbase carrying a merge-mining commitment must be rejected");
+    }
+}
+
+/// Security fork, end to end with a REAL proven spend: after the activation a spend must name its
+/// anchor block. Unnamed: the carrying block is invalid (format rule). Named but wrong block: the
+/// spend is dropped (the named block did not produce the root) and the block stays valid. Named
+/// correctly: applied.
+#[tokio::test]
+async fn security_fork_spends_must_name_their_anchor_block() {
+    use kaspa_consensus_core::subnets::SUBNETWORK_ID_NATIVE;
+    use kaspa_consensus_core::tx::TX_VERSION_SHIELDED;
+
+    let mut params = MAINNET_PARAMS.clone();
+    params.shielded_coinbase = true;
+    params.dev_fee_recipient = None;
+    params.security_fork_activation = ForkActivation::always();
+    let config = ConfigBuilder::new(params)
+        .edit_consensus_params(|p| {
+            p.genesis.bits = 0x207fffff;
+            p.blockrate.finality_depth = 5;
+            p.blockrate.shielded_anchor_depth = 5;
+        })
+        .build();
+    let net = config.genesis.hash.as_bytes();
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+    let miner_seed = [7u8; 32];
+    let miner_addr = kaspa_shielded_core::wallet::address_bytes_from_seed(miner_seed).expect("orchard address");
+    ctx.miner_data = MinerData::new(ScriptPublicKey::new(0, ScriptVec::from_slice(&miner_addr)), vec![]);
+
+    let mut block1 = None;
+    for _ in 0..2 {
+        let b = ctx.mine_real_pow_block();
+        ctx.consensus.validate_and_insert_block(b.clone()).virtual_state_task.await.unwrap();
+        block1 = Some(b);
+    }
+    let block1 = block1.unwrap();
+    let cb = &block1.transactions[0];
+    let (cb_txid, note_value) = (cb.id(), cb.outputs[0].value);
+    let mut later = Vec::new();
+    for _ in 0..6 {
+        let b = ctx.mine_real_pow_block();
+        later.push(b.header.hash);
+        ctx.consensus.validate_and_insert_block(b).virtual_state_task.await.unwrap();
+    }
+    let recipient_addr = kaspa_shielded_core::wallet::address_bytes_from_seed([9u8; 32]).unwrap();
+    let spend = |anchor_block: Option<Hash>| {
+        let mut tx = Transaction::new(TX_VERSION_SHIELDED, vec![], vec![], 0, SUBNETWORK_ID_NATIVE, 0, vec![]);
+        let tx_ctx = tx.shielded_sighash_context();
+        tx.payload = kaspa_shielded_core::wallet::build::build_singleleaf_coinbase_spend_anchored(
+            miner_seed,
+            cb_txid.as_bytes(),
+            0,
+            note_value,
+            recipient_addr,
+            note_value - 2_000,
+            &net,
+            &tx_ctx,
+            anchor_block.map(|h| h.as_bytes()),
+        )
+        .expect("wallet builds a real spend bundle");
+        tx.finalize();
+        tx
+    };
+
+    // 1. Unnamed after the fork: the carrying block is invalid.
+    // Injected behind the template validator, which would never include it.
+    let bad = ctx.mine_real_pow_block_injecting(vec![spend(None)]);
+    let verdict = ctx.consensus.validate_and_insert_block(bad).virtual_state_task.await;
+    assert!(
+        matches!(verdict, Err(_) | Ok(BlockStatus::StatusDisqualifiedFromChain)),
+        "an unnamed spend after the fork invalidates its block: {verdict:?}"
+    );
+
+    // 2. Named, but the named block (a later block) did not produce block 1's root: dropped, block valid.
+    let wrong = spend(Some(later[0]));
+    let wrong_id = wrong.id();
+    let b = ctx.mine_real_pow_block_with(vec![wrong]);
+    ctx.consensus.validate_and_insert_block(b).virtual_state_task.await.expect("the block itself stays valid");
+    let child = ctx.mine_real_pow_block();
+    let child_hash = child.header.hash;
+    ctx.consensus.validate_and_insert_block(child).virtual_state_task.await.unwrap();
+    let applied = ctx.consensus.get_shielded_chain_block_data(child_hash).unwrap();
+    assert!(!applied.accepted_txids.contains(&wrong_id), "a spend naming the wrong anchor block is not applied");
+
+    // 3. Named correctly: applied.
+    let good = spend(Some(block1.header.hash));
+    let good_id = good.id();
+    let b = ctx.mine_real_pow_block_with(vec![good]);
+    ctx.consensus.validate_and_insert_block(b).virtual_state_task.await.expect("valid");
+    let child = ctx.mine_real_pow_block();
+    let child_hash = child.header.hash;
+    ctx.consensus.validate_and_insert_block(child).virtual_state_task.await.unwrap();
+    let applied = ctx.consensus.get_shielded_chain_block_data(child_hash).unwrap();
+    assert!(applied.accepted_txids.contains(&good_id), "a correctly named spend is applied");
+}
+
+/// Before the fork the anchor-block field is not part of the format: a named spend invalidates its
+/// block, so nobody can use the field early and split un-upgraded nodes.
+#[tokio::test]
+async fn named_anchor_block_is_refused_before_the_fork() {
+    use kaspa_consensus_core::subnets::SUBNETWORK_ID_NATIVE;
+    use kaspa_consensus_core::tx::TX_VERSION_SHIELDED;
+
+    let mut params = MAINNET_PARAMS.clone();
+    params.shielded_coinbase = true;
+    params.dev_fee_recipient = None;
+    let config = ConfigBuilder::new(params)
+        .edit_consensus_params(|p| {
+            p.genesis.bits = 0x207fffff;
+            p.blockrate.finality_depth = 5;
+            p.blockrate.shielded_anchor_depth = 5;
+        })
+        .build();
+    let net = config.genesis.hash.as_bytes();
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+    let miner_seed = [7u8; 32];
+    let miner_addr = kaspa_shielded_core::wallet::address_bytes_from_seed(miner_seed).expect("orchard address");
+    ctx.miner_data = MinerData::new(ScriptPublicKey::new(0, ScriptVec::from_slice(&miner_addr)), vec![]);
+    let mut block1 = None;
+    for _ in 0..2 {
+        let b = ctx.mine_real_pow_block();
+        ctx.consensus.validate_and_insert_block(b.clone()).virtual_state_task.await.unwrap();
+        block1 = Some(b);
+    }
+    let block1 = block1.unwrap();
+    let cb = &block1.transactions[0];
+    for _ in 0..6 {
+        let b = ctx.mine_real_pow_block();
+        ctx.consensus.validate_and_insert_block(b).virtual_state_task.await.unwrap();
+    }
+    let mut tx = Transaction::new(TX_VERSION_SHIELDED, vec![], vec![], 0, SUBNETWORK_ID_NATIVE, 0, vec![]);
+    let tx_ctx = tx.shielded_sighash_context();
+    tx.payload = kaspa_shielded_core::wallet::build::build_singleleaf_coinbase_spend_anchored(
+        miner_seed,
+        cb.id().as_bytes(),
+        0,
+        cb.outputs[0].value,
+        kaspa_shielded_core::wallet::address_bytes_from_seed([9u8; 32]).unwrap(),
+        cb.outputs[0].value - 2_000,
+        &net,
+        &tx_ctx,
+        Some(block1.header.hash.as_bytes()),
+    )
+    .unwrap();
+    tx.finalize();
+    let b = ctx.mine_real_pow_block_injecting(vec![tx]);
+    let verdict = ctx.consensus.validate_and_insert_block(b).virtual_state_task.await;
+    assert!(
+        matches!(verdict, Err(_) | Ok(BlockStatus::StatusDisqualifiedFromChain)),
+        "a named anchor block before the fork invalidates its block: {verdict:?}"
     );
 }

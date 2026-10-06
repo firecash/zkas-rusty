@@ -189,9 +189,18 @@ impl IbdFlow {
             return;
         }
         info!("shielded history: this node is synced but holds partial history; asking {} to backfill it", self.router);
+        // The base before this attempt: anything a failed attempt wrote below it is unproven and is
+        // discarded, whatever the failure was (a peer that times out or disconnects mid-stream used
+        // to leave its records in the live index for good).
+        let base_before = session.async_get_shielded_history_base().await;
         match self.backfill_shielded_history(&session).await {
             Ok(()) => SHIELDED_HISTORY_BACKFILL_DONE.store(true, Ordering::SeqCst),
             Err(e) => {
+                match session.async_purge_shielded_history_below(base_before).await {
+                    Ok(n) if n > 0 => warn!("archival: discarded {n} unproven scan records from the failed backfill"),
+                    Ok(_) => {}
+                    Err(purge_err) => warn!("archival: could not discard the failed backfill's records ({purge_err})"),
+                }
                 let asked = SHIELDED_HISTORY_ASKED_PEERS.lock().unwrap().as_ref().map_or(0, |s| s.len());
                 let floor = session.async_get_shielded_history_status().await.map(|(daa, _)| daa).unwrap_or(0);
                 warn!(
@@ -377,11 +386,18 @@ impl IbdFlow {
                 asked.len() < SHIELDED_HISTORY_MAX_PEERS && asked.insert(self.router.key())
             };
         if should_ask {
+            let base_before = session.async_get_shielded_history_base().await;
             match self.backfill_shielded_history(&session).await {
                 Ok(()) => {
                     SHIELDED_HISTORY_BACKFILL_DONE.store(true, Ordering::SeqCst);
                 }
                 Err(e) => {
+                    // See `backfill_if_synced_and_incomplete`: a failed attempt leaves nothing behind.
+                    match session.async_purge_shielded_history_below(base_before).await {
+                        Ok(n) if n > 0 => warn!("archival: discarded {n} unproven scan records from the failed backfill"),
+                        Ok(_) => {}
+                        Err(purge_err) => warn!("archival: could not discard the failed backfill's records ({purge_err})"),
+                    }
                     let asked = SHIELDED_HISTORY_ASKED_PEERS.lock().unwrap().as_ref().map_or(0, |s| s.len());
                     // Name the floor the node is left with, so an operator reading this line
                     // knows what wallets will see rather than only that something failed.
@@ -1174,10 +1190,20 @@ impl IbdFlow {
                     );
                     return Err(ProtocolError::OtherOwned(format!("shielded history failed verification: {reason}")));
                 }
+                // Unproven history is no longer kept. Retaining it was a permanent wedge: the index
+                // then anchored every later attempt at a peer-chosen base, and `Unverifiable` also
+                // marked the backfill done, so no honest peer was ever asked again. Discard it and
+                // report failure; a later IBD retries with another peer.
                 Ok(ShieldedHistoryVerdict::Unverifiable { reason }) => {
-                    warn!("archival: shielded history could NOT be verified ({reason}); it is retained but unproven");
+                    let discarded = consensus.async_purge_shielded_history_below(verify_base).await.unwrap_or(0);
+                    warn!("archival: shielded history could NOT be verified ({reason}); discarded {discarded} unproven scan records");
+                    return Err(ProtocolError::OtherOwned(format!("shielded history could not be verified: {reason}")));
                 }
-                Err(e) => warn!("archival: shielded history verification did not run ({e}); history is retained but unproven"),
+                Err(e) => {
+                    let discarded = consensus.async_purge_shielded_history_below(verify_base).await.unwrap_or(0);
+                    warn!("archival: shielded history verification did not run ({e}); discarded {discarded} unproven scan records");
+                    return Err(ProtocolError::OtherOwned(format!("shielded history verification did not run: {e}")));
+                }
             }
         }
         // One closing line in the terms wallets and the RPC use, whatever path led here: the

@@ -437,27 +437,21 @@ impl VirtualStateProcessor {
         // Security fork: send the entries of every bucket the pruning point's window retains, so the
         // syncing node can re-fold them to the committed window. Walk the selected chain down from
         // `pp`; entries are kept below the pruning point exactly for this.
+        // Follow the entries' own parent links rather than the selected-chain index: a node that
+        // fast-synced has no index below its pruning point, but it does hold the imported entries.
         if let Some(window) = self.shielded_state_manager.window_at(pp)? {
             if let Some(floor) = window.floor_bucket() {
-                let sc_read = self.selected_chain_store.read();
-                if let Some(pp_index) = sc_read.get_by_hash(pp).optional()? {
-                    let mut entries = Vec::new();
-                    let mut i = pp_index;
-                    loop {
-                        let Some(block) = sc_read.get_by_index(i).optional()? else { break };
-                        let Some(entry) = self.shielded_state_manager.window_entry(block)? else { break };
-                        if entry.blue_score / kaspa_shielded_core::anchor_window::BUCKET_SPAN < floor {
-                            break;
-                        }
-                        entries.push(entry);
-                        if i == 0 {
-                            break;
-                        }
-                        i -= 1;
+                let mut entries = Vec::new();
+                let mut cursor = pp;
+                while let Some(entry) = self.shielded_state_manager.window_entry(cursor)? {
+                    if entry.blue_score / kaspa_shielded_core::anchor_window::BUCKET_SPAN < floor {
+                        break;
                     }
-                    entries.reverse();
-                    md.window_entries = entries;
+                    cursor = Hash::from_bytes(entry.parent);
+                    entries.push(entry);
                 }
+                entries.reverse();
+                md.window_entries = entries;
             }
         }
         let nullifier_count = self.pruning_point_nullifier_set(pp)?.len() as u64;
@@ -503,6 +497,16 @@ impl VirtualStateProcessor {
         // The PP is finality-deep, so it is always a chain ancestor of the tip.
         let post_blocks = self.reachability_service.forward_chain_iterator(pp, tip, true).skip(1);
         let set = Arc::new(self.shielded_state_manager.subtract_nullifier_diffs(snapshot, post_blocks)?);
+        // Never cache (or serve) a torn view. The raw store iteration above is not synchronized with
+        // a reorg walk that is committing nullifiers, so the derived set can include a branch the tip
+        // has not adopted yet. It is cached until the pruning point moves (hours), and every syncing
+        // peer would fail against it. Check it against the accumulator the pruning point committed;
+        // on mismatch return an error so the requester retries and nothing bad is kept.
+        if !self.shielded_state_manager.set_matches_snapshot(&set, pp)? {
+            return Err(kaspa_database::prelude::StoreError::DataInconsistency(format!(
+                "pruning-point nullifier set at {pp} was captured mid-reorg; not serving it"
+            )));
+        }
         *self.pp_nullifier_export_cache.lock() = Some((pp, Arc::clone(&set)));
         Ok(set)
     }
@@ -652,6 +656,37 @@ impl VirtualStateProcessor {
             self.shielded_state_manager.state_root_v1_at(block)
         } else {
             self.shielded_state_manager.state_root_at(block)
+        }
+    }
+
+    /// Startup self-check: the live nullifier set must hash to the snapshot at the sink, which is the
+    /// set the committed state root covers. They are two representations of one set, written on
+    /// different paths (a crash inside a rejected reorg can leave them apart), and nothing else
+    /// reconciles them. On mismatch the node refuses block templates and says so loudly; it never
+    /// repairs itself. Holds the virtual read lock so blocks are not committed mid-scan.
+    pub fn check_nullifier_set_consistency(&self) {
+        // Only a node whose shielded state is marked stable is judged: one restarted mid-import (or
+        // a staging consensus during IBD) is legitimately not at its sink yet, and a false alarm
+        // here would refuse templates until restart.
+        if !self.shielded_coinbase || !self.pruning_meta_stores.read().pruning_shielded_stable_flag() {
+            return;
+        }
+        let _guard = self.virtual_stores.read();
+        let sink = self.lkg_virtual_state.load().ghostdag_data.selected_parent;
+        let started = std::time::Instant::now();
+        match self.shielded_state_manager.global_set_matches_snapshot(sink) {
+            Ok((true, count)) => {
+                info!("shielded self-check: live nullifier set ({count}) matches the committed snapshot at {sink} ({:.1?})", started.elapsed())
+            }
+            Ok((false, count)) => {
+                kaspa_consensus_core::SHIELDED_STATE_DIVERGED.store(true, std::sync::atomic::Ordering::SeqCst);
+                kaspa_core::error!(
+                    "shielded self-check FAILED: the live nullifier set ({count}) does not match the snapshot the committed \
+                     state root covers at {sink}. This node would judge double-spends differently from the network. Block \
+                     templates are refused. Resync this node."
+                );
+            }
+            Err(e) => warn!("shielded self-check could not run: {e}"),
         }
     }
 
@@ -1385,6 +1420,7 @@ impl VirtualStateProcessor {
                 let parent_window = self.shielded_state_manager.window_at(sp).unwrap().unwrap_or_default();
                 let entry = kaspa_shielded_core::anchor_window::WindowEntry {
                     block: current.as_bytes(),
+                    parent: sp.as_bytes(),
                     root: computed.anchor(),
                     blue_score,
                 };

@@ -64,3 +64,27 @@ pub fn build_aux_pow(fc_header: &Header, threads: usize, stop: &AtomicBool) -> O
 
     Some((fc, AuxPow { parent_header: parent, parent_coinbase: coinbase, coinbase_merkle_branch: vec![] }))
 }
+
+/// Security-fork form of [`build_aux_pow`]. The parent commits `ZKM1 || hex(bound_commitment(genesis,
+/// nonce-free H_fc))` (the header hash with the nonce zeroed, the timestamp kept), the parent is mined,
+/// and only then is the ZKas header's nonce set to the parent's hash. Order matters: the commitment
+/// cannot depend on the nonce, and the nonce must name the parent, which is what makes one block have
+/// exactly one witness.
+pub fn build_aux_pow_bound(fc_header: &Header, genesis: Hash, threads: usize, stop: &AtomicBool) -> Option<(Header, AuxPow)> {
+    let mut fc = fc_header.clone();
+    let nonce_free = kaspa_consensus_core::hashing::header::hash_override_nonce_time(&fc, 0, fc.timestamp);
+    let commitment = AuxPow::bound_commitment(genesis, nonce_free);
+    let coinbase = Transaction::new(0, vec![], vec![], 0, SUBNETWORK_ID_COINBASE, 0, AuxPow::embed_commitment_v1(&[], commitment, &[]));
+    let hash_merkle_root = calc_hash_merkle_root(std::iter::once(&coinbase));
+
+    let mut parent = Header::from_precomputed_hash(ZERO_HASH, vec![Hash::from_u64_word(0xF12E_CA54)]);
+    parent.hash_merkle_root = hash_merkle_root;
+    parent.bits = fc_header.bits;
+    parent.timestamp = fc_header.timestamp;
+    let nonce = solver::mine_header(&parent, threads, stop)?;
+    parent.nonce = nonce;
+
+    fc.nonce = AuxPow::nonce_binding(&parent);
+    fc.finalize();
+    Some((fc, AuxPow { parent_header: parent, parent_coinbase: coinbase, coinbase_merkle_branch: vec![] }))
+}

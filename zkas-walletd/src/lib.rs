@@ -70,7 +70,8 @@ use kaspa_shielded_core::tree::{FrontierState, GlobalTree, NoteCommitmentTree};
 use kaspa_shielded_core::wallet::CompactActionRecord;
 use kaspa_shielded_core::wallet::address_bytes_from_seed;
 use kaspa_shielded_core::wallet::build::{
-    MultiOutput, MultiSpend, PreparedPayment, build_wallet_payment, build_wallet_payment_multi, finalize_payment,
+    MultiOutput, MultiSpend, PreparedPayment, build_wallet_payment, build_wallet_payment_anchored, build_wallet_payment_multi,
+    build_wallet_payment_multi_anchored, finalize_payment,
     fvk_from_bytes, prepare_multiparty, prepare_payment, proving_key, spend_offer_from_bytes, spend_offer_to_bytes,
 };
 use kaspa_shielded_core::walletdb::{BlockMeta, HistoryKind, OwnedNote, Preview, WalletDb};
@@ -499,6 +500,50 @@ fn require_custodial(state: &AppState) -> Result<(), (StatusCode, Json<serde_jso
 
 /// Map the `--network` string to the consensus [`NetworkType`] the compile-time
 /// params are keyed by.
+/// The security-fork activation of this daemon's network, set once at startup. From it every spend
+/// must name its anchor block (`kaspa_shielded_core::bundle::BUNDLE_FLAG_ANCHOR_BLOCK`).
+static SECURITY_FORK: std::sync::OnceLock<kaspa_consensus_core::config::params::ForkActivation> = std::sync::OnceLock::new();
+
+/// Whether a spend built now must name its anchor block, judged at the wallet's synced DAA score.
+/// Near the boundary a transaction can land on the other side; consensus then rejects it and the
+/// wallet re-proves, which costs time and never funds.
+fn security_fork_active(daa_score: u64) -> bool {
+    SECURITY_FORK.get().is_some_and(|f| f.is_active(daa_score))
+}
+
+/// Sidecar next to a wallet's checkpoint: `leaves -> block hash` for the matured-anchor ring. Kept out
+/// of the checkpoint format on purpose, so adding it needs no CHECKPOINT_VERSION bump (which would
+/// force every wallet to rescan).
+fn anchor_blocks_path(dir: &str, token: &str) -> String {
+    format!("{dir}/{token}.anchors")
+}
+
+fn save_anchor_blocks(dir: &str, token: &str, blocks: &HashMap<u64, [u8; 32]>) {
+    if blocks.is_empty() {
+        return;
+    }
+    let mut out = String::with_capacity(blocks.len() * 90);
+    for (leaves, hash) in blocks {
+        out.push_str(&format!("{leaves} {}\n", hex::encode(hash)));
+    }
+    let path = anchor_blocks_path(dir, token);
+    let tmp = format!("{path}.tmp");
+    if std::fs::write(&tmp, out).and_then(|_| std::fs::rename(&tmp, &path)).is_err() {
+        log::warn!("wallet {token}: could not persist anchor-block sidecar (sends after a restart wait for sync)");
+    }
+}
+
+fn load_anchor_blocks(dir: &str, token: &str) -> HashMap<u64, [u8; 32]> {
+    let Ok(text) = std::fs::read_to_string(anchor_blocks_path(dir, token)) else { return HashMap::new() };
+    text.lines()
+        .filter_map(|l| {
+            let (a, b) = l.split_once(' ')?;
+            let hash: [u8; 32] = hex::decode(b).ok()?.try_into().ok()?;
+            Some((a.parse().ok()?, hash))
+        })
+        .collect()
+}
+
 fn state_prefix_network(network: &str) -> kaspa_consensus_core::network::NetworkType {
     use kaspa_consensus_core::network::NetworkType;
     match network.to_ascii_lowercase().as_str() {
@@ -557,7 +602,9 @@ fn build_chain_tree(dir: &str, genesis: RpcHash) -> Wallet {
             // trial-decrypting against a key that matches nothing.
             db.set_leaves_only(true);
             log::info!("shared chain tree resumed from checkpoint: {} leaves, scanned {scanned} blocks", db.size());
-            WalletEntry::from_parts(key, false, db, genesis, low, scanned, boundaries, sink_blue)
+            let mut e = WalletEntry::from_parts(key, false, db, genesis, low, scanned, boundaries, sink_blue);
+            e.boundary_blocks = load_anchor_blocks(dir, CHAIN_TREE_TOKEN);
+            e
         }
         None => {
             log::info!("shared chain tree starting from genesis — one keyless pass builds the stream every wallet shares");
@@ -1568,11 +1615,14 @@ fn save_checkpoint(
     scanned: u64,
     db: &WalletDb,
     boundaries: &VecDeque<(u64, u64)>,
+    boundary_blocks: &HashMap<u64, [u8; 32]>,
     sink_blue: u64,
     blind_below: u64,
 ) -> std::io::Result<()> {
     let buf = checkpoint_bytes(genesis, low, scanned, db, boundaries, sink_blue, blind_below);
-    write_checkpoint_bytes(dir, token, &buf)
+    write_checkpoint_bytes(dir, token, &buf)?;
+    save_anchor_blocks(dir, token, boundary_blocks);
+    Ok(())
 }
 
 /// The serialised checkpoint file for [`save_checkpoint`], built from the wallet
@@ -2001,7 +2051,7 @@ pub fn graft_wallet(dir: &str, token: &str, older_scan: &str, secret: Option<&st
     let before = db.stranded_notes().len();
     let restored = db.graft_history(&old_db).map_err(|e| e.to_string())?;
     let after = db.stranded_notes().len();
-    save_checkpoint(dir, token, &genesis, &low, scanned as u64, &db, &boundaries, sink_blue, blind_below)
+    save_checkpoint(dir, token, &genesis, &low, scanned as u64, &db, &boundaries, &load_anchor_blocks(dir, token), sink_blue, blind_below)
         .map_err(|e| format!("write repaired checkpoint: {e}"))?;
     Ok(format!("grafted {restored} leaves back (base now {}); stranded notes {before} -> {after}", db.base_size()))
 }
@@ -2573,6 +2623,10 @@ struct WalletEntry {
     /// at a matured, canonical chain-block anchor without a rescan. Persisted in
     /// the v2 checkpoint, so it survives restarts.
     boundaries: VecDeque<(u64, u64)>,
+    /// Block hash at each ring boundary, keyed by leaf count (the boundary's anchor is that block's
+    /// own tree root). Needed after the security fork, when a spend must name its anchor block.
+    /// Persisted in a sidecar (`anchor_blocks_path`), not in the checkpoint.
+    boundary_blocks: HashMap<u64, [u8; 32]>,
     /// The sink's blue score from the latest sync response — the reference the
     /// matured cutoff is measured against.
     sink_blue: u64,
@@ -2778,6 +2832,7 @@ impl WalletEntry {
             last_checkpoint_at: std::time::Instant::now(),
             history_examined: 0,
             boundaries,
+            boundary_blocks: HashMap::new(),
             sink_blue,
             reorged_strikes: 0,
             preview: Preview::default(),
@@ -2949,6 +3004,11 @@ impl WalletEntry {
         // `[base, covers)`; a wallet whose oldest note is below `base` is NOT covered.
         shared_tree_base: u64,
     ) {
+        // A database that ingested inconsistent data is not advanced any further; see `poisoned`.
+        if self.db.poisoned() {
+            self.error = Some("inconsistent shielded data from the node; sync halted until restart".into());
+            return;
+        }
         // Local to the pass on purpose: a fresh pass should publish promptly rather
         // than inherit a timer from the last one.
         let mut last_publish = std::time::Instant::now();
@@ -3264,11 +3324,27 @@ impl WalletEntry {
                         daa_score: b.daa_score,
                     });
                     self.db.ingest_block_compact_precomputed_with_meta(&b.coinbase, &b.compact, meta.as_ref());
+                    if self.db.poisoned() {
+                        // A repeated nullifier: data consensus could never have applied. Stop here and
+                        // never checkpoint this state; the error keeps the wallet from being saved,
+                        // and a reload resumes from the last good checkpoint.
+                        log::error!(
+                            "wallet {token}: the node served block {} with a nullifier this wallet already saw; \
+                             refusing to continue from inconsistent data (restart walletd or point it at another node)",
+                            b.hash
+                        );
+                        self.error = Some("inconsistent shielded data from the node (repeated nullifier); sync halted".into());
+                        return;
+                    }
                     self.low = b.hash;
                     self.scanned = b.daa_score as usize;
                     self.boundaries.push_back((b.blue_score, self.db.size()));
+                    self.boundary_blocks.insert(self.db.size(), b.hash.as_bytes());
                     if self.boundaries.len() > MATURED_RING {
                         self.boundaries.pop_front();
+                        if let Some(&(_, oldest)) = self.boundaries.front() {
+                            self.boundary_blocks.retain(|leaves, _| *leaves >= oldest);
+                        }
                     }
                     advanced = true;
                 }
@@ -3762,7 +3838,9 @@ impl WalletEntry {
                 }
             }
         }
-        self.error = None;
+        if !self.db.poisoned() {
+            self.error = None;
+        }
         self.updated_unix = now_unix();
     }
 
@@ -3771,6 +3849,28 @@ impl WalletEntry {
     fn matured_leaves(&self) -> Option<u64> {
         let cutoff_blue = self.sink_blue.saturating_sub(DEFAULT_ANCHOR_DEPTH + ANCHOR_SLACK);
         self.boundaries.iter().rev().find(|(bs, _)| *bs <= cutoff_blue).map(|&(_, leaves)| leaves)
+    }
+
+    /// The anchor block a spend rooted at `matured` leaves must name, or `None` before the security
+    /// fork. After the fork an unknown block is a retryable condition, never a guess.
+    fn send_anchor_block(&self, matured: u64) -> Result<Option<[u8; 32]>, (StatusCode, Json<serde_json::Value>)> {
+        // Every send path passes through here, so this is also where a wallet whose tree ingested
+        // inconsistent data refuses to build a spend on it.
+        if self.db.poisoned() {
+            return Err(err(
+                StatusCode::CONFLICT,
+                "this wallet received inconsistent data from its node and is halted; it resumes from its last good checkpoint after a restart",
+            ));
+        }
+        if !security_fork_active(self.scanned as u64) {
+            return Ok(None);
+        }
+        self.boundary_blocks.get(&matured).copied().map(Some).ok_or_else(|| {
+            err(
+                StatusCode::CONFLICT,
+                "this wallet has not yet recorded the block its spend anchor belongs to (needed since the security fork); retry after a few minutes of sync",
+            )
+        })
     }
 
     /// Send-time witness top-up, **bounded for every wallet**.
@@ -5285,6 +5385,7 @@ impl AppState {
                         e.scanned as u64,
                         &e.db,
                         &e.boundaries,
+                        &e.boundary_blocks,
                         e.sink_blue,
                         e.blind_below,
                     )
@@ -5872,6 +5973,7 @@ impl AppState {
         let entry = match restored {
             Some((db, low, scanned, boundaries, sink_blue, blind_below)) => {
                 let mut e = WalletEntry::from_parts(key, recoverable_history, db, genesis, low, scanned, boundaries, sink_blue);
+                e.boundary_blocks = load_anchor_blocks(&self.wallet_dir, token);
                 e.blind_below = blind_below;
                 e
             }
@@ -6571,6 +6673,7 @@ async fn evict_idle_wallets(state: &Arc<AppState>) {
                     e.scanned as u64,
                     &e.db,
                     &e.boundaries,
+                    &e.boundary_blocks,
                     e.sink_blue,
                     e.blind_below,
                 )
@@ -7296,6 +7399,35 @@ async fn wallet_import(
 /// `birthday` is the block height the display scan starts from (0 = from genesis).
 /// `adopt_twin`: for an IMPORTED seed, allow cloning a same-key checkpoint another
 /// token already scanned (a freshly created seed cannot have a twin).
+/// Whether `token`'s wallet file holds spend authority (a seed, plaintext or encrypted). Read from
+/// the raw file, not via `load_wallet_meta`, so an encrypted seed this process cannot decrypt still
+/// counts. Used to refuse any request that would overwrite the only copy of a seed.
+fn wallet_file_holds_seed(dir: &str, token: &str) -> bool {
+    std::fs::read(wallet_path(dir, token))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<WalletFile>(&b).ok())
+        .is_some_and(|wf| !wf.seed_hex.is_empty())
+}
+
+/// Refuse to replace a stored seed with anything except the same seed. Overwriting it destroyed the
+/// only plaintext copy of the spend key with one request (a wrong-token paste, or a leaked token).
+fn refuse_seed_overwrite(state: &AppState, token: &str, replacement: Option<&[u8; 32]>) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if !wallet_file_holds_seed(&state.wallet_dir, token) {
+        return Ok(());
+    }
+    let same = match (load_wallet_meta(&state.wallet_dir, token, state.wallet_secret.as_deref()), replacement) {
+        (Some((WalletKey::Seed(existing), _, _)), Some(new)) => existing == *new,
+        _ => false,
+    };
+    if same {
+        return Ok(());
+    }
+    Err(err(
+        StatusCode::CONFLICT,
+        "this token already holds a seed wallet; refusing to replace it. Export or back it up and use a new token",
+    ))
+}
+
 async fn load_new_wallet(
     state: &Arc<AppState>,
     token: &str,
@@ -7303,6 +7435,7 @@ async fn load_new_wallet(
     birthday: u64,
     adopt_twin: bool,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    refuse_seed_overwrite(state, token, Some(&seed))?;
     let key = WalletKey::Seed(seed);
     save_seed(&state.wallet_dir, token, &state.network, &seed, birthday, state.wallet_secret.as_deref())
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to write wallet file: {e}")))?;
@@ -7448,6 +7581,7 @@ async fn wallet_watch(
     let fvk = unhex(&req.fvk_hex)
         .and_then(|b| <[u8; FVK_LEN]>::try_from(b.as_slice()).ok())
         .ok_or_else(|| err(StatusCode::BAD_REQUEST, "fvk_hex must be 96 bytes of hex"))?;
+    refuse_seed_overwrite(&state, &token, None)?;
     let key = WalletKey::Fvk(fvk);
     let db = key.empty_db().ok_or_else(|| err(StatusCode::BAD_REQUEST, "fvk_hex is not a valid full viewing key"))?;
     let address = state.address_of(&db);
@@ -8214,6 +8348,53 @@ fn stranded_hint(stranded_value: u64) -> String {
 /// Prove that a loaded wallet's commitment tree is exactly the node's canonical
 /// tree at the wallet cursor. Height/freshness alone cannot establish this: a
 /// legacy checkpoint may be near-tip yet contain bundles consensus dropped.
+/// Background audit of the SHARED chain tree, which every borrowing wallet roots its spends at.
+///
+/// `ensure_canonical_checkpoint` checks a wallet's own tree on its send path and deliberately skips
+/// borrowers, noting that the shared tree "belongs in one background place". This is that place:
+/// every ten minutes the shared tree's root at its cursor is compared with the node's own consensus
+/// frontier at that block (`GetShieldedTreeState`). The node's consensus state never reads the scan
+/// archive, so a poisoned archive that forked the stream shows up here as a mismatch. On mismatch
+/// the shared tree is halted (no further sync, no checkpoint) and borrowing wallets refuse to spend
+/// until a restart reloads the last good checkpoint.
+async fn shared_tree_audit_loop(state: Arc<AppState>) {
+    const EVERY: std::time::Duration = std::time::Duration::from_secs(600);
+    loop {
+        tokio::time::sleep(EVERY).await;
+        let (cursor, size, anchor) = {
+            let e = state.chain_tree.lock().await;
+            if e.db.poisoned() || !e.db.tree_is_valid() || e.db.size() == 0 {
+                continue;
+            }
+            (e.low, e.db.size(), e.db.anchor())
+        };
+        let Some(node) = state.request_client().await else { continue };
+        let Ok(Ok(ts)) = tokio::time::timeout(SYNC_RPC_TIMEOUT, node.get_shielded_tree_state(Some(cursor))).await else { continue };
+        let fs = FrontierState {
+            size: ts.size,
+            leaf: (ts.size > 0).then(|| ts.leaf.as_bytes()),
+            ommers: ts.ommers.iter().map(|o| o.as_bytes()).collect(),
+        };
+        let Ok(tree) = GlobalTree::from_state(&fs) else { continue };
+        if fs.size == size && tree.anchor().to_bytes() == anchor {
+            continue;
+        }
+        let mut e = state.chain_tree.lock().await;
+        if e.low != cursor || e.db.size() != size {
+            continue; // the tree moved while we asked; judge it next round
+        }
+        e.db.mark_poisoned();
+        e.error = Some("shared chain tree diverged from the node's consensus state".into());
+        log::error!(
+            "shared chain tree DIVERGED at {cursor}: tree size/root {}/{}, node consensus {}/{}; halted until restart",
+            size,
+            hex(&anchor),
+            fs.size,
+            hex(&tree.anchor().to_bytes()),
+        );
+    }
+}
+
 async fn ensure_canonical_checkpoint(state: &Arc<AppState>, w: &Wallet) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
     // A borrowing wallet's mirror tree is stale until it adopts the shared tree's
     // frontier, and `anchor()` is meaningless until then. Comparing a stale anchor
@@ -8248,6 +8429,13 @@ async fn ensure_canonical_checkpoint(state: &Arc<AppState>, w: &Wallet) -> Resul
     // Waiting for a borrowing wallet's mirror to become valid is waiting for something
     // the spend path does not require.
     if w.lock().await.db.is_borrowing() {
+        // A borrower spends against the shared tree; if that tree failed its audit, so does this.
+        if state.chain_tree.lock().await.db.poisoned() {
+            return Err(err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the shared chain state failed its consistency audit; sends resume after the daemon restarts",
+            ));
+        }
         return Ok(());
     }
     {
@@ -8442,6 +8630,9 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
     // consensus accepts (`is_shielded_anchor_final`; maturity is measured in blue
     // score). The entry lock is held only for selection + witness building.
     let mut planned: Option<(Vec<(Vec<_>, u64, Vec<u64>, u64)>, u64, bool, u64)> = None;
+    // Security fork: the block the matured anchor belongs to, named in every chunk this send builds.
+    let mut anchor_block: Option<[u8; 32]> = None;
+    let mut fork_now = false;
     // A first send may need the wallet's subtree cache built: do that OFF the lock, on
     // every core, before taking it — see `build_send_cache_off_lock`.
     build_send_cache_off_lock(&state, &token, &w).await;
@@ -8455,7 +8646,9 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
         let shared_base = state.chain_tree_base.load(std::sync::atomic::Ordering::Relaxed);
         tokio::task::block_in_place(|| e.advance_spend_witnesses_bounded(shared_covers, shared_base));
         let cutoff_blue = e.sink_blue.saturating_sub(DEFAULT_ANCHOR_DEPTH + ANCHOR_SLACK);
+        fork_now = security_fork_active(e.scanned as u64);
         if let Some(matured) = e.boundaries.iter().rev().find(|(bs, _)| *bs <= cutoff_blue).map(|&(_, lc)| lc) {
+            anchor_block = e.send_anchor_block(matured)?;
             let (mut candidates, stranded_value) = matured_candidates(&e.db, matured);
             sort_candidates_for_spend(&mut candidates, amount, fee);
             let values: Vec<u64> = candidates.iter().map(|n| n.value()).collect();
@@ -8504,6 +8697,11 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
         // Ring not filled yet (cold start) or wallet behind the tip: one-off matured
         // replay — correct, just slow, and transient until the sync loop catches up.
         _ => {
+            // The replay roots at its own tip, whose block this path does not track, so after the
+            // security fork it cannot name the anchor block. Wait for the ring instead of guessing.
+            if fork_now {
+                return Err(err(StatusCode::CONFLICT, "wallet is still building its matured-anchor ring; retry after a few minutes of sync"));
+            }
             log::warn!("send: fast path unavailable/insufficient; falling back to a matured chain replay (slow, one-off)");
             let fresh = WalletDb::from_seed(seed).ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "bad seed"))?;
             let db = replay_matured(client, state.genesis, fresh).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
@@ -8594,7 +8792,8 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
             proving.push(tokio::task::spawn_blocking(move || {
                 let _proving = ProvingGuard::new();
                 let started = std::time::Instant::now();
-                let build = || build_wallet_payment(seed, inputs, recipient, pay, cfee, &net, &ctx2, recoverable, chunk_memo);
+                let build =
+                    || build_wallet_payment_anchored(seed, inputs, recipient, pay, cfee, &net, &ctx2, recoverable, chunk_memo, anchor_block);
                 // A scoped pool bounds THIS proof's threads; halo2's rayon work nests
                 // inside `install`, so the group shares the box instead of fighting for it.
                 let built = match threads_each.map(|n| rayon::ThreadPoolBuilder::new().num_threads(n).build()) {
@@ -8804,6 +9003,8 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
         fee: u64,
     }
     let mut batches: Vec<Batch> = Vec::with_capacity(groups.len());
+    // Security fork: every batch roots at this one matured anchor, so they all name one block.
+    let mut anchor_block: Option<[u8; 32]> = None;
     // As in `wallet_send`: any one-time subtree-cache build happens off the lock first.
     build_send_cache_off_lock(&state, &token, &w).await;
     {
@@ -8812,6 +9013,7 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
         let shared_base = state.chain_tree_base.load(std::sync::atomic::Ordering::Relaxed);
         tokio::task::block_in_place(|| e.advance_spend_witnesses_bounded(shared_covers, shared_base));
         let matured = e.matured_leaves().ok_or_else(|| err(StatusCode::CONFLICT, "wallet has no matured anchor yet"))?;
+        anchor_block = e.send_anchor_block(matured)?;
         let (mut candidates, stranded) = matured_candidates(&e.db, matured);
         sort_candidates_for_spend(&mut candidates, requested, base_fee);
         let have: u64 = candidates.iter().map(|n| n.value()).sum();
@@ -8927,7 +9129,7 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
         let (payees, inputs, fee) = (b.payees, b.inputs, b.fee);
         let payload = tokio::task::spawn_blocking(move || {
             let _proving = ProvingGuard::new();
-            build_wallet_payment_multi(seed, inputs, &payees, fee, &net, &ctx2, recoverable)
+            build_wallet_payment_multi_anchored(seed, inputs, &payees, fee, &net, &ctx2, recoverable, anchor_block)
         })
         .await
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("proof task failed: {e}")))?
@@ -9071,12 +9273,13 @@ async fn consolidate_once(
     let net: [u8; 32] = state.genesis.as_bytes();
 
     // Select up to a tx-full of the smallest matured notes under the entry lock.
-    let (inputs, positions, sum, fee) = {
+    let (inputs, positions, sum, fee, anchor_block) = {
         let e = w.lock().await;
         let cutoff_blue = e.sink_blue.saturating_sub(DEFAULT_ANCHOR_DEPTH + ANCHOR_SLACK);
         let Some(matured) = e.boundaries.iter().rev().find(|(bs, _)| *bs <= cutoff_blue).map(|&(_, lc)| lc) else {
             return Err(err(StatusCode::CONFLICT, "wallet is still syncing the maturity window; try again shortly"));
         };
+        let anchor_block = e.send_anchor_block(matured)?;
         let (mut candidates, _stranded) = matured_candidates(&e.db, matured);
         if heal {
             // Oldest first: spending the lowest-position notes lets the fast-sync base
@@ -9116,7 +9319,7 @@ async fn consolidate_once(
             inputs.push((n.note.clone(), path));
             positions.push(n.position);
         }
-        (inputs, positions, sum, fee)
+        (inputs, positions, sum, fee, anchor_block)
     };
 
     let consolidated = inputs.len();
@@ -9125,7 +9328,7 @@ async fn consolidate_once(
     log::info!("consolidate: merging {consolidated} notes ({sum} sompi) into one...");
     let payload = tokio::task::spawn_blocking(move || {
         let _proving = ProvingGuard::new();
-        build_wallet_payment(seed, inputs, own_recipient, value, fee, &net, &ctx, recoverable, [0u8; 512])
+        build_wallet_payment_anchored(seed, inputs, own_recipient, value, fee, &net, &ctx, recoverable, [0u8; 512], anchor_block)
     })
     .await
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("proof task failed: {e}")))?
@@ -9370,6 +9573,8 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
     let mut inputs = Vec::new();
     let mut selected = 0u64;
     let mut have_total: Option<u64> = None;
+    // Security fork: the block the matured anchor belongs to (set on the tracked-wallet path).
+    let mut anchor_block: Option<[u8; 32]> = None;
     // Set when the spend is planned from the live tracked-wallet view rather than
     // the watch-only chain replay — reported to the caller as `fast_path`.
     let mut fast_path = false;
@@ -9426,6 +9631,7 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
                 );
                 let cutoff_blue = e.sink_blue.saturating_sub(DEFAULT_ANCHOR_DEPTH + ANCHOR_SLACK);
                 if let Some(matured) = e.boundaries.iter().rev().find(|(bs, _)| *bs <= cutoff_blue).map(|&(_, lc)| lc) {
+                    anchor_block = e.send_anchor_block(matured)?;
                     let (mut candidates, _stranded) = matured_candidates(&e.db, matured);
                     sort_candidates_for_spend(&mut candidates, amount, base_fee);
                     have_total = Some(candidates.iter().map(|n| n.value()).sum());
@@ -9495,6 +9701,22 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
     // set from the FVK alone over the settled matured chain prefix, so every witness
     // still roots at a matured canonical anchor.
     if have_total.is_none() {
+        // After the security fork a spend must name its anchor block, and this replay does not
+        // track which block its tip belongs to. Refuse rather than build a bundle consensus rejects.
+        let tip_daa = state.chain_tree.lock().await.scanned as u64;
+        if security_fork_active(tip_daa) {
+            return Err(err(
+                StatusCode::CONFLICT,
+                "this key is not tracked by the daemon yet; register it (watch) and retry after it syncs",
+            ));
+        }
+        // A full-chain replay for a key the daemon does not track runs inside an unauthenticated
+        // request. Allow one at a time daemon-wide: concurrent requests with fresh keys each started
+        // their own genesis replay and could exhaust CPU and RAM.
+        static UNTRACKED_REPLAY: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+        let _replay_slot = UNTRACKED_REPLAY.try_acquire().map_err(|_| {
+            err(StatusCode::SERVICE_UNAVAILABLE, "another untracked-key replay is running; register the key (watch) or retry shortly")
+        })?;
         let db =
             WalletDb::from_fvk(&fvk_bytes).ok_or_else(|| err(StatusCode::BAD_REQUEST, "fvk_hex is not a valid full viewing key"))?;
         log::info!("non-custodial prepare: watch-only matured chain replay...");
@@ -9700,7 +9922,18 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
     let t_proof = std::time::Instant::now();
     let payment = tokio::task::spawn_blocking(move || {
         let _proving = ProvingGuard::new();
-        prepare_payment(&fvk, inputs, recipient, amount, fee, &net, &ctx, recoverable, memo)
+        kaspa_shielded_core::wallet::build::prepare_payment_anchored(
+            &fvk,
+            inputs,
+            recipient,
+            amount,
+            fee,
+            &net,
+            &ctx,
+            recoverable,
+            memo,
+            anchor_block,
+        )
     })
     .await
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("proof task failed: {e}")))?
@@ -11126,6 +11359,13 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
         kaspa_consensus_core::config::params::Params::from(state_prefix_network(&cfg.network)).genesis.hash.as_bytes(),
     );
     log::info!("network genesis (shielded sighash domain): {genesis}");
+    // `ZKAS_SECURITY_FORK_DAA` overrides the activation for a test network started with an
+    // override-params file (refused on mainnet, as the node refuses overrides there).
+    let fork = match std::env::var("ZKAS_SECURITY_FORK_DAA").ok().and_then(|v| v.parse::<u64>().ok()) {
+        Some(d) if cfg.network != "mainnet" => kaspa_consensus_core::config::params::ForkActivation::new(d),
+        _ => kaspa_consensus_core::config::params::Params::from(state_prefix_network(&cfg.network)).security_fork_activation,
+    };
+    let _ = SECURITY_FORK.set(fork);
 
     let resources = cfg.resources.clone();
     log::info!("wallet resource limits: {:?}", resources);
@@ -11250,6 +11490,7 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
     }
 
     let sync_task = tokio::spawn(sync_loop(state.clone()));
+    let shared_tree_audit_task = tokio::spawn(shared_tree_audit_loop(state.clone()));
     let eviction_task = tokio::spawn(eviction_loop(state.clone()));
     // Unmined payments — the instant-payment path. Separate from sync_loop on purpose
     // (see mempool_loop): it must never queue behind block scanning.
@@ -11516,6 +11757,7 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
     // reclaimed: switch nodes five times and five full wallet states stay resident,
     // each still talking to a node nobody asked about.
     sync_task.abort();
+    shared_tree_audit_task.abort();
     eviction_task.abort();
     mempool_task.abort();
     tip_task.abort();
@@ -11557,6 +11799,7 @@ async fn flush_checkpoints(state: &Arc<AppState>, only: Option<&str>) -> (usize,
             e.scanned as u64,
             &e.db,
             &e.boundaries,
+            &e.boundary_blocks,
             e.sink_blue,
             e.blind_below,
         )
@@ -11789,7 +12032,7 @@ mod sdk_api_tests {
         // Donor: a seed wallet with a persisted, complete-view checkpoint.
         save_seed(&dir, "donor", "mainnet", &seed, 4242, None).unwrap();
         let boundaries: VecDeque<(u64, u64)> = VecDeque::from([(100, 0)]);
-        save_checkpoint(&dir, "donor", &genesis, &RpcHash::from_bytes([9u8; 32]), 777, &db, &boundaries, 100, 0).unwrap();
+        save_checkpoint(&dir, "donor", &genesis, &RpcHash::from_bytes([9u8; 32]), 777, &db, &boundaries, &HashMap::new(), 100, 0).unwrap();
 
         // The index build finds the donor by viewing key.
         let index = build_fvk_index(&dir, None);
@@ -11814,7 +12057,7 @@ mod sdk_api_tests {
 
         // A donor that is BLIND below its fast-sync base must not serve a restore that
         // claims an EARLIER birthday than the donor's...
-        save_checkpoint(&dir, "donor", &genesis, &RpcHash::from_bytes([9u8; 32]), 777, &db, &boundaries, 100, 555).unwrap();
+        save_checkpoint(&dir, "donor", &genesis, &RpcHash::from_bytes([9u8; 32]), 777, &db, &boundaries, &HashMap::new(), 100, 555).unwrap();
         std::fs::remove_file(scan_path(&dir, "phone")).unwrap();
         assert!(
             adopt_twin_checkpoint(&dir, "phone", &fvk, 1000, false, &genesis, None, &candidates).is_none(),
@@ -12198,6 +12441,11 @@ async fn bundle_prepare(
     }
 
     let domain: [u8; 32] = state.genesis.as_bytes();
+    // Multi-party bundles do not yet carry a named anchor block; after the security fork consensus
+    // would reject them, so refuse up front instead of spending everyone's proving time.
+    if security_fork_active(state.chain_tree.lock().await.scanned as u64) {
+        return Err(err(StatusCode::CONFLICT, "multi-party bundles are not available after the security fork in this build"));
+    }
     let ctx = payment_tx_context();
     // The same bounded-concurrency gate a single-party payment waits on, so a bundle cannot
     // monopolise the prover, plus the ProvingGuard that makes background CPU work back off.
@@ -12326,11 +12574,19 @@ async fn bundle_submit(
         // Refusing an index that is not in `spend_auth_requests` is the stronger check: a bundle
         // session is shared with counterparties, so a participant must not be able to touch an
         // action it was not asked to authorize.
-        for (i, _) in &incoming {
+        for (i, sig) in &incoming {
             if !sess.payment.spend_auth_requests.iter().any(|(want, _)| want == i) {
                 // Put the session back: a bad submit must not destroy an in-flight settlement.
                 map.insert(req.session.clone(), sess);
                 return Err(err(StatusCode::BAD_REQUEST, format!("action {i} is not awaiting a signature in this bundle")));
+            }
+            // Verify on arrival. Signatures were stored unchecked and first-wins, so a counterparty
+            // could fill an honest party's slot with garbage; the honest signature was then
+            // skipped and the whole settlement failed at finalize, after everyone had proven.
+            let rk = sess.payment.effects.actions.get(*i).map(|a| a.rk);
+            if !rk.is_some_and(|rk| kaspa_shielded_core::verify::verify_spend_auth_sig(&rk, &sess.payment.sighash, sig)) {
+                map.insert(req.session.clone(), sess);
+                return Err(err(StatusCode::BAD_REQUEST, format!("the signature for action {i} does not verify against this bundle")));
             }
         }
         for (i, sig) in incoming {

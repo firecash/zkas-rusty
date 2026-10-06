@@ -225,6 +225,60 @@ mod tests {
         (parent, branch)
     }
 
+    fn coinbase_committing_v1(commitment: Hash) -> Transaction {
+        let payload = AuxPow::embed_commitment_v1(&[0xaa, 0xbb], commitment, &[0xcc]);
+        Transaction::new(0, vec![], vec![], 0, SUBNETWORK_ID_COINBASE, 0, payload)
+    }
+
+    /// Security fork: one parent backs exactly one block, and one block has exactly one witness.
+    #[test]
+    fn bound_rule_pins_parent_and_genesis() {
+        let genesis = Hash::from_u64_word(0x6e6e);
+        for seed in 1..200u64 {
+            let mut fc = zkas_header(seed, EASY_BITS);
+            let nonce_free = kaspa_consensus_core::hashing::header::hash_override_nonce_time(&fc, 0, fc.timestamp);
+            let cb = coinbase_committing_v1(AuxPow::bound_commitment(genesis, nonce_free));
+            let (parent, branch) = mine_parent(std::slice::from_ref(&cb), EASY_BITS);
+            fc.nonce = AuxPow::nonce_binding(&parent);
+            fc.finalize();
+            if State::new(&fc).check_pow(fc.nonce).0 {
+                continue; // the forced nonce happens to be natively valid; pick a block that needs the witness
+            }
+            let aux = AuxPow { parent_header: parent.clone(), parent_coinbase: cb.clone(), coinbase_merkle_branch: branch.clone() };
+            assert!(check_pow_gated(&fc, Some(&aux), AuxRule::Bound(genesis)).0, "a correctly bound witness passes");
+            assert!(!check_pow_gated(&fc, Some(&aux), AuxRule::Legacy).0, "the legacy rule does not read the ZKM1 form");
+            assert!(!check_pow_gated(&fc, Some(&aux), AuxRule::Bound(Hash::from_u64_word(1))).0, "another chain's genesis fails");
+
+            // A second, independently mined parent committing the same block: its hash, hence the
+            // required nonce, differs, so it cannot back this block.
+            let mut other = parent.clone();
+            other.timestamp += 1;
+            let state = State::new(&other);
+            let mut n = 0u64;
+            while state.calculate_pow(n) > target(EASY_BITS) {
+                n += 1;
+            }
+            other.nonce = n;
+            if AuxPow::nonce_binding(&other) != fc.nonce {
+                let aux2 = AuxPow { parent_header: other, parent_coinbase: cb.clone(), coinbase_merkle_branch: branch.clone() };
+                assert!(!check_pow_gated(&fc, Some(&aux2), AuxRule::Bound(genesis)).0, "a second parent cannot back the same block");
+            }
+
+            // A legacy ZKMM witness over the full hash is refused under the bound rule.
+            let legacy_cb = coinbase_committing(fc.hash);
+            let (lp, lb) = mine_parent(std::slice::from_ref(&legacy_cb), EASY_BITS);
+            let legacy = AuxPow { parent_header: lp, parent_coinbase: legacy_cb, coinbase_merkle_branch: lb };
+            assert!(!check_pow_gated(&fc, Some(&legacy), AuxRule::Bound(genesis)).0, "legacy form refused after the fork");
+
+            // The commitment detector sees both tags, which the coinbase ban relies on.
+            assert!(AuxPow::payload_carries_commitment(&cb.payload));
+            assert!(AuxPow::payload_carries_commitment(&coinbase_committing(fc.hash).payload));
+            assert!(!AuxPow::payload_carries_commitment(b"ZKM1 not hex, ZKMMshort"));
+            return;
+        }
+        panic!("no seed produced a header that needs its witness");
+    }
+
     #[test]
     fn native_path_unchanged_by_dual_gate() {
         // With no aux proof, check_pow_dual is exactly the native check.
