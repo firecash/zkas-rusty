@@ -94,9 +94,10 @@ pub struct CoinbaseManager {
     dev_fee_recipient: Option<[u8; 43]>,
     /// DAA score at which the dev fee stops being minted every block and starts accruing.
     dev_fee_accrual_activation: ForkActivation,
-    /// DAA-score interval between dev-fee payouts once accrual is active. Also the interval at
-    /// which the miner accrual slot is paid out (security fork).
+    /// DAA-score interval between dev-fee payouts once accrual is active.
     dev_fee_payout_interval: u64,
+    /// DAA-score interval at which the miner accrual slot is paid out (security fork).
+    miner_accrual_payout_interval: u64,
     /// DAA score from which miner rewards accrue in one carried slot (the security fork).
     miner_accrual_activation: ForkActivation,
 
@@ -141,6 +142,7 @@ impl CoinbaseManager {
         dev_fee_accrual_activation: ForkActivation,
         dev_fee_payout_interval: u64,
         miner_accrual_activation: ForkActivation,
+        miner_accrual_payout_interval: u64,
     ) -> Self {
         // Precomputed subsidy by month table for the actual block per second rate.
         // Values are rounded up per BPS (keeping the same number of rewarding months as the original
@@ -164,6 +166,7 @@ impl CoinbaseManager {
             // network degrades to the old shape instead of dividing by zero.
             dev_fee_payout_interval: dev_fee_payout_interval.max(1),
             miner_accrual_activation,
+            miner_accrual_payout_interval: miner_accrual_payout_interval.max(1),
             subsidy_by_month_table_before,
             subsidy_by_month_table_after,
             crescendo_activation_daa_score: bps_history.activation().daa_score(),
@@ -261,7 +264,8 @@ impl CoinbaseManager {
         }
 
         let (mut outputs, miner_accrual) = if self.miner_accrual_activation.is_active(daa_score) {
-            Self::accrue_miner_rewards(miner_accrual_parent, payments, self.is_dev_fee_payout(parent_daa_score, daa_score))?
+            let payout = daa_score / self.miner_accrual_payout_interval > parent_daa_score / self.miner_accrual_payout_interval;
+            Self::accrue_miner_rewards(miner_accrual_parent, payments, payout)?
         } else {
             (payments.into_iter().map(|(value, spk)| TransactionOutput::new(value, spk)).collect(), MinerAccrual::default())
         };
@@ -928,6 +932,7 @@ mod tests {
             ForkActivation::never(),
             1_000,
             ForkActivation::never(),
+            100,
         );
         let tx2 = no_fee
             .expected_coinbase_transaction(
@@ -1140,7 +1145,7 @@ mod tests {
         use kaspa_hashes::Hash;
         let mut params = MAINNET_PARAMS.clone();
         params.security_fork_activation = ForkActivation::new(1_000);
-        params.dev_fee_payout_interval = 100;
+        params.miner_accrual_payout_interval = 100;
         let cbm = create_manager(&params);
         let blue = Hash::from_bytes([7u8; 32]);
         let ghostdag_data = GhostdagData { mergeset_blues: std::sync::Arc::new(vec![blue]), ..Default::default() };
@@ -1169,6 +1174,11 @@ mod tests {
         assert!(post.tx.outputs.iter().all(|o| o.script_public_key != spk(1)), "post-fork: nothing minted for the miner yet");
         let miner_reward = 1_000_000_000 - cbm.dev_fee_cut(1_000_000_000) + 5;
         assert_eq!(post.miner_accrual, slot(1, miner_reward));
+
+        let quiet = build(1_150, &post.miner_accrual);
+        assert!(quiet.tx.outputs.iter().all(|o| o.script_public_key != spk(1)), "no payout inside the interval");
+        assert_eq!(quiet.miner_accrual.amount, 2 * miner_reward);
+        assert!(cbm.is_dev_fee_payout(1_100, 2_000), "the dev interval is separate (1,000 here)");
 
         let payout = build(1_100, &post.miner_accrual);
         let paid: Vec<_> = payout.tx.outputs.iter().filter(|o| o.script_public_key == spk(1)).collect();
@@ -1208,6 +1218,7 @@ mod tests {
             params.dev_fee_accrual_activation,
             params.dev_fee_payout_interval,
             params.security_fork_activation,
+            params.miner_accrual_payout_interval,
         )
     }
 
@@ -1225,6 +1236,7 @@ mod tests {
             ForkActivation::never(),
             1_000,
             ForkActivation::never(),
+            100,
         )
     }
 }

@@ -320,6 +320,9 @@ pub struct OverrideParams {
     /// the score it crosses.
     pub security_fork_activation: Option<ForkActivation>,
 
+    /// See [`Params::miner_accrual_payout_interval`].
+    pub miner_accrual_payout_interval: Option<u64>,
+
     /// Whether the coinbase mints its reward into the shielded pool (private-by-default
     /// networks) rather than as a transparent output. Overridable so tests can exercise
     /// the shielded pipeline on a small-pruning simnet base (which is otherwise
@@ -359,6 +362,7 @@ impl From<Params> for OverrideParams {
             toccata_activation: Some(p.toccata_activation),
             merged_mining_activation: Some(p.merged_mining_activation),
             security_fork_activation: Some(p.security_fork_activation),
+            miner_accrual_payout_interval: Some(p.miner_accrual_payout_interval),
             shielded_coinbase: Some(p.shielded_coinbase),
         }
     }
@@ -494,6 +498,12 @@ pub struct Params {
     /// judged against its selected parent's score — so the rule is per-block and
     /// deterministic even though a DAG block's score can jump by more than one.
     pub dev_fee_payout_interval: u64,
+
+    /// Security fork: DAA-score interval at which the miner accrual slot is paid out, by the same
+    /// crossing rule as [`Self::dev_fee_payout_interval`]. About 100 seconds of blocks: a pool that
+    /// mines every block mints one reward note per interval instead of one per block (99% fewer),
+    /// while a miner waits at most this long for its reward to be minted.
+    pub miner_accrual_payout_interval: u64,
 
     /// Merged-mining (AuxPoW) activation DAA score. Before this score a block must
     /// clear the native kHeavyHash PoW; at/after it a block may instead carry a valid
@@ -810,6 +820,7 @@ impl Params {
             shielded_coinbase_seed_activation: self.shielded_coinbase_seed_activation,
             dev_fee_accrual_activation: self.dev_fee_accrual_activation,
             dev_fee_payout_interval: self.dev_fee_payout_interval,
+            miner_accrual_payout_interval: overrides.miner_accrual_payout_interval.unwrap_or(self.miner_accrual_payout_interval),
             merged_mining_activation: overrides.merged_mining_activation.unwrap_or(self.merged_mining_activation),
             security_fork_activation: overrides.security_fork_activation.unwrap_or(self.security_fork_activation),
 
@@ -978,6 +989,8 @@ pub const MAINNET_PARAMS: Params = Params {
     // ~17 minutes at 1 BPS: short enough that the dev fund is never far behind,
     // long enough to cut per-block dev notes by three orders of magnitude.
     dev_fee_payout_interval: 1_000,
+    // About 100 seconds of blocks (see Params::miner_accrual_payout_interval).
+    miner_accrual_payout_interval: 100,
     // LAUNCH VALUE (decided 2026-07-22, reset bundle): merged mining active from
     // genesis. This is ZKas's production model — the chain merge-mines Kaspa from
     // block 0 (~20-25 KAS blocks/h in production), so aux-PoW acceptance is a launch
@@ -1074,6 +1087,8 @@ pub const TESTNET_PARAMS: Params = Params {
     // ~17 minutes at 1 BPS: short enough that the dev fund is never far behind,
     // long enough to cut per-block dev notes by three orders of magnitude.
     dev_fee_payout_interval: 1_000,
+    // About 100 seconds of blocks (see Params::miner_accrual_payout_interval).
+    miner_accrual_payout_interval: 100,
     // On testnet, merged mining is available from genesis for testing.
     merged_mining_activation: ForkActivation::always(),
     security_fork_activation: ForkActivation::never(),
@@ -1138,6 +1153,8 @@ pub const SIMNET_PARAMS: Params = Params {
     // ~17 minutes at 1 BPS: short enough that the dev fund is never far behind,
     // long enough to cut per-block dev notes by three orders of magnitude.
     dev_fee_payout_interval: 1_000,
+    // About 100 seconds of blocks (see Params::miner_accrual_payout_interval).
+    miner_accrual_payout_interval: 1_000,
     merged_mining_activation: ForkActivation::always(),
     security_fork_activation: ForkActivation::always(),
 
@@ -1210,6 +1227,8 @@ pub const DEVNET_PARAMS: Params = Params {
     // ~17 minutes at 1 BPS: short enough that the dev fund is never far behind,
     // long enough to cut per-block dev notes by three orders of magnitude.
     dev_fee_payout_interval: 20,
+    // About 100 seconds of blocks (see Params::miner_accrual_payout_interval).
+    miner_accrual_payout_interval: 1_000,
     merged_mining_activation: ForkActivation::always(),
     security_fork_activation: ForkActivation::new(1_500),
 
@@ -1242,6 +1261,11 @@ mod tests {
             assert!(p.blockrate.shielded_anchor_depth < p.max_shielded_anchor_age(), "{:?}", p.net);
         }
         assert!(!MAINNET_PARAMS.security_fork_activation.is_active(u64::MAX - 1));
+        // The miner accrual payout interval is about 100 seconds of blocks on every network.
+        for p in [MAINNET_PARAMS, TESTNET_PARAMS, SIMNET_PARAMS, DEVNET_PARAMS] {
+            let secs = p.miner_accrual_payout_interval * p.target_time_per_block() / 1000;
+            assert_eq!(secs, 100, "{:?}", p.net);
+        }
     }
 
     #[test]

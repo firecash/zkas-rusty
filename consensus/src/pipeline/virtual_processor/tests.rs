@@ -1742,7 +1742,7 @@ async fn security_fork_miner_rewards_accrue_and_pay_out_end_to_end() {
     let mut params = MAINNET_PARAMS.clone();
     params.shielded_coinbase = true;
     params.security_fork_activation = ForkActivation::always();
-    params.dev_fee_payout_interval = 6;
+    params.miner_accrual_payout_interval = 6;
     let config = ConfigBuilder::new(params)
         .edit_consensus_params(|p| {
             p.genesis.bits = 0x207fffff;
@@ -1832,7 +1832,7 @@ async fn security_fork_spends_must_name_their_anchor_block() {
     // This test is about anchor naming and spends a block's own coinbase note. A payout interval of
     // one flushes the miner accrual slot every block, so each block still mints its reward as one
     // note exactly as before the fork (accrual itself is covered by its own end-to-end test).
-    params.dev_fee_payout_interval = 1;
+    params.miner_accrual_payout_interval = 1;
     let config = ConfigBuilder::new(params)
         .edit_consensus_params(|p| {
             p.genesis.bits = 0x207fffff;
