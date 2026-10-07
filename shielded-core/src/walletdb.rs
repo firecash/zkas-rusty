@@ -5028,6 +5028,107 @@ mod tests {
         }
     }
 
+    /// Can a checkpoint written by a DIFFERENT build of the Orchard stack still be
+    /// restored by this one?
+    ///
+    /// `from_checkpoint` returns `Option` and every caller treats `None` as "start
+    /// over", so a format change here is not an error anyone sees — it is a silent
+    /// full rescan of the whole chain, on every wallet, after an app update. That
+    /// is the single worst regression this product has, and it has shipped before.
+    ///
+    /// Run with `--ignored`: `ckpt_emit` on one build, `ckpt_load` on the other.
+    /// `CKPT_NAME` names the file; `CKPT_DIR` holds them.
+    fn ckpt_dir() -> std::path::PathBuf {
+        std::path::PathBuf::from(std::env::var("CKPT_DIR").unwrap_or_else(|_| "/root/zkas/mobile-test/ckpt".into()))
+    }
+
+    /// The wallet both halves build, identically, so the blob is comparable.
+    fn ckpt_fixture() -> (WalletDb, u64) {
+        let mine = [44u8; 32];
+        let mut db = WalletDb::from_seed(mine).unwrap();
+        for b in 0..16u8 {
+            let theirs = coinbase_for(address_of([b.wrapping_add(1); 32]), &[b, 5, 6, 7], 100 + b as u64);
+            if b == 2 || b == 6 || b == 11 {
+                let ours = coinbase_for(address_of(mine), &[b, 4, 4, 4], 2_000 + b as u64);
+                db.ingest_block(&[theirs, ours], &[]);
+            } else {
+                db.ingest_block(&[theirs], &[]);
+            }
+        }
+        let matured = db.size();
+        db.advance_witnesses(matured);
+        (db, matured)
+    }
+
+    #[test]
+    #[ignore]
+    fn ckpt_emit() {
+        let name = std::env::var("CKPT_NAME").expect("CKPT_NAME");
+        let (db, matured) = ckpt_fixture();
+        let blob = db.to_checkpoint();
+        std::fs::create_dir_all(ckpt_dir()).unwrap();
+        std::fs::write(ckpt_dir().join(format!("{name}.bin")), &blob).unwrap();
+        // The facts a restore must reproduce, recorded beside the blob.
+        let roots: Vec<String> = db
+            .notes()
+            .iter()
+            .filter(|n| n.position < matured)
+            .map(|n| {
+                let p = db.witness_path_at(n.position, matured).expect("live path");
+                let r = p.root(ExtractedNoteCommitment::from(n.note.commitment()));
+                format!("{}:{}", n.position, r.to_bytes().iter().map(|b| format!("{b:02x}")).collect::<String>())
+            })
+            .collect();
+        let facts = format!(
+            "version={}\nnotes={}\nsize={}\nwitnessed_upto={}\nwitnesses={}\nroots={}\n",
+            blob[0], db.notes().len(), db.size(), db.witnessed_upto, db.witnesses.len(), roots.join(",")
+        );
+        std::fs::write(ckpt_dir().join(format!("{name}.facts")), &facts).unwrap();
+        println!("[{name}] wrote {} byte checkpoint (v{})", blob.len(), blob[0]);
+        println!("[{name}] {facts}");
+    }
+
+    #[test]
+    #[ignore]
+    fn ckpt_load() {
+        let name = std::env::var("CKPT_NAME").expect("CKPT_NAME");
+        let mine = [44u8; 32];
+        let mut checked = 0;
+        for e in std::fs::read_dir(ckpt_dir()).expect("ckpt dir") {
+            let p = e.unwrap().path();
+            if p.extension().map(|x| x != "bin").unwrap_or(true) {
+                continue;
+            }
+            let blob = std::fs::read(&p).unwrap();
+            let facts = std::fs::read_to_string(p.with_extension("facts")).unwrap();
+            let want = |k: &str| -> String {
+                facts.lines().find(|l| l.starts_with(&format!("{k}="))).unwrap()[k.len() + 1..].to_string()
+            };
+            let restored = WalletDb::from_checkpoint(mine, &blob)
+                .unwrap_or_else(|| panic!("[{name}] REFUSED the checkpoint in {p:?} — every wallet would rescan from zero"));
+            assert_eq!(restored.notes().len().to_string(), want("notes"), "note count from {p:?}");
+            assert_eq!(restored.size().to_string(), want("size"), "size from {p:?}");
+            assert_eq!(restored.witnessed_upto.to_string(), want("witnessed_upto"), "witnessed_upto from {p:?}");
+            assert_eq!(restored.witnesses.len().to_string(), want("witnesses"), "witness count from {p:?}");
+            // The roots are the real test: same tree, same hashing, same money.
+            let matured: u64 = want("size").parse().unwrap();
+            let got: Vec<String> = restored
+                .notes()
+                .iter()
+                .filter(|n| n.position < matured)
+                .map(|n| {
+                    let pa = restored.witness_path_at(n.position, matured).expect("restored path");
+                    let r = pa.root(ExtractedNoteCommitment::from(n.note.commitment()));
+                    format!("{}:{}", n.position, r.to_bytes().iter().map(|b| format!("{b:02x}")).collect::<String>())
+                })
+                .collect();
+            assert_eq!(got.join(","), want("roots"), "witness roots differ for {p:?}");
+            println!("[{name}] restored {p:?} — notes/size/witnesses/roots all identical");
+            checked += 1;
+        }
+        assert!(checked > 0, "no checkpoints found to verify");
+    }
+
     /// The v5 checkpoint persists the per-note witnesses, so a restored wallet spends with
     /// no leaf replay at all (the Zcash-style incremental-witness invariant). This test
     /// proves the restored witnesses are byte-for-path identical to the live ones AND that
