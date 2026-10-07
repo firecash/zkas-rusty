@@ -2492,11 +2492,17 @@ impl ConsensusApi for Consensus {
         {
             use crate::processes::shielded::PruningPointShieldedMetadata;
             let md = PruningPointShieldedMetadata::from_wire_bytes(&metadata.data).map_err(PruningImportError::ShieldedStateError)?;
-            if let Some(committed) = expected_state_root {
-                self.virtual_processor
-                    .verify_import_binding_versioned(new_pruning_point, &md, committed)
-                    .map_err(PruningImportError::ShieldedStateError)?;
-            }
+            // Unbound means unverified: nothing in the metadata is proven, and a post-fork import would
+            // also replace the proven anchor window with none. The IBD flow already refuses this; the
+            // import itself must too, so no caller can seed peer data the PoW does not cover.
+            let Some(committed) = expected_state_root else {
+                return Err(PruningImportError::ShieldedStateError(
+                    "shielded import is not bound to a PoW-committed state root; refusing".to_string(),
+                ));
+            };
+            self.virtual_processor
+                .verify_import_binding_versioned(new_pruning_point, &md, committed)
+                .map_err(PruningImportError::ShieldedStateError)?;
             if metadata.nullifier_count > md.frontier.size {
                 return Err(PruningImportError::ShieldedStateError(format!(
                     "declared nullifier count {} exceeds the committed note count {}; a spend implies a note",

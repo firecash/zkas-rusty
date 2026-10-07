@@ -1,298 +1,327 @@
-//! Anchor window commitment (security fork, 2026-10).
+//! Anchor log commitment (security fork, 2026-10).
 //!
-//! Every chain block at or after the fork appends one entry `(block, own_tree_root, blue_score)`.
-//! Entries are folded into hash chains, one per bucket of [`BUCKET_SPAN`] blue score, and a block
-//! keeps only the buckets that can still hold a usable anchor source. The commitment is a hash over
-//! the retained `(bucket_index, chain_hash)` pairs and is folded into `zkas_state_root1`.
+//! Every chain block at or after the fork appends one entry `(block, parent, own_tree_root,
+//! blue_score)` to an append-only log, a Merkle mountain range whose root is folded into
+//! `zkas_state_root1`.
 //!
 //! Why: a node that fast-syncs to a pruning point has no tree roots for the chain blocks just below
 //! it, yet spends mined just above it may name those blocks as anchors. Before the fork the syncing
-//! node took `(root, block)` pairs from its sync peer on trust. With the window committed, the peer
-//! must send exactly the entries that re-fold to the PoW-committed value, so every imported pair
-//! is proven.
+//! node took `(root, block)` pairs from its sync peer on trust. With the log committed, the peer
+//! sends the log state just below the anchor window plus the window's entries; the syncing node
+//! appends them and must reproduce the PoW-committed log, so every imported pair is proven.
 //!
 //! Properties:
-//! - A block's window is derived only from its selected parent's window plus its own entry, so it
-//!   is identical on every node that agrees on the selected chain, and a reorg simply reloads the
-//!   new parent's window.
-//! - Per-block cost is one hash for the entry and one over at most `keep + 1` bucket pairs.
-//! - Folding the entries of the retained buckets in ascending blue score reproduces the window
-//!   exactly ([`AnchorWindow::from_entries`]), which is what a syncing node checks.
+//! - A block's log is its selected parent's log plus its own entry, so it is identical on every node
+//!   that agrees on the selected chain, and a reorg simply reloads the new parent's log.
+//! - Appending costs O(log n) hashes and needs no other data.
+//! - The root commits the entry count, so nothing can be added, dropped, reordered or slipped in
+//!   anywhere, including below the window: a replay matches exactly when the entries are the log's
+//!   last ones, in order.
+//! - Entries carry their selected parent, so a node with no chain index below its pruning point can
+//!   still walk them back from the pruning point to serve a later sync.
 
 use blake2b_simd::Params;
 use serde::{Deserialize, Serialize};
 
-/// Blue-score width of one bucket.
-pub const BUCKET_SPAN: u64 = 1_000;
+const LEAF_PERSONAL: &[u8; 16] = b"zkas_anchorlog_l";
+const NODE_PERSONAL: &[u8; 16] = b"zkas_anchorlog_n";
+const ROOT_PERSONAL: &[u8; 16] = b"zkas_anchorlog_r";
 
-const ENTRY_PERSONAL: &[u8; 16] = b"zkas_anchor_win1";
-const COMMIT_PERSONAL: &[u8; 16] = b"zkas_anchor_cmt1";
+/// The most peaks a well-formed log can have (one per bit of a `u64` count).
+pub const MAX_PEAKS: usize = 64;
+
+fn hash(personal: &[u8; 16], parts: &[&[u8]]) -> [u8; 32] {
+    let mut h = Params::new().hash_length(32).personal(personal).to_state();
+    for part in parts {
+        h.update(part);
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(h.finalize().as_bytes());
+    out
+}
 
 /// One chain block's contribution.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WindowEntry {
     pub block: [u8; 32],
-    /// The block's selected parent. Folded in, so the chain order of the entries is committed, and
-    /// it lets any node (including a fast-synced one with no chain index below its pruning point)
-    /// enumerate the window by following parent links.
+    /// The block's selected parent. Committed, and lets any node (including a fast-synced one with no
+    /// chain index below its pruning point) walk the entries back by parent links.
     pub parent: [u8; 32],
     pub root: [u8; 32],
     pub blue_score: u64,
 }
 
-/// The retained buckets, ascending by bucket index.
+impl WindowEntry {
+    pub fn hash(&self) -> [u8; 32] {
+        hash(LEAF_PERSONAL, &[&self.block, &self.parent, &self.root, &self.blue_score.to_le_bytes()])
+    }
+}
+
+/// The log after some number of entries: the count and the mountain-range peaks, highest first.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AnchorWindow {
-    pub buckets: Vec<(u64, [u8; 32])>,
+pub struct AnchorLog {
+    pub count: u64,
+    pub peaks: Vec<[u8; 32]>,
 }
 
-/// How many buckets below the newest one are retained: enough that every source within
-/// `max_anchor_age` blue score of any block that can use this window is covered.
-pub fn buckets_to_keep(max_anchor_age: u64) -> u64 {
-    max_anchor_age.div_ceil(BUCKET_SPAN) + 1
-}
-
-impl AnchorWindow {
-    /// The window after appending `entry`. Entries must arrive in strictly increasing blue score.
-    /// Consensus appends selected-chain blocks, whose blue scores strictly increase; peer-supplied
-    /// lists go through [`Self::from_entries`], which refuses any non-increasing score. This method
-    /// itself only refuses an entry that goes back a whole bucket (it keeps no per-entry score).
-    pub fn append(&self, entry: &WindowEntry, keep: u64) -> Result<Self, &'static str> {
-        let idx = entry.blue_score / BUCKET_SPAN;
-        let mut buckets = self.buckets.clone();
-        match buckets.last_mut() {
-            Some((last_idx, chain)) if *last_idx == idx => *chain = fold(chain, entry),
-            Some((last_idx, _)) if *last_idx > idx => return Err("anchor window entry goes backwards in blue score"),
-            _ => buckets.push((idx, fold(&[0u8; 32], entry))),
-        }
-        let floor = idx.saturating_sub(keep);
-        buckets.retain(|(i, _)| *i >= floor);
-        Ok(Self { buckets })
+impl AnchorLog {
+    /// Whether the peaks match the count. Anything received from a peer must pass this before use.
+    pub fn is_well_formed(&self) -> bool {
+        self.peaks.len() == self.count.count_ones() as usize && self.peaks.len() <= MAX_PEAKS
     }
 
-    /// Rebuild a window from its entries (ascending blue score), as a syncing node does.
-    pub fn from_entries<'a>(entries: impl IntoIterator<Item = &'a WindowEntry>, keep: u64) -> Result<Self, &'static str> {
-        let mut w = Self::default();
-        let mut last: Option<u64> = None;
+    /// The log after appending `entry`. Fails only on a malformed log or a count that would overflow.
+    pub fn append(&self, entry: &WindowEntry) -> Result<Self, &'static str> {
+        if !self.is_well_formed() {
+            return Err("malformed anchor log");
+        }
+        let count = self.count.checked_add(1).ok_or("anchor log is full")?;
+        let mut peaks = self.peaks.clone();
+        let mut node = entry.hash();
+        let mut height_bits = self.count;
+        while height_bits & 1 == 1 {
+            let left = peaks.pop().expect("a set bit always has a peak");
+            node = hash(NODE_PERSONAL, &[&left, &node]);
+            height_bits >>= 1;
+        }
+        peaks.push(node);
+        Ok(Self { count, peaks })
+    }
+
+    /// Replay peer-supplied `entries` onto `prefix`, as a syncing node does. The entries must be
+    /// strictly increasing in blue score and each must name the previous one as its parent (both
+    /// hold for any stretch of a selected chain). The result equals the committed log exactly when
+    /// the entries are its last `entries.len()` ones, in order.
+    pub fn replay<'a>(prefix: &Self, entries: impl IntoIterator<Item = &'a WindowEntry>) -> Result<Self, &'static str> {
+        let mut log = prefix.clone();
+        let mut last: Option<&WindowEntry> = None;
         for e in entries {
-            if last.is_some_and(|l| e.blue_score <= l) {
-                return Err("anchor window entries are not strictly increasing in blue score");
+            if let Some(prev) = last {
+                if e.blue_score <= prev.blue_score {
+                    return Err("anchor log entries are not strictly increasing in blue score");
+                }
+                if e.parent != prev.block {
+                    return Err("anchor log entry does not name the previous entry as its parent");
+                }
             }
-            last = Some(e.blue_score);
-            w = w.append(e, keep)?;
+            log = log.append(e)?;
+            last = Some(e);
         }
-        Ok(w)
-    }
-
-    /// [`Self::from_entries`] for a peer-supplied list whose every entry the caller will treat as
-    /// proven by the window's commitment. Folding drops the buckets below the final floor, so an
-    /// entry there would pass any comparison of the commitment without being covered by it; such a
-    /// list is refused, as is one whose consecutive entries are not selected parent and child.
-    pub fn from_entries_exact(entries: &[WindowEntry], keep: u64) -> Result<Self, &'static str> {
-        let w = Self::from_entries(entries.iter(), keep)?;
-        let floor = w.floor_bucket().unwrap_or(0);
-        if entries.first().is_some_and(|e| e.blue_score / BUCKET_SPAN < floor) {
-            return Err("anchor window carries entries below its oldest retained bucket");
-        }
-        if entries.windows(2).any(|p| p[1].parent != p[0].block) {
-            return Err("anchor window entries are not a selected-parent chain");
-        }
-        Ok(w)
-    }
-
-    /// The lowest bucket index still retained, i.e. the floor from which a serving node must send
-    /// entries for a syncing node to reproduce this window.
-    pub fn floor_bucket(&self) -> Option<u64> {
-        self.buckets.first().map(|(i, _)| *i)
+        Ok(log)
     }
 
     /// The 32-byte value folded into `zkas_state_root1`.
     pub fn commitment(&self) -> [u8; 32] {
-        let mut h = Params::new().hash_length(32).personal(COMMIT_PERSONAL).to_state();
-        h.update(&(self.buckets.len() as u32).to_le_bytes());
-        for (i, chain) in &self.buckets {
-            h.update(&i.to_le_bytes());
-            h.update(chain);
+        let count = self.count.to_le_bytes();
+        let mut parts: Vec<&[u8]> = Vec::with_capacity(self.peaks.len() + 1);
+        parts.push(&count);
+        for peak in &self.peaks {
+            parts.push(peak);
         }
-        let mut out = [0u8; 32];
-        out.copy_from_slice(h.finalize().as_bytes());
-        out
+        hash(ROOT_PERSONAL, &parts)
     }
-}
-
-fn fold(prev: &[u8; 32], e: &WindowEntry) -> [u8; 32] {
-    let mut h = Params::new().hash_length(32).personal(ENTRY_PERSONAL).to_state();
-    h.update(prev);
-    h.update(&e.block);
-    h.update(&e.parent);
-    h.update(&e.root);
-    h.update(&e.blue_score.to_le_bytes());
-    let mut out = [0u8; 32];
-    out.copy_from_slice(h.finalize().as_bytes());
-    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn e(n: u8, bs: u64) -> WindowEntry {
-        WindowEntry { block: [n; 32], parent: [n.wrapping_sub(1); 32], root: [n.wrapping_add(100); 32], blue_score: bs }
+    /// A selected-chain-shaped run: each entry names the previous as its parent.
+    fn chain(n: u64, start_bs: u64) -> Vec<WindowEntry> {
+        (0..n)
+            .map(|i| WindowEntry {
+                block: block_id(i),
+                parent: if i == 0 { [0xAA; 32] } else { block_id(i - 1) },
+                root: [(i % 251) as u8 ^ 0x33; 32],
+                blue_score: start_bs + i * 10 + (i % 7),
+            })
+            .collect()
     }
 
-    /// Random windows (random retention, random blue-score jumps including jumps past the whole
-    /// window): the served tail always rebuilds the exact window, and every manipulation a lying peer
-    /// can make to that tail (change any field of any entry, drop, duplicate, reorder, drop the
-    /// oldest entries of the floor bucket, append a foreign entry) is either refused or produces a
-    /// different commitment.
+    fn block_id(i: u64) -> [u8; 32] {
+        let mut b = [0u8; 32];
+        b[..8].copy_from_slice(&i.to_le_bytes());
+        b[31] = 0xB1;
+        b
+    }
+
+    fn all_states(entries: &[WindowEntry]) -> Vec<AnchorLog> {
+        let mut log = AnchorLog::default();
+        let mut out = vec![log.clone()];
+        for e in entries {
+            log = log.append(e).unwrap();
+            out.push(log.clone());
+        }
+        out
+    }
+
+    /// The textbook root of a mountain range, built from scratch rather than by appending.
+    fn root_from_scratch(entries: &[WindowEntry]) -> [u8; 32] {
+        let mut peaks = Vec::new();
+        let mut start = 0usize;
+        let n = entries.len();
+        for bit in (0..64).rev() {
+            let size = 1usize << bit;
+            if n & size != 0 {
+                let mut level: Vec<[u8; 32]> = entries[start..start + size].iter().map(WindowEntry::hash).collect();
+                while level.len() > 1 {
+                    level = level.chunks(2).map(|p| hash(NODE_PERSONAL, &[&p[0], &p[1]])).collect();
+                }
+                peaks.push(level[0]);
+                start += size;
+            }
+        }
+        AnchorLog { count: n as u64, peaks }.commitment()
+    }
+
     #[test]
-    fn random_windows_rebuild_exactly_and_every_tampering_is_caught() {
-        let mut x: u64 = 0x0123_4567_89ab_cdef;
-        let mut rnd = move |n: u64| {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            x % n.max(1)
+    fn appending_matches_the_mountain_range_built_from_scratch() {
+        let entries = chain(300, 10);
+        let states = all_states(&entries);
+        assert_eq!(states[0].commitment(), root_from_scratch(&[]));
+        for i in 1..=entries.len() {
+            assert!(states[i].is_well_formed());
+            assert_eq!(states[i].commitment(), root_from_scratch(&entries[..i]), "after {i} entries");
+        }
+    }
+
+    /// The served tail rebuilds the log from any split point.
+    #[test]
+    fn a_prefix_plus_the_tail_reproduces_the_log() {
+        let entries = chain(200, 5);
+        let states = all_states(&entries);
+        for split in [0, 1, 2, 63, 64, 65, 127, 199, 200] {
+            assert_eq!(AnchorLog::replay(&states[split], &entries[split..]).unwrap(), states[200], "split {split}");
+        }
+    }
+
+    /// Exhaustive, not sampled: for every log size up to 33 and every split, flipping any single bit
+    /// of any entry field, any prefix peak, or the prefix count makes the replay miss the committed
+    /// root (or be refused).
+    #[test]
+    fn every_single_bit_lie_misses_the_committed_root() {
+        let entries = chain(33, 100);
+        let mut checked = 0u64;
+        for n in (1..=17).chain([31, 32, 33]) {
+            let states = all_states(&entries[..n]);
+            let target = states[n].commitment();
+            let reaches = |prefix: &AnchorLog, tail: &[WindowEntry]| AnchorLog::replay(prefix, tail).map(|l| l.commitment()).ok() == Some(target);
+            for split in 0..=n {
+                let tail = entries[split..n].to_vec();
+                assert!(reaches(&states[split], &tail));
+                for i in 0..tail.len() {
+                    for bit in 0..(32 * 3 + 8) * 8 {
+                        let mut t = tail.clone();
+                        let e = &mut t[i];
+                        match bit / 8 {
+                            b @ 0..32 => e.block[b] ^= 1 << (bit % 8),
+                            b @ 32..64 => e.parent[b - 32] ^= 1 << (bit % 8),
+                            b @ 64..96 => e.root[b - 64] ^= 1 << (bit % 8),
+                            _ => e.blue_score ^= 1 << (bit - 768),
+                        }
+                        assert!(!reaches(&states[split], &t), "n={n} split={split} entry={i} bit={bit}");
+                        checked += 1;
+                    }
+                }
+                for peak in 0..states[split].peaks.len() {
+                    for bit in 0..256 {
+                        let mut p = states[split].clone();
+                        p.peaks[peak][bit / 8] ^= 1 << (bit % 8);
+                        assert!(!reaches(&p, &tail), "n={n} split={split} peak={peak} bit={bit}");
+                        checked += 1;
+                    }
+                }
+                for bit in 0..64 {
+                    let mut p = states[split].clone();
+                    p.count ^= 1 << bit;
+                    assert!(!reaches(&p, &tail), "n={n} split={split} count bit={bit}");
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 100_000, "the sweep must be exhaustive, checked {checked}");
+    }
+
+    /// From any real prefix, only the exact true tail reaches the root: nothing can be dropped,
+    /// added, cut short or slipped in below, which is what closes the "entries below the floor" class.
+    #[test]
+    fn only_the_true_tail_reaches_the_root_from_any_real_prefix() {
+        let entries = chain(40, 1);
+        let states = all_states(&entries);
+        let n = entries.len();
+        let target = states[n].commitment();
+        for (split, prefix) in states.iter().enumerate() {
+            for start in 0..=n {
+                for end in start..=n {
+                    let reaches = AnchorLog::replay(prefix, &entries[start..end]).map(|l| l.commitment()).ok() == Some(target);
+                    let honest = (start == split && end == n) || (split == n && start == end);
+                    assert_eq!(reaches, honest, "split={split} entries={start}..{end}");
+                }
+            }
+        }
+        // A real entry prepended to the honest tail (below the window) changes the count: refused.
+        let mut t = entries[10..].to_vec();
+        t.insert(0, entries[9]);
+        assert_ne!(AnchorLog::replay(&states[10], &t).map(|l| l.commitment()).ok(), Some(target));
+    }
+
+    #[test]
+    fn peer_lists_must_be_chain_shaped() {
+        let entries = chain(10, 50);
+        let mut repeated = entries.clone();
+        repeated[4].blue_score = repeated[3].blue_score;
+        assert!(AnchorLog::replay(&AnchorLog::default(), &repeated).is_err(), "a repeated blue score is refused");
+        let mut swapped = entries.clone();
+        swapped.swap(3, 4);
+        assert!(AnchorLog::replay(&AnchorLog::default(), &swapped).is_err(), "out of order is refused");
+        let mut unlinked = entries.clone();
+        unlinked[6].parent = [0xEE; 32];
+        assert!(AnchorLog::replay(&AnchorLog::default(), &unlinked).is_err(), "a broken parent link is refused");
+    }
+
+    /// Differential and associativity checks at random sizes up to a few thousand entries.
+    #[test]
+    fn appending_agrees_with_scratch_and_is_associative_at_random_sizes() {
+        let mut rng = 0x243f_6a88_85a3_08d3u64;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
         };
-        for case in 0..200 {
-            let keep = 1 + rnd(5);
-            let mut bs = rnd(3_000);
-            let mut entries = vec![];
-            let mut w = AnchorWindow::default();
-            for i in 0..(5 + rnd(400)) {
-                bs += 1 + if rnd(20) == 0 { rnd(8_000) } else { rnd(300) };
-                let en = WindowEntry {
-                    block: [(i % 256) as u8; 32],
-                    parent: [(i % 256) as u8 ^ 0x5a; 32],
-                    root: [(rnd(256)) as u8; 32],
-                    blue_score: bs,
-                };
-                w = w.append(&en, keep).unwrap();
-                entries.push(en);
+        for _ in 0..12 {
+            let n = (next() % 5000) as usize;
+            let entries = chain(n as u64, next() % 1000);
+            let states = all_states(&entries);
+            assert_eq!(states[n].commitment(), root_from_scratch(&entries), "n={n}");
+            for _ in 0..8 {
+                let a = (next() as usize) % (n + 1);
+                let b = a + (next() as usize) % (n - a + 1);
+                let mid = AnchorLog::replay(&states[a], &entries[a..b]).unwrap();
+                assert_eq!(mid, states[b]);
+                assert_eq!(AnchorLog::replay(&mid, &entries[b..]).unwrap(), states[n], "n={n} a={a} b={b}");
             }
-            assert!(w.append(&WindowEntry { blue_score: bs.saturating_sub(BUCKET_SPAN), ..entries[0] }, keep).is_err() || bs < BUCKET_SPAN, "a bucket going backwards is refused");
-            let floor = w.floor_bucket().unwrap();
-            let tail: Vec<WindowEntry> = entries.iter().copied().filter(|e| e.blue_score / BUCKET_SPAN >= floor).collect();
-            let good = AnchorWindow::from_entries(tail.iter(), keep).unwrap();
-            assert_eq!(good, w, "case {case}: the served tail rebuilds the window");
-            let caught = |t: &[WindowEntry]| match AnchorWindow::from_entries(t.iter(), keep) {
-                Err(_) => true,
-                Ok(r) => r.commitment() != w.commitment(),
-            };
-            let n = tail.len();
-            let i = rnd(n as u64) as usize;
-            let mut t = tail.clone();
-            match rnd(4) {
-                0 => t[i].root[rnd(32) as usize] ^= 1,
-                1 => t[i].block[rnd(32) as usize] ^= 1,
-                2 => t[i].parent[rnd(32) as usize] ^= 1,
-                _ => t[i].blue_score ^= 1 + rnd(3),
-            }
-            // A blue-score edit that keeps strict order AND the bucket can only be caught by the fold.
-            assert!(caught(&t), "case {case}: field tampering of entry {i}/{n}");
-            let mut t = tail.clone();
-            t.remove(i);
-            assert!(n == 1 || caught(&t), "case {case}: dropped entry");
-            let mut t = tail.clone();
-            t.insert(i, tail[i]);
-            assert!(caught(&t), "case {case}: duplicated entry");
-            if n > 1 {
-                let mut t = tail.clone();
-                let j = (i + 1) % n;
-                t.swap(i, j);
-                assert!(caught(&t), "case {case}: reordered entries");
-                assert!(caught(&tail[1..]), "case {case}: oldest entry of the floor bucket dropped");
-            }
-            let mut t = tail.clone();
-            t.push(WindowEntry { blue_score: bs + 1, ..tail[n - 1] });
-            assert!(caught(&t), "case {case}: foreign entry appended");
-            // A peer list repeating a blue score is refused outright, wherever the repeat is.
-            let mut t = tail.clone();
-            t.insert(i + 1, WindowEntry { root: [0xee; 32], ..tail[i] });
-            assert!(AnchorWindow::from_entries(t.iter(), keep).is_err(), "case {case}: equal score in a peer list refused");
         }
     }
 
-    /// Folding drops buckets below the final floor, so entries a peer PREPENDS there leave the
-    /// commitment unchanged. The plain rebuild cannot see them; the exact one, whose entries the
-    /// import seeds as proven, must refuse them, and must refuse a list that is not one chain.
     #[test]
-    fn exact_rebuild_refuses_entries_below_the_floor_and_broken_links() {
-        let keep = 2;
-        let mut entries: Vec<WindowEntry> = Vec::new();
-        let mut w = AnchorWindow::default();
-        for i in 0..800u64 {
-            let mut b = [0u8; 32];
-            b[..8].copy_from_slice(&(i + 1).to_le_bytes());
-            let parent = entries.last().map(|p| p.block).unwrap_or([0u8; 32]);
-            let en = WindowEntry { block: b, parent, root: [(i % 251) as u8; 32], blue_score: 2_000 + i * 7 };
-            w = w.append(&en, keep).unwrap();
-            entries.push(en);
-        }
-        let floor = w.floor_bucket().unwrap();
-        let tail: Vec<WindowEntry> = entries.iter().copied().filter(|e| e.blue_score / BUCKET_SPAN >= floor).collect();
-        assert_eq!(AnchorWindow::from_entries_exact(&tail, keep).unwrap(), w, "the honest tail is accepted");
-
-        // Linked to the first honest entry (it claims to be that entry's parent), so only the floor
-        // rule can refuse it.
-        let forged = WindowEntry { block: tail[0].parent, parent: [0xAA; 32], root: [0xEE; 32], blue_score: 5 };
-        let mut prepended = vec![forged];
-        prepended.extend_from_slice(&tail);
-        assert_eq!(
-            AnchorWindow::from_entries(prepended.iter(), keep).unwrap().commitment(),
-            w.commitment(),
-            "the hole: a prepended entry below the floor does not move the commitment"
-        );
-        assert!(AnchorWindow::from_entries_exact(&prepended, keep).is_err(), "so the exact rebuild refuses it");
-
-        let mut relinked = tail.clone();
-        relinked[10].parent = [0x55; 32];
-        assert!(AnchorWindow::from_entries_exact(&relinked, keep).is_err(), "a broken parent link is refused");
+    fn counts_and_hash_domains_are_separated() {
+        let peaks = vec![[9u8; 32]];
+        let one = AnchorLog { count: 1, peaks: peaks.clone() }.commitment();
+        let two = AnchorLog { count: 2, peaks: peaks.clone() }.commitment();
+        assert_ne!(one, two);
+        let e = chain(1, 0)[0];
+        let parts: [&[u8]; 4] = [&e.block, &e.parent, &e.root, &e.blue_score.to_le_bytes()];
+        assert_ne!(hash(LEAF_PERSONAL, &parts), hash(NODE_PERSONAL, &parts));
+        assert_ne!(hash(LEAF_PERSONAL, &parts), hash(ROOT_PERSONAL, &parts));
     }
 
     #[test]
-    fn incremental_equals_rebuild_and_old_buckets_drop() {
-        let keep = buckets_to_keep(27_000);
-        let entries: Vec<WindowEntry> = (0..400u64).map(|i| e((i % 251) as u8, i * 97 + 5)).collect();
-        let mut w = AnchorWindow::default();
-        for x in &entries {
-            w = w.append(x, keep).unwrap();
-        }
-        // A syncing node only gets the entries of the retained buckets.
-        let floor = w.floor_bucket().unwrap();
-        let tail: Vec<&WindowEntry> = entries.iter().filter(|x| x.blue_score / BUCKET_SPAN >= floor).collect();
-        let rebuilt = AnchorWindow::from_entries(tail.into_iter(), keep).unwrap();
-        assert_eq!(rebuilt, w);
-        assert_eq!(rebuilt.commitment(), w.commitment());
-        assert!(w.buckets.len() as u64 <= keep + 1);
-    }
-
-    #[test]
-    fn any_change_moves_the_commitment() {
-        let keep = buckets_to_keep(27_000);
-        let base: Vec<WindowEntry> = (0..50u64).map(|i| e(i as u8, i * 300)).collect();
-        let c = AnchorWindow::from_entries(base.iter(), keep).unwrap().commitment();
-        let mut fake_root = base.clone();
-        fake_root[20].root = [0xEE; 32];
-        assert_ne!(AnchorWindow::from_entries(fake_root.iter(), keep).unwrap().commitment(), c, "a substituted root");
-        let mut fake_block = base.clone();
-        fake_block[20].block = [0xEE; 32];
-        assert_ne!(AnchorWindow::from_entries(fake_block.iter(), keep).unwrap().commitment(), c, "a substituted block");
-        let mut omitted = base.clone();
-        omitted.remove(20);
-        assert_ne!(AnchorWindow::from_entries(omitted.iter(), keep).unwrap().commitment(), c, "an omitted entry");
-        let mut reparented = base.clone();
-        reparented[20].parent = [0xEE; 32];
-        assert_ne!(AnchorWindow::from_entries(reparented.iter(), keep).unwrap().commitment(), c, "a changed parent link");
-        let mut rescored = base.clone();
-        rescored[20].blue_score += 1;
-        assert_ne!(AnchorWindow::from_entries(rescored.iter(), keep).unwrap().commitment(), c, "a changed blue score");
-    }
-
-    #[test]
-    fn out_of_order_entries_are_refused() {
-        let keep = buckets_to_keep(27_000);
-        assert!(AnchorWindow::from_entries([e(1, 10), e(2, 10)].iter(), keep).is_err());
-        assert!(AnchorWindow::from_entries([e(1, 2_500), e(2, 1_200)].iter(), keep).is_err());
+    fn malformed_logs_are_refused_not_trusted() {
+        let bad = AnchorLog { count: 3, peaks: vec![[0; 32]] };
+        assert!(!bad.is_well_formed());
+        assert!(bad.append(&chain(1, 0)[0]).is_err());
+        let full = AnchorLog { count: u64::MAX, peaks: vec![[0; 32]; 64] };
+        assert!(full.append(&chain(1, 0)[0]).is_err(), "a full log cannot grow");
     }
 }
