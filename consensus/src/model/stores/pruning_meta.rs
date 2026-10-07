@@ -21,6 +21,7 @@ pub struct PruningMetaStores {
     body_missing_anticone_blocks: CachedDbItem<Vec<Hash>>,
     shielded_history_backfilled_access: CachedDbItem<bool>,
     shielded_history_verified_base_access: CachedDbItem<Hash>,
+    shielded_history_own_base_access: CachedDbItem<Hash>,
 }
 
 impl PruningMetaStores {
@@ -34,6 +35,7 @@ impl PruningMetaStores {
             body_missing_anticone_blocks: CachedDbItem::new(db.clone(), DatabaseStorePrefixes::BodyMissingAnticone.into()),
             shielded_history_backfilled_access: CachedDbItem::new(db.clone(), DatabaseStorePrefixes::ShieldedHistoryBackfilled.into()),
             shielded_history_verified_base_access: CachedDbItem::new(db.clone(), DatabaseStorePrefixes::ShieldedHistoryVerifiedBase.into()),
+            shielded_history_own_base_access: CachedDbItem::new(db.clone(), DatabaseStorePrefixes::ShieldedHistoryOwnBase.into()),
         }
     }
 
@@ -58,6 +60,29 @@ impl PruningMetaStores {
 
     pub fn shielded_history_verified_base(&self) -> Option<Hash> {
         self.shielded_history_verified_base_access.read().optional().unwrap()
+    }
+
+    /// Record the lowest block this node indexed itself, in the batch of the first backfill write
+    /// below it.
+    pub fn set_shielded_history_own_base(&mut self, batch: &mut WriteBatch, base: Hash) -> StoreResult<()> {
+        self.shielded_history_own_base_access.write(BatchDbWriter::new(batch), &base)
+    }
+
+    /// The lowest block this node indexed itself, when part of its index is peer-supplied (`None` for
+    /// a node that never backfilled). Nodes that backfilled before this was recorded verified against
+    /// exactly that block, so the verified base stands in for it.
+    pub fn shielded_history_own_base(&self) -> Option<Hash> {
+        if !self.shielded_history_backfilled() {
+            return None;
+        }
+        self.shielded_history_own_base_access.read().optional().unwrap().or_else(|| self.shielded_history_verified_base())
+    }
+
+    /// Forget a backfill (its records were purged): the index is this node's own again.
+    pub fn clear_shielded_history_backfill(&mut self, batch: &mut WriteBatch) -> StoreResult<()> {
+        self.shielded_history_backfilled_access.remove(BatchDbWriter::new(&mut *batch))?;
+        self.shielded_history_own_base_access.remove(BatchDbWriter::new(&mut *batch))?;
+        self.shielded_history_verified_base_access.remove(BatchDbWriter::new(batch))
     }
 
     /// Represents the exact point of the current pruning point utxoset. Used in order to safely

@@ -554,6 +554,13 @@ pub trait ConsensusApi: Send + Sync {
         unimplemented!()
     }
 
+    /// Verify a shielded transaction's bundle (proof and signatures) without any consensus lock, and
+    /// remember a success, so the mempool's locked validation of the same transaction is a cache hit.
+    /// Context-free: it says nothing about anchors or nullifiers. A no-op for other transactions.
+    fn preverify_shielded_transaction(&self, _transaction: &Transaction) -> ConsensusResult<()> {
+        Ok(())
+    }
+
     /// The shielded turnstile totals as of `block`, as raw parts
     /// `(cumulative_coinbase, cumulative_fees, cumulative_burns)` in sompi — the
     /// public form of the PLAN §2.7 invariant `pool = minted - fees - burns`. Raw

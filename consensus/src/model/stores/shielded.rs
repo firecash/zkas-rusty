@@ -418,6 +418,11 @@ impl DbShieldedAnchorSourceScoreStore {
         self.access.delete(BatchDbWriter::new(batch), source)
     }
 
+    /// Stage the removal of every attested score (a pruning-point re-import starts from none).
+    pub fn delete_all_batch(&self, batch: &mut WriteBatch) -> StoreResult<()> {
+        self.access.delete_all(BatchDbWriter::new(batch))
+    }
+
     /// The attested blue score of `source`, or `None` when nothing was attested — which the
     /// caller must treat as "cannot judge", never as zero.
     pub fn get(&self, source: Hash) -> StoreResult<Option<u64>> {
@@ -825,6 +830,18 @@ impl DbAnchorProducersStore {
         self.access.write(BatchDbWriter::new(batch), AnchorKey(anchor), producers)
     }
 
+    /// Overwrite the producer list of `anchor` without reading the old row. The pruning-point seed
+    /// uses this right after a staged clear in the same batch, where a read-modify-write would read
+    /// the not-yet-deleted row and write its producers back.
+    pub fn set_producers_batch(&self, batch: &mut WriteBatch, anchor: [u8; 32], producers: Vec<Hash>) -> StoreResult<()> {
+        self.access.write(BatchDbWriter::new(batch), AnchorKey(anchor), producers)
+    }
+
+    /// Stage the removal of every row (a pruning-point re-import starts from none).
+    pub fn delete_all_batch(&self, batch: &mut WriteBatch) -> StoreResult<()> {
+        self.access.delete_all(BatchDbWriter::new(batch))
+    }
+
     /// Remove one producer of `anchor`; drops the row entirely when it was the last.
     /// Only the age-based GC calls this.
     pub fn remove_producer_batch(&self, batch: &mut WriteBatch, anchor: [u8; 32], block: Hash) -> StoreResult<()> {
@@ -905,6 +922,11 @@ impl DbAnchorBlockStore {
     /// outside every window a spend or the IBD export can name.
     pub fn delete_batch(&self, batch: &mut WriteBatch, anchor: [u8; 32]) -> StoreResult<()> {
         self.access.delete(BatchDbWriter::new(batch), AnchorKey(anchor))
+    }
+
+    /// Stage the removal of every mapping (a pruning-point re-import starts from none).
+    pub fn delete_all_batch(&self, batch: &mut WriteBatch) -> StoreResult<()> {
+        self.access.delete_all(BatchDbWriter::new(batch))
     }
 
     /// Every `(anchor, source block)` pair this node has indexed.

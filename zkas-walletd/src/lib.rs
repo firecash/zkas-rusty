@@ -524,9 +524,84 @@ fn security_fork_active(daa_score: u64) -> bool {
     at >= SECURITY_FORK_DAA.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Whether a wallet whose ingest hit a repeated nullifier may be rebuilt from scratch: once per
+/// wallet per process (see the poison handling in `sync_chunk`).
+fn poison_rebuild_allowed(token: &str) -> bool {
+    static REBUILT: std::sync::Mutex<std::collections::BTreeSet<String>> = std::sync::Mutex::new(std::collections::BTreeSet::new());
+    REBUILT.lock().unwrap_or_else(|p| p.into_inner()).insert(token.to_string())
+}
+
 /// DAA scores before the security fork during which sends are held: a spend built then in the
-/// pre-fork format could be mined after the activation and refused.
-const FORK_BOUNDARY_HOLD: u64 = 120;
+/// pre-fork format could be mined after the activation and refused. Above [`PREPARED_TTL`] (300 s
+/// at 1 BPS) plus proving time, so a payment prepared just outside the hold cannot be submitted
+/// inside it either; [`submit_guarded`] re-checks at broadcast.
+const FORK_BOUNDARY_HOLD: u64 = 600;
+
+/// Broadcast a payment, refusing an unnamed (pre-fork format) spend that could no longer be mined
+/// before the security fork. Without this a payment prepared before the hold and submitted inside
+/// it entered the mempool, was refused by every post-fork template, and its notes stayed parked for
+/// an hour. Refused here, nothing is parked; the error takes each caller's ordinary rejection path
+/// (with its partial-send report).
+async fn submit_guarded(client: &GrpcClient, tx: &Transaction) -> kaspa_rpc_core::RpcResult<kaspa_rpc_core::RpcTransactionId> {
+    const SUBMIT_FORK_MARGIN: u64 = 60;
+    let named = ShieldedBundle::from_bytes_at(&tx.payload, true).is_ok_and(|b| b.anchor_block.is_some());
+    let tip = NODE_TIP_DAA.load(std::sync::atomic::Ordering::Relaxed);
+    if !named && security_fork_active(tip.saturating_add(SUBMIT_FORK_MARGIN)) {
+        return Err(kaspa_rpc_core::RpcError::General(
+            "a network upgrade activates before this payment could be mined; nothing was sent, prepare it again".to_string(),
+        ));
+    }
+    client.submit_transaction(RpcTransaction::from(tx), false).await
+}
+
+/// DAA scores after the security fork during which sends are held: from the fork a spend must name a
+/// post-fork anchor block, and the matured anchor (`DEFAULT_ANCHOR_DEPTH + ANCHOR_SLACK` blue below
+/// the sink) is still a pre-fork block until the chain has grown that far past the activation. Blue
+/// score rises no faster than DAA, so twice the depth in DAA leaves room for up to half the merged
+/// blocks being red.
+const POST_FORK_ANCHOR_HOLD: u64 = 2 * (DEFAULT_ANCHOR_DEPTH + ANCHOR_SLACK);
+
+/// The lowest blue score of any post-fork chain block this daemon has ingested (`u64::MAX` = none
+/// yet). Blue score rises along the chain, so an anchor at or above it is a post-fork block, which is
+/// the only kind a post-fork spend may name. Persisted (see [`note_chain_block`]) so a restart does not
+/// hold sends until the ring refills.
+static FIRST_POST_FORK_BLUE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+static FIRST_POST_FORK_BLUE_FILE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Record an ingested chain block for [`FIRST_POST_FORK_BLUE`].
+fn note_chain_block(daa_score: u64, blue_score: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if daa_score < SECURITY_FORK_DAA.load(Relaxed) {
+        return;
+    }
+    if FIRST_POST_FORK_BLUE.fetch_min(blue_score, Relaxed) > blue_score {
+        // Written under the lock from the atomic's current value, so racing callers cannot leave a
+        // higher value on disk than in memory.
+        let path = FIRST_POST_FORK_BLUE_FILE.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(path) = path.as_deref() {
+            let _ = std::fs::write(path, FIRST_POST_FORK_BLUE.load(Relaxed).to_string());
+        }
+    }
+}
+
+/// Point [`FIRST_POST_FORK_BLUE`] at this network's file under `wallet_dir` and load it.
+fn load_first_post_fork_blue(wallet_dir: &str, genesis: &RpcHash) {
+    // Keyed by the fork score too: a value learned under another activation (a test override, an
+    // older build) says nothing about this one.
+    let fork = SECURITY_FORK_DAA.load(std::sync::atomic::Ordering::Relaxed);
+    let path = format!("{wallet_dir}/.first-post-fork-blue-{genesis}-{fork}");
+    let loaded = std::fs::read_to_string(&path).ok().and_then(|t| t.trim().parse::<u64>().ok()).unwrap_or(u64::MAX);
+    FIRST_POST_FORK_BLUE.store(loaded, std::sync::atomic::Ordering::Relaxed);
+    *FIRST_POST_FORK_BLUE_FILE.lock().unwrap_or_else(|p| p.into_inner()) = Some(path);
+}
+
+/// Whether a matured anchor is certainly a post-fork block: the highest known DAA score (as in
+/// [`security_fork_active`]) is at least [`POST_FORK_ANCHOR_HOLD`] past the activation.
+fn post_fork_anchor_matured(daa_score: u64) -> bool {
+    let at = daa_score.max(NODE_TIP_DAA.load(std::sync::atomic::Ordering::Relaxed));
+    let fork = SECURITY_FORK_DAA.load(std::sync::atomic::Ordering::Relaxed);
+    fork != u64::MAX && at >= fork.saturating_add(POST_FORK_ANCHOR_HOLD)
+}
 
 /// The network's maximum shielded anchor age (blue score): a spend whose anchor is older than this
 /// at inclusion is rejected by every node.
@@ -2204,6 +2279,25 @@ fn select_coinbase_cmx(
     }
 }
 
+/// The DAA score from which a coinbase note's seed mixes in its block hash
+/// (`Params::shielded_coinbase_seed_activation`, F-02), for the network `serve` was last started on;
+/// `u64::MAX` = never.
+static COINBASE_SEED_ACTIVATION_DAA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// A coinbase note's seed, exactly as consensus derives it (`coinbase_notes_from_outputs`):
+/// `[block hash ||] coinbase txid || output index`, the block hash from the seed activation on.
+/// Every walletd derivation site goes through here, so a wallet never mis-derives a reward once the
+/// activation is set.
+fn coinbase_note_seed(block: &RpcHash, daa_score: u64, coinbase_txid: &RpcHash, index: usize) -> Vec<u8> {
+    let mut seed = Vec::with_capacity(32 + 32 + 4);
+    if daa_score >= COINBASE_SEED_ACTIVATION_DAA.load(std::sync::atomic::Ordering::Relaxed) {
+        seed.extend_from_slice(&block.as_bytes());
+    }
+    seed.extend_from_slice(&coinbase_txid.as_bytes());
+    seed.extend_from_slice(&(index as u32).to_le_bytes());
+    seed
+}
+
 /// Shared page decoding gets a bounded pool so it cannot consume every host core
 /// and starve HTTP or kaspad while several wallets ingest concurrently. Two threads
 /// are used on a 4-core box; larger wallet hosts expand to `cores - 2`, capped at
@@ -2227,9 +2321,7 @@ fn decode_block(b: &kaspa_rpc_core::RpcShieldedChainBlock) -> Result<DecodedBloc
         {
             let mut recipient = [0u8; ORCHARD_SCRIPT_LEN];
             recipient.copy_from_slice(&out.script_public_key[..ORCHARD_SCRIPT_LEN]);
-            let mut note_seed = Vec::with_capacity(36);
-            note_seed.extend_from_slice(&b.coinbase_txid.as_bytes());
-            note_seed.extend_from_slice(&(i as u32).to_le_bytes());
+            let note_seed = coinbase_note_seed(&b.hash, b.daa_score, &b.coinbase_txid, i);
             let desc = derive_coinbase_note_desc(recipient, &note_seed);
             // Only keep a note that commits — exactly `WalletDb::ingest_block`'s skip
             // rule, so the shared leaf stream matches the recompute path leaf-for-leaf.
@@ -3391,19 +3483,35 @@ impl WalletEntry {
                     self.db.ingest_block_compact_precomputed_with_meta(&b.coinbase, &b.compact, meta.as_ref());
                     if self.db.poisoned() {
                         // A repeated nullifier: data consensus could never have applied. Stop here and
-                        // never checkpoint this state; the error keeps the wallet from being saved,
-                        // and a reload resumes from the last good checkpoint.
-                        log::error!(
-                            "wallet {token}: the node served block {} with a nullifier this wallet already saw; \
-                             refusing to continue from inconsistent data (restart walletd or point it at another node)",
-                            b.hash
-                        );
-                        self.error = Some("inconsistent shielded data from the node (repeated nullifier); sync halted".into());
+                        // never checkpoint this state. The repeat can sit in the CHECKPOINT rather than
+                        // in this page (a nullifier ingested from bad history that the honest chain
+                        // repeats later), and then every reload re-poisons at the same block: halting
+                        // alone never recovers. So the first time per wallet and process the checkpoint
+                        // is retired and the wallet rebuilt from scratch, by the same path as a shared
+                        // tree audit mismatch; a repeat after that rebuild is the node's own data and
+                        // halts for the operator.
+                        if poison_rebuild_allowed(token) {
+                            log::error!(
+                                "wallet {token}: the node served block {} with a nullifier this wallet already saw; \
+                                 retiring the checkpoint and rebuilding the wallet",
+                                b.hash
+                            );
+                            self.audit_retire = true;
+                            self.error = Some("inconsistent shielded data (repeated nullifier); rebuilding the wallet".into());
+                        } else {
+                            log::error!(
+                                "wallet {token}: the node served block {} with a nullifier this wallet already saw, again after \
+                                 a rebuild; refusing to continue from inconsistent data (point walletd at another node)",
+                                b.hash
+                            );
+                            self.error = Some("inconsistent shielded data from the node (repeated nullifier); sync halted".into());
+                        }
                         // Leaves the blocking section; the pass returns right after it.
                         break;
                     }
                     self.low = b.hash;
                     self.scanned = b.daa_score as usize;
+                    note_chain_block(b.daa_score, b.blue_score);
                     self.boundaries.push_back((b.blue_score, self.db.size()));
                     // Keyed by blue score, which is unique per chain block. Leaf count is not: a block
                     // that mints nothing (miner reward accrued) leaves it unchanged, and keying by it
@@ -3928,10 +4036,10 @@ impl WalletEntry {
     fn send_anchor_block(&self, matured: u64) -> Result<Option<[u8; 32]>, (StatusCode, Json<serde_json::Value>)> {
         // Every send path passes through here, so this is also where a wallet whose tree ingested
         // inconsistent data refuses to build a spend on it.
-        if self.db.poisoned() {
+        if self.db.poisoned() || self.audit_retire {
             return Err(err(
                 StatusCode::CONFLICT,
-                "this wallet received inconsistent data from its node and is halted; it resumes from its last good checkpoint after a restart",
+                "this wallet received inconsistent data from its node and is halted or being rebuilt; it resumes after the rebuild",
             ));
         }
         // The rule applies by the DAA score of the block that includes the spend, which is at or
@@ -3971,6 +4079,23 @@ impl WalletEntry {
                 ));
             }
             return Ok(None);
+        }
+        // Right after the fork the matured anchor is still a pre-fork block, which consensus no longer
+        // accepts as a spend's anchor (only post-fork blocks are in the anchor log).
+        if !post_fork_anchor_matured(tip) {
+            return Err(err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "a network upgrade has just activated; sends resume once a post-upgrade anchor matures (about 20 minutes)",
+            ));
+        }
+        // The wallet's own anchor must itself be post-fork. The hold above is judged at the node's tip;
+        // a wallet still catching up (a phone reopened after the fork, a parked hosted wallet) has an
+        // older matured boundary, a pre-fork block, which consensus drops as an anchor.
+        if anchor_blue.is_none_or(|bs| bs < FIRST_POST_FORK_BLUE.load(std::sync::atomic::Ordering::Relaxed)) {
+            return Err(err(
+                StatusCode::CONFLICT,
+                "this wallet's spend anchor predates the network upgrade; retry once the wallet has synced past it",
+            ));
         }
         anchor_blue.and_then(|bs| self.boundary_blocks.get(&bs)).copied().map(Some).ok_or_else(|| {
             err(
@@ -4086,9 +4211,7 @@ fn ingest_shielded_chain_block(db: &mut WalletDb, blk: &RpcShieldedChainBlock) {
         if out.script_public_key.len() >= ORCHARD_SCRIPT_LEN {
             let mut recipient = [0u8; ORCHARD_SCRIPT_LEN];
             recipient.copy_from_slice(&out.script_public_key[..ORCHARD_SCRIPT_LEN]);
-            let mut note_seed = Vec::with_capacity(36);
-            note_seed.extend_from_slice(&blk.coinbase_txid.as_bytes());
-            note_seed.extend_from_slice(&(i as u32).to_le_bytes());
+            let note_seed = coinbase_note_seed(&blk.hash, blk.daa_score, &blk.coinbase_txid, i);
             coinbase_notes.push((derive_coinbase_note_desc(recipient, &note_seed), out.value));
         }
     }
@@ -8577,10 +8700,14 @@ async fn ensure_canonical_checkpoint(state: &Arc<AppState>, w: &Wallet) -> Resul
     // the spend path does not require.
     if w.lock().await.db.is_borrowing() {
         // A borrower spends against the shared tree; if that tree failed its audit, so does this.
-        if state.chain_tree.lock().await.db.poisoned() {
+        // Also while it waits to be rebuilt (`audit_retire`): on a node that cannot serve genesis that
+        // wait is indefinite, and every spend rooted at the diverged tree would be dropped by consensus.
+        let tree = state.chain_tree.lock().await;
+        if tree.db.poisoned() || tree.audit_retire {
             return Err(err(
                 StatusCode::SERVICE_UNAVAILABLE,
-                "the shared chain state failed its consistency audit again after a rebuild; point the daemon at another node and restart it",
+                "the shared chain state failed its consistency audit and is not rebuilt yet; sends resume after the rebuild \
+                 (if this persists, point the daemon at an archival node and restart it)",
             ));
         }
         return Ok(());
@@ -8966,7 +9093,7 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
             log::info!("send: tx {}/{tx_count} proven in {:.0?}", idx + 1, took);
 
             let tx: Transaction = payment_tx(payload);
-            match client.submit_transaction(RpcTransaction::from(&tx), false).await {
+            match submit_guarded(&client, &tx).await {
                 Ok(accepted) => {
                     txids.push(accepted.to_string());
                     sent += pay;
@@ -9284,7 +9411,7 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
         log::info!("send_many: tx {}/{tx_count} proven in {:.0?}", bi + 1, started.elapsed());
 
         let tx: Transaction = payment_tx(payload);
-        match client.submit_transaction(RpcTransaction::from(&tx), false).await {
+        match submit_guarded(&client, &tx).await {
             Ok(accepted) => {
                 txids.push(accepted.to_string());
                 // `groups` was built by `resolved.chunks(per_tx)`, so batch `bi` is
@@ -9486,7 +9613,7 @@ async fn consolidate_once(
         .request_client()
         .await
         .ok_or_else(|| err(StatusCode::SERVICE_UNAVAILABLE, "the wallet service cannot reach its node to broadcast; nothing was sent"))?;
-    match node.submit_transaction(RpcTransaction::from(&tx), false).await {
+    match submit_guarded(&node, &tx).await {
         Ok(accepted) => {
             let mut e = w.lock().await;
             let now_daa = e.scanned as u64;
@@ -10253,7 +10380,7 @@ async fn wallet_submit(
         .request_client()
         .await
         .ok_or_else(|| err(StatusCode::SERVICE_UNAVAILABLE, "the wallet service cannot reach its node to broadcast; nothing was sent"))?;
-    match node.submit_transaction(RpcTransaction::from(&tx), false).await {
+    match submit_guarded(&node, &tx).await {
         Ok(accepted) => {
             // The node has the transaction: park the notes it spends so they leave the
             // unspent set NOW rather than ~3 minutes from now when the block carrying
@@ -11515,6 +11642,13 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
         _ => kaspa_consensus_core::config::params::Params::from(state_prefix_network(&cfg.network)).security_fork_activation,
     };
     SECURITY_FORK_DAA.store(fork.daa_score(), std::sync::atomic::Ordering::Relaxed);
+    load_first_post_fork_blue(&wallet_dir, &genesis);
+    COINBASE_SEED_ACTIVATION_DAA.store(
+        kaspa_consensus_core::config::params::Params::from(state_prefix_network(&cfg.network))
+            .shielded_coinbase_seed_activation
+            .daa_score(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
     // The tip seen by a previous `serve` (another node, possibly another network) says nothing here.
     NODE_TIP_DAA.store(0, std::sync::atomic::Ordering::Relaxed);
     // `ZKAS_MAX_ANCHOR_AGE` likewise mirrors an override-params file on a test network.
@@ -12276,6 +12410,43 @@ mod sdk_api_tests {
         );
     }
 
+    /// The fork gates read process-wide atomics, so they are exercised in one test that restores them.
+    /// Coinbase seeds follow consensus (`coinbase_notes_from_outputs`) on both sides of the F-02
+    /// activation, and after the security fork sends wait until a post-fork anchor has matured.
+    #[test]
+    fn fork_gates_follow_consensus_at_their_boundaries() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (block, txid) = (RpcHash::from_bytes([3; 32]), RpcHash::from_bytes([4; 32]));
+        COINBASE_SEED_ACTIVATION_DAA.store(1_000, Relaxed);
+        let before = coinbase_note_seed(&block, 999, &txid, 2);
+        let after = coinbase_note_seed(&block, 1_000, &txid, 2);
+        COINBASE_SEED_ACTIVATION_DAA.store(u64::MAX, Relaxed);
+        let mut want_before = txid.as_bytes().to_vec();
+        want_before.extend_from_slice(&2u32.to_le_bytes());
+        let mut want_after = block.as_bytes().to_vec();
+        want_after.extend_from_slice(&want_before);
+        assert_eq!(before, want_before, "pre-activation seed: txid || index");
+        assert_eq!(after, want_after, "from the activation: block hash || txid || index");
+
+        SECURITY_FORK_DAA.store(10_000, Relaxed);
+        NODE_TIP_DAA.store(0, Relaxed);
+        assert!(security_fork_active(10_000) && !security_fork_active(9_999));
+        assert!(!post_fork_anchor_matured(10_000 + POST_FORK_ANCHOR_HOLD - 1), "sends wait for a post-fork anchor");
+        assert!(post_fork_anchor_matured(10_000 + POST_FORK_ANCHOR_HOLD));
+        assert!(POST_FORK_ANCHOR_HOLD > DEFAULT_ANCHOR_DEPTH + ANCHOR_SLACK, "the hold outlasts the anchor depth");
+        // The first post-fork blue score: only post-fork blocks lower it, and it only falls.
+        FIRST_POST_FORK_BLUE.store(u64::MAX, Relaxed);
+        note_chain_block(9_999, 500);
+        assert_eq!(FIRST_POST_FORK_BLUE.load(Relaxed), u64::MAX, "a pre-fork block says nothing");
+        note_chain_block(10_002, 700);
+        note_chain_block(10_000, 690);
+        note_chain_block(10_005, 720);
+        assert_eq!(FIRST_POST_FORK_BLUE.load(Relaxed), 690, "the lowest post-fork blue seen");
+        FIRST_POST_FORK_BLUE.store(u64::MAX, Relaxed);
+        SECURITY_FORK_DAA.store(u64::MAX, Relaxed);
+        assert!(!post_fork_anchor_matured(u64::MAX - 1), "never active without a fork");
+    }
+
     #[test]
     fn decode_block_prefers_node_commitment_and_keeps_legacy_fallback() {
         let db = WalletDb::from_seed([0x31; 32]).expect("valid test seed");
@@ -12793,7 +12964,7 @@ async fn bundle_submit(
         .request_client()
         .await
         .ok_or_else(|| err(StatusCode::SERVICE_UNAVAILABLE, "cannot reach the node to broadcast; nothing was sent"))?;
-    match node.submit_transaction(RpcTransaction::from(&tx), false).await {
+    match submit_guarded(&node, &tx).await {
         Ok(_) => Ok(Json(BundleSubmitResp { complete: true, pending: Vec::new(), txid: Some(tx.id().to_string()) })),
         Err(e) => {
             log::error!("multiparty broadcast failed for session {}: {e}", req.session);

@@ -159,6 +159,9 @@ pub enum DatabaseStorePrefixes {
     /// garbage-collected with the anchor indexes.
     ShieldedWindowEntry = 96,
     ShieldedMinerAccrual = 97,
+    /// `Hash` of the lowest block this node indexed itself, recorded when a shielded-history backfill
+    /// first writes below it. Everything under it is peer-supplied.
+    ShieldedHistoryOwnBase = 98,
 
     // ---- Separator ----
     /// Reserved as a separator

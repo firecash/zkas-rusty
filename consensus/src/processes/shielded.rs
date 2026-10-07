@@ -1528,13 +1528,27 @@ impl ShieldedStateManager {
         // the old rule to the new one. `persist` writes both for self-validated blocks;
         // the import path must match it or the two disagree exactly across the window a
         // syncee cannot self-populate.
-        self.anchor_producers.add_producer_batch(batch, anchor, block)?;
+        //
         // Seed the in-window historical anchors too. Without these the node drops every spend
         // anchored below the pruning point and disqualifies the block that merged it; see
         // [`PruningPointShieldedMetadata::in_window_anchors`].
+        //
+        // The producer lists are assembled here and written whole. A per-pair read-modify-write
+        // reads the DATABASE, not this batch: two pairs sharing a root (sibling producers, the case
+        // the producer index exists for) each read the old row and the second write dropped the
+        // first producer, and after the re-import clear staged in this same batch it read the
+        // not-yet-deleted row and wrote the previous import's producers back.
+        let mut producers: std::collections::BTreeMap<[u8; 32], Vec<Hash>> = std::collections::BTreeMap::new();
+        producers.entry(anchor).or_default().push(block);
         for (hist_anchor, source) in md.in_window_anchors.iter() {
             self.anchor_block.set_batch(batch, *hist_anchor, *source)?;
-            self.anchor_producers.add_producer_batch(batch, *hist_anchor, *source)?;
+            let list = producers.entry(*hist_anchor).or_default();
+            if !list.contains(source) {
+                list.push(*source);
+            }
+        }
+        for (root, list) in producers {
+            self.anchor_producers.set_producers_batch(batch, root, list)?;
         }
         // And the blue score of each of those sources. Without this the mappings above resolve
         // and then fail the maturity check, because a fast-synced node has no ghostdag data
@@ -1620,10 +1634,17 @@ impl ShieldedStateManager {
     /// with the batch — the same semantics behind the F-01 two-batch reorg fix),
     /// so the caller MUST write the batch before any subsequent seed/validation.
     ///
-    /// The per-block nullifier diffs and the anchor→block index are deliberately
-    /// retained: diffs of chain blocks above the pruning point stay valid (the
-    /// re-seeded set is their base state), and the anchor index is append-only by
-    /// design with canonicality re-checked via reachability on every query.
+    /// The per-block nullifier diffs are deliberately retained: diffs of chain blocks above the
+    /// pruning point stay valid (the re-seeded set is their base state).
+    ///
+    /// The anchor indexes and the attested source scores are cleared whole. A
+    /// re-import happens only with no locally validated chain block above the pruning point, so
+    /// every row they hold came from an import, and the seed staged after this rewrites the ones the
+    /// new pruning point needs. Kept, a previous import's unproven pairs (a fake root beside a real
+    /// window block, ZK-01) outlived the very re-import meant to replace them. The anchor-log
+    /// entries stay: each was replayed against a committed log, so none is unproven. The GC queue
+    /// stays too, since its rows are what removes those entries with their age (draining a row whose
+    /// anchor rows are already gone is a no-op).
     pub fn clear_for_pruning_reimport(&self, batch: &mut WriteBatch, pruning_point: Hash) -> StoreResult<()> {
         // The whole global membership set. `iter_all` is a pure RocksDB iterator
         // (no cache), and the deletions are only staged in `batch`, so iterating
@@ -1644,6 +1665,9 @@ impl ShieldedStateManager {
         self.dev_accrued_store.delete_batch(batch, pruning_point)?;
         self.miner_accrual_store.delete_batch(batch, pruning_point)?;
         self.anchor_window.delete_window_batch(batch, pruning_point)?;
+        self.anchor_block.delete_all_batch(batch)?;
+        self.anchor_producers.delete_all_batch(batch)?;
+        self.anchor_source_scores.delete_all_batch(batch)?;
         Ok(())
     }
 }
@@ -2183,6 +2207,59 @@ mod tests {
             vec![pp],
             "the pruning point's own anchor must resolve under the multi-producer rule"
         );
+    }
+
+    /// A re-import is the clear and the seed in ONE batch. The previous import's peer pairs (a fake
+    /// root beside a real block, ZK-01), their scores and queue rows must not survive it, and a seed
+    /// whose pairs share a root (sibling producers) must keep every producer. Both broke when the seed
+    /// read the old producer row from the database: the second pair overwrote the first, and the
+    /// staged clear was undone by writing the stale row back.
+    #[test]
+    fn reimport_replaces_every_anchor_row_and_keeps_sibling_producers() {
+        let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
+        let mgr = manager(&db);
+        let pp = h(9);
+        let md = |pairs: Vec<([u8; 32], Hash)>, scores: Vec<(Hash, u64)>| PruningPointShieldedMetadata {
+            frontier: FrontierState::default(),
+            supply: SupplyTotals::default(),
+            nullifier_muhash: MuHash::new(),
+            burns: BurnReceipts::default(),
+            state_root: [0u8; 32],
+            in_window_anchors: pairs,
+            dev_accrued: 0,
+            in_window_anchor_source_scores: scores,
+            window_entries: Vec::new(),
+            miner_accrual: Default::default(),
+            window_prefix: Default::default(),
+        };
+        let (fake_root, real_block) = ([0xEE; 32], h(5));
+        let (root, sib_a, sib_b) = ([0x11; 32], h(6), h(7));
+        let mut batch = WriteBatch::default();
+        // The first import also pairs a real root with a block that did not produce it.
+        let lies = md(vec![(fake_root, real_block), (root, real_block)], vec![(real_block, 40)]);
+        mgr.seed_pruning_point_shielded(&mut batch, pp, &lies, std::iter::empty()).unwrap();
+        db.write(batch).unwrap();
+        assert_eq!(mgr.anchor_producer_blocks(&fake_root).unwrap(), vec![real_block], "precondition: the lie is seeded");
+
+        // Re-import from an honest peer: two siblings produced the same root.
+        let honest = md(vec![(root, sib_a), (root, sib_b)], vec![(sib_a, 41), (sib_b, 41)]);
+        let mut batch = WriteBatch::default();
+        mgr.clear_for_pruning_reimport(&mut batch, pp).unwrap();
+        mgr.seed_pruning_point_shielded(&mut batch, pp, &honest, std::iter::empty()).unwrap();
+        db.write(batch).unwrap();
+
+        assert!(mgr.anchor_producer_blocks(&fake_root).unwrap().is_empty(), "the previous import's pair is gone");
+        assert_eq!(mgr.anchor_source_block(&fake_root).unwrap(), None, "from both indexes");
+        assert_eq!(mgr.attested_source_blue_score(real_block).unwrap(), None, "and its attested score");
+        let mut producers = mgr.anchor_producer_blocks(&root).unwrap();
+        producers.sort();
+        let mut expected = vec![sib_a, sib_b];
+        expected.sort();
+        assert_eq!(producers, expected, "every sibling producer of one root is kept, and the previous import's is gone");
+        // The new pairs are queued for GC. The previous queue rows stay: they are what collects the
+        // anchor-log entries a re-import keeps, and draining one whose rows are gone is a no-op.
+        let queued: Vec<_> = mgr.anchor_gc.peek_upto(u64::MAX, usize::MAX).into_iter().map(|(_, _, b)| b).collect();
+        assert!(queued.contains(&sib_a) && queued.contains(&sib_b), "the new pairs are queued for GC");
     }
 
     /// Re-applying a block after a reorg must not duplicate it: the producers list is a set, and
@@ -2842,8 +2919,7 @@ mod tests {
         db.write(cb).unwrap();
 
         // The global set is empty and the pruning point's snapshots are gone (the
-        // root reads back as the empty-state root). The anchor→block index is
-        // intentionally retained (append-only; canonicality is re-checked at query).
+        // root reads back as the empty-state root).
         assert_eq!(mgr.nullifiers().count(), 0, "the whole global nullifier set must be deleted");
         assert!(!mgr.nullifiers().contains(&nf(1)).unwrap() && !mgr.nullifiers().contains(&nf(2)).unwrap());
         assert_eq!(mgr.state_root_at(pp).unwrap(), PruningPointShieldedMetadata::empty_state_root(), "pp snapshots cleared");

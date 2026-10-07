@@ -239,6 +239,9 @@ pub struct VirtualStateProcessor {
     /// captured view. Keyed by pruning-point hash; the PP-time set is immutable per
     /// pruning point, so the cached value never goes stale.
     pub(super) pp_nullifier_export_cache: Mutex<Option<(Hash, Arc<Vec<[u8; 32]>>)>>,
+    /// The serialized shielded export of the last pruning point served. Immutable per pruning point,
+    /// and rebuilding it walks the anchor indexes, so every syncing peer re-paid that walk.
+    pp_export_metadata_cache: Mutex<Option<(Hash, kaspa_consensus_core::api::ShieldedExportMetadata)>>,
 
     // zkas: when true, the coinbase reward enters the shielded pool as
     // coinbase notes (no transparent outputs) — see `build_coinbase_mint`.
@@ -357,6 +360,7 @@ impl VirtualStateProcessor {
             smt_metadata_store: storage.smt_metadata_store.clone(),
             shielded_state_manager,
             pp_nullifier_export_cache: Mutex::new(None),
+            pp_export_metadata_cache: Mutex::new(None),
             _mining_rules: mining_rules,
             finality_depth: params.finality_depth(),
             shielded_anchor_depth: params.shielded_anchor_depth(),
@@ -426,6 +430,11 @@ impl VirtualStateProcessor {
         &self,
         pp: kaspa_hashes::Hash,
     ) -> Result<Option<kaspa_consensus_core::api::ShieldedExportMetadata>, kaspa_database::prelude::StoreError> {
+        if let Some((cached_pp, md)) = self.pp_export_metadata_cache.lock().as_ref() {
+            if *cached_pp == pp {
+                return Ok(Some(md.clone()));
+            }
+        }
         let Some(mut md) = self.shielded_state_manager.export_pruning_point_shielded(pp)? else {
             return Ok(None);
         };
@@ -436,7 +445,10 @@ impl VirtualStateProcessor {
         // `pp` over exactly the consensus window; stop early if the chain index does not reach that
         // far (a node that itself fast-synced), since anything we cannot resolve we simply do not
         // claim — the receiver is no worse off than today.
-        let window = self.max_shielded_anchor_age;
+        // A post-fork pruning point sends its anchor log instead: a syncing node seeds no peer pairs for
+        // it (`seed_pruning_point_shielded`), so building them would be two index scans per request for
+        // bytes the receiver discards.
+        let window = if self.is_post_security_fork(pp)? { 0 } else { self.max_shielded_anchor_age };
         let window_blocks: BlockHashSet = {
             let sc_read = self.selected_chain_store.read();
             match sc_read.get_by_hash(pp).optional()? {
@@ -484,7 +496,16 @@ impl VirtualStateProcessor {
             md.window_prefix = prefix;
         }
         let nullifier_count = self.pruning_point_nullifier_set(pp)?.len() as u64;
-        Ok(Some(kaspa_consensus_core::api::ShieldedExportMetadata { data: md.to_wire_bytes(), nullifier_count }))
+        let export = kaspa_consensus_core::api::ShieldedExportMetadata { data: md.to_wire_bytes(), nullifier_count };
+        // Only a complete post-fork export is kept: one missing its anchor log (a node that does not hold
+        // the whole stretch yet) is rebuilt on the next request rather than served for hours. Pre-fork
+        // exports are never kept: their pair list is as long as this node's chain index reaches, which
+        // grows while its own history backfill runs.
+        let complete = self.is_post_security_fork(pp)? && !md.window_entries.is_empty();
+        if complete {
+            *self.pp_export_metadata_cache.lock() = Some((pp, export.clone()));
+        }
+        Ok(Some(export))
     }
 
     /// Server side: the spent-nullifier set **as of the pruning point** (for shielded
@@ -633,7 +654,8 @@ impl VirtualStateProcessor {
             return Err("pruning-point anchor window does not end at the pruning point".to_string());
         }
         // Coverage: the entries must reach the oldest source a spend above `pp` may use, unless the log
-        // itself starts above it (the transition, where older anchors still come from the peer).
+        // itself starts above it (the transition: no anchor older than the log's first entry is usable
+        // after the fork, see `resolve_shielded_anchor`).
         let pp_blue = self.headers_store.get_blue_score(pp).map_err(|e| format!("pruning point header {pp}: {e}"))?;
         let oldest_usable = pp_blue.saturating_sub(self.max_shielded_anchor_age);
         let first_bs = md.window_entries.first().map_or(u64::MAX, |e| e.blue_score);
@@ -678,8 +700,8 @@ impl VirtualStateProcessor {
         let n = ShieldedStateManager::verify_pruning_point_shielded(&md, nullifiers.iter())?;
         self.retain_provable_window_anchors(pp, &mut md)?;
         // Post-fork: the replayed log entries are proven, so they are authoritative for the blocks
-        // they cover. Add them as (root -> block) pairs with their committed blue scores; peer pairs
-        // remain only for blocks older than the first logged entry (the transition).
+        // they cover, and the only anchor state a post-fork pruning point keeps. Add them as
+        // (root -> block) pairs with their committed blue scores.
         let proven_entries = match &window {
             Some(_) => {
                 // Every entry is covered by the committed log (its count is committed, so nothing can be
@@ -694,13 +716,12 @@ impl VirtualStateProcessor {
                         (e, before)
                     })
                     .collect();
-                // The peer's own pairs are unproven: keep them only for blocks older than the first
-                // committed entry (the transition). For any block the window covers, its entry is the
-                // only source of truth, or a fake root paired with a real window block is seeded.
-                let first = entries.first().map_or(u64::MAX, |(e, _)| e.blue_score);
-                let older = |source: &kaspa_hashes::Hash| self.headers_store.get_blue_score(*source).is_ok_and(|bs| bs < first);
-                md.in_window_anchors.retain(|(_, source)| older(source));
-                md.in_window_anchor_source_scores.retain(|(source, _)| older(source));
+                // The peer's own pairs are unproven, and nothing above a post-fork pruning point reads
+                // them: every block validated after this import is post-fork, and a post-fork spend is
+                // judged by its named block's log entry only (`resolve_shielded_anchor`). So none are
+                // seeded; the committed entries below are the whole anchor state.
+                md.in_window_anchors.clear();
+                md.in_window_anchor_source_scores.clear();
                 entries
             }
             None => Vec::new(),
@@ -865,7 +886,10 @@ impl VirtualStateProcessor {
         let Some(scan) = self.shielded_state_manager.scan_block(block).map_err(|e| format!("scan archive for {block}: {e}"))? else {
             // No shielded effects recorded (or a shielded-inactive block): return an
             // empty record, reading blue/daa/timestamp from the retained header.
-            let blue_score = self.ghostdag_store.get_blue_score(block).unwrap_or(0);
+            // The header's blue score, not ghostdag's: ghostdag is pruned below the pruning point while
+            // the header of a past pruning point is kept, and `unwrap_or(0)` then served blue score 0,
+            // which a wallet keys its anchor ring by and a history backfill refuses as out of order.
+            let blue_score = self.headers_store.get_blue_score(block).map_err(|e| format!("blue score for {block}: {e}"))?;
             let daa_score = self.headers_store.get_daa_score(block).map_err(|e| format!("daa score for {block}: {e}"))?;
             let timestamp = self.headers_store.get_timestamp(block).map_err(|e| format!("timestamp for {block}: {e}"))?;
             return Ok(kaspa_consensus_core::api::ShieldedChainBlockData {
@@ -1079,10 +1103,26 @@ impl VirtualStateProcessor {
     /// Validation calls [`Self::resolve_shielded_anchor`] directly so it can record the
     /// reasoning; this bool-only spelling is kept because the finality tests read far better
     /// against it.
+    /// Test helper: write a staged batch to this node's database.
+    #[cfg(test)]
+    pub(super) fn write_batch_for_test(&self, batch: WriteBatch) {
+        self.db.write(batch).unwrap();
+    }
+
+    /// Test helper: replace `block`'s scan record, as a backfilling peer could have written it.
+    #[cfg(test)]
+    pub(super) fn overwrite_scan_record_for_test(&self, block: Hash, data: crate::model::stores::shielded::ShieldedScanBlockData) {
+        let mut batch = WriteBatch::default();
+        self.shielded_state_manager.persist_backfilled_scan(&mut batch, block, data).unwrap();
+        self.db.write(batch).unwrap();
+    }
+
     /// Test helper: drop `block`'s per-block shielded snapshots as pruning does, so the node holds no
     /// frontier for it, as a fast-synced node holds none below its pruning point.
     #[cfg(test)]
     pub(super) fn prune_shielded_snapshots_for_test(&self, block: Hash, drop_window_entry: bool) {
+        // The state an export reads changes here, which in production never happens under one pruning point.
+        *self.pp_export_metadata_cache.lock() = None;
         let mut batch = WriteBatch::default();
         self.shielded_state_manager.prune_block_snapshots(&mut batch, block, false, None).unwrap();
         if drop_window_entry {
@@ -1112,44 +1152,45 @@ impl VirtualStateProcessor {
         if *anchor == self.empty_shielded_anchor {
             return AnchorVerdict { is_final: true, ..Default::default() };
         }
-        // Security fork: the spend names the block that produced its anchor (presence is enforced
-        // by the transaction validator from the activation score). Judge exactly that block: it
-        // must have produced this root, and be a matured selected-chain ancestor in the window.
-        // No search over an index of producers, so orphans, identical sibling roots and
-        // peer-seeded rows for OTHER blocks cannot influence the verdict.
-        if let Some(named) = anchor_block {
-            let named = kaspa_hashes::Hash::from_bytes(named);
-            let produced = match self
-                .shielded_state_manager
-                .own_anchor_of(named)
-                .expect("shielded tree store read failed; refusing to treat an IO error as an unknown anchor")
-            {
-                Some(root) => root == *anchor,
-                // Below this node's pruning point (fast sync). A post-fork block is vouched for only
-                // by its proven window entry; the producer index can hold peer-seeded pairs and is
-                // consulted only for a pre-fork block, which no window covers.
-                None => match self
-                    .shielded_state_manager
-                    .window_entry(named)
-                    .expect("anchor window store read failed; refusing to treat an IO error as an unknown anchor")
-                {
-                    Some(entry) => entry.root == *anchor,
-                    None if matches!(self.is_post_security_fork(named), Ok(false)) => self
-                        .shielded_state_manager
-                        .anchor_producer_blocks(anchor)
-                        .expect("anchor producer store read failed; refusing to treat an IO error as an unknown anchor")
-                        .contains(&named),
-                    None => false,
-                },
-            };
-            if !produced {
+        // Security fork, judged at the chain block that applies the spend: a spend there must name the
+        // block that produced its anchor, and that block must be a post-fork chain block. It is judged by
+        // its anchor-log entry alone, the only per-block record covered by `zkas_state_root1`: a node
+        // writes the entry when it validates the block, and a fast-synced node holds exactly the
+        // entries it replayed against the committed log. So no post-fork verdict reads the producer
+        // indexes, which a fast-synced node fills with peer pairs nothing proves (ZK-01). An unnamed
+        // spend (carried by a pre-fork block merged after the fork) or one naming a pre-fork block is
+        // dropped, not disqualifying: its fee is deducted and the wallet re-sends against a post-fork
+        // anchor. The price is one maturity span right after the fork with no anchor mature enough.
+        if self.security_fork_activation.is_active(block_daa_score) {
+            let Some(named) = anchor_block else {
                 return AnchorVerdict {
+                    reject_reason: Some("after the security fork a spend must name a post-fork anchor block"),
+                    ..Default::default()
+                };
+            };
+            let named = kaspa_hashes::Hash::from_bytes(named);
+            let entry = self
+                .shielded_state_manager
+                .window_entry(named)
+                .expect("anchor log store read failed; refusing to treat an IO error as an unknown anchor");
+            return match entry {
+                Some(entry) if entry.root == *anchor => self.judge_anchor_source(named, selected_parent, block_blue_score),
+                Some(_) => AnchorVerdict {
                     source: Some(named),
                     reject_reason: Some("named anchor block did not produce this anchor"),
                     ..Default::default()
-                };
-            }
-            return self.judge_anchor_source(named, selected_parent, block_blue_score);
+                },
+                None => AnchorVerdict {
+                    source: Some(named),
+                    reject_reason: Some("named anchor block is not a post-fork chain block in the anchor log"),
+                    ..Default::default()
+                },
+            };
+        }
+        // Before the fork the format has no named block (the transaction validator refuses the field and
+        // the parser does not read it); refuse one anyway rather than resolve it by the old rules.
+        if anchor_block.is_some() {
+            return AnchorVerdict { reject_reason: Some("anchor block field is not valid before the security fork"), ..Default::default() };
         }
         // Post-activation: consider EVERY block that produced this root, not just the last one
         // written to the single-valued index. An orphan can no longer destroy the canonical
