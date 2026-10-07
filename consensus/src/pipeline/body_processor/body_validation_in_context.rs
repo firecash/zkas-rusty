@@ -100,9 +100,10 @@ impl BlockBodyProcessor {
                     ));
                 }
 
-                // Security fork: our own coinbase may not commit to another block for merge mining.
-                // Same scanner the aux-parent check uses, so the two rules cannot drift apart.
-                if self.security_fork_activation.is_active(block.header.daa_score)
+                // Security fork: our own coinbase may not commit to another block for merge mining,
+                // from `2 * finality_depth` before the fork (see the activation's doc). Same scanner the
+                // aux-parent check uses, so the two rules cannot drift apart.
+                if self.coinbase_commitment_ban_activation.is_active(block.header.daa_score)
                     && kaspa_consensus_core::auxpow::AuxPow::payload_carries_commitment(&block.transactions[0].payload)
                 {
                     return Err(RuleError::CoinbaseCarriesMergeMiningCommitment);

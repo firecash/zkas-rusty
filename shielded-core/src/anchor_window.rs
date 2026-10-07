@@ -84,6 +84,22 @@ impl AnchorWindow {
         Ok(w)
     }
 
+    /// [`Self::from_entries`] for a peer-supplied list whose every entry the caller will treat as
+    /// proven by the window's commitment. Folding drops the buckets below the final floor, so an
+    /// entry there would pass any comparison of the commitment without being covered by it; such a
+    /// list is refused, as is one whose consecutive entries are not selected parent and child.
+    pub fn from_entries_exact(entries: &[WindowEntry], keep: u64) -> Result<Self, &'static str> {
+        let w = Self::from_entries(entries.iter(), keep)?;
+        let floor = w.floor_bucket().unwrap_or(0);
+        if entries.first().is_some_and(|e| e.blue_score / BUCKET_SPAN < floor) {
+            return Err("anchor window carries entries below its oldest retained bucket");
+        }
+        if entries.windows(2).any(|p| p[1].parent != p[0].block) {
+            return Err("anchor window entries are not a selected-parent chain");
+        }
+        Ok(w)
+    }
+
     /// The lowest bucket index still retained, i.e. the floor from which a serving node must send
     /// entries for a syncing node to reproduce this window.
     pub fn floor_bucket(&self) -> Option<u64> {
@@ -195,6 +211,43 @@ mod tests {
             t.insert(i + 1, WindowEntry { root: [0xee; 32], ..tail[i] });
             assert!(AnchorWindow::from_entries(t.iter(), keep).is_err(), "case {case}: equal score in a peer list refused");
         }
+    }
+
+    /// Folding drops buckets below the final floor, so entries a peer PREPENDS there leave the
+    /// commitment unchanged. The plain rebuild cannot see them; the exact one, whose entries the
+    /// import seeds as proven, must refuse them, and must refuse a list that is not one chain.
+    #[test]
+    fn exact_rebuild_refuses_entries_below_the_floor_and_broken_links() {
+        let keep = 2;
+        let mut entries: Vec<WindowEntry> = Vec::new();
+        let mut w = AnchorWindow::default();
+        for i in 0..800u64 {
+            let mut b = [0u8; 32];
+            b[..8].copy_from_slice(&(i + 1).to_le_bytes());
+            let parent = entries.last().map(|p| p.block).unwrap_or([0u8; 32]);
+            let en = WindowEntry { block: b, parent, root: [(i % 251) as u8; 32], blue_score: 2_000 + i * 7 };
+            w = w.append(&en, keep).unwrap();
+            entries.push(en);
+        }
+        let floor = w.floor_bucket().unwrap();
+        let tail: Vec<WindowEntry> = entries.iter().copied().filter(|e| e.blue_score / BUCKET_SPAN >= floor).collect();
+        assert_eq!(AnchorWindow::from_entries_exact(&tail, keep).unwrap(), w, "the honest tail is accepted");
+
+        // Linked to the first honest entry (it claims to be that entry's parent), so only the floor
+        // rule can refuse it.
+        let forged = WindowEntry { block: tail[0].parent, parent: [0xAA; 32], root: [0xEE; 32], blue_score: 5 };
+        let mut prepended = vec![forged];
+        prepended.extend_from_slice(&tail);
+        assert_eq!(
+            AnchorWindow::from_entries(prepended.iter(), keep).unwrap().commitment(),
+            w.commitment(),
+            "the hole: a prepended entry below the floor does not move the commitment"
+        );
+        assert!(AnchorWindow::from_entries_exact(&prepended, keep).is_err(), "so the exact rebuild refuses it");
+
+        let mut relinked = tail.clone();
+        relinked[10].parent = [0x55; 32];
+        assert!(AnchorWindow::from_entries_exact(&relinked, keep).is_err(), "a broken parent link is refused");
     }
 
     #[test]

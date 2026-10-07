@@ -1753,6 +1753,151 @@ async fn security_fork_chain_commits_v1_roots_and_the_window_rebinds() {
     assert!(vp.verify_import_binding_versioned(pp, &tampered, committed).is_err(), "a different dev accrual is refused");
 }
 
+/// Round-2 audit, pre-fork k + 2 stall. Two 18-block chains and one extra block, all forked from
+/// the same block: from one chain's tip, the other chain's 18 blocks are all blue (each has exactly
+/// k = 18 blues in its anticone) and the extra block is red. The coinbase every node must build for
+/// that virtual has 19 blue rewards, the red reward and the dev note: k + 3 = 21 outputs, over the
+/// pre-fork cap of k + 2, so every template was invalid and the chain could not advance. The
+/// virtual now merges fewer tips, so the next template is valid, and the tips left out are merged
+/// by the blocks after it.
+#[tokio::test]
+async fn pre_fork_virtual_never_builds_an_unmineable_coinbase() {
+    let mut params = MAINNET_PARAMS.clone();
+    params.shielded_coinbase = true;
+    assert!(params.dev_fee_recipient.is_some() && !params.security_fork_activation.is_active(1_000));
+    let config = ConfigBuilder::new(params)
+        .edit_consensus_params(|p| {
+            p.genesis.bits = 0x207fffff;
+            p.blockrate.shielded_anchor_depth = 1;
+        })
+        .build();
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+    let miner_addr = kaspa_shielded_core::wallet::address_bytes_from_seed([7u8; 32]).expect("orchard address");
+    ctx.miner_data = MinerData::new(ScriptPublicKey::new(0, ScriptVec::from_slice(&miner_addr)), vec![]);
+    let base = ctx.mine_real_pow_block();
+    let base_hash = base.header.hash;
+    ctx.consensus.validate_and_insert_block(base).virtual_state_task.await.unwrap();
+    let k = config.params.ghostdag_k() as usize;
+    for _ in 0..2 {
+        let mut tip = base_hash;
+        for _ in 0..k {
+            let b = ctx.mine_real_pow_block_on(vec![tip], vec![]);
+            tip = b.header.hash;
+            ctx.consensus.validate_and_insert_block(b).virtual_state_task.await.expect("a branch block is valid");
+        }
+    }
+    let extra = ctx.mine_real_pow_block_on(vec![base_hash], vec![]);
+    ctx.consensus.validate_and_insert_block(extra).virtual_state_task.await.expect("the extra block is valid");
+    assert_eq!(ctx.consensus.get_tips().len(), 3);
+    for i in 0..4 {
+        let b = ctx.mine_real_pow_block();
+        let outputs = b.transactions[0].outputs.len();
+        assert!(outputs <= k + 2, "block {i}: the template's coinbase has {outputs} outputs, over the pre-fork cap");
+        ctx.consensus.validate_and_insert_block(b).virtual_state_task.await.expect("the template block is valid");
+    }
+    assert_eq!(ctx.consensus.get_tips().len(), 1, "every tip is merged within a few blocks");
+}
+
+/// Round-2 audit: a history-backfill chunk may not place a block this node already indexes at a
+/// different index (it re-pointed a validated block's `index_by_hash`, and a later purge deleted
+/// that block's own scan record), nor repeat a block. An honest re-send of an indexed block at its
+/// own index is still fine.
+#[tokio::test]
+async fn backfill_refuses_records_that_collide_with_the_chain_index() {
+    let mut params = MAINNET_PARAMS.clone();
+    params.shielded_coinbase = true;
+    let config = ConfigBuilder::new(params)
+        .edit_consensus_params(|p| {
+            p.genesis.bits = 0x207fffff;
+            p.blockrate.shielded_anchor_depth = 1;
+        })
+        .build();
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+    let miner_addr = kaspa_shielded_core::wallet::address_bytes_from_seed([7u8; 32]).expect("orchard address");
+    ctx.miner_data = MinerData::new(ScriptPublicKey::new(0, ScriptVec::from_slice(&miner_addr)), vec![]);
+    let mut chain = Vec::new();
+    for _ in 0..8 {
+        let b = ctx.mine_real_pow_block();
+        let h = b.header.hash;
+        ctx.consensus.validate_and_insert_block(b).virtual_state_task.await.unwrap();
+        chain.push(h);
+    }
+    // A linear chain: genesis is index 0, chain[i] is index i + 1.
+    let anchor = chain[5];
+    let anchor_index = 6u64;
+    let validated = ctx.consensus.get_shielded_chain_block_data(chain[7]).unwrap();
+    let err = ctx.consensus.backfill_shielded_history(anchor, anchor_index, &[(2, validated.clone())]);
+    assert!(err.is_err(), "a validated block may not be re-indexed below the anchor");
+    let below = ctx.consensus.get_shielded_chain_block_data(chain[2]).unwrap();
+    assert!(
+        ctx.consensus.backfill_shielded_history(anchor, anchor_index, &[(3, below.clone()), (2, below.clone())]).is_err(),
+        "a chunk repeating a block is refused"
+    );
+    ctx.consensus.backfill_shielded_history(anchor, anchor_index, &[(3, below)]).expect("a block at its own index is accepted");
+    // The validated tip block still resolves at its own index: nothing is above it.
+    let above_tip = ctx.consensus.get_shielded_chain_range(chain[7], 4).unwrap().expect("the tip is indexed");
+    assert!(above_tip.is_empty(), "the tip's index entry was not re-pointed below the anchor");
+}
+
+/// Round-2 audit: for a post-fork pruning point the window entries are the proof, so a peer pair
+/// naming a post-fork block (a fake root beside a real window block) must not be seeded, and a named
+/// anchor block this node holds no frontier for is judged by its proven window entry only. Also a
+/// score lie for a proven block and a broken entry chain.
+#[tokio::test]
+async fn post_fork_import_trusts_only_the_proven_window() {
+    let config = fork_config();
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+    let miner_addr = kaspa_shielded_core::wallet::address_bytes_from_seed([9u8; 32]).expect("orchard address");
+    ctx.miner_data = MinerData::new(ScriptPublicKey::new(0, ScriptVec::from_slice(&miner_addr)), vec![]);
+    let mut chain = Vec::new();
+    for _ in 0..10 {
+        let b = ctx.mine_real_pow_block();
+        let h = b.header.hash;
+        ctx.consensus.validate_and_insert_block(b).virtual_state_task.await.expect("every post-fork block validates");
+        chain.push(h);
+    }
+    let vp = ctx.consensus.virtual_processor();
+    let mgr = vp.shielded_state_manager_ref();
+    let blue_score = |h: Hash| ctx.consensus.get_header(h).unwrap().blue_score;
+    let (src, pp, tip) = (chain[2], chain[6], chain[9]);
+    let real_root = mgr.own_anchor_of(src).unwrap().expect("src has a frontier");
+    let fake_root = [0xEEu8; 32];
+    let committed = vp.shielded_state_root_at(pp).unwrap();
+
+    let wire = vp.export_pruning_point_shielded(pp).unwrap().expect("pp exports");
+    let mut md = crate::processes::shielded::PruningPointShieldedMetadata::from_wire_bytes(&wire.data).unwrap();
+    md.in_window_anchors.push((fake_root, src));
+    md.in_window_anchor_source_scores.retain(|(b, _)| *b != src);
+    md.in_window_anchor_source_scores.insert(0, (src, 1));
+    let wire = kaspa_consensus_core::api::ShieldedExportMetadata { data: md.to_wire_bytes(), nullifier_count: wire.nullifier_count };
+    let mut none = std::iter::empty::<Vec<[u8; 32]>>();
+    ctx.consensus.import_pruning_point_shielded(pp, wire, Some(committed), &mut none).expect("honest window imports");
+    assert!(!mgr.anchor_producer_blocks(&fake_root).unwrap().contains(&src), "a peer pair for a post-fork block is not seeded");
+    assert_eq!(mgr.attested_source_blue_score(src).unwrap(), Some(blue_score(src)), "a proven block's score comes from its entry");
+
+    // The node no longer holds src's frontier (as below a fast-synced node's pruning point).
+    vp.prune_shielded_snapshots_for_test(src, false);
+    assert_eq!(mgr.own_anchor_of(src).unwrap(), None);
+    let named = |root: [u8; 32], block: Hash| vp.resolve_shielded_anchor(&root, Some(block.as_bytes()), tip, blue_score(tip), u64::MAX);
+    assert!(named(real_root, src).is_final, "the proven entry vouches for the real root");
+    assert!(!named(fake_root, src).is_final, "and for nothing else");
+    assert!(!named(real_root, Hash::from_bytes([0x77; 32])).is_final, "an unknown named block is refused");
+    // A post-fork block with neither a frontier nor a window entry: the producer index (which this
+    // node wrote for its own block) must not vouch for it.
+    let src2 = chain[3];
+    let root2 = mgr.own_anchor_of(src2).unwrap().expect("src2 has a frontier");
+    assert!(mgr.anchor_producer_blocks(&root2).unwrap().contains(&src2), "precondition: the producer index names src2");
+    vp.prune_shielded_snapshots_for_test(src2, true);
+    assert!(!named(root2, src2).is_final, "without its proven entry a post-fork block vouches for nothing");
+
+    // A short chain has only bucket 0, so nothing can sit below its floor; that rule is unit-tested in
+    // anchor_window. The chain-link rule is checked here.
+    let wire = vp.export_pruning_point_shielded(pp).unwrap().expect("pp exports");
+    let mut md = crate::processes::shielded::PruningPointShieldedMetadata::from_wire_bytes(&wire.data).unwrap();
+    md.window_entries[1].parent = [0x55; 32];
+    assert!(vp.verify_import_binding_versioned(pp, &md, committed).is_err(), "a broken parent link is refused");
+}
+
 /// Before the security fork the v0 root does not cover the carried dev balance or the miner slot,
 /// so a lying peer could seed either at a pruning point. Where consensus fixes the value (no dev
 /// balance from the dev-fee end on; no slot before the fork) the import must refuse anything else,
@@ -1956,6 +2101,49 @@ async fn security_fork_rejects_a_coinbase_carrying_a_merge_mining_commitment() {
         let verdict = ctx.consensus.validate_and_insert_block(p).virtual_state_task.await;
         assert!(verdict.is_err(), "a post-fork ZKas coinbase carrying a merge-mining commitment must be rejected");
     }
+}
+
+/// Round-2 audit: the own-coinbase commitment ban starts `2 * finality_depth` before the fork. Starting
+/// at the fork let a pre-fork block A carry the bound commitment of a post-fork block B, be mined
+/// natively, and then serve as B's aux parent: one solution, two blocks. Before the lead a commitment
+/// is still accepted (the rule is unchanged for history); inside it, refused.
+#[tokio::test]
+async fn coinbase_commitment_ban_starts_two_finality_depths_before_the_fork() {
+    use kaspa_consensus_core::auxpow::AuxPow;
+    let mut params = MAINNET_PARAMS.clone();
+    params.shielded_coinbase = true;
+    params.security_fork_activation = ForkActivation::new(2 * params.finality_depth() + 4);
+    assert_eq!(params.coinbase_commitment_ban_activation().daa_score(), 4);
+    assert!(!ForkActivation::never().early_by(1).is_active(u64::MAX - 1), "never stays never");
+    let config = ConfigBuilder::new(params)
+        .edit_consensus_params(|p| {
+            p.genesis.bits = 0x207fffff;
+            p.blockrate.shielded_anchor_depth = 1;
+        })
+        .build();
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+    let miner_addr = kaspa_shielded_core::wallet::address_bytes_from_seed([9u8; 32]).expect("orchard address");
+    let spk = ScriptPublicKey::new(0, ScriptVec::from_slice(&miner_addr));
+    let tagged = MinerData::new(spk.clone(), AuxPow::embed_commitment_v1(&[], Hash::from_u64_word(7), &[]));
+    let mut accepted_before = false;
+    let mut refused_inside = false;
+    for _ in 0..8 {
+        ctx.miner_data = tagged.clone();
+        let p = ctx.mine_real_pow_block();
+        let daa = p.header.daa_score;
+        let verdict = ctx.consensus.validate_and_insert_block(p).virtual_state_task.await;
+        if daa < 4 {
+            assert!(verdict.is_ok(), "before the lead a commitment is accepted as it always was (daa {daa})");
+            accepted_before = true;
+            continue;
+        }
+        assert!(verdict.is_err(), "inside the lead a ZKas coinbase carrying a commitment is refused (daa {daa})");
+        refused_inside = true;
+        ctx.miner_data = MinerData::new(spk.clone(), vec![]);
+        let b = ctx.mine_real_pow_block();
+        ctx.consensus.validate_and_insert_block(b).virtual_state_task.await.expect("an untagged block is fine");
+    }
+    assert!(accepted_before && refused_inside);
 }
 
 /// Security fork, end to end with a REAL proven spend: after the activation a spend must name its

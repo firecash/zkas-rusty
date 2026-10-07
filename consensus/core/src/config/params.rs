@@ -699,6 +699,17 @@ impl Params {
         self.blockrate.finality_depth
     }
 
+    /// From which DAA score a ZKas coinbase may carry no merge-mining commitment: `2 * finality_depth`
+    /// before the security fork. Starting at the fork itself left a gap: a pre-fork block A could carry
+    /// the bound commitment of a post-fork block B and be mined natively, and B then used A as its aux
+    /// parent, so one solution paid both. With the lead, an A that may still carry the commitment sits
+    /// more than `2 * finality_depth` DAA below every post-fork block. A post-fork chain block can merge
+    /// only blocks in the future of its finality point (`finality_depth` blue score back), which lies
+    /// fewer than `2 * finality_depth` DAA below it unless half the blocks in that span were red.
+    pub fn coinbase_commitment_ban_activation(&self) -> ForkActivation {
+        self.security_fork_activation.early_by(2 * self.finality_depth())
+    }
+
     /// Shielded-spend anchor maturity in blue-score units (PLAN §2.5): how deep a
     /// mined shielded note must be before it can be spent (~10 min at 10 BPS).
     pub fn shielded_anchor_depth(&self) -> u64 {

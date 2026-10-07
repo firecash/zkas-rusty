@@ -136,6 +136,12 @@ pub struct VirtualStateProcessor {
     pub(super) genesis: GenesisBlock,
     pub(super) max_block_parents: u8,
     pub(super) mergeset_size_limit: u64,
+    /// Pre-fork coinbase output cap (`k + 2`, enforced in body validation) and the outputs a coinbase
+    /// may add beyond one per rewarded blue: the merged reds' reward, and the dev note while one can
+    /// still be paid. See `pick_virtual_parents`.
+    pre_fork_coinbase_outputs_limit: u64,
+    pre_fork_coinbase_extra_outputs: u64,
+    dev_fee_end_for_cap: ForkActivation,
     pub(super) finality_depth: u64,
     /// Shielded-spend anchor maturity (PLAN §2.5): a shielded spend must prove its
     /// input note into the anchor as of the chain block this many blue-score units
@@ -297,6 +303,9 @@ impl VirtualStateProcessor {
             genesis: params.genesis.clone(),
             max_block_parents: params.max_block_parents(),
             mergeset_size_limit: params.mergeset_size_limit(),
+            pre_fork_coinbase_outputs_limit: params.ghostdag_k() as u64 + 2,
+            pre_fork_coinbase_extra_outputs: 1 + params.dev_fee_recipient.is_some() as u64,
+            dev_fee_end_for_cap: params.dev_fee_end_activation,
             mempool_mass_cofactors: params.mempool_block_mass_cofactors(),
             block_version: params.block_version(),
 
@@ -371,6 +380,20 @@ impl VirtualStateProcessor {
         block: kaspa_hashes::Hash,
     ) -> Result<kaspa_shielded_core::tree::FrontierState, kaspa_database::prelude::StoreError> {
         self.shielded_state_manager.frontier_at(block)
+    }
+
+    /// The frontier this node retains for `block`: the stored row, or the empty tree only where a
+    /// missing row really means empty (genesis, or a network whose coinbase mints no notes, where a
+    /// block before the first shielded transaction writes none). `None` = not retained (pruned).
+    pub fn shielded_frontier_retained(
+        &self,
+        block: kaspa_hashes::Hash,
+    ) -> Result<Option<kaspa_shielded_core::tree::FrontierState>, kaspa_database::prelude::StoreError> {
+        match self.shielded_state_manager.frontier_present(block)? {
+            Some(fs) => Ok(Some(fs)),
+            None if block == self.genesis.hash || !self.shielded_coinbase => Ok(Some(Default::default())),
+            None => Ok(None),
+        }
     }
 
     /// The turnstile cumulative totals (PLAN §2.6) as of a given chain block.
@@ -604,11 +627,16 @@ impl VirtualStateProcessor {
         }
         // A window holds at most one entry per chain block across its buckets; refuse anything larger
         // before spending any hashing on it (the root comparison would refuse it anyway, later).
-        let max_entries = (self.anchor_window_keep() + 2).saturating_mul(kaspa_shielded_core::anchor_window::BUCKET_SPAN) as usize;
+        // The retained buckets span `keep + 1` bucket indexes, each holding at most one entry per unit
+        // of blue score.
+        use kaspa_shielded_core::anchor_window::BUCKET_SPAN;
+        let max_entries = (self.anchor_window_keep() + 1).saturating_mul(BUCKET_SPAN) as usize;
         if md.window_entries.len() > max_entries {
             return Err(format!("pruning-point anchor window has {} entries, more than a window can hold ({max_entries})", md.window_entries.len()));
         }
-        let window = kaspa_shielded_core::anchor_window::AnchorWindow::from_entries(md.window_entries.iter(), self.anchor_window_keep())
+        // Exact: every entry must lie in a retained bucket and the entries must be one selected-parent
+        // chain, because the caller seeds each of them as proven (see `from_entries_exact`).
+        let window = kaspa_shielded_core::anchor_window::AnchorWindow::from_entries_exact(&md.window_entries, self.anchor_window_keep())
             .map_err(|e| format!("pruning-point anchor window: {e}"))?;
         if md.window_entries.last().map(|e| e.block) != Some(pp.as_bytes()) {
             return Err("pruning-point anchor window does not end at the pruning point".to_string());
@@ -651,15 +679,25 @@ impl VirtualStateProcessor {
         let n = ShieldedStateManager::verify_pruning_point_shielded(&md, nullifiers.iter())?;
         self.retain_provable_window_anchors(pp, &mut md)?;
         // Post-fork: the re-folded entries are proven, so they are authoritative for the blocks they
-        // cover. Add them as (root -> block) pairs with their committed blue scores; the filtered
-        // peer pairs above remain only for pre-fork window blocks.
+        // cover. Peer pairs are kept only for pre-fork sources (the window does not reach them): a
+        // peer pair naming a post-fork block is unproven, and a fake root paired with a real window
+        // block would otherwise resolve as that block's anchor on this node alone. Scores for proven
+        // blocks come from the proven entry, never from whichever row came first.
         let proven_entries = if window.is_some() { std::mem::take(&mut md.window_entries) } else { Vec::new() };
-        for e in &proven_entries {
-            let block = kaspa_hashes::Hash::from_bytes(e.block);
-            md.in_window_anchors.push((e.root, block));
-            if !md.in_window_anchor_source_scores.iter().any(|(b, _)| *b == block) {
-                md.in_window_anchor_source_scores.push((block, e.blue_score));
+        if window.is_some() {
+            let before = md.in_window_anchors.len();
+            md.in_window_anchors.retain(|(_, source)| matches!(self.is_post_security_fork(*source), Ok(false)));
+            let dropped = before - md.in_window_anchors.len();
+            if dropped > 0 {
+                warn!("pruning-point import: dropped {dropped} peer anchor pairs for post-fork blocks (the proven window covers them)");
             }
+            let mut scores: kaspa_consensus_core::BlockHashMap<u64> = md.in_window_anchor_source_scores.drain(..).collect();
+            for e in &proven_entries {
+                let block = kaspa_hashes::Hash::from_bytes(e.block);
+                md.in_window_anchors.push((e.root, block));
+                scores.insert(block, e.blue_score);
+            }
+            md.in_window_anchor_source_scores = scores.into_iter().collect();
         }
         if n as u64 != metadata.nullifier_count {
             return Err(format!("nullifier count mismatch: metadata says {}, streamed {}", metadata.nullifier_count, n));
@@ -992,6 +1030,18 @@ impl VirtualStateProcessor {
     /// Validation calls [`Self::resolve_shielded_anchor`] directly so it can record the
     /// reasoning; this bool-only spelling is kept because the finality tests read far better
     /// against it.
+    /// Test helper: drop `block`'s per-block shielded snapshots as pruning does, so the node holds no
+    /// frontier for it, as a fast-synced node holds none below its pruning point.
+    #[cfg(test)]
+    pub(super) fn prune_shielded_snapshots_for_test(&self, block: Hash, drop_window_entry: bool) {
+        let mut batch = WriteBatch::default();
+        self.shielded_state_manager.prune_block_snapshots(&mut batch, block, false, None).unwrap();
+        if drop_window_entry {
+            self.shielded_state_manager.delete_window_entry_for_test(&mut batch, block).unwrap();
+        }
+        self.db.write(batch).unwrap();
+    }
+
     #[cfg(test)]
     pub(super) fn is_shielded_anchor_final(&self, anchor: &[u8; 32], selected_parent: Hash, block_blue_score: u64) -> bool {
         // Tests predate the activation; resolve with the pre-fork path (daa 0).
@@ -1026,13 +1076,22 @@ impl VirtualStateProcessor {
                 .expect("shielded tree store read failed; refusing to treat an IO error as an unknown anchor")
             {
                 Some(root) => root == *anchor,
-                // Below this node's pruning point (fast sync): only the import-verified window pairs
-                // can vouch for it.
-                None => self
+                // Below this node's pruning point (fast sync). A post-fork block is vouched for only
+                // by its proven window entry; the producer index can hold peer-seeded pairs and is
+                // consulted only for a pre-fork block, which no window covers.
+                None => match self
                     .shielded_state_manager
-                    .anchor_producer_blocks(anchor)
-                    .expect("anchor producer store read failed; refusing to treat an IO error as an unknown anchor")
-                    .contains(&named),
+                    .window_entry(named)
+                    .expect("anchor window store read failed; refusing to treat an IO error as an unknown anchor")
+                {
+                    Some(entry) => entry.root == *anchor,
+                    None if matches!(self.is_post_security_fork(named), Ok(false)) => self
+                        .shielded_state_manager
+                        .anchor_producer_blocks(anchor)
+                        .expect("anchor producer store read failed; refusing to treat an IO error as an unknown anchor")
+                        .contains(&named),
+                    None => false,
+                },
             };
             if !produced {
                 return AnchorVerdict {
@@ -2104,7 +2163,27 @@ impl VirtualStateProcessor {
         }
         assert!(mergeset_size <= mergeset_size_limit);
         assert!(virtual_parents.len() <= max_block_parents);
-        self.remove_bounded_merge_breaking_parents(virtual_parents, pruning_point)
+        let (mut virtual_parents, mut ghostdag_data) = self.remove_bounded_merge_breaking_parents(virtual_parents, pruning_point);
+        // Before the security fork a coinbase may hold at most `k + 2` outputs, yet the coinbase every
+        // node must build for a mergeset of `k + 1` rewarded blues plus a red reward plus the dev note
+        // has `k + 3`: that template is unmineable, and since every node derives it from the same
+        // virtual, the chain would halt until the tips change, which nobody could do. A miner releasing
+        // ~18 parallel blocks at a dev payout crossing could force exactly that. Choosing the virtual's
+        // parents is node policy, not consensus, so merge fewer tips instead (the rest are merged by the
+        // next blocks). Counted conservatively (any red, a dev note always possible); the selected
+        // parent alone always fits.
+        let sp_daa = self.headers_store.get_daa_score(selected_parent).unwrap_or(0);
+        if !self.security_fork_activation.is_active(sp_daa) {
+            // The dev note can be paid by any block before the end and by the first ended block (the
+            // final note); once the selected parent is past the end, it paid out and nothing is carried.
+            let dev = if self.dev_fee_end_for_cap.is_active(sp_daa) { 0 } else { self.pre_fork_coinbase_extra_outputs - 1 };
+            let outputs = |gd: &GhostdagData| gd.mergeset_blues.len() as u64 + (!gd.mergeset_reds.is_empty()) as u64 + dev;
+            while virtual_parents.len() > 1 && outputs(&ghostdag_data) > self.pre_fork_coinbase_outputs_limit {
+                virtual_parents.pop();
+                ghostdag_data = self.ghostdag_manager.ghostdag(&virtual_parents);
+            }
+        }
+        (virtual_parents, ghostdag_data)
     }
 
     fn mergeset_increase(&self, selected_parents: &[Hash], candidate: Hash, budget: u64) -> MergesetIncreaseResult {
