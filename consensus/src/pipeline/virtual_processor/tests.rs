@@ -1866,6 +1866,7 @@ async fn post_fork_import_trusts_only_the_proven_window() {
 
     let wire = vp.export_pruning_point_shielded(pp).unwrap().expect("pp exports");
     let mut md = crate::processes::shielded::PruningPointShieldedMetadata::from_wire_bytes(&wire.data).unwrap();
+    let honest = md.clone();
     md.in_window_anchors.push((fake_root, src));
     md.in_window_anchor_source_scores.retain(|(b, _)| *b != src);
     md.in_window_anchor_source_scores.insert(0, (src, 1));
@@ -1890,10 +1891,16 @@ async fn post_fork_import_trusts_only_the_proven_window() {
     vp.prune_shielded_snapshots_for_test(src2, true);
     assert!(!named(root2, src2).is_final, "without its proven entry a post-fork block vouches for nothing");
 
-    // A short chain has only bucket 0, so nothing can sit below its floor; that rule is unit-tested in
-    // anchor_window. The chain-link rule is checked here.
+    // A node missing an entry it would have to serve sends no log at all, rather than a short one.
     let wire = vp.export_pruning_point_shielded(pp).unwrap().expect("pp exports");
-    let mut md = crate::processes::shielded::PruningPointShieldedMetadata::from_wire_bytes(&wire.data).unwrap();
+    let md = crate::processes::shielded::PruningPointShieldedMetadata::from_wire_bytes(&wire.data).unwrap();
+    assert!(md.window_entries.is_empty(), "an export with a hole in its log is not served");
+    assert!(vp.verify_import_binding_versioned(pp, &md, committed).is_err(), "and an empty log does not bind");
+
+    // Entries slipped in below the window are refused structurally (the log commits its count), which
+    // is unit-tested in anchor_window. The chain-link rule is checked here, on the honest export.
+    let mut md = honest;
+    vp.verify_import_binding_versioned(pp, &md, committed).expect("the honest export binds");
     md.window_entries[1].parent = [0x55; 32];
     assert!(vp.verify_import_binding_versioned(pp, &md, committed).is_err(), "a broken parent link is refused");
 }
@@ -2299,3 +2306,863 @@ async fn named_anchor_block_is_refused_before_the_fork() {
         "a named anchor block before the fork invalidates its block: {verdict:?}"
     );
 }
+
+/// Regression (audit of 709b995): after the security fork, a sync peer must not be able to pair a
+/// FAKE root with a REAL window block. The window entries are proven, but the peer's own `in_window_anchors` survive
+/// `retain_provable_window_anchors` whenever the block is a real chain ancestor in range, and are
+/// seeded into the same producer index the named-anchor rule reads for blocks below the pruning point.
+#[tokio::test]
+async fn post_fork_import_refuses_a_peer_pair_with_a_fake_root_for_a_window_block() {
+    use crate::model::stores::headers::HeaderStoreReader;
+    use crate::processes::shielded::PruningPointShieldedMetadata;
+    let config = fork_config();
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+    let miner_addr = kaspa_shielded_core::wallet::address_bytes_from_seed([9u8; 32]).expect("orchard address");
+    ctx.miner_data = MinerData::new(ScriptPublicKey::new(0, ScriptVec::from_slice(&miner_addr)), vec![]);
+    let mut chain = vec![config.genesis.hash];
+    for _ in 0..12 {
+        let b = ctx.mine_real_pow_block();
+        let h = b.header.hash;
+        ctx.consensus.validate_and_insert_block(b).virtual_state_task.await.expect("post-fork block validates");
+        chain.push(h);
+    }
+    let vp = ctx.consensus.virtual_processor();
+    let pp = chain[9];
+    let committed = vp.shielded_state_root_at(pp).unwrap();
+    let honest = vp.export_pruning_point_shielded(pp).unwrap().expect("pp exports");
+    let nullifiers = vp.collect_pruning_point_nullifiers(pp).unwrap().to_vec();
+
+    let real_block = chain[6];
+    let real_root = vp.shielded_state_manager_ref().own_anchor_of(real_block).unwrap().expect("server has the root");
+    let fake_root = [0xAB; 32];
+    assert_ne!(real_root, fake_root);
+    let mut md = PruningPointShieldedMetadata::from_wire_bytes(&honest.data).unwrap();
+    assert!(md.window_entries.iter().any(|e| e.block == real_block.as_bytes()), "the window covers the real block");
+    md.in_window_anchors.push((fake_root, real_block));
+
+    // A fresh node that holds only headers, as during fast sync.
+    let node = TestConsensus::new(&config);
+    let wait = node.init();
+    for &b in &chain[1..] {
+        let header = ctx.consensus.headers_store().get_header(b).unwrap();
+        node.validate_and_insert_block(kaspa_consensus_core::block::Block::from_header_arc(header)).virtual_state_task.await.unwrap();
+    }
+    let wire = kaspa_consensus_core::api::ShieldedExportMetadata { data: md.to_wire_bytes(), nullifier_count: honest.nullifier_count };
+    let mut batches = std::iter::once(nullifiers);
+    let result = node.consensus_clone().import_pruning_point_shielded(pp, wire, Some(committed), &mut batches);
+    eprintln!("import with a fake (root, real window block) pair: {result:?}");
+    assert!(result.is_ok(), "the honest parts of the import still apply: {result:?}");
+
+    let nvp = node.virtual_processor();
+    let producers = nvp.shielded_state_manager_ref().anchor_producer_blocks(&fake_root).unwrap();
+    eprintln!("producers of the fake root on the synced node: {producers:?}");
+    let tip = chain[12];
+    let tip_blue = node.headers_store().get_blue_score(tip).unwrap();
+    let tip_daa = node.headers_store().get_daa_score(tip).unwrap();
+    let verdict = nvp.resolve_shielded_anchor(&fake_root, Some(real_block.as_bytes()), tip, tip_blue + 1, tip_daa + 1);
+    eprintln!("verdict for a spend naming the real block with the FAKE root: {verdict:?}");
+    let honest_verdict = nvp.resolve_shielded_anchor(&real_root, Some(real_block.as_bytes()), tip, tip_blue + 1, tip_daa + 1);
+    eprintln!("verdict for the same block with its REAL root: {honest_verdict:?}");
+    assert!(producers.is_empty(), "a peer pair for a block the window covers must not be seeded");
+    assert!(!verdict.is_final, "a fake root for a real window block must be refused");
+    assert!(honest_verdict.is_final, "the committed root for the same block is still final");
+    node.shutdown(wait);
+}
+
+/// Regression 2 (audit of 709b995): under ZKrise's bucketed window, an entry a peer prepended below
+/// the oldest bucket never reached the commitment, yet was stored as proven. With the anchor log the
+/// prepended entry changes the committed count and breaks the parent links, so the binding itself
+/// refuses it, and a fake root for a REAL in-window block is never seeded.
+#[tokio::test]
+async fn post_fork_import_never_seeds_entries_below_the_window_floor() {
+    use crate::model::stores::headers::HeaderStoreReader;
+    use crate::processes::shielded::PruningPointShieldedMetadata;
+    use kaspa_shielded_core::anchor_window::WindowEntry;
+    const BUCKET_SPAN: u64 = 1_000; // a convenient unit of blue score for these chains
+    let mut params = MAINNET_PARAMS.clone();
+    params.shielded_coinbase = true;
+    params.security_fork_activation = ForkActivation::always();
+    let config = ConfigBuilder::new(params)
+        .edit_consensus_params(|p| {
+            p.genesis.bits = 0x207fffff;
+            p.blockrate.shielded_anchor_depth = 1;
+            p.blockrate.max_shielded_anchor_age = 1_500; // keep = 3 buckets below the newest
+        })
+        .build();
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+    let miner_addr = kaspa_shielded_core::wallet::address_bytes_from_seed([9u8; 32]).expect("orchard address");
+    ctx.miner_data = MinerData::new(ScriptPublicKey::new(0, ScriptVec::from_slice(&miner_addr)), vec![]);
+    let mut chain = vec![config.genesis.hash];
+    while ctx.consensus.headers_store().get_blue_score(*chain.last().unwrap()).unwrap() < 4 * BUCKET_SPAN + 300 {
+        let b = ctx.mine_real_pow_block();
+        let h = b.header.hash;
+        ctx.consensus.validate_and_insert_block(b).virtual_state_task.await.expect("post-fork block validates");
+        chain.push(h);
+    }
+    let vp = ctx.consensus.virtual_processor();
+    let hs = ctx.consensus.headers_store();
+    let pp = chain[chain.len() - 4];
+    let committed = vp.shielded_state_root_at(pp).unwrap();
+    let honest = vp.export_pruning_point_shielded(pp).unwrap().expect("pp exports");
+    let nullifiers = vp.collect_pruning_point_nullifiers(pp).unwrap().to_vec();
+    let mut md = PruningPointShieldedMetadata::from_wire_bytes(&honest.data).unwrap();
+    let first = md.window_entries[0];
+    let floor = first.blue_score / BUCKET_SPAN;
+    assert!(floor >= 1, "the window must have dropped at least one bucket, floor {floor}");
+
+    // A real block well inside the window and close enough to the tip to be a usable anchor.
+    let real_block = chain[chain.len() - 200];
+    let real_blue = hs.get_blue_score(real_block).unwrap();
+    assert!(real_blue / BUCKET_SPAN >= floor);
+    let fake_root = [0xCD; 32];
+    // Drop any peer pair for it so only the prepended entry can vouch for the fake root.
+    md.in_window_anchors.retain(|(r, _)| *r != fake_root);
+    md.window_entries.insert(0, WindowEntry { block: real_block.as_bytes(), parent: [0; 32], root: fake_root, blue_score: floor * BUCKET_SPAN - 1 });
+    // With the anchor log the entry count and the parent links are committed, so the binding itself
+    // refuses an entry prepended below the window.
+    assert!(vp.verify_import_binding_versioned(pp, &md, committed).is_err(), "a prepended entry must fail the binding");
+
+    let node = TestConsensus::new(&config);
+    let wait = node.init();
+    for &b in &chain[1..] {
+        let header = hs.get_header(b).unwrap();
+        node.validate_and_insert_block(kaspa_consensus_core::block::Block::from_header_arc(header)).virtual_state_task.await.unwrap();
+    }
+    let wire = kaspa_consensus_core::api::ShieldedExportMetadata { data: md.to_wire_bytes(), nullifier_count: honest.nullifier_count };
+    let mut batches = std::iter::once(nullifiers);
+    let result = node.consensus_clone().import_pruning_point_shielded(pp, wire, Some(committed), &mut batches);
+    eprintln!("import with a prepended below-window entry: {result:?}");
+    let nvp = node.virtual_processor();
+    eprintln!("producers of the fake root: {:?}", nvp.shielded_state_manager_ref().anchor_producer_blocks(&fake_root).unwrap());
+    let tip = *chain.last().unwrap();
+    let verdict = nvp.resolve_shielded_anchor(
+        &fake_root,
+        Some(real_block.as_bytes()),
+        tip,
+        hs.get_blue_score(tip).unwrap() + 1,
+        hs.get_daa_score(tip).unwrap() + 1,
+    );
+    eprintln!("verdict for the fake root via the prepended entry: {verdict:?}");
+    assert!(result.is_err(), "the import is refused outright: {result:?}");
+    assert!(!verdict.is_final, "a below-window entry must never vouch for a root");
+    node.shutdown(wait);
+}
+
+/// GUARD over the REAL post-fork import (`import_pruning_point_shielded`): after an honest import, each
+/// random lie (window entries changed, dropped, duplicated, swapped, prepended below the floor,
+/// appended past the pruning point; fake peer pairs; a different dev balance or miner slot; a wrong
+/// nullifier count; flipped wire bytes; no binding) is either refused leaving the node's state exactly
+/// as it was, or accepted leaving exactly the committed state. A fake root is never usable for any block.
+#[tokio::test]
+async fn guard_post_fork_real_import_is_exact_or_refused() {
+    use crate::model::stores::headers::HeaderStoreReader;
+    use crate::processes::shielded::PruningPointShieldedMetadata;
+    use kaspa_shielded_core::anchor_window::WindowEntry;
+    const BUCKET_SPAN: u64 = 1_000; // a convenient unit of blue score for these chains
+    let mut params = MAINNET_PARAMS.clone();
+    params.shielded_coinbase = true;
+    params.security_fork_activation = ForkActivation::always();
+    let config = ConfigBuilder::new(params)
+        .edit_consensus_params(|p| {
+            p.genesis.bits = 0x207fffff;
+            p.blockrate.shielded_anchor_depth = 1;
+            p.blockrate.max_shielded_anchor_age = 1_500;
+        })
+        .build();
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+    let miner_addr = kaspa_shielded_core::wallet::address_bytes_from_seed([9u8; 32]).expect("orchard address");
+    ctx.miner_data = MinerData::new(ScriptPublicKey::new(0, ScriptVec::from_slice(&miner_addr)), vec![]);
+    let mut chain = vec![config.genesis.hash];
+    while ctx.consensus.headers_store().get_blue_score(*chain.last().unwrap()).unwrap() < 4 * BUCKET_SPAN + 300 {
+        let b = ctx.mine_real_pow_block();
+        let h = b.header.hash;
+        ctx.consensus.validate_and_insert_block(b).virtual_state_task.await.expect("post-fork block validates");
+        chain.push(h);
+    }
+    let vp = ctx.consensus.virtual_processor();
+    let hs = ctx.consensus.headers_store();
+    let pp = chain[chain.len() - 4];
+    let committed = vp.shielded_state_root_at(pp).unwrap();
+    let honest = vp.export_pruning_point_shielded(pp).unwrap().expect("pp exports");
+    let nullifiers = vp.collect_pruning_point_nullifiers(pp).unwrap().to_vec();
+    let base = PruningPointShieldedMetadata::from_wire_bytes(&honest.data).unwrap();
+    let floor = base.window_entries[0].blue_score / BUCKET_SPAN;
+    assert!(floor >= 1);
+
+    let node = TestConsensus::new(&config);
+    let wait = node.init();
+    for &b in &chain[1..] {
+        node.validate_and_insert_block(kaspa_consensus_core::block::Block::from_header_arc(hs.get_header(b).unwrap()))
+            .virtual_state_task
+            .await
+            .unwrap();
+    }
+    let import = |data: Vec<u8>, count: u64, root: Option<[u8; 32]>| {
+        let wire = kaspa_consensus_core::api::ShieldedExportMetadata { data, nullifier_count: count };
+        let mut batches = std::iter::once(nullifiers.clone());
+        node.consensus_clone().import_pruning_point_shielded(pp, wire, root, &mut batches)
+    };
+    import(honest.data.clone(), honest.nullifier_count, Some(committed)).expect("honest import accepted");
+
+    // Usable blocks: in the window, below the pruning point, within the anchor age of the next block.
+    let tip = *chain.last().unwrap();
+    let (tip_blue, tip_daa) = (hs.get_blue_score(tip).unwrap(), hs.get_daa_score(tip).unwrap());
+    let real: Vec<_> = base.window_entries.iter().filter(|e| e.block != pp.as_bytes()).copied().collect();
+    let fakes: Vec<[u8; 32]> = (0..4u8).map(|i| [0xF0 | i; 32]).collect();
+    let snapshot = || {
+        let nvp = node.virtual_processor();
+        let mgr = nvp.shielded_state_manager_ref();
+        let producers: Vec<_> = real.iter().map(|e| mgr.anchor_producer_blocks(&e.root).unwrap()).collect();
+        let fake_producers: Vec<_> = fakes.iter().map(|f| mgr.anchor_producer_blocks(f).unwrap()).collect();
+        (
+            nvp.shielded_state_root_at(pp).ok(),
+            mgr.window_at(pp).unwrap(),
+            mgr.dev_accrued_at(pp).unwrap(),
+            mgr.miner_accrual_at(pp).unwrap(),
+            producers,
+            fake_producers,
+        )
+    };
+    let clean = snapshot();
+    assert_eq!(clean.0, Some(committed));
+    assert!(clean.5.iter().all(|p| p.is_empty()));
+    let no_fake_is_usable = |round: u64| {
+        let nvp = node.virtual_processor();
+        for f in &fakes {
+            for e in real.iter().step_by(37) {
+                let v = nvp.resolve_shielded_anchor(f, Some(e.block), tip, tip_blue + 1, tip_daa + 1);
+                assert!(!v.is_final, "round {round}: fake root accepted for block {:?}", Hash::from_bytes(e.block));
+            }
+        }
+    };
+
+    let mut rng = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = move || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng
+    };
+    let (mut refused, mut accepted) = (0u32, 0u32);
+    for round in 0..120u64 {
+        let mut md = base.clone();
+        let mut count = honest.nullifier_count;
+        let mut root = Some(committed);
+        let mut raw: Option<Vec<u8>> = None;
+        let n = md.window_entries.len();
+        let i = (next() as usize) % n;
+        let fake = fakes[(next() % 4) as usize];
+        let kind = next() % 14;
+        match kind {
+            0 => md.window_entries[i].root = fake,
+            1 => md.window_entries[i].blue_score ^= 1 << (next() % 12),
+            2 => md.window_entries[i].block[(next() % 32) as usize] ^= 1,
+            3 => md.window_entries[i].parent[(next() % 32) as usize] ^= 1,
+            4 => {
+                md.window_entries.remove(i);
+            }
+            5 => {
+                let d = md.window_entries[i];
+                md.window_entries.insert(i, d);
+            }
+            6 if n > 1 => md.window_entries.swap(i.min(n - 2), i.min(n - 2) + 1),
+            7 => {
+                // Below the floor bucket: invisible to the commitment.
+                let target = real[(next() as usize) % real.len()];
+                let at = floor * BUCKET_SPAN - 1 - (next() % 500);
+                md.window_entries.insert(0, WindowEntry { block: target.block, parent: [0; 32], root: fake, blue_score: at });
+            }
+            8 => {
+                let mut extra = *md.window_entries.last().unwrap();
+                extra.blue_score += 1;
+                extra.block[0] ^= 0x80;
+                extra.root = fake;
+                md.window_entries.push(extra);
+            }
+            9 => {
+                let target = real[(next() as usize) % real.len()];
+                md.in_window_anchors.push((fake, Hash::from_bytes(target.block)));
+            }
+            10 => md.dev_accrued = md.dev_accrued.wrapping_add(1 + next() % 1000),
+            11 => count = count.wrapping_add(1),
+            12 => {
+                let mut b = base.to_wire_bytes();
+                let j = (next() as usize) % b.len();
+                b[j] ^= 1 << (next() % 8);
+                raw = Some(b);
+            }
+            _ => root = None,
+        }
+        let data = raw.unwrap_or_else(|| md.to_wire_bytes());
+        match import(data, count, root) {
+            Err(_) => {
+                refused += 1;
+                assert!(snapshot() == clean, "round {round}: a refused import changed the node's state");
+            }
+            Ok(()) => {
+                accepted += 1;
+                let now = snapshot();
+                if now != clean {
+                    eprintln!("ROUND {round} KIND {kind} ACCEPTED BUT DIFFERENT:");
+                    eprintln!("  root same={} window same={} dev {}->{} miner same={}", now.0 == clean.0, now.1 == clean.1, clean.2, now.2, now.3 == clean.3);
+                    for (j, (a, b)) in now.4.iter().zip(clean.4.iter()).enumerate() {
+                        if a != b {
+                            eprintln!("  real producers differ at {j}: before {b:?} after {a:?}");
+                        }
+                    }
+                    for (j, (a, b)) in now.5.iter().zip(clean.5.iter()).enumerate() {
+                        if a != b {
+                            eprintln!("  FAKE producers {j}: {a:?}");
+                        }
+                    }
+                }
+                assert!(now == clean, "round {round} kind {kind}: an accepted import left a state other than the committed one");
+            }
+        }
+        no_fake_is_usable(round);
+    }
+    eprintln!("post-fork real import: {refused} refused (state untouched), {accepted} accepted (state exact)");
+    assert!(refused > 60, "most lies must be refused: {refused} refused, {accepted} accepted");
+    node.shutdown(wait);
+}
+
+/// A window larger than any real one is refused by its size, before any entry is hashed: the cap is
+/// the only thing between a peer and an arbitrarily long re-fold.
+#[tokio::test]
+async fn post_fork_import_refuses_an_oversized_window_before_hashing() {
+    use kaspa_shielded_core::anchor_window::WindowEntry;
+    const BUCKET_SPAN: u64 = 1_000; // a convenient unit of blue score for these chains
+    let config = fork_config();
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+    let miner_addr = kaspa_shielded_core::wallet::address_bytes_from_seed([9u8; 32]).expect("orchard address");
+    ctx.miner_data = MinerData::new(ScriptPublicKey::new(0, ScriptVec::from_slice(&miner_addr)), vec![]);
+    let mut chain = Vec::new();
+    for _ in 0..12 {
+        let b = ctx.mine_real_pow_block();
+        chain.push(b.header.hash);
+        ctx.consensus.validate_and_insert_block(b).virtual_state_task.await.unwrap();
+    }
+    let vp = ctx.consensus.virtual_processor();
+    let pp = chain[8];
+    let committed = vp.shielded_state_root_at(pp).unwrap();
+    let wire = vp.export_pruning_point_shielded(pp).unwrap().expect("pp exports");
+    let mut md = crate::processes::shielded::PruningPointShieldedMetadata::from_wire_bytes(&wire.data).unwrap();
+    let cap = vp.anchor_log_max_entries() as u64;
+    let last = *md.window_entries.last().unwrap();
+    // Strictly increasing and ending at the pruning point, so only the size can refuse it early.
+    md.window_entries = (0..=cap).map(|i| WindowEntry { blue_score: i, ..last }).collect();
+    let err = vp.verify_import_binding_versioned(pp, &md, committed).unwrap_err();
+    assert!(err.contains("more than a window can hold"), "refused by size, got: {err}");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Combined version: deep reorgs and the activation boundary, against an independent oracle.
+// ---------------------------------------------------------------------------------------------
+
+fn combined_config(activation: ForkActivation, anchor_age: u64) -> kaspa_consensus_core::config::Config {
+    let mut params = MAINNET_PARAMS.clone();
+    params.shielded_coinbase = true;
+    params.security_fork_activation = activation;
+    ConfigBuilder::new(params)
+        .edit_consensus_params(|p| {
+            p.genesis.bits = 0x207fffff;
+            p.blockrate.shielded_anchor_depth = 1;
+            p.blockrate.max_shielded_anchor_age = anchor_age;
+        })
+        .build()
+}
+
+fn shielded_miner() -> MinerData {
+    let addr = kaspa_shielded_core::wallet::address_bytes_from_seed([9u8; 32]).expect("orchard address");
+    MinerData::new(ScriptPublicKey::new(0, ScriptVec::from_slice(&addr)), vec![])
+}
+
+/// The anchor log of `chain` (genesis first) rebuilt from nothing but each block's anchor, selected
+/// parent and blue score: independent of the node's incremental bookkeeping. `None` where inactive.
+fn oracle_anchor_logs(
+    node: &TestConsensus,
+    chain: &[Hash],
+    activation: ForkActivation,
+) -> Vec<Option<kaspa_shielded_core::anchor_window::AnchorLog>> {
+    use crate::model::stores::headers::HeaderStoreReader;
+    let hs = node.headers_store();
+    let mut log = kaspa_shielded_core::anchor_window::AnchorLog::default();
+    chain
+        .iter()
+        .enumerate()
+        .map(|(i, &b)| {
+            if i == 0 || !activation.is_active(hs.get_daa_score(b).unwrap()) {
+                return None;
+            }
+            let entry = kaspa_shielded_core::anchor_window::WindowEntry {
+                block: b.as_bytes(),
+                parent: chain[i - 1].as_bytes(),
+                root: node.virtual_processor().shielded_anchor_at(b).unwrap(),
+                blue_score: hs.get_blue_score(b).unwrap(),
+            };
+            log = log.append(&entry).unwrap();
+            Some(log.clone())
+        })
+        .collect()
+}
+
+/// DIFFERENTIAL: a node that reorgs deeply (8 blocks onto a rival branch, then 12 back) ends with
+/// byte-identical anchor logs, entries, state roots and pruning-point exports to nodes that only ever
+/// saw one branch, and every log equals the from-scratch oracle. No block is disqualified. Run with
+/// the fork active from genesis and activating inside the contested stretch.
+#[tokio::test]
+async fn combined_deep_reorgs_leave_the_same_log_as_never_reorging() {
+    use crate::model::stores::headers::HeaderStoreReader;
+    const PREFIX: usize = 6;
+    for activation_after in [None, Some(PREFIX as u64 + 3)] {
+        let activation = match activation_after {
+            None => ForkActivation::always(),
+            Some(k) => ForkActivation::new(MAINNET_PARAMS.genesis.daa_score + k),
+        };
+        let config = combined_config(activation, 1_000);
+        let mut ca = TestContext::new(TestConsensus::new(&config));
+        let mut cb = TestContext::new(TestConsensus::new(&config));
+        ca.miner_data = shielded_miner();
+        cb.miner_data = shielded_miner();
+        let x = TestConsensus::new(&config);
+        let xw = x.init();
+
+        let mut prefix = vec![config.genesis.hash];
+        for _ in 0..PREFIX {
+            let b = ca.mine_real_pow_block_on(vec![*prefix.last().unwrap()], vec![]);
+            for node in [&ca.consensus, &cb.consensus, &x] {
+                node.validate_and_insert_block(b.clone()).virtual_state_task.await.unwrap();
+            }
+            prefix.push(b.header.hash);
+        }
+        cb.simulated_time = ca.simulated_time;
+        let (mut a, mut a_blocks) = (prefix.clone(), Vec::new());
+        for _ in 0..16 {
+            let b = ca.mine_real_pow_block_on(vec![*a.last().unwrap()], vec![]);
+            ca.consensus.validate_and_insert_block(b.clone()).virtual_state_task.await.unwrap();
+            a.push(b.header.hash);
+            a_blocks.push(b);
+        }
+        let (mut bch, mut b_blocks) = (prefix.clone(), Vec::new());
+        for _ in 0..12 {
+            let b = cb.mine_real_pow_block_on(vec![*bch.last().unwrap()], vec![]);
+            cb.consensus.validate_and_insert_block(b.clone()).virtual_state_task.await.unwrap();
+            bch.push(b.header.hash);
+            b_blocks.push(b);
+        }
+        for b in &a_blocks[..8] {
+            x.validate_and_insert_block(b.clone()).virtual_state_task.await.unwrap();
+        }
+        assert_eq!(x.get_sink(), a[PREFIX + 8]);
+        for b in &b_blocks {
+            x.validate_and_insert_block(b.clone()).virtual_state_task.await.unwrap();
+        }
+        assert_eq!(x.get_sink(), *bch.last().unwrap(), "x reorged 8 blocks deep onto branch B");
+        for b in &a_blocks[8..] {
+            x.validate_and_insert_block(b.clone()).virtual_state_task.await.unwrap();
+        }
+        assert_eq!(x.get_sink(), *a.last().unwrap(), "x reorged 12 blocks deep back onto branch A");
+
+        let mx = x.virtual_processor().shielded_state_manager_ref();
+        for (chain, reference) in [(&a, &ca.consensus), (&bch, &cb.consensus)] {
+            let mr = reference.virtual_processor().shielded_state_manager_ref();
+            let oracle = oracle_anchor_logs(reference, chain, activation);
+            assert!(oracle.iter().any(|o| o.is_some()), "the fork must be active somewhere on the chain");
+            for (i, &blk) in chain.iter().enumerate().skip(1) {
+                assert_eq!(x.get_block_status(blk), Some(BlockStatus::StatusUTXOValid), "block {i} must stay valid on x");
+                assert_eq!(mx.window_at(blk).unwrap(), mr.window_at(blk).unwrap(), "block {i}: log differs after the reorgs");
+                assert_eq!(mx.window_entry_with_log(blk).unwrap(), mr.window_entry_with_log(blk).unwrap(), "block {i}: entry differs");
+                assert_eq!(mx.window_at(blk).unwrap(), oracle[i], "block {i}: log differs from the oracle");
+                assert_eq!(
+                    x.virtual_processor().shielded_state_root_at(blk).unwrap(),
+                    reference.virtual_processor().shielded_state_root_at(blk).unwrap(),
+                    "block {i}: state root differs after the reorgs"
+                );
+            }
+        }
+        let pp = a[a.len() - 4];
+        let ex = x.virtual_processor().export_pruning_point_shielded(pp).unwrap().expect("x exports");
+        let en = ca.consensus.virtual_processor().export_pruning_point_shielded(pp).unwrap().expect("a exports");
+        assert_eq!(ex.data, en.data, "x and the never-reorged node serve the same export");
+        let _ = x.headers_store().get_blue_score(pp).unwrap();
+        x.shutdown(xw);
+    }
+}
+
+/// BOUNDARY SWEEP over the real import: the activation is placed at many distances from the pruning
+/// point (after it, at it, inside the window, at its bottom, below it). Each time a header-only node
+/// imports the honest export bound to the committed root and ends with the committed state root and
+/// every logged block's anchor usable by a spend naming it; a fake root paired with a logged block is
+/// never usable.
+#[tokio::test]
+async fn combined_activation_sweep_real_import_is_exact_at_every_offset() {
+    use crate::model::stores::headers::HeaderStoreReader;
+    const ANCHOR_AGE: u64 = 8;
+    const BLOCKS: usize = 24;
+    let pp_index = BLOCKS - 3;
+    let mut seen = (false, false); // (log starts inside the window, log covers the window)
+    for d in [-1i64, 0, 1, 2, 4, 7, 8, 9, 10, 12, 20] {
+        // Width-1 chains in this harness: block i (genesis = 0) has DAA score genesis + i - 1.
+        let pp_daa = MAINNET_PARAMS.genesis.daa_score + pp_index as u64 - 1;
+        let activation = ForkActivation::new((pp_daa as i64 - d) as u64);
+        let config = combined_config(activation, ANCHOR_AGE);
+        let mut ctx = TestContext::new(TestConsensus::new(&config));
+        ctx.miner_data = shielded_miner();
+        let mut chain = vec![config.genesis.hash];
+        for _ in 0..BLOCKS {
+            let b = ctx.mine_real_pow_block();
+            chain.push(b.header.hash);
+            ctx.consensus.validate_and_insert_block(b).virtual_state_task.await.unwrap();
+        }
+        let vp = ctx.consensus.virtual_processor();
+        let hs = ctx.consensus.headers_store();
+        let pp = chain[pp_index];
+        assert_eq!(hs.get_daa_score(pp).unwrap(), pp_daa, "width-1 chain DAA layout");
+        let committed = vp.shielded_state_root_at(pp).unwrap();
+        let wire = vp.export_pruning_point_shielded(pp).unwrap().expect("pp exports");
+        let md = crate::processes::shielded::PruningPointShieldedMetadata::from_wire_bytes(&wire.data).unwrap();
+        assert_eq!(!md.window_entries.is_empty(), d >= 0, "d={d}: a log export exactly when the fork is active at the pruning point");
+        if d >= 0 {
+            if md.window_prefix.count == 0 {
+                seen.0 = true;
+            } else {
+                seen.1 = true;
+            }
+        }
+        let nullifiers = vp.collect_pruning_point_nullifiers(pp).unwrap().to_vec();
+
+        let node = TestConsensus::new(&config);
+        let wait = node.init();
+        for &b in &chain[1..] {
+            node.validate_and_insert_block(kaspa_consensus_core::block::Block::from_header_arc(hs.get_header(b).unwrap()))
+                .virtual_state_task
+                .await
+                .unwrap();
+        }
+        let mut batches = std::iter::once(nullifiers);
+        node.consensus_clone()
+            .import_pruning_point_shielded(pp, wire, Some(committed), &mut batches)
+            .unwrap_or_else(|e| panic!("d={d}: honest import refused: {e:?}"));
+        let nvp = node.virtual_processor();
+        assert_eq!(nvp.shielded_state_root_at(pp).unwrap(), committed, "d={d}: seeded state has the committed root");
+        let tip = *chain.last().unwrap();
+        let (tip_blue, tip_daa) = (hs.get_blue_score(tip).unwrap(), hs.get_daa_score(tip).unwrap());
+        for e in md.window_entries.iter().filter(|e| e.block != pp.as_bytes()) {
+            if e.blue_score + ANCHOR_AGE < tip_blue + 1 {
+                continue; // too old for a spend in the next block, whatever the log says
+            }
+            let real = nvp.resolve_shielded_anchor(&e.root, Some(e.block), tip, tip_blue + 1, tip_daa + 1);
+            assert!(real.is_final, "d={d}: logged anchor of {:?} must be usable: {real:?}", Hash::from_bytes(e.block));
+            let fake = nvp.resolve_shielded_anchor(&[0xEE; 32], Some(e.block), tip, tip_blue + 1, tip_daa + 1);
+            assert!(!fake.is_final, "d={d}: a fake root for a logged block must not be usable");
+        }
+        node.shutdown(wait);
+    }
+    assert!(seen.0 && seen.1, "the sweep must cover both the transition and the fully logged window");
+}
+
+/// A peer can shorten a proof without breaking the replay: fold the bottom entries into the prefix.
+/// The result still reproduces the committed log, but no longer reaches the oldest usable anchor, so
+/// the node would lack anchors honest blocks may use. The coverage rule must refuse it.
+#[tokio::test]
+async fn combined_import_refuses_a_proof_that_stops_short() {
+    let config = combined_config(ForkActivation::always(), 8);
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+    ctx.miner_data = shielded_miner();
+    let mut chain = vec![config.genesis.hash];
+    for _ in 0..24 {
+        let b = ctx.mine_real_pow_block();
+        chain.push(b.header.hash);
+        ctx.consensus.validate_and_insert_block(b).virtual_state_task.await.unwrap();
+    }
+    let vp = ctx.consensus.virtual_processor();
+    let pp = chain[21];
+    let committed = vp.shielded_state_root_at(pp).unwrap();
+    let wire = vp.export_pruning_point_shielded(pp).unwrap().expect("pp exports");
+    let honest = crate::processes::shielded::PruningPointShieldedMetadata::from_wire_bytes(&wire.data).unwrap();
+    assert!(honest.window_prefix.count > 0, "the log starts below the window, so a prefix is sent");
+    vp.verify_import_binding_versioned(pp, &honest, committed).expect("the honest proof binds");
+    for fold in 1..=3 {
+        let mut short = honest.clone();
+        for _ in 0..fold {
+            let e = short.window_entries.remove(0);
+            short.window_prefix = short.window_prefix.append(&e).unwrap();
+        }
+        let err = vp.verify_import_binding_versioned(pp, &short, committed).expect_err("a proof that stops short must be refused");
+        assert!(err.contains("stops above the oldest usable anchor"), "fold {fold}: refused for coverage, got: {err}");
+    }
+}
+
+/// A node holding only the headers of `chain`, as during fast sync.
+async fn combined_header_only_node(config: &kaspa_consensus_core::config::Config, from: &TestConsensus, chain: &[Hash]) -> (TestConsensus, Vec<JoinHandle<()>>) {
+    use crate::model::stores::headers::HeaderStoreReader;
+    let node = TestConsensus::new(config);
+    let wait = node.init();
+    for &b in &chain[1..] {
+        node.validate_and_insert_block(kaspa_consensus_core::block::Block::from_header_arc(from.headers_store().get_header(b).unwrap()))
+            .virtual_state_task
+            .await
+            .unwrap();
+    }
+    (node, wait)
+}
+
+/// GUARD over the REAL import, aimed at the anchor log: random lies in the prefix and the entries
+/// (fold entries into the prefix, flip a peak or count bit, take the prefix from the wrong point,
+/// claim the log starts at the window, break a parent link, reorder, drop, duplicate, fake a root,
+/// append past the pruning point, prepend a real older entry) plus the generic ones (peer pairs,
+/// dev balance, nullifier count, raw bytes, no binding). After an honest import, each is refused with
+/// the node's state untouched, or accepted with exactly the committed state; no fake root is ever
+/// usable. Two chains: the log reaching far below the window, and the log starting inside it.
+#[tokio::test]
+async fn combined_guard_log_lies_are_refused_or_exact() {
+    use crate::model::stores::headers::HeaderStoreReader;
+    use crate::processes::shielded::PruningPointShieldedMetadata;
+    use kaspa_shielded_core::anchor_window::{AnchorLog, WindowEntry};
+    for (anchor_age, label) in [(8u64, "log below the window"), (40u64, "log starts inside the window")] {
+        let config = combined_config(ForkActivation::always(), anchor_age);
+        let mut ctx = TestContext::new(TestConsensus::new(&config));
+        ctx.miner_data = shielded_miner();
+        let mut chain = vec![config.genesis.hash];
+        for _ in 0..30 {
+            let b = ctx.mine_real_pow_block();
+            chain.push(b.header.hash);
+            ctx.consensus.validate_and_insert_block(b).virtual_state_task.await.unwrap();
+        }
+        let vp = ctx.consensus.virtual_processor();
+        let hs = ctx.consensus.headers_store();
+        let pp = chain[26];
+        let committed = vp.shielded_state_root_at(pp).unwrap();
+        let honest = vp.export_pruning_point_shielded(pp).unwrap().expect("pp exports");
+        let nullifiers = vp.collect_pruning_point_nullifiers(pp).unwrap().to_vec();
+        let base = PruningPointShieldedMetadata::from_wire_bytes(&honest.data).unwrap();
+        assert_eq!(base.window_prefix.count > 0, anchor_age == 8, "{label}: prefix shape");
+
+        let (node, wait) = combined_header_only_node(&config, &ctx.consensus, &chain).await;
+        let import = |data: Vec<u8>, count: u64, root: Option<[u8; 32]>| {
+            let wire = kaspa_consensus_core::api::ShieldedExportMetadata { data, nullifier_count: count };
+            let mut batches = std::iter::once(nullifiers.clone());
+            node.consensus_clone().import_pruning_point_shielded(pp, wire, root, &mut batches)
+        };
+        import(honest.data.clone(), honest.nullifier_count, Some(committed)).expect("honest import accepted");
+
+        let real: Vec<_> = base.window_entries.iter().filter(|e| e.block != pp.as_bytes()).copied().collect();
+        let fakes: Vec<[u8; 32]> = (0..3u8).map(|i| [0xF0 | i; 32]).collect();
+        let tip = *chain.last().unwrap();
+        let (tip_blue, tip_daa) = (hs.get_blue_score(tip).unwrap(), hs.get_daa_score(tip).unwrap());
+        let snapshot = || {
+            let nvp = node.virtual_processor();
+            let mgr = nvp.shielded_state_manager_ref();
+            (
+                nvp.shielded_state_root_at(pp).ok(),
+                mgr.window_at(pp).unwrap(),
+                real.iter().map(|e| mgr.window_entry_with_log(Hash::from_bytes(e.block)).unwrap()).collect::<Vec<_>>(),
+                real.iter().map(|e| mgr.anchor_producer_blocks(&e.root).unwrap()).collect::<Vec<_>>(),
+                fakes.iter().map(|f| mgr.anchor_producer_blocks(f).unwrap()).collect::<Vec<_>>(),
+                mgr.dev_accrued_at(pp).unwrap(),
+            )
+        };
+        let clean = snapshot();
+        assert_eq!(clean.0, Some(committed));
+
+        let mut rng = 0x5851_f42d_4c95_7f2du64 ^ anchor_age;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let (mut refused, mut accepted) = (0u32, 0u32);
+        for round in 0..150u64 {
+            let mut md = base.clone();
+            let mut count = honest.nullifier_count;
+            let mut root = Some(committed);
+            let mut raw: Option<Vec<u8>> = None;
+            let n = md.window_entries.len();
+            let i = (next() as usize) % n;
+            let fake = fakes[(next() % 3) as usize];
+            let kind = next() % 18;
+            match kind {
+                0 => {
+                    for _ in 0..1 + (next() as usize) % 3 {
+                        if md.window_entries.len() > 1 {
+                            let e = md.window_entries.remove(0);
+                            md.window_prefix = md.window_prefix.append(&e).unwrap();
+                        }
+                    }
+                }
+                1 if !md.window_prefix.peaks.is_empty() => {
+                    let p = (next() as usize) % md.window_prefix.peaks.len();
+                    md.window_prefix.peaks[p][(next() % 32) as usize] ^= 1 << (next() % 8);
+                }
+                2 => md.window_prefix.count ^= 1 << (next() % 12),
+                3 => md.window_prefix = AnchorLog::default(),
+                4 => md.window_entries[i].parent[(next() % 32) as usize] ^= 1,
+                5 if n > 1 => md.window_entries.swap(i.min(n - 2), i.min(n - 2) + 1),
+                6 => {
+                    md.window_entries.remove(i);
+                }
+                7 => {
+                    let d = md.window_entries[i];
+                    md.window_entries.insert(i, d);
+                }
+                8 => md.window_entries[i].root = fake,
+                9 => md.window_entries[i].blue_score ^= 1 << (next() % 6),
+                10 => {
+                    let mut extra = *md.window_entries.last().unwrap();
+                    extra.parent = extra.block;
+                    extra.block[0] ^= 0x80;
+                    extra.blue_score += 1;
+                    extra.root = fake;
+                    md.window_entries.push(extra);
+                }
+                11 => {
+                    // A real, correctly linked older entry prepended below the window.
+                    let first = md.window_entries[0];
+                    let below = Hash::from_bytes(first.parent);
+                    if let Some((e, _)) = ctx.consensus.virtual_processor().shielded_state_manager_ref().window_entry_with_log(below).unwrap() {
+                        md.window_entries.insert(0, e);
+                    } else {
+                        md.window_entries.insert(0, WindowEntry { block: first.parent, parent: [0; 32], root: fake, blue_score: first.blue_score.saturating_sub(1) });
+                    }
+                }
+                12 => {
+                    let target = real[(next() as usize) % real.len().max(1)];
+                    md.in_window_anchors.push((fake, Hash::from_bytes(target.block)));
+                }
+                13 => md.dev_accrued = md.dev_accrued.wrapping_add(1 + next() % 1000),
+                14 => count = count.wrapping_add(1),
+                15 => {
+                    let mut b = base.to_wire_bytes();
+                    let j = (next() as usize) % b.len();
+                    b[j] ^= 1 << (next() % 8);
+                    raw = Some(b);
+                }
+                16 => root = None,
+                _ => md.window_entries[i].block[(next() % 32) as usize] ^= 1,
+            }
+            let data = raw.unwrap_or_else(|| md.to_wire_bytes());
+            match import(data, count, root) {
+                Err(_) => {
+                    refused += 1;
+                    assert!(snapshot() == clean, "{label} round {round} kind {kind}: a refused import changed the node's state");
+                }
+                Ok(()) => {
+                    accepted += 1;
+                    assert!(snapshot() == clean, "{label} round {round} kind {kind}: an accepted import left a different state");
+                }
+            }
+            let nvp = node.virtual_processor();
+            for f in &fakes {
+                for e in &real {
+                    let v = nvp.resolve_shielded_anchor(f, Some(e.block), tip, tip_blue + 1, tip_daa + 1);
+                    assert!(!v.is_final, "{label} round {round} kind {kind}: fake root accepted for a logged block");
+                }
+            }
+        }
+        eprintln!("{label}: {refused} refused (state untouched), {accepted} accepted (state exact)");
+        assert!(refused > 80, "{label}: most lies must be refused: {refused} refused, {accepted} accepted");
+        node.shutdown(wait);
+    }
+}
+
+/// A node that has just FAST-SYNCED can serve the next syncing node at once: its anchor-log export
+/// at the pruning point is byte-identical to a full node's. It has no chain index and no per-block
+/// logs below its pruning point; the imported entries carry their log states, which is what makes this
+/// work. Checked at several pruning points, with the log reaching below the window and starting in it.
+#[tokio::test]
+async fn combined_fast_synced_node_serves_the_same_log_export() {
+    use crate::processes::shielded::PruningPointShieldedMetadata;
+    for anchor_age in [8u64, 40] {
+        let config = combined_config(ForkActivation::always(), anchor_age);
+        let mut ctx = TestContext::new(TestConsensus::new(&config));
+        ctx.miner_data = shielded_miner();
+        let mut chain = vec![config.genesis.hash];
+        for _ in 0..34 {
+            let b = ctx.mine_real_pow_block();
+            chain.push(b.header.hash);
+            ctx.consensus.validate_and_insert_block(b).virtual_state_task.await.unwrap();
+        }
+        let vp = ctx.consensus.virtual_processor();
+        for idx in [12usize, 20, 30] {
+            let pp = chain[idx];
+            let committed = vp.shielded_state_root_at(pp).unwrap();
+            let wire = vp.export_pruning_point_shielded(pp).unwrap().expect("exports");
+            let nullifiers = vp.collect_pruning_point_nullifiers(pp).unwrap().to_vec();
+            let (node, wait) = combined_header_only_node(&config, &ctx.consensus, &chain).await;
+            let mut batches = std::iter::once(nullifiers);
+            node.consensus_clone().import_pruning_point_shielded(pp, wire.clone(), Some(committed), &mut batches).expect("honest import");
+            // The log part of what the synced node serves. (The rest of an export walks the node's chain
+            // up to its tip; this header-only test node has no tip above the pruning point, which a real
+            // synced node always has, so only the log export is taken from it.)
+            let (entries, prefix) =
+                node.virtual_processor().anchor_log_export(pp).unwrap().expect("the synced node can serve the log at once");
+            let theirs = PruningPointShieldedMetadata::from_wire_bytes(&wire.data).unwrap();
+            assert!(!theirs.window_entries.is_empty());
+            assert_eq!(entries, theirs.window_entries, "age {anchor_age} pp {idx}: entries differ");
+            assert_eq!(prefix, theirs.window_prefix, "age {anchor_age} pp {idx}: prefix differs");
+            // And a third node can import a sync whose log comes from the synced node.
+            let mut served = theirs.clone();
+            served.window_entries = entries;
+            served.window_prefix = prefix;
+            let served = kaspa_consensus_core::api::ShieldedExportMetadata { data: served.to_wire_bytes(), nullifier_count: wire.nullifier_count };
+            let (third, w3) = combined_header_only_node(&config, &ctx.consensus, &chain).await;
+            let mut batches = std::iter::once(vp.collect_pruning_point_nullifiers(pp).unwrap().to_vec());
+            third.consensus_clone().import_pruning_point_shielded(pp, served, Some(committed), &mut batches).expect("a node syncing from the synced node succeeds");
+            third.shutdown(w3);
+            node.shutdown(wait);
+        }
+    }
+}
+
+/// Importing the same honest state twice, or importing over a node that already holds it, leaves
+/// exactly the same state: the clear-then-seed batch is idempotent.
+#[tokio::test]
+async fn combined_reimport_is_idempotent() {
+    let config = combined_config(ForkActivation::always(), 8);
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+    ctx.miner_data = shielded_miner();
+    let mut chain = vec![config.genesis.hash];
+    for _ in 0..24 {
+        let b = ctx.mine_real_pow_block();
+        chain.push(b.header.hash);
+        ctx.consensus.validate_and_insert_block(b).virtual_state_task.await.unwrap();
+    }
+    let vp = ctx.consensus.virtual_processor();
+    let pp = chain[20];
+    let committed = vp.shielded_state_root_at(pp).unwrap();
+    let wire = vp.export_pruning_point_shielded(pp).unwrap().expect("exports");
+    let nullifiers = vp.collect_pruning_point_nullifiers(pp).unwrap().to_vec();
+    let md = crate::processes::shielded::PruningPointShieldedMetadata::from_wire_bytes(&wire.data).unwrap();
+    let (node, wait) = combined_header_only_node(&config, &ctx.consensus, &chain).await;
+    let state = || {
+        let nvp = node.virtual_processor();
+        let mgr = nvp.shielded_state_manager_ref();
+        (
+            nvp.shielded_state_root_at(pp).unwrap(),
+            mgr.window_at(pp).unwrap(),
+            md.window_entries.iter().map(|e| mgr.window_entry_with_log(Hash::from_bytes(e.block)).unwrap()).collect::<Vec<_>>(),
+            mgr.nullifiers().count(),
+        )
+    };
+    let mut first = None;
+    for _ in 0..3 {
+        let mut batches = std::iter::once(nullifiers.clone());
+        node.consensus_clone().import_pruning_point_shielded(pp, wire.clone(), Some(committed), &mut batches).expect("import");
+        let s = state();
+        assert_eq!(s.0, committed);
+        assert!(s.2.iter().all(|r| r.is_some()), "every imported entry is stored with its log");
+        if let Some(f) = &first {
+            assert!(&s == f, "re-import changed the state");
+        }
+        first = Some(s);
+    }
+    // And the imported entries carry exactly the server's log states.
+    let server = vp.shielded_state_manager_ref();
+    for e in &md.window_entries {
+        let b = Hash::from_bytes(e.block);
+        assert_eq!(node.virtual_processor().shielded_state_manager_ref().window_entry_with_log(b).unwrap(), server.window_entry_with_log(b).unwrap());
+    }
+    node.shutdown(wait);
+}
+

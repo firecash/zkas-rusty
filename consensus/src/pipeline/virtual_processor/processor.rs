@@ -471,25 +471,17 @@ impl VirtualStateProcessor {
             }
             md.in_window_anchor_source_scores = scores;
         }
-        // Security fork: send the entries of every bucket the pruning point's window retains, so the
-        // syncing node can re-fold them to the committed window. Walk the selected chain down from
-        // `pp`; entries are kept below the pruning point exactly for this.
+        // Security fork: send the anchor-log entries from the pruning point down to the first one at
+        // or below the oldest usable source (or the log's first entry), plus the log state just below
+        // them, so the syncing node can replay them onto it and reproduce the committed log.
         // Follow the entries' own parent links rather than the selected-chain index: a node that
         // fast-synced has no index below its pruning point, but it does hold the imported entries.
-        if let Some(window) = self.shielded_state_manager.window_at(pp)? {
-            if let Some(floor) = window.floor_bucket() {
-                let mut entries = Vec::new();
-                let mut cursor = pp;
-                while let Some(entry) = self.shielded_state_manager.window_entry(cursor)? {
-                    if entry.blue_score / kaspa_shielded_core::anchor_window::BUCKET_SPAN < floor {
-                        break;
-                    }
-                    cursor = Hash::from_bytes(entry.parent);
-                    entries.push(entry);
-                }
-                entries.reverse();
-                md.window_entries = entries;
-            }
+        // Anything this node cannot back is simply not sent, and the receiver refuses and retries.
+        if self.shielded_state_manager.window_at(pp)?.is_some()
+            && let Some((entries, prefix)) = self.anchor_log_export(pp)?
+        {
+            md.window_entries = entries;
+            md.window_prefix = prefix;
         }
         let nullifier_count = self.pruning_point_nullifier_set(pp)?.len() as u64;
         Ok(Some(kaspa_consensus_core::api::ShieldedExportMetadata { data: md.to_wire_bytes(), nullifier_count }))
@@ -600,15 +592,15 @@ impl VirtualStateProcessor {
 
     /// Bind imported pruning-point metadata to the PoW-committed root, by the pruning point's own
     /// DAA score. Before the fork that is the v0 root. From it, the committed value is
-    /// `zkas_state_root1(root0, dev_accrued, window)`, where the window is re-folded from the
-    /// peer's entries, so the accrual and every window pair are proven together. Returns the
-    /// re-folded window for a post-fork pruning point.
+    /// `zkas_state_root1(root0, dev_accrued, anchor_log, miner_slot)`, where the anchor log is
+    /// replayed from the peer's prefix and entries, so the accrual, the slot and every logged pair
+    /// are proven together. Returns the replayed anchor log for a post-fork pruning point.
     pub fn verify_import_binding_versioned(
         &self,
         pp: kaspa_hashes::Hash,
         md: &crate::processes::shielded::PruningPointShieldedMetadata,
         committed: [u8; 32],
-    ) -> Result<Option<kaspa_shielded_core::anchor_window::AnchorWindow>, String> {
+    ) -> Result<Option<kaspa_shielded_core::anchor_window::AnchorLog>, String> {
         use crate::processes::shielded::ShieldedStateManager;
         let pp_daa = self.headers_store.get_daa_score(pp).map_err(|e| format!("pruning point header {pp}: {e}"))?;
         // Values that consensus rules fix regardless of any root: no dev fee is carried before
@@ -625,21 +617,28 @@ impl VirtualStateProcessor {
             ShieldedStateManager::verify_import_binding(md, committed)?;
             return Ok(None);
         }
-        // A window holds at most one entry per chain block across its buckets; refuse anything larger
+        // The entries span at most `max_age` blue score above the oldest usable source plus one entry
+        // at or below it, and blue score rises by at least one per chain block. Refuse anything larger
         // before spending any hashing on it (the root comparison would refuse it anyway, later).
-        // The retained buckets span `keep + 1` bucket indexes, each holding at most one entry per unit
-        // of blue score.
-        use kaspa_shielded_core::anchor_window::BUCKET_SPAN;
-        let max_entries = (self.anchor_window_keep() + 1).saturating_mul(BUCKET_SPAN) as usize;
+        let max_entries = self.anchor_log_max_entries();
         if md.window_entries.len() > max_entries {
             return Err(format!("pruning-point anchor window has {} entries, more than a window can hold ({max_entries})", md.window_entries.len()));
         }
-        // Exact: every entry must lie in a retained bucket and the entries must be one selected-parent
-        // chain, because the caller seeds each of them as proven (see `from_entries_exact`).
-        let window = kaspa_shielded_core::anchor_window::AnchorWindow::from_entries_exact(&md.window_entries, self.anchor_window_keep())
-            .map_err(|e| format!("pruning-point anchor window: {e}"))?;
+        if !md.window_prefix.is_well_formed() {
+            return Err("pruning-point anchor log prefix is malformed".to_string());
+        }
+        let window = kaspa_shielded_core::anchor_window::AnchorLog::replay(&md.window_prefix, md.window_entries.iter())
+            .map_err(|e| format!("pruning-point anchor log: {e}"))?;
         if md.window_entries.last().map(|e| e.block) != Some(pp.as_bytes()) {
             return Err("pruning-point anchor window does not end at the pruning point".to_string());
+        }
+        // Coverage: the entries must reach the oldest source a spend above `pp` may use, unless the log
+        // itself starts above it (the transition, where older anchors still come from the peer).
+        let pp_blue = self.headers_store.get_blue_score(pp).map_err(|e| format!("pruning point header {pp}: {e}"))?;
+        let oldest_usable = pp_blue.saturating_sub(self.max_shielded_anchor_age);
+        let first_bs = md.window_entries.first().map_or(u64::MAX, |e| e.blue_score);
+        if md.window_prefix.count != 0 && first_bs > oldest_usable {
+            return Err(format!("pruning-point anchor log stops above the oldest usable anchor (blue {first_bs} > {oldest_usable})"));
         }
         let expected = kaspa_shielded_core::commitment::shielded_state_root_v1(
             &md.state_root,
@@ -678,26 +677,43 @@ impl VirtualStateProcessor {
         };
         let n = ShieldedStateManager::verify_pruning_point_shielded(&md, nullifiers.iter())?;
         self.retain_provable_window_anchors(pp, &mut md)?;
-        // Post-fork: the re-folded entries are proven, so they are authoritative for the blocks they
-        // cover. Peer pairs are kept only for pre-fork sources (the window does not reach them): a
-        // peer pair naming a post-fork block is unproven, and a fake root paired with a real window
-        // block would otherwise resolve as that block's anchor on this node alone. Scores for proven
-        // blocks come from the proven entry, never from whichever row came first.
-        let proven_entries = if window.is_some() { std::mem::take(&mut md.window_entries) } else { Vec::new() };
-        if window.is_some() {
-            let before = md.in_window_anchors.len();
-            md.in_window_anchors.retain(|(_, source)| matches!(self.is_post_security_fork(*source), Ok(false)));
-            let dropped = before - md.in_window_anchors.len();
-            if dropped > 0 {
-                warn!("pruning-point import: dropped {dropped} peer anchor pairs for post-fork blocks (the proven window covers them)");
+        // Post-fork: the replayed log entries are proven, so they are authoritative for the blocks
+        // they cover. Add them as (root -> block) pairs with their committed blue scores; peer pairs
+        // remain only for blocks older than the first logged entry (the transition).
+        let proven_entries = match &window {
+            Some(_) => {
+                // Every entry is covered by the committed log (its count is committed, so nothing can be
+                // slipped in anywhere). Pair each with the log state right before it, which is all a later
+                // export needs to serve from this node, even straight after this sync.
+                let mut log = md.window_prefix.clone();
+                let entries: Vec<_> = std::mem::take(&mut md.window_entries)
+                    .into_iter()
+                    .map(|e| {
+                        let before = log.clone();
+                        log = log.append(&e).expect("replayed once already");
+                        (e, before)
+                    })
+                    .collect();
+                // The peer's own pairs are unproven: keep them only for blocks older than the first
+                // committed entry (the transition). For any block the window covers, its entry is the
+                // only source of truth, or a fake root paired with a real window block is seeded.
+                let first = entries.first().map_or(u64::MAX, |(e, _)| e.blue_score);
+                let older = |source: &kaspa_hashes::Hash| self.headers_store.get_blue_score(*source).is_ok_and(|bs| bs < first);
+                md.in_window_anchors.retain(|(_, source)| older(source));
+                md.in_window_anchor_source_scores.retain(|(source, _)| older(source));
+                entries
             }
-            let mut scores: kaspa_consensus_core::BlockHashMap<u64> = md.in_window_anchor_source_scores.drain(..).collect();
-            for e in &proven_entries {
-                let block = kaspa_hashes::Hash::from_bytes(e.block);
-                md.in_window_anchors.push((e.root, block));
-                scores.insert(block, e.blue_score);
+            None => Vec::new(),
+        };
+        // A set, not a scan per entry: up to `max_age + 2` entries would otherwise cost hundreds of
+        // millions of comparisons on every mainnet fast sync.
+        let mut scored: kaspa_consensus_core::BlockHashSet = md.in_window_anchor_source_scores.iter().map(|(b, _)| *b).collect();
+        for (e, _) in &proven_entries {
+            let block = kaspa_hashes::Hash::from_bytes(e.block);
+            md.in_window_anchors.push((e.root, block));
+            if scored.insert(block) {
+                md.in_window_anchor_source_scores.push((block, e.blue_score));
             }
-            md.in_window_anchor_source_scores = scores.into_iter().collect();
         }
         if n as u64 != metadata.nullifier_count {
             return Err(format!("nullifier count mismatch: metadata says {}, streamed {}", metadata.nullifier_count, n));
@@ -712,9 +728,9 @@ impl VirtualStateProcessor {
             .map_err(|e| format!("seeding shielded stores failed: {e:?}"))?;
         if let Some(window) = window {
             self.shielded_state_manager.persist_window_only(batch, pp, window).map_err(|e| format!("seeding the anchor window: {e:?}"))?;
-            for e in proven_entries {
+            for (e, log_before) in proven_entries {
                 self.shielded_state_manager
-                    .persist_window_entry(batch, kaspa_hashes::Hash::from_bytes(e.block), e)
+                    .persist_window_entry(batch, kaspa_hashes::Hash::from_bytes(e.block), e, log_before)
                     .map_err(|e| format!("seeding window entries: {e:?}"))?;
             }
         }
@@ -776,9 +792,42 @@ impl VirtualStateProcessor {
         Ok(self.security_fork_activation.is_active(self.headers_store.get_daa_score(block)?))
     }
 
-    /// Number of anchor-window buckets retained, derived from the consensus anchor age.
-    pub(crate) fn anchor_window_keep(&self) -> u64 {
-        kaspa_shielded_core::anchor_window::buckets_to_keep(self.max_shielded_anchor_age)
+    /// The most anchor-log entries a pruning-point export can carry: every chain block above the
+    /// oldest usable source (blue score rises by at least one per chain block) plus the one at or
+    /// below it, with one entry of slack.
+    pub(crate) fn anchor_log_max_entries(&self) -> usize {
+        self.max_shielded_anchor_age.saturating_add(2) as usize
+    }
+
+    /// Server side of the anchor log: the entries from `pp` down to the first at or below the oldest
+    /// usable source (or the log's first entry), oldest first, and the log state just below them.
+    /// `None` when this node does not hold that stretch (it fast-synced past it).
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn anchor_log_export(
+        &self,
+        pp: kaspa_hashes::Hash,
+    ) -> Result<
+        Option<(Vec<kaspa_shielded_core::anchor_window::WindowEntry>, kaspa_shielded_core::anchor_window::AnchorLog)>,
+        kaspa_database::prelude::StoreError,
+    > {
+        let oldest_usable = self.headers_store.get_blue_score(pp)?.saturating_sub(self.max_shielded_anchor_age);
+        let mut entries = Vec::new();
+        let mut cursor = pp;
+        let prefix = loop {
+            let Some((entry, log_before)) = self.shielded_state_manager.window_entry_with_log(cursor)? else { return Ok(None) };
+            entries.push(entry);
+            // Stop at the log's first entry, or at the first entry at or below the oldest usable source;
+            // either way the prefix is the log just before it, kept on the entry itself.
+            if log_before.count == 0 || entry.blue_score <= oldest_usable {
+                break log_before;
+            }
+            if entries.len() > self.anchor_log_max_entries() {
+                return Ok(None);
+            }
+            cursor = Hash::from_bytes(entry.parent);
+        };
+        entries.reverse();
+        Ok(Some((entries, prefix)))
     }
 
     /// F-15: stage the real clear of the shielded import state (the whole global
@@ -1526,17 +1575,22 @@ impl VirtualStateProcessor {
             // on the selected chain, and a reorg reloads it from the new parent.
             if self.security_fork_activation.is_active(self.headers_store.get_daa_score(current).unwrap()) {
                 let sp = self.ghostdag_store.get_selected_parent(current).unwrap();
-                let parent_window = self.shielded_state_manager.window_at(sp).unwrap().unwrap_or_default();
+                // An empty log only for a parent before the fork (or genesis). A post-fork parent always
+                // has its row (it is never pruned while it is a selected parent); a missing one is a store
+                // inconsistency, and silently restarting the log would commit a different root.
+                let parent_window = match self.shielded_state_manager.window_at(sp).unwrap() {
+                    Some(log) => log,
+                    None if sp == self.genesis.hash || !self.is_post_security_fork(sp).unwrap() => Default::default(),
+                    None => panic!("post-fork selected parent {sp} has no anchor log; the shielded store is inconsistent"),
+                };
                 let entry = kaspa_shielded_core::anchor_window::WindowEntry {
                     block: current.as_bytes(),
                     parent: sp.as_bytes(),
                     root: computed.anchor(),
                     blue_score,
                 };
-                let window = parent_window
-                    .append(&entry, self.anchor_window_keep())
-                    .expect("selected-chain blue scores are strictly increasing");
-                self.shielded_state_manager.persist_window(&mut batch, current, window, entry).unwrap();
+                let window = parent_window.append(&entry).expect("the parent's anchor log is well formed");
+                self.shielded_state_manager.persist_window(&mut batch, current, window, entry, parent_window).unwrap();
             }
         }
         // Dev-fee accrual rides the same atomic batch, so a crash can never leave a

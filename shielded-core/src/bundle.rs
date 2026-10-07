@@ -577,6 +577,21 @@ mod tests {
         }
     }
 
+    /// The named anchor block is signed: changing it, adding it or removing it changes the sighash,
+    /// so a relayer cannot swap a spend onto another block that produced the same root.
+    #[test]
+    fn anchor_block_is_covered_by_the_sighash() {
+        let (domain, tx_context) = ([1u8; 32], b"tx".as_slice());
+        let sig = |b: &ShieldedBundle| crate::verify::sighash(b, &domain, tx_context);
+        let plain = sample_bundle(2);
+        let (mut a, mut b) = (plain.clone(), plain.clone());
+        a.set_anchor_block([7u8; 32]);
+        b.set_anchor_block([8u8; 32]);
+        assert_ne!(sig(&a), sig(&b), "a different named block must change the sighash");
+        assert_ne!(sig(&a), sig(&plain), "naming a block must change the sighash");
+        assert_eq!(sig(&plain), sig(&plain.clone()));
+    }
+
     #[test]
     fn round_trips() {
         for n in [0u8, 1, 2, 5] {

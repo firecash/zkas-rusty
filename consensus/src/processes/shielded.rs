@@ -212,10 +212,11 @@ pub struct PruningPointShieldedMetadata {
     /// `dev_accrued` needed. Empty means "peer cannot attest", which fails closed.
     #[serde(default)]
     pub in_window_anchor_source_scores: Vec<(Hash, u64)>,
-    /// Security fork: every window entry the pruning point's anchor window retains, ascending by
-    /// blue score. A syncing node re-folds them and must reproduce the window committed in
-    /// `zkas_state_root1`, so these pairs are proven, not trusted. Empty for a pre-fork pruning
-    /// point. Trailing, like every field added before it (see [`Self::from_wire_bytes`]).
+    /// Security fork: the anchor-log entries from the first at or below the oldest usable anchor
+    /// source up to the pruning point, ascending by blue score. A syncing node replays them onto
+    /// [`Self::window_prefix`] and must reproduce the log committed in `zkas_state_root1`, so these
+    /// pairs are proven, not trusted. Empty for a pre-fork pruning point. Trailing, like every field
+    /// added before it (see [`Self::from_wire_bytes`]).
     #[serde(default)]
     pub window_entries: Vec<kaspa_shielded_core::anchor_window::WindowEntry>,
     /// Security fork: the miner accrual slot carried by the pruning point, bound by
@@ -223,6 +224,11 @@ pub struct PruningPointShieldedMetadata {
     /// `window_entries` (both new with the fork), so the pre-window layout covers older peers.
     #[serde(default)]
     pub miner_accrual: kaspa_consensus_core::coinbase::MinerAccrual,
+    /// Security fork: the anchor log just below the first of `window_entries`. Replaying the entries
+    /// onto it must give the log `zkas_state_root1` commits at the pruning point. Empty when the log
+    /// starts inside the window (the transition after the fork).
+    #[serde(default)]
+    pub window_prefix: kaspa_shielded_core::anchor_window::AnchorLog,
 }
 
 /// The layout before `window_entries`: the current struct minus its trailing field.
@@ -255,6 +261,7 @@ impl From<PreWindowPruningPointShieldedMetadata> for PruningPointShieldedMetadat
             in_window_anchor_source_scores: v.in_window_anchor_source_scores,
             window_entries: Vec::new(),
             miner_accrual: Default::default(),
+            window_prefix: Default::default(),
         }
     }
 }
@@ -287,6 +294,7 @@ impl From<LegacyPruningPointShieldedMetadata> for PruningPointShieldedMetadata {
             in_window_anchor_source_scores: Vec::new(),
             window_entries: Vec::new(),
             miner_accrual: Default::default(),
+            window_prefix: Default::default(),
         }
     }
 }
@@ -324,6 +332,7 @@ impl From<PreAnchorScoresPruningPointShieldedMetadata> for PruningPointShieldedM
             in_window_anchor_source_scores: Vec::new(),
             window_entries: Vec::new(),
             miner_accrual: Default::default(),
+            window_prefix: Default::default(),
         }
     }
 }
@@ -604,13 +613,23 @@ impl ShieldedStateManager {
 
     /// The anchor window as of `block`, `None` if this node holds none (a pre-fork block, or a
     /// post-fork block below the pruning point).
-    pub fn window_at(&self, block: Hash) -> StoreResult<Option<kaspa_shielded_core::anchor_window::AnchorWindow>> {
+    pub fn window_at(&self, block: Hash) -> StoreResult<Option<kaspa_shielded_core::anchor_window::AnchorLog>> {
         self.anchor_window.window(block)
     }
 
-    /// A post-fork chain block's own window entry, `None` if absent.
+    /// A post-fork chain block's own log entry, `None` if absent.
     pub fn window_entry(&self, block: Hash) -> StoreResult<Option<kaspa_shielded_core::anchor_window::WindowEntry>> {
         self.anchor_window.entry(block)
+    }
+
+    /// A post-fork chain block's own log entry with the log state right before it. Kept below the
+    /// pruning point (GC'd with the anchor indexes) so an export can attach the state below its window
+    /// from its lowest entry alone.
+    pub fn window_entry_with_log(
+        &self,
+        block: Hash,
+    ) -> StoreResult<Option<(kaspa_shielded_core::anchor_window::WindowEntry, kaspa_shielded_core::anchor_window::AnchorLog)>> {
+        self.anchor_window.entry_with_log(block)
     }
 
     /// Stage a post-fork block's window and entry in the block-commit batch.
@@ -618,21 +637,24 @@ impl ShieldedStateManager {
         &self,
         batch: &mut WriteBatch,
         block: Hash,
-        window: kaspa_shielded_core::anchor_window::AnchorWindow,
+        window: kaspa_shielded_core::anchor_window::AnchorLog,
         entry: kaspa_shielded_core::anchor_window::WindowEntry,
+        log_before: kaspa_shielded_core::anchor_window::AnchorLog,
     ) -> StoreResult<()> {
-        self.anchor_window.set_window_batch(batch, block, window)?;
-        self.anchor_window.set_entry_batch(batch, block, entry)
+        self.anchor_window.set_entry_batch(batch, block, entry, log_before)?;
+        self.anchor_window.set_window_batch(batch, block, window)
     }
 
-    /// Stage only a window entry (used when seeding imported, PoW-verified entries).
+    /// Stage only a log entry with the log state before it (used when seeding imported, PoW-verified
+    /// entries).
     pub fn persist_window_entry(
         &self,
         batch: &mut WriteBatch,
         block: Hash,
         entry: kaspa_shielded_core::anchor_window::WindowEntry,
+        log_before: kaspa_shielded_core::anchor_window::AnchorLog,
     ) -> StoreResult<()> {
-        self.anchor_window.set_entry_batch(batch, block, entry)
+        self.anchor_window.set_entry_batch(batch, block, entry, log_before)
     }
 
     /// Stage only a window (used when seeding the pruning point's window on import).
@@ -640,7 +662,7 @@ impl ShieldedStateManager {
         &self,
         batch: &mut WriteBatch,
         block: Hash,
-        window: kaspa_shielded_core::anchor_window::AnchorWindow,
+        window: kaspa_shielded_core::anchor_window::AnchorLog,
     ) -> StoreResult<()> {
         self.anchor_window.set_window_batch(batch, block, window)
     }
@@ -1060,12 +1082,10 @@ impl ShieldedStateManager {
     /// of the chain (~3.1M rows at 36 days old), and the IBD export pays a full-index
     /// scan per syncing peer. With it they stay bounded by the pruning window.
     pub fn gc_aged_anchors(&self, batch: &mut WriteBatch, pp_blue_score: u64, max_age: u64, cap: usize) -> StoreResult<usize> {
-        // The window entries share this queue, and the pruning point's anchor window spans whole
-        // buckets: up to `(buckets_to_keep + 1) * BUCKET_SPAN` below it, which exceeds `2 * max_age`
-        // for a small anchor age. Keep the larger of the two, or the export loses entries the
-        // window commitment still covers and a post-fork pruning-point import fails.
-        use kaspa_shielded_core::anchor_window::{BUCKET_SPAN, buckets_to_keep};
-        let margin = max_age.saturating_mul(2).max((buckets_to_keep(max_age) + 1).saturating_mul(BUCKET_SPAN));
+        // The log entries share this queue. An export needs the entries from the pruning point down
+        // to the first one at or below `pp - max_age`, plus the log state of the entry under that, so
+        // `2 * max_age` keeps every entry an export (for this or a later pruning point) can need.
+        let margin = max_age.saturating_mul(2);
         let limit = pp_blue_score.saturating_sub(margin);
         if limit == 0 {
             return Ok(0);
@@ -1077,6 +1097,7 @@ impl ShieldedStateManager {
             }
             self.anchor_producers.remove_producer_batch(batch, anchor, block)?;
             self.anchor_window.delete_entry_batch(batch, block)?;
+            self.anchor_source_scores.delete_batch(batch, block)?;
             self.anchor_gc.delete_batch(batch, blue, anchor, block)?;
         }
         Ok(aged.len())
@@ -1343,6 +1364,7 @@ impl ShieldedStateManager {
             // Filled by the caller for a post-fork pruning point (selected-chain walk).
             window_entries: Vec::new(),
             miner_accrual,
+            window_prefix: Default::default(),
         }))
     }
 
@@ -1520,6 +1542,16 @@ impl ShieldedStateManager {
         for (source, blue_score) in md.in_window_anchor_source_scores.iter() {
             self.anchor_source_scores.set_batch(batch, *source, *blue_score)?;
         }
+        // Queue every seeded pair for age-based GC under its source's blue score, exactly as pruning
+        // queues self-validated blocks. These sources lie below the pruning point, so pruning never
+        // visits them: without this every fast sync would leave its whole window of anchor rows, log
+        // entries and scores behind for good.
+        let scores: std::collections::HashMap<Hash, u64> = md.in_window_anchor_source_scores.iter().copied().collect();
+        for (hist_anchor, source) in md.in_window_anchors.iter() {
+            if let Some(&blue_score) = scores.get(source) {
+                self.anchor_gc.enqueue_batch(batch, blue_score, *hist_anchor, *source)?;
+            }
+        }
         if md.supply.cumulative_coinbase > 0 || md.supply.cumulative_fees > 0 {
             self.supply_store.set_batch(batch, block, md.supply)?;
         }
@@ -1689,6 +1721,7 @@ mod tests {
                 script_public_key: kaspa_consensus_core::tx::ScriptPublicKey::from_vec(0, vec![9u8; 43]),
                 amount: 5,
             },
+            window_prefix: Default::default(),
         };
         let base = md.to_wire_bytes();
         let mut x: u64 = 0xfeed_face_0bad_f00d;
@@ -1740,9 +1773,12 @@ mod tests {
                 script_public_key: kaspa_consensus_core::tx::ScriptPublicKey::from_vec(0, vec![9u8; 43]),
                 amount: 999,
             },
+            window_prefix: Default::default(),
         };
         // What an empty trailing slot costs on the wire, so each older layout can be cut exactly.
         let slot_len = bincode::serialized_size(&kaspa_consensus_core::coinbase::MinerAccrual::default()).unwrap() as usize;
+        let prefix_len = bincode::serialized_size(&kaspa_shielded_core::anchor_window::AnchorLog::default()).unwrap() as usize;
+        let slot_len = slot_len + prefix_len; // the trailing anchor-log prefix rides after the slot
 
         // Round-trip through the current layout.
         let bytes = md.to_wire_bytes();
@@ -1761,6 +1797,7 @@ mod tests {
             burns: md.burns.clone(),
             window_entries: Vec::new(),
             miner_accrual: Default::default(),
+            window_prefix: Default::default(),
             ..md.clone()
         };
         let pre_scores_bytes = pre_scores.to_wire_bytes();
@@ -1830,6 +1867,7 @@ mod tests {
             in_window_anchor_source_scores: vec![(source, 990_606)],
             window_entries: Vec::new(),
             miner_accrual: Default::default(),
+            window_prefix: Default::default(),
         };
 
         let mut batch = WriteBatch::default();
@@ -1934,11 +1972,11 @@ mod tests {
         mgr.anchor_gc.enqueue_batch(&mut batch, 500, root, young_block).unwrap();
         db.write(batch).unwrap();
 
-        // max_age 10: the margin is the anchor window's span, (buckets_to_keep(10) + 1) * 1000 = 3000,
-        // not 2 * max_age. pp_blue 3110: limit = 110 -> only the blue-100 entry qualifies.
+        // max_age 10: the margin is 2 * max_age = 20, which covers every log entry an export can need.
+        // pp_blue 119: limit 99 -> nothing; pp_blue 130: limit 110 -> only the blue-100 entry qualifies.
         let mut batch = WriteBatch::default();
-        assert_eq!(mgr.gc_aged_anchors(&mut batch, 130, 10, 1000).unwrap(), 0, "nothing inside the window span is collected");
-        let processed = mgr.gc_aged_anchors(&mut batch, 3110, 10, 1000).unwrap();
+        assert_eq!(mgr.gc_aged_anchors(&mut batch, 119, 10, 1000).unwrap(), 0, "nothing inside the margin is collected");
+        let processed = mgr.gc_aged_anchors(&mut batch, 130, 10, 1000).unwrap();
         db.write(batch).unwrap();
         assert_eq!(processed, 1, "only the aged entry is drained");
 
@@ -2122,6 +2160,7 @@ mod tests {
             in_window_anchor_source_scores: Vec::new(),
             window_entries: Vec::new(),
             miner_accrual: Default::default(),
+            window_prefix: Default::default(),
         };
 
         let mut batch = WriteBatch::default();
@@ -2135,6 +2174,7 @@ mod tests {
         // every spend against it is dropped.
         let producers = mgr.anchor_producer_blocks(&hist_anchor).unwrap();
         assert_eq!(producers, vec![hist_source], "in-window anchor must be seeded into anchor_producers too");
+        // Without a proven blue score nothing is queued (and nothing can be judged final either).
 
         // The pruning point's own root as well.
         let pp_anchor = GlobalTree::from_state(&md.frontier).unwrap().anchor().to_bytes();
@@ -2830,5 +2870,100 @@ mod tests {
         // And a spend of nf(1) — unspent on the new chain — is accepted, not frozen.
         let ok = mgr.compute(pp, Some(&coinbase(50, 30)), &[stx(&[1], &[400], 5)]).unwrap();
         assert_eq!(ok.outcome.accepted, vec![0], "previously-frozen note is spendable again after the clean re-seed");
+    }
+
+    /// Retention: anchor GC keeps every log entry (with its log state) within 2 x max_age below the
+    /// pruning point, which covers everything an export needs: the entries down to the first at or
+    /// below `pp - max_age` and the log state of the entry under that. Older entries go.
+    #[test]
+    fn anchor_log_entries_survive_gc_exactly_as_long_as_an_export_needs() {
+        use kaspa_shielded_core::anchor_window::{AnchorLog, WindowEntry};
+        let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
+        let mgr = ShieldedStateManager::new(db.clone(), CachePolicy::Empty);
+        let age = 8u64;
+        let mut log = AnchorLog::default();
+        let mut prev = [0u8; 32];
+        let mut batch = WriteBatch::default();
+        let blocks: Vec<(Hash, u64)> = (1..=60u64).map(|i| (Hash::from_u64_word(1_000 + i), i)).collect();
+        for &(b, bs) in &blocks {
+            let e = WindowEntry { block: b.as_bytes(), parent: prev, root: [bs as u8; 32], blue_score: bs };
+            let before = log.clone();
+            log = log.append(&e).unwrap();
+            mgr.persist_window(&mut batch, b, log.clone(), e, before).unwrap();
+            mgr.anchor_gc.enqueue_batch(&mut batch, bs, e.root, b).unwrap();
+            prev = b.as_bytes();
+        }
+        db.write(batch).unwrap();
+        let pp_blue = 50u64;
+        let mut batch = WriteBatch::default();
+        mgr.gc_aged_anchors(&mut batch, pp_blue, age, 10_000).unwrap();
+        db.write(batch).unwrap();
+        let limit = pp_blue - 2 * age;
+        for &(b, bs) in &blocks {
+            let kept = mgr.window_entry_with_log(b).unwrap().is_some();
+            if bs > limit {
+                assert!(kept, "entry at blue {bs} is within 2 x max_age of the pruning point and must be kept");
+            }
+            if bs < limit {
+                assert!(!kept, "entry at blue {bs} is older than 2 x max_age and must be collected");
+            }
+        }
+        // Everything an export at the pruning point needs is still there.
+        let oldest_usable = pp_blue - age;
+        for &(b, bs) in &blocks {
+            if bs + 1 >= oldest_usable && bs <= pp_blue {
+                assert!(mgr.window_entry_with_log(b).unwrap().is_some(), "export needs blue {bs}");
+            }
+        }
+    }
+
+    /// Imported anchor pairs age out like self-validated ones: the import queues each under its proven
+    /// blue score, so once the pruning point is far enough above them GC removes the anchor rows, the
+    /// log entries and the scores. Before that they are all kept.
+    #[test]
+    fn imported_anchor_pairs_are_garbage_collected_when_they_age_out() {
+        use kaspa_shielded_core::anchor_window::{AnchorLog, WindowEntry};
+        let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
+        let mgr = manager(&db);
+        let pp = h(90);
+        let pairs: Vec<([u8; 32], Hash, u64)> = (1..=10u64).map(|i| ([i as u8; 32], h(i as u8), 100 + i)).collect();
+        let md = PruningPointShieldedMetadata {
+            frontier: FrontierState::default(),
+            supply: SupplyTotals::default(),
+            nullifier_muhash: MuHash::new(),
+            burns: BurnReceipts::default(),
+            state_root: [0u8; 32],
+            in_window_anchors: pairs.iter().map(|&(a, b, _)| (a, b)).collect(),
+            dev_accrued: 0,
+            in_window_anchor_source_scores: pairs.iter().map(|&(_, b, s)| (b, s)).collect(),
+            window_entries: Vec::new(),
+            miner_accrual: Default::default(),
+            window_prefix: Default::default(),
+        };
+        let mut batch = WriteBatch::default();
+        mgr.seed_pruning_point_shielded(&mut batch, pp, &md, std::iter::empty()).unwrap();
+        // Their log entries, as the processor seeds them alongside.
+        for &(a, b, s) in &pairs {
+            mgr.persist_window_entry(&mut batch, b, WindowEntry { block: b.as_bytes(), parent: [0; 32], root: a, blue_score: s }, AnchorLog::default())
+                .unwrap();
+        }
+        db.write(batch).unwrap();
+        let alive = |b: Hash, a: [u8; 32]| {
+            (mgr.anchor_producer_blocks(&a).unwrap().contains(&b), mgr.window_entry(b).unwrap().is_some(), mgr.attested_source_blue_score(b).unwrap().is_some())
+        };
+        // Still inside 2 x max_age of the pruning point (limit 120 - 20 = 100, below every pair): kept.
+        let mut batch = WriteBatch::default();
+        mgr.gc_aged_anchors(&mut batch, 100 + 2 * 10, 10, 1000).unwrap();
+        db.write(batch).unwrap();
+        for &(a, b, _) in &pairs {
+            assert_eq!(alive(b, a), (true, true, true), "kept while young");
+        }
+        // Far above: all of it goes.
+        let mut batch = WriteBatch::default();
+        mgr.gc_aged_anchors(&mut batch, 10_000, 10, 1000).unwrap();
+        db.write(batch).unwrap();
+        for &(a, b, _) in &pairs {
+            assert_eq!(alive(b, a), (false, false, false), "imported pair at {b} must age out completely");
+        }
     }
 }

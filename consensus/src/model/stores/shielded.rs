@@ -414,6 +414,10 @@ impl DbShieldedAnchorSourceScoreStore {
         self.access.write(BatchDbWriter::new(batch), source, blue_score)
     }
 
+    pub fn delete_batch(&self, batch: &mut WriteBatch, source: Hash) -> StoreResult<()> {
+        self.access.delete(BatchDbWriter::new(batch), source)
+    }
+
     /// The attested blue score of `source`, or `None` when nothing was attested — which the
     /// caller must treat as "cannot judge", never as zero.
     pub fn get(&self, source: Hash) -> StoreResult<Option<u64>> {
@@ -427,9 +431,12 @@ impl DbShieldedAnchorSourceScoreStore {
 
 // --------------------------- Anchor window (security fork) ---------------------------
 
-/// Per-block anchor window and per-block window entry (see `kaspa_shielded_core::anchor_window`).
-/// Both read an absent key as `None`, never as a default: a missing window at a post-fork block is
-/// a store inconsistency the caller must surface, not an empty window.
+/// Per-block anchor log and per-block log entry (see `kaspa_shielded_core::anchor_window`).
+/// Both read an absent key as `None`, never as a default: a missing log at a post-fork block is a
+/// store inconsistency the caller must surface, not an empty log. The entry row also keeps the log
+/// state just BEFORE that entry: the per-block log row is pruned with the block, but an export needs
+/// the state just below its lowest entry, and keeping it on that entry means a node needs nothing from
+/// further below (a freshly fast-synced node holds exactly the entries it imported).
 #[derive(Clone)]
 pub struct DbAnchorWindowStore {
     db: Arc<DB>,
@@ -438,11 +445,11 @@ pub struct DbAnchorWindowStore {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-pub struct StoredAnchorWindow(pub kaspa_shielded_core::anchor_window::AnchorWindow);
+pub struct StoredAnchorWindow(pub kaspa_shielded_core::anchor_window::AnchorLog);
 impl MemSizeEstimator for StoredAnchorWindow {}
 
 #[derive(Clone, Serialize, Deserialize)]
-pub struct StoredWindowEntry(pub kaspa_shielded_core::anchor_window::WindowEntry);
+pub struct StoredWindowEntry(pub kaspa_shielded_core::anchor_window::WindowEntry, pub kaspa_shielded_core::anchor_window::AnchorLog);
 impl MemSizeEstimator for StoredWindowEntry {}
 
 impl DbAnchorWindowStore {
@@ -462,12 +469,12 @@ impl DbAnchorWindowStore {
         &self,
         batch: &mut WriteBatch,
         block: Hash,
-        window: kaspa_shielded_core::anchor_window::AnchorWindow,
+        window: kaspa_shielded_core::anchor_window::AnchorLog,
     ) -> StoreResult<()> {
         self.windows.write(BatchDbWriter::new(batch), block, StoredAnchorWindow(window))
     }
 
-    pub fn window(&self, block: Hash) -> StoreResult<Option<kaspa_shielded_core::anchor_window::AnchorWindow>> {
+    pub fn window(&self, block: Hash) -> StoreResult<Option<kaspa_shielded_core::anchor_window::AnchorLog>> {
         match self.windows.read(block) {
             Ok(v) => Ok(Some(v.0)),
             Err(StoreError::KeyNotFound(_)) => Ok(None),
@@ -484,13 +491,22 @@ impl DbAnchorWindowStore {
         batch: &mut WriteBatch,
         block: Hash,
         entry: kaspa_shielded_core::anchor_window::WindowEntry,
+        log_before: kaspa_shielded_core::anchor_window::AnchorLog,
     ) -> StoreResult<()> {
-        self.entries.write(BatchDbWriter::new(batch), block, StoredWindowEntry(entry))
+        self.entries.write(BatchDbWriter::new(batch), block, StoredWindowEntry(entry, log_before))
     }
 
     pub fn entry(&self, block: Hash) -> StoreResult<Option<kaspa_shielded_core::anchor_window::WindowEntry>> {
+        Ok(self.entry_with_log(block)?.map(|(e, _)| e))
+    }
+
+    /// The entry and the log state right before it.
+    pub fn entry_with_log(
+        &self,
+        block: Hash,
+    ) -> StoreResult<Option<(kaspa_shielded_core::anchor_window::WindowEntry, kaspa_shielded_core::anchor_window::AnchorLog)>> {
         match self.entries.read(block) {
-            Ok(v) => Ok(Some(v.0)),
+            Ok(v) => Ok(Some((v.0, v.1))),
             Err(StoreError::KeyNotFound(_)) => Ok(None),
             Err(e) => Err(e),
         }
