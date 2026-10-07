@@ -750,8 +750,9 @@ impl ConsensusApi for Consensus {
     fn get_shielded_tree_frontier(&self, block: Hash) -> ConsensusResult<(u64, Option<[u8; 32]>, Vec<[u8; 32]>)> {
         let fs = self
             .virtual_processor
-            .shielded_frontier_at(block)
-            .map_err(|e| ConsensusError::GeneralOwned(format!("shielded frontier for {block}: {e}")))?;
+            .shielded_frontier_retained(block)
+            .map_err(|e| ConsensusError::GeneralOwned(format!("shielded frontier for {block}: {e}")))?
+            .ok_or_else(|| ConsensusError::GeneralOwned(format!("no shielded frontier retained for {block}")))?;
         Ok((fs.size, fs.leaf, fs.ommers))
     }
 
@@ -787,6 +788,19 @@ impl ConsensusApi for Consensus {
         let Some(low_index) = sc_read.get_by_hash(low).optional().unwrap() else {
             return Ok(None);
         };
+        // Peer-supplied history is served only once it verified: between the backfill writing it and
+        // the replay checking it (minutes to an hour) a wallet would otherwise scan unchecked records.
+        // Blocks this node validated itself (those with a header) are always served.
+        {
+            let meta = self.pruning_meta_stores.read();
+            let unverified = meta.shielded_history_backfilled() && meta.shielded_history_verified_base().is_none();
+            drop(meta);
+            if unverified && self.headers_store.get_compact_header_data(low).is_err() {
+                return Err(ConsensusError::GeneralOwned(format!(
+                    "shielded history below the pruning point is not verified yet; {low} cannot be served until it is"
+                )));
+            }
+        }
         let tip_index = sc_read.get_tip().unwrap().0;
 
         let high_index = tip_index.min(low_index.saturating_add(limit as u64));
@@ -839,7 +853,7 @@ impl ConsensusApi for Consensus {
         let mut index = lo - 1;
         for _ in 0..FRONTIER_SEARCH {
             let Some(hash) = sc.get_by_index(index).optional().unwrap() else { return Ok(None) };
-            if self.virtual_processor.shielded_frontier_at(hash).is_ok() {
+            if matches!(self.virtual_processor.shielded_frontier_retained(hash), Ok(Some(_))) {
                 return Ok(Some(hash));
             }
             if index == low {
@@ -978,9 +992,26 @@ impl ConsensusApi for Consensus {
         }
 
         let (mut idx_written, mut rec_written) = (0u64, 0u64);
+        let mut seen = kaspa_consensus_core::BlockHashSet::default();
         for (index, r) in records.iter() {
             if *index > ours_from {
                 continue; // above the anchor is our own validated range; ours is authoritative
+            }
+            // A peer-chosen hash must not already be indexed elsewhere, nor repeat in the chunk. Writing
+            // it anyway re-pointed `index_by_hash` of a real (possibly validated) block to a low index:
+            // the chain index then disagreed with itself (locators, the export window and the cursor
+            // pages read it), and a later purge deleted that block's own scan record.
+            if !seen.insert(r.hash) {
+                return Err(ConsensusError::GeneralOwned(format!("backfill chunk repeats block {}", r.hash)));
+            }
+            // `existing` is in this node's numbering before the re-base staged above; `index` is the peer's.
+            if let Some(existing) = sc.get_by_hash(r.hash).optional().unwrap() {
+                if existing + shift != *index {
+                    return Err(ConsensusError::GeneralOwned(format!(
+                        "backfilled block {} is already in this node's chain index at {existing}, not {index}",
+                        r.hash
+                    )));
+                }
             }
             // Every action blob must be a whole number of `CompactActionRecord`s. The frontier replay
             // that is supposed to bind this data reads it with `chunks_exact`, which silently DROPS a
@@ -1222,9 +1253,33 @@ impl ConsensusApi for Consensus {
         // Note this cannot be wrapped in `pool.install(..)` as a whole: the stream carries the
         // progress counters as `Cell`s, which are `!Sync`, so the closure is not `Send`. That is
         // the right shape anyway — the pool belongs around the parallel part, not the serial one.
+        // The replay binds only the cmx of each action. Fold every archived nullifier too and require
+        // the multiset to equal the accumulator committed at the base: otherwise a peer could repeat
+        // or fabricate nullifiers (halting every wallet that scans the block) or drop them (showing
+        // spent notes as unspent), and the record would still verify.
+        let mut nullifier_acc = kaspa_muhash::MuHash::new();
+        let stream = stream.map(|item| {
+            if let Ok((_, _, accepted)) = &item {
+                for actions in accepted {
+                    for rec in actions.chunks_exact(kaspa_shielded_core::wallet::CompactActionRecord::SERIALIZED_LEN) {
+                        nullifier_acc.add_element(&rec[0..32]);
+                    }
+                }
+            }
+            item
+        });
         let replayed = ShieldedStateManager::replay_frontier_streaming_capturing(stream, |hash, frontier| {
             checkpoints.push((hash, frontier.clone()));
         });
+        let expected_nullifiers = match sm.nullifier_muhash_at(base) {
+            Ok(mut m) => m.finalize(),
+            Err(e) => return Ok(ShieldedHistoryVerdict::Unverifiable { reason: format!("no nullifier accumulator at {base}: {e}") }),
+        };
+        if matches!(&replayed, Ok((frontier, _)) if *frontier == expected) && nullifier_acc.finalize() != expected_nullifiers {
+            return Ok(ShieldedHistoryVerdict::Mismatch {
+                reason: format!("the archived nullifiers do not hash to the accumulator committed at {base}"),
+            });
+        }
 
         match replayed {
             Ok((frontier, leaves)) if frontier == expected => {

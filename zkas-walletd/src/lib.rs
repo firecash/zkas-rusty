@@ -502,7 +502,10 @@ fn require_custodial(state: &AppState) -> Result<(), (StatusCode, Json<serde_jso
 /// params are keyed by.
 /// The security-fork activation of this daemon's network, set once at startup. From it every spend
 /// must name its anchor block (`kaspa_shielded_core::bundle::BUNDLE_FLAG_ANCHOR_BLOCK`).
-static SECURITY_FORK: std::sync::OnceLock<kaspa_consensus_core::config::params::ForkActivation> = std::sync::OnceLock::new();
+/// The security fork's activation DAA score for the network `serve` was last started on (`u64::MAX` =
+/// never). Atomics, not `OnceLock`s: the desktop app calls `serve` again on a node or network switch,
+/// and the values of the first network must not stay in force for the next.
+static SECURITY_FORK_DAA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
 
 /// The node's virtual DAA score as last seen by any sync pass (process-wide; a wallet's own
 /// `chain_len` is refreshed only when that wallet syncs, and a parked wallet can trail by minutes).
@@ -514,17 +517,20 @@ fn note_node_tip(daa_score: u64) {
 
 /// Whether a spend built now must name its anchor block. Judged at the highest DAA score known
 /// (the caller's, or the node tip seen by any sync pass), because the rule applies by the DAA of
-/// the block that includes the spend, which is at or above the tip. Near the boundary a
-/// transaction can still land on the other side; consensus then rejects it and the wallet
-/// re-proves, which costs time and never funds.
+/// the block that includes the spend, which is at or above the tip. Sends are held for
+/// [`FORK_BOUNDARY_HOLD`] scores before the activation, so a pre-fork spend does not land after it.
 fn security_fork_active(daa_score: u64) -> bool {
     let at = daa_score.max(NODE_TIP_DAA.load(std::sync::atomic::Ordering::Relaxed));
-    SECURITY_FORK.get().is_some_and(|f| f.is_active(at))
+    at >= SECURITY_FORK_DAA.load(std::sync::atomic::Ordering::Relaxed)
 }
+
+/// DAA scores before the security fork during which sends are held: a spend built then in the
+/// pre-fork format could be mined after the activation and refused.
+const FORK_BOUNDARY_HOLD: u64 = 120;
 
 /// The network's maximum shielded anchor age (blue score): a spend whose anchor is older than this
 /// at inclusion is rejected by every node.
-static MAX_ANCHOR_AGE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+static MAX_ANCHOR_AGE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
 
 /// Blue-score headroom kept below [`MAX_ANCHOR_AGE`] for the time between choosing an anchor and the
 /// spend landing in a block (proving, relay, mempool wait).
@@ -2165,8 +2171,7 @@ fn trust_node_cmx() -> bool {
 /// script, coinbase txid, output index and value that feed desc/value), so the
 /// locally-derived value is authoritative. A node-supplied commitment is only a
 /// CPU hint. In the default (secure) mode we derive locally and, if the node also
-/// supplied one, verify they match: a valid-but-wrong supplied leaf would silently
-/// fork the wallet note-commitment tree and break every future spend. In
+/// supplied one, require they match (a mismatch refuses the block: see below). In
 /// trust_node mode we take the supplied value as-is (fast path, opt-in).
 fn select_coinbase_cmx(
     supplied: Option<kaspa_shielded_core::ExtractedNoteCommitment>,
@@ -2179,11 +2184,15 @@ fn select_coinbase_cmx(
     }
     match kaspa_shielded_core::coinbase::coinbase_note_commitment(desc, value).ok() {
         Some(derived) => {
+            // A mismatch means the node's record is inconsistent, and which half is wrong cannot be
+            // told from here: forged outputs paired with the real commitment (a history-backfill peer
+            // can supply exactly that, and the node's replay checks only the commitments) would credit
+            // income that does not exist if the derived value were kept. Refuse the block instead; the
+            // page fails and is retried, as for any other bad page.
             if let Some(sup) = supplied {
                 if sup.to_bytes() != derived.to_bytes() {
-                    log::warn!(
-                        "coinbase commitment mismatch: node-supplied value != local derivation; using derived (node may be faulty or malicious)"
-                    );
+                    log::warn!("coinbase commitment mismatch: node-supplied value != local derivation; refusing the block");
+                    return None;
                 }
             }
             Some(derived)
@@ -2233,7 +2242,7 @@ fn decode_block(b: &kaspa_rpc_core::RpcShieldedChainBlock) -> Result<DecodedBloc
             // PoW-committed block fields and reject a valid-but-wrong node value
             // (which would silently fork the wallet tree). See select_coinbase_cmx.
             let cmx = select_coinbase_cmx(supplied, &desc, out.value, trust_node_cmx())
-                .ok_or_else(|| format!("block {}: coinbase output {i} does not derive a note commitment", b.hash))?;
+                .ok_or_else(|| format!("block {}: coinbase output {i} does not derive a note commitment, or disagrees with the node's", b.hash))?;
             coinbase.push((desc, out.value, cmx));
         }
     }
@@ -2680,6 +2689,10 @@ struct WalletEntry {
     /// retry; at [`REORG_STRIKES`] the sync loop discards the checkpoint and
     /// reloads this wallet from scratch (the append-only tree cannot roll back).
     reorged_strikes: u32,
+    /// Set by the shared-tree audit on a divergence: the next sync pass retires this entry's
+    /// checkpoint and the caller rebuilds it, as for a reorg it cannot follow. A flag, not a strike
+    /// count, because a successful page clears the strikes before the pass reaches the retire step.
+    audit_retire: bool,
     /// Balance effect of the blocks between the settled cutoff and the tip — value
     /// arriving and owned value being spent, seen by trial-decryption without touching
     /// the append-only tree. This is what makes a payment visible ~1 second after it is
@@ -2881,6 +2894,7 @@ impl WalletEntry {
             sink_blue,
             sink_live: false,
             reorged_strikes: 0,
+            audit_retire: false,
             preview: Preview::default(),
             mempool: Preview::default(),
             unsettled_nulls: HashSet::new(),
@@ -3050,6 +3064,10 @@ impl WalletEntry {
         // `[base, covers)`; a wallet whose oldest note is below `base` is NOT covered.
         shared_tree_base: u64,
     ) {
+        // A tree the audit found diverged is not advanced: the pass goes straight to retiring it.
+        if self.audit_retire {
+            return;
+        }
         // A database that ingested inconsistent data is not advanced any further; see `poisoned`.
         if self.db.poisoned() {
             self.error = Some("inconsistent shielded data from the node; sync halted until restart".into());
@@ -3934,14 +3952,24 @@ impl WalletEntry {
             .rev()
             .find(|(bs, leaves)| *bs <= cutoff_blue && *leaves == matured)
             .map(|&(bs, _)| bs);
-        let budget = MAX_ANCHOR_AGE.get().copied().unwrap_or(u64::MAX).saturating_sub(ANCHOR_AGE_HEADROOM);
+        let budget = MAX_ANCHOR_AGE.load(std::sync::atomic::Ordering::Relaxed).saturating_sub(ANCHOR_AGE_HEADROOM);
         if anchor_blue.is_none_or(|bs| self.sink_blue.saturating_sub(bs) > budget) {
             return Err(err(
                 StatusCode::CONFLICT,
                 "this wallet is too far behind the chain tip to build a spend the network accepts; retry once it has synced",
             ));
         }
-        if !security_fork_active(self.chain_len.max(self.scanned as u64)) {
+        let tip = self.chain_len.max(self.scanned as u64);
+        if !security_fork_active(tip) {
+            // Just before the fork a spend built in the old format would likely land in a post-fork
+            // block, be refused there, and keep its notes locked until the pending spend expires
+            // (about an hour). Hold sends across the boundary instead.
+            if security_fork_active(tip.saturating_add(FORK_BOUNDARY_HOLD)) {
+                return Err(err(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "a network upgrade activates within the next few blocks; retry in about two minutes",
+                ));
+            }
             return Ok(None);
         }
         anchor_blue.and_then(|bs| self.boundary_blocks.get(&bs)).copied().map(Some).ok_or_else(|| {
@@ -6472,7 +6500,7 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
     // a spend becomes a lookup instead of an O(chain) Sinsemilla replay; `witness_path_at`
     // still rebuilds on demand for any note whose witness isn't held (correctness never
     // depends on the pre-advance).
-    if e.reorged_strikes >= REORG_STRIKES {
+    if e.reorged_strikes >= REORG_STRIKES || e.audit_retire {
         // Cursor off the selected chain (or pruned away) for enough passes: retire the
         // checkpoint to .bak and let the caller evict + reload it from a fresh anchor.
         //
@@ -8447,8 +8475,8 @@ fn stranded_hint(stranded_value: u64) -> String {
 /// every ten minutes the shared tree's root at its cursor is compared with the node's own consensus
 /// frontier at that block (`GetShieldedTreeState`). The node's consensus state never reads the scan
 /// archive, so a poisoned archive that forked the stream shows up here as a mismatch. On mismatch
-/// the shared tree is halted (no further sync, no checkpoint) and borrowing wallets refuse to spend
-/// until a restart reloads the last good checkpoint.
+/// its checkpoint is retired and the tree rebuilt from genesis (once per process); a mismatch after
+/// that rebuild halts it (no further sync, no checkpoint) and borrowing wallets refuse to spend.
 async fn shared_tree_audit_loop(state: Arc<AppState>) {
     const EVERY: std::time::Duration = std::time::Duration::from_secs(600);
     loop {
@@ -8480,6 +8508,27 @@ async fn shared_tree_audit_loop(state: Arc<AppState>) {
         let mut e = state.chain_tree.lock().await;
         if e.low != cursor || e.db.size() != size {
             continue; // the tree moved while we asked; judge it next round
+        }
+        // Halting alone never recovered: the tree is checkpointed every minute and audited every ten,
+        // so the diverged state is normally already on disk and a restart reloads it. Strike it out
+        // instead, exactly as a reorg it cannot follow does: the sync pass that owns the checkpoint
+        // retires it to .bak (only on a node that can serve genesis, else it parks the tree) and the
+        // reorg path rebuilds the tree from genesis. Retiring here, off the sync pass, would race its
+        // off-lock checkpoint write. Once per process: a tree that diverges again after its rebuild
+        // is fed data it cannot follow, so it is halted for the operator.
+        static AUDIT_REBUILT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !AUDIT_REBUILT.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            log::error!(
+                "shared chain tree DIVERGED at {cursor}: tree size/root {}/{}, node consensus {}/{}; retiring its checkpoint \
+                 and rebuilding from genesis",
+                size,
+                hex(&anchor),
+                fs.size,
+                hex(&tree.anchor().to_bytes()),
+            );
+            e.audit_retire = true;
+            e.error = Some("shared chain tree diverged from the node's consensus state; rebuilding".into());
+            continue;
         }
         e.db.mark_poisoned();
         e.error = Some("shared chain tree diverged from the node's consensus state".into());
@@ -8531,7 +8580,7 @@ async fn ensure_canonical_checkpoint(state: &Arc<AppState>, w: &Wallet) -> Resul
         if state.chain_tree.lock().await.db.poisoned() {
             return Err(err(
                 StatusCode::SERVICE_UNAVAILABLE,
-                "the shared chain state failed its consistency audit; sends resume after the daemon restarts",
+                "the shared chain state failed its consistency audit again after a rebuild; point the daemon at another node and restart it",
             ));
         }
         return Ok(());
@@ -11465,13 +11514,15 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
         Some(d) if state_prefix_network(&cfg.network) != kaspa_consensus_core::network::NetworkType::Mainnet => kaspa_consensus_core::config::params::ForkActivation::new(d),
         _ => kaspa_consensus_core::config::params::Params::from(state_prefix_network(&cfg.network)).security_fork_activation,
     };
-    let _ = SECURITY_FORK.set(fork);
+    SECURITY_FORK_DAA.store(fork.daa_score(), std::sync::atomic::Ordering::Relaxed);
+    // The tip seen by a previous `serve` (another node, possibly another network) says nothing here.
+    NODE_TIP_DAA.store(0, std::sync::atomic::Ordering::Relaxed);
     // `ZKAS_MAX_ANCHOR_AGE` likewise mirrors an override-params file on a test network.
     let max_anchor_age = match std::env::var("ZKAS_MAX_ANCHOR_AGE").ok().and_then(|v| v.parse::<u64>().ok()) {
         Some(a) if state_prefix_network(&cfg.network) != kaspa_consensus_core::network::NetworkType::Mainnet => a,
         _ => kaspa_consensus_core::config::params::Params::from(state_prefix_network(&cfg.network)).max_shielded_anchor_age(),
     };
-    let _ = MAX_ANCHOR_AGE.set(max_anchor_age);
+    MAX_ANCHOR_AGE.store(max_anchor_age, std::sync::atomic::Ordering::Relaxed);
 
     let resources = cfg.resources.clone();
     log::info!("wallet resource limits: {:?}", resources);
@@ -12260,10 +12311,10 @@ mod sdk_api_tests {
                 .unwrap();
         let mut with_commitment = base;
         with_commitment.coinbase_outputs[0].commitment = Some(supplied_cmx.to_bytes());
-        // Secure default: a supplied-but-wrong commitment is rejected in favour of
-        // the locally-derived (PoW-committed-input) value.
-        let supplied = decode_block(&with_commitment).unwrap();
-        assert_eq!(supplied.coinbase[0].2.to_bytes(), expected.to_bytes());
+        // Secure default: a supplied commitment that disagrees with the outputs refuses the block.
+        // Keeping the derived value instead would credit forged outputs that a history-backfill peer
+        // paired with the real commitment (the node's replay checks only the commitment).
+        assert!(decode_block(&with_commitment).is_err(), "an inconsistent coinbase record is refused");
     }
 
     #[test]
@@ -12286,8 +12337,9 @@ mod sdk_api_tests {
         .unwrap();
         assert_ne!(derived.to_bytes(), wrong.to_bytes());
 
-        // verify mode: a wrong supplied value is rejected -> derived wins
-        assert_eq!(select_coinbase_cmx(Some(wrong), &desc, value, false).unwrap().to_bytes(), derived.to_bytes());
+        // verify mode: a supplied value that disagrees with the outputs refuses the block (either half
+        // may be the forged one; keeping the derived value would credit forged outputs)
+        assert!(select_coinbase_cmx(Some(wrong), &desc, value, false).is_none());
         // verify mode: honest supplied (== derived) is accepted
         assert_eq!(select_coinbase_cmx(Some(derived), &desc, value, false).unwrap().to_bytes(), derived.to_bytes());
         // verify mode: no supplied value -> derive locally
@@ -12500,7 +12552,14 @@ async fn bundle_prepare(
     // token. Unauthenticated, this endpoint let anyone on the network spend the daemon's entire
     // CPU budget and starve the wallet that owns it — the single-party `/api/wallet/prepare` path
     // has gone through both a token and an admission gate for exactly that reason.
-    let _token = token_from(&headers, state.allow_default_token)?;
+    // A well-formed header alone authenticates nothing, so the token must name a wallet this daemon
+    // has loaded. Where anyone may create a wallet this is a speed bump, not access control: keep
+    // `enable_multiparty` off on a public daemon.
+    // Resident wallets only: a lookup, never an inline load on the request path.
+    let token = token_from(&headers, state.allow_default_token)?;
+    if !state.wallets.lock().await.contains_key(&token) {
+        return Err(err(StatusCode::UNAUTHORIZED, "unknown or unloaded wallet token; open the wallet first"));
+    }
     if req.spends.is_empty() || req.outputs.is_empty() {
         return Err(err(StatusCode::BAD_REQUEST, "a bundle needs at least one spend and one output"));
     }

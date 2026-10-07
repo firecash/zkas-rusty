@@ -906,6 +906,20 @@ impl ShieldedStateManager {
         self.tree_store.get(block)
     }
 
+    /// Test helper: drop a block's window entry, as age-based GC does.
+    #[cfg(test)]
+    pub fn delete_window_entry_for_test(&self, batch: &mut WriteBatch, block: Hash) -> StoreResult<()> {
+        self.anchor_window.delete_entry_batch(batch, block)
+    }
+
+    /// The frontier this node actually holds for `block`, `None` when it holds none. Unlike
+    /// [`Self::frontier_at`] a missing row is not read as the empty tree: below the pruning point only
+    /// sparse checkpoints keep a row, and serving the empty frontier there starts a wallet's tree at
+    /// size 0 in the middle of the chain.
+    pub fn frontier_present(&self, block: Hash) -> StoreResult<Option<FrontierState>> {
+        self.tree_store.get_present(block)
+    }
+
     /// The chain block whose shielded tree root equals `anchor`, if any block ever
     /// produced it (PLAN §2.5). The caller decides finality by checking that this
     /// block is a selected-chain ancestor of the spending block (reorg-safety) and
@@ -1144,6 +1158,11 @@ impl ShieldedStateManager {
 
     fn load_nullifier_muhash(&self, block: Hash) -> StoreResult<MuHash> {
         self.nullifier_muhash.get(block)
+    }
+
+    /// The nullifier-set accumulator committed (through the state root) as of `block`.
+    pub fn nullifier_muhash_at(&self, block: Hash) -> StoreResult<MuHash> {
+        self.load_nullifier_muhash(block)
     }
 
     /// The canonical shielded state root (PLAN §2.10) as of a given chain block:
