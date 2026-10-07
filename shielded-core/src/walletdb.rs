@@ -2104,7 +2104,15 @@ impl WalletDb {
         self.scan_cost.subtree_ns += t_subtree.elapsed().as_nanos();
         if let Some(note) = owned {
             let nullifier = note.nullifier(&self.fvk).to_bytes();
-            self.notes.push(OwnedNote { note, position: self.size, nullifier });
+            // The stream already carried this note's nullifier, so the note was spent before it
+            // appeared here. The chain's own order never does that, but a backfilled history archive
+            // is bound by its leaf sequence and its nullifier multiset, not by which action carries
+            // each nullifier, so a record can move a spend earlier than the note it spends. The
+            // nullifier set is the truth either way: keep the leaf (the tree must not change) and
+            // never offer the note as spendable.
+            if !self.spent_nullifiers.contains(&nullifier) {
+                self.notes.push(OwnedNote { note, position: self.size, nullifier });
+            }
         }
         self.size += 1;
         self.scan_cost.tree_ns += t_leaf.elapsed().as_nanos();
@@ -4014,6 +4022,27 @@ mod tests {
         assert_eq!(db.notes().len(), 1, "only the wallet's own coinbase note is tracked");
         assert_eq!(db.balance(), 5_000);
         assert_eq!(db.notes()[0].position, 0, "our note is leaf 0 (first coinbase note)");
+    }
+
+    /// A backfilled archive binds the nullifier multiset, not which action carries each nullifier, so a
+    /// record can show a note's spend BEFORE the note. The wallet must not then offer the note as
+    /// spendable: its nullifier was already in the stream when the note appeared.
+    #[test]
+    fn a_note_whose_nullifier_the_stream_already_carried_is_spent_on_arrival() {
+        let mine = [7u8; 32];
+        let cb = coinbase_for(address_of(mine), b"txid-a||0", 5_000);
+        let mut probe = WalletDb::from_seed(mine).unwrap();
+        probe.ingest_block(std::slice::from_ref(&cb), &[]);
+        let nf = probe.notes()[0].nullifier;
+
+        let mut db = WalletDb::from_seed(mine).unwrap();
+        let early_spend = CompactActionRecord { nullifier: nf, cmx: [0xFF; 32], ephemeral_key: [0; 32], enc_ciphertext: [0; 52] };
+        db.ingest_block_compact_with_meta(&[], &[vec![early_spend]], None);
+        db.ingest_block(std::slice::from_ref(&cb), &[]);
+        assert!(db.notes().is_empty(), "a note spent before it appeared is never spendable");
+        assert_eq!(db.balance(), 0);
+        assert!(!db.poisoned(), "this is not a repeated nullifier");
+        assert_eq!(db.size(), probe.size(), "the leaf is still appended");
     }
 
     /// `ingest_block_precomputed` (the shared-cache path) must produce a wallet

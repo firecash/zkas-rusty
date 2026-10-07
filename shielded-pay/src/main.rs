@@ -581,8 +581,19 @@ async fn balance(rpc_server: String, seed: [u8; 32]) {
     }
 }
 
+/// This tool builds the pre-fork spend format (no named anchor block). From the security fork every
+/// node refuses that format, so refuse up front instead of proving a payment that cannot be mined.
+async fn refuse_after_security_fork(client: &GrpcClient) {
+    let dag = client.get_block_dag_info().await.unwrap_or_else(|e| fatal(format!("get_block_dag_info failed: {e}")));
+    let params = kaspa_consensus_core::config::params::Params::from(dag.network);
+    if params.security_fork_activation.is_active(dag.virtual_daa_score.saturating_add(600)) {
+        fatal("shielded-pay builds the pre-upgrade spend format, which the network no longer accepts; send with zkas-walletd".into());
+    }
+}
+
 async fn send(rpc_server: String, owner_seed: [u8; 32], to: String, amount: u64, fee: u64, anchor_depth: u64) {
     let client = connect(&rpc_server).await;
+    refuse_after_security_fork(&client).await;
 
     let net: [u8; 32] = resolve_genesis(&client).await.as_bytes();
 
@@ -661,6 +672,7 @@ async fn send(rpc_server: String, owner_seed: [u8; 32], to: String, amount: u64,
 
 async fn pay(rpc_server: String, owner_seed: [u8; 32], to: String, fee: u64) {
     let client = connect(&rpc_server).await;
+    refuse_after_security_fork(&client).await;
 
     let dag = client.get_block_dag_info().await.unwrap_or_else(|e| fatal(format!("get_block_dag_info failed: {e}")));
     let genesis = resolve_genesis(&client).await;

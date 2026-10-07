@@ -72,6 +72,12 @@ impl TransactionValidator {
     /// key — so a hit is as authoritative as a fresh proof check. Only the boolean is
     /// stored; the error text is rebuilt on a cached failure, which costs nothing and keeps
     /// the cache one machine word per entry.
+    /// [`Self::verify_shielded_bundle_cached`] for a transaction offered outside any block, judged in
+    /// the format of `daa_score` (the virtual's). See `ConsensusApi::preverify_shielded_transaction`.
+    pub fn preverify_shielded_bundle(&self, tx: &Transaction, daa_score: u64) -> TxResult<()> {
+        self.verify_shielded_bundle_cached(tx, daa_score)
+    }
+
     fn verify_shielded_bundle_cached(&self, tx: &Transaction, block_daa_score: u64) -> TxResult<()> {
         let id = tx.id();
         if self.shielded_verify_cache.get(&id).is_some_and(|ok| ok == 1) {

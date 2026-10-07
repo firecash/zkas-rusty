@@ -1833,10 +1833,124 @@ async fn backfill_refuses_records_that_collide_with_the_chain_index() {
         ctx.consensus.backfill_shielded_history(anchor, anchor_index, &[(3, below.clone()), (2, below.clone())]).is_err(),
         "a chunk repeating a block is refused"
     );
+    // The scores a record claims are bound too: they must agree with any header this node holds, rise
+    // strictly along the index and stay below the anchor's.
+    let mut lying = below.clone();
+    lying.daa_score += 1;
+    assert!(ctx.consensus.backfill_shielded_history(anchor, anchor_index, &[(3, lying)]).is_err(), "a score disagreeing with the header");
+    // Blocks this node holds no header for (as below a real backfill base) are bound only by order.
+    let unknown = |seed: u8, blue: u64| {
+        let mut r = below.clone();
+        r.hash = Hash::from_bytes([seed; 32]);
+        r.blue_score = blue;
+        r
+    };
+    assert!(
+        ctx.consensus
+            .backfill_shielded_history(anchor, anchor_index, &[(3, unknown(0xA3, below.blue_score)), (2, unknown(0xA2, below.blue_score))])
+            .is_err(),
+        "blue scores that do not rise along the index"
+    );
+    let mut fell = unknown(0xA2, below.blue_score - 1);
+    fell.daa_score = below.daa_score + 1;
+    assert!(
+        ctx.consensus.backfill_shielded_history(anchor, anchor_index, &[(3, unknown(0xA3, below.blue_score)), (2, fell)]).is_err(),
+        "a DAA score that falls along the index"
+    );
     ctx.consensus.backfill_shielded_history(anchor, anchor_index, &[(3, below)]).expect("a block at its own index is accepted");
+    // The write marked the index peer-supplied and recorded the node's own base. A purge forgets both,
+    // so nothing of the node's own is gated as unverified afterwards (the flag used to stay set).
+    let meta = || ctx.consensus.pruning_meta_stores.read();
+    assert!(meta().shielded_history_backfilled());
+    assert_eq!(meta().shielded_history_own_base(), Some(config.genesis.hash));
+    ctx.consensus.purge_shielded_history_below(anchor).unwrap();
+    assert!(!meta().shielded_history_backfilled() && meta().shielded_history_own_base().is_none(), "the purge forgets the backfill");
+
+    // As on a fast-synced node: the own base sits above peer-supplied entries. A purge drops those,
+    // shifts the index back and forgets the backfill in the same write.
+    {
+        use crate::model::stores::selected_chain::SelectedChainStoreReader;
+        let vp = ctx.consensus.virtual_processor();
+        let mut batch = rocksdb::WriteBatch::default();
+        {
+            let mut sc = vp.selected_chain_store.write();
+            let (tip, _) = sc.get_tip().unwrap();
+            for i in (0..=tip).rev() {
+                let h = sc.get_by_index(i).unwrap();
+                sc.rebase_entry(&mut batch, i, h, i + 1).unwrap();
+            }
+            sc.write_entry(&mut batch, 0, Hash::from_bytes([0xB0; 32])).unwrap();
+            sc.set_highest_index(&mut batch, tip + 1).unwrap();
+        }
+        let mut meta_w = ctx.consensus.pruning_meta_stores.write();
+        meta_w.set_shielded_history_backfilled(&mut batch).unwrap();
+        meta_w.set_shielded_history_own_base(&mut batch, config.genesis.hash).unwrap();
+        drop(meta_w);
+        vp.write_batch_for_test(batch);
+        assert!(ctx.consensus.purge_shielded_history_below(chain[0]).is_ok());
+        assert!(!meta().shielded_history_backfilled(), "a full purge forgets the backfill too");
+        assert_eq!(vp.selected_chain_store.read().get_by_index(0).unwrap(), config.genesis.hash, "the own base is index 0 again");
+    }
     // The validated tip block still resolves at its own index: nothing is above it.
     let above_tip = ctx.consensus.get_shielded_chain_range(chain[7], 4).unwrap().expect("the tip is indexed");
     assert!(above_tip.is_empty(), "the tip's index entry was not re-pointed below the anchor");
+}
+
+/// Verification binds what the leaf replay alone does not: each record's coinbase outputs must derive
+/// exactly the commitments it carries (a forged value beside the real commitment used to verify, and a
+/// wallet then credited it), and blue scores must rise and DAA scores never fall along the index.
+#[tokio::test]
+async fn history_verification_binds_coinbase_outputs_and_scores() {
+    use kaspa_consensus_core::api::ShieldedHistoryVerdict;
+    let mut params = MAINNET_PARAMS.clone();
+    params.shielded_coinbase = true;
+    let config = ConfigBuilder::new(params)
+        .edit_consensus_params(|p| {
+            p.genesis.bits = 0x207fffff;
+            p.blockrate.shielded_anchor_depth = 1;
+        })
+        .build();
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+    let miner_addr = kaspa_shielded_core::wallet::address_bytes_from_seed([7u8; 32]).expect("orchard address");
+    ctx.miner_data = MinerData::new(ScriptPublicKey::new(0, ScriptVec::from_slice(&miner_addr)), vec![]);
+    let mut chain = Vec::new();
+    for _ in 0..8 {
+        let b = ctx.mine_real_pow_block();
+        chain.push(b.header.hash);
+        ctx.consensus.validate_and_insert_block(b).virtual_state_task.await.unwrap();
+    }
+    let tip = *chain.last().unwrap();
+    let vp = ctx.consensus.virtual_processor();
+    let sm = vp.shielded_state_manager_ref();
+    let verify = || ctx.consensus.verify_shielded_history(tip).unwrap();
+    assert!(matches!(verify(), ShieldedHistoryVerdict::Verified { .. }), "honest history verifies: {:?}", verify());
+
+    let honest = sm.scan_block(chain[3]).unwrap().expect("a record");
+    assert!(!honest.coinbase_commitments.is_empty(), "precondition: the record carries its commitments");
+    let mut forged = honest.clone();
+    forged.coinbase_outputs[0].1 += 1;
+    vp.overwrite_scan_record_for_test(chain[3], forged);
+    assert!(!matches!(verify(), ShieldedHistoryVerdict::Verified { .. }), "a forged output beside a real commitment fails");
+
+    // The replay derives its leaves from the outputs, so a forged stored commitment leaves the frontier
+    // intact; but it is what the node serves wallets, so it must fail on its own.
+    let mut forged_cmx = honest.clone();
+    forged_cmx.coinbase_commitments[0] = [0x11; 32];
+    vp.overwrite_scan_record_for_test(chain[3], forged_cmx);
+    assert!(!matches!(verify(), ShieldedHistoryVerdict::Verified { .. }), "a stored commitment that disagrees with its output fails");
+
+    let mut fell = honest.clone();
+    fell.daa_score = sm.scan_block(chain[2]).unwrap().unwrap().daa_score - 1;
+    vp.overwrite_scan_record_for_test(chain[3], fell);
+    assert!(matches!(verify(), ShieldedHistoryVerdict::Mismatch { .. }), "a DAA score that falls along the index fails");
+
+    let mut flat = honest.clone();
+    flat.blue_score = sm.scan_block(chain[2]).unwrap().unwrap().blue_score;
+    vp.overwrite_scan_record_for_test(chain[3], flat);
+    assert!(matches!(verify(), ShieldedHistoryVerdict::Mismatch { .. }), "a blue score that does not rise fails");
+
+    vp.overwrite_scan_record_for_test(chain[3], honest);
+    assert!(matches!(verify(), ShieldedHistoryVerdict::Verified { .. }), "and the honest record verifies again");
 }
 
 /// Round-2 audit: for a post-fork pruning point the window entries are the proof, so a peer pair
@@ -2859,6 +2973,51 @@ async fn combined_activation_sweep_real_import_is_exact_at_every_offset() {
         node.shutdown(wait);
     }
     assert!(seen.0 && seen.1, "the sweep must cover both the transition and the fully logged window");
+}
+
+/// From the security fork a spend is judged only through its named block's anchor-log entry, the only
+/// per-block anchor record the committed root covers. An unnamed spend, or one naming a pre-fork block,
+/// is refused even though this node's producer index lists that block: on a fast-synced node that index
+/// holds peer pairs nothing proves (ZK-01). Before the fork the producer index still decides and the
+/// named field is refused.
+#[tokio::test]
+async fn post_fork_spends_resolve_only_through_the_anchor_log() {
+    use crate::model::stores::headers::HeaderStoreReader;
+    const K: u64 = 6;
+    let activation = ForkActivation::new(MAINNET_PARAMS.genesis.daa_score + K);
+    let config = combined_config(activation, 50);
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+    ctx.miner_data = shielded_miner();
+    let mut chain = vec![config.genesis.hash];
+    for _ in 0..12 {
+        let b = ctx.mine_real_pow_block();
+        chain.push(b.header.hash);
+        ctx.consensus.validate_and_insert_block(b).virtual_state_task.await.unwrap();
+    }
+    let vp = ctx.consensus.virtual_processor();
+    let mgr = vp.shielded_state_manager_ref();
+    let hs = ctx.consensus.headers_store();
+    let (pre, post) = (chain[3], chain[10]);
+    assert!(!activation.is_active(hs.get_daa_score(pre).unwrap()) && activation.is_active(hs.get_daa_score(post).unwrap()));
+    let root_pre = mgr.own_anchor_of(pre).unwrap().expect("pre-fork frontier");
+    let root_post = mgr.own_anchor_of(post).unwrap().expect("post-fork frontier");
+    assert!(mgr.anchor_producer_blocks(&root_pre).unwrap().contains(&pre), "precondition: the producer index names the pre-fork block");
+    assert!(mgr.window_entry(pre).unwrap().is_none() && mgr.window_entry(post).unwrap().is_some());
+    let tip = *chain.last().unwrap();
+    let (blue, daa) = (hs.get_blue_score(tip).unwrap() + 1, hs.get_daa_score(tip).unwrap() + 1);
+    let pre_fork = activation.daa_score() - 1;
+
+    assert!(vp.resolve_shielded_anchor(&root_pre, None, tip, blue, pre_fork).is_final, "before the fork the producer index decides");
+    assert!(!vp.resolve_shielded_anchor(&root_pre, Some(pre.as_bytes()), tip, blue, pre_fork).is_final, "and a named block is refused");
+
+    let unnamed = vp.resolve_shielded_anchor(&root_pre, None, tip, blue, daa);
+    assert!(!unnamed.is_final, "after the fork an unnamed spend is dropped: {unnamed:?}");
+    let unnamed_post = vp.resolve_shielded_anchor(&root_post, None, tip, blue, daa);
+    assert!(!unnamed_post.is_final, "an unnamed spend is dropped even against a logged post-fork root: {unnamed_post:?}");
+    let named_pre = vp.resolve_shielded_anchor(&root_pre, Some(pre.as_bytes()), tip, blue, daa);
+    assert!(!named_pre.is_final, "a pre-fork anchor block is not in the log, whatever the producer index says: {named_pre:?}");
+    assert!(vp.resolve_shielded_anchor(&root_post, Some(post.as_bytes()), tip, blue, daa).is_final, "a logged post-fork block is usable");
+    assert!(!vp.resolve_shielded_anchor(&root_pre, Some(post.as_bytes()), tip, blue, daa).is_final, "an entry vouches only for its own root");
 }
 
 /// A peer can shorten a proof without breaking the replay: fold the bottom entries into the prefix.

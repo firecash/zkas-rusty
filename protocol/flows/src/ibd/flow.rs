@@ -100,6 +100,23 @@ const SHIELDED_HISTORY_MAX_PEERS: usize = 8;
 /// has no obligation to honour the server-side cap, and the ingest writes before it verifies.
 const MAX_HISTORY_CHUNK_RECORDS: usize = 8_000;
 
+/// One serialized history record: a chain block's record holds its whole mergeset's accepted actions,
+/// so this sits well above a full mergeset of shielded-heavy blocks, and far below what lets one
+/// record dominate memory.
+const MAX_HISTORY_RECORD_BYTES: usize = 32 * 1024 * 1024;
+
+/// One history chunk's serialized records in total, checked before any is decoded.
+const MAX_HISTORY_CHUNK_BYTES: usize = 256 * 1024 * 1024;
+
+/// A chunk that is not the last must carry at least this many records. An honest server fills every
+/// chunk but the last (`max_blocks + 1` records); without a floor a peer could drip one record per
+/// round trip, just inside the dequeue timeout, and hold the sync for days.
+const MIN_HISTORY_CHUNK_RECORDS: usize = 1_000;
+
+/// The whole backfill, fetch and verification together. Mainnet takes 10-60 minutes; a peer that
+/// stretches it past this is dropped and the next one is asked.
+const MAX_HISTORY_BACKFILL_DURATION: std::time::Duration = std::time::Duration::from_secs(4 * 3600);
+
 pub enum IbdType {
     Sync {
         highest_known_syncer_chain_hash: Hash,
@@ -1018,10 +1035,11 @@ impl IbdFlow {
 
         const MAX_BLOCKS_PER_CHUNK: u32 = 4_000;
         let mut anchor = consensus.async_get_shielded_history_base().await;
-        // The base BEFORE any backfill: this node's own pruning point, and the only block down
-        // here whose shielded frontier came from the chain rather than from the peer. Captured
-        // now because ingesting the first chunk renumbers the index and moves the base.
-        let verify_base = anchor;
+        // Verified against the CURRENT pruning point: its frontier and nullifier accumulator are
+        // PoW-bound and always retained. The base before the backfill is the same block on a fresh
+        // node, but on a node synced long ago it is an old pruning point whose accumulator the pruner
+        // deleted, so verifying there always came out `Unverifiable` and every backfill was purged.
+        let verify_base = consensus.async_pruning_point().await;
         let (mut total_idx, mut total_rec, mut rounds) = (0u64, 0u64, 0u32);
         // The floor wallets see while this runs. On a first sync this whole fetch plus its
         // verification runs BEFORE block bodies are synced, so the node reports NOT synced and
@@ -1064,6 +1082,34 @@ impl IbdFlow {
                 return Err(ProtocolError::OtherOwned(format!(
                     "peer sent {} shielded history records in one chunk, above the {MAX_HISTORY_CHUNK_RECORDS} ceiling",
                     msg.entries.len()
+                )));
+            }
+
+            let mut chunk_bytes = 0usize;
+            for e in &msg.entries {
+                if e.data.len() > MAX_HISTORY_RECORD_BYTES {
+                    return Err(ProtocolError::OtherOwned(format!(
+                        "peer sent a {}-byte shielded history record, above the {MAX_HISTORY_RECORD_BYTES} ceiling",
+                        e.data.len()
+                    )));
+                }
+                chunk_bytes += e.data.len();
+            }
+            if chunk_bytes > MAX_HISTORY_CHUNK_BYTES {
+                return Err(ProtocolError::OtherOwned(format!(
+                    "peer sent {chunk_bytes} bytes of shielded history in one chunk, above the {MAX_HISTORY_CHUNK_BYTES} ceiling"
+                )));
+            }
+            if !msg.done && msg.entries.len() < MIN_HISTORY_CHUNK_RECORDS {
+                return Err(ProtocolError::OtherOwned(format!(
+                    "peer sent a short shielded history chunk ({} records) that is not the last; refusing a drip feed",
+                    msg.entries.len()
+                )));
+            }
+            if started.elapsed() > MAX_HISTORY_BACKFILL_DURATION {
+                return Err(ProtocolError::OtherOwned(format!(
+                    "shielded history backfill from this peer exceeded {:?}; asking another peer",
+                    MAX_HISTORY_BACKFILL_DURATION
                 )));
             }
 

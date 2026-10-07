@@ -395,6 +395,11 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         if session.async_is_consensus_in_transitional_ibd_state().await {
             return Err(RpcError::ConsensusInTransitionalIbdState);
         }
+        // Refuse oversized extra data before building: the template cache would otherwise build (and,
+        // for a red-reward template, replace its entry with) a template the length check below refuses.
+        if request.extra_data.len() > self.config.max_coinbase_payload_len {
+            return Err(RpcError::CoinbasePayloadLengthAboveMax(self.config.max_coinbase_payload_len));
+        }
         let script_public_key = kaspa_txscript::pay_to_address_script(&request.pay_address);
         let extra_data = version().as_bytes().iter().chain(once(&(b'/'))).chain(&request.extra_data).cloned().collect::<Vec<_>>();
         if kaspa_consensus_core::SHIELDED_STATE_DIVERGED.load(std::sync::atomic::Ordering::SeqCst) {
@@ -466,6 +471,21 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
             return Ok(GetBlockRewardInfoResponse::new(
                 header,
                 RpcBlockColor::Red,
+                Some(confirmation_count),
+                Some(merging_chain_block_hash),
+                None,
+            ));
+        }
+
+        // From the security fork (on shielded-coinbase networks) blue rewards pass through the miner
+        // accrual slot: consecutive rewards to one script merge and payouts are deferred to payout
+        // blocks, so no coinbase output of the merging block belongs to this blue alone. Report the
+        // colour and leave the amount out rather than read a neighbour's output.
+        let params = &self.config.params;
+        if params.shielded_coinbase && params.security_fork_activation.is_active(merging_chain_block.header.daa_score) {
+            return Ok(GetBlockRewardInfoResponse::new(
+                header,
+                RpcBlockColor::Blue,
                 Some(confirmation_count),
                 Some(merging_chain_block_hash),
                 None,
@@ -712,6 +732,17 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         let transaction: Transaction = request.transaction.try_into()?;
         let transaction_id = transaction.id();
         let session = self.consensus_manager.consensus().unguarded_session();
+        // A shielded proof is checked here, outside every consensus lock, before the mempool sees the
+        // transaction: an RPC caller (unlike a relay peer, who is banned for a bad proof) could submit
+        // fresh junk bundles that each cost a full Halo 2 verification while the virtual state lock was
+        // held, delaying every chain update. A success is cached, so the mempool's check is a hit.
+        if transaction.is_shielded() {
+            session.async_preverify_shielded_transaction(transaction.clone()).await.map_err(|err| {
+                let err = RpcError::RejectedTransaction(transaction_id, err.to_string());
+                debug!("{err}");
+                err
+            })?;
+        }
         let orphan = match allow_orphan {
             true => Orphan::Allowed,
             false => Orphan::Forbidden,

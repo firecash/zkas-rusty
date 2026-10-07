@@ -196,15 +196,29 @@ impl Consensus {
         // read side, and would deadlock for the same reason as the ingest. The caller's guard
         // pins the pruning point; `selected_chain_store.write()` serialises the mutation.
         let mut sc = self.storage.selected_chain_store.write();
+        // Purge down to the lowest block this node indexed itself when that is known: the caller's
+        // `base` is read from index 0, which after a restart mid-backfill is a peer's block (or a hole,
+        // read as genesis), so purging below it discarded nothing and the unverified records stayed.
+        let own_base = self.pruning_meta_stores.read().shielded_history_own_base();
+        let base = own_base.unwrap_or(base);
+        let mut batch = rocksdb::WriteBatch::default();
         let Some(base_index) = sc.get_by_hash(base).optional().unwrap() else {
             return Ok(0);
         };
         if base_index == 0 {
-            return Ok(0); // nothing below the base; the index is already as it started
+            // Nothing below the base; the index is already as it started. Forget the backfill so the
+            // node serves its own history without the unverified-history gate.
+            if own_base.is_some() || self.pruning_meta_stores.read().shielded_history_backfilled() {
+                let verified = self.pruning_meta_stores.read().shielded_history_verified_base().is_some();
+                if !verified {
+                    self.pruning_meta_stores.write().clear_shielded_history_backfill(&mut batch).unwrap();
+                    self.db.write(batch).map_err(|e| ConsensusError::GeneralOwned(format!("cannot clear backfill state: {e}")))?;
+                }
+            }
+            return Ok(0);
         }
         let (tip, _) = sc.get_tip().map_err(|e| ConsensusError::GeneralOwned(format!("cannot read chain tip: {e}")))?;
 
-        let mut batch = rocksdb::WriteBatch::default();
         let mut discarded = 0u64;
         // Drop the backfilled range: records and index entries, in lockstep.
         for index in 0..base_index {
@@ -230,6 +244,10 @@ impl Consensus {
         }
         sc.set_highest_index(&mut batch, tip - base_index)
             .map_err(|e| ConsensusError::GeneralOwned(format!("cannot set highest index: {e}")))?;
+        // Same batch: the index is this node's own again, so nothing it serves is gated as unverified
+        // (a purge used to leave the flag set, and the gate then refused the node's own history below
+        // its pruning point for good).
+        self.pruning_meta_stores.write().clear_shielded_history_backfill(&mut batch).unwrap();
         self.db.write(batch).map_err(|e| ConsensusError::GeneralOwned(format!("cannot commit history purge: {e}")))?;
         Ok(discarded)
     }
@@ -437,6 +455,56 @@ impl Consensus {
     }
 
     pub fn run_processors(&self) -> Vec<JoinHandle<()>> {
+        // A backfill interrupted before its verdict (a restart mid-fetch or mid-replay) leaves peer
+        // records that nothing checked, and at index 0 a peer's block or a hole. Every later attempt then
+        // anchored there and failed, and the range stayed unservable. Discard it before anything reads
+        // the index; the next IBD fetches it again.
+        {
+            let meta = self.pruning_meta_stores.read();
+            let interrupted = meta.shielded_history_backfilled() && meta.shielded_history_verified_base().is_none();
+            drop(meta);
+            let own_base_recorded = self.pruning_meta_stores.read().shielded_history_own_base().is_some();
+            let index0 = self.storage.selected_chain_store.read().get_by_index(0).optional().unwrap();
+            if interrupted && !own_base_recorded && index0.is_some_and(|h| h != self.config.genesis.hash) {
+                // An older build set the flag and never cleared it, even after purging a failed attempt
+                // (every attempt on a node synced long ago failed that way). Index 0 is then this node's
+                // own base again: nothing peer-supplied is left, so only the flag goes. Purging here would
+                // delete the node's own history between that base and the pruning point.
+                let mut batch = rocksdb::WriteBatch::default();
+                self.pruning_meta_stores.write().clear_shielded_history_backfill(&mut batch).unwrap();
+                self.db.write(batch).unwrap();
+                info!("shielded history: cleared a stale backfill flag left by an older build");
+            } else if interrupted {
+                // Down to the recorded own base. A backfill from an older build interrupted mid-fetch or
+                // mid-verify left a hole or genesis at index 0 and no record of the base, so it is purged
+                // below the pruning point (anything of our own it takes is fetched and verified again).
+                let pruning_point = self.pruning_point_store.read().pruning_point().unwrap();
+                match self.purge_backfilled_shielded_history(pruning_point) {
+                    Ok(n) => info!("shielded history: discarded {n} unverified records left by an interrupted backfill"),
+                    Err(e) => kaspa_core::warn!("shielded history: could not discard an interrupted backfill: {e}"),
+                }
+            }
+        }
+        // A node that kept running an older build past the security fork followed the old rules there:
+        // its post-fork chain blocks have no anchor log, and the first commit or template would panic on
+        // the missing row deep inside consensus. Refuse to start with the remedy instead. Judged only on
+        // stable shielded state (a node mid-import legitimately holds none yet).
+        if self.config.params.shielded_coinbase && self.pruning_meta_stores.read().pruning_shielded_stable_flag() {
+            let sink = self.lkg_virtual_state.load().ghostdag_data.selected_parent;
+            let post_fork = self
+                .headers_store
+                .get_daa_score(sink)
+                .is_ok_and(|daa| self.config.params.security_fork_activation.is_active(daa));
+            if post_fork
+                && sink != self.config.genesis.hash
+                && matches!(self.virtual_processor.shielded_state_manager_ref().window_at(sink), Ok(None))
+            {
+                panic!(
+                    "this database followed pre-upgrade rules past the security fork (sink {sink} has no anchor log). \
+                     Delete the data directory and resync, or restore a snapshot taken before the fork, then start this release."
+                );
+            }
+        }
         // Spawn the asynchronous processors.
         let header_processor = self.header_processor.clone();
         let body_processor = self.body_processor.clone();
@@ -747,7 +815,37 @@ impl ConsensusApi for Consensus {
         BlockValidationFutures { block_task: Box::pin(block_task), virtual_state_task: Box::pin(virtual_state_task) }
     }
 
+    fn preverify_shielded_transaction(&self, transaction: &Transaction) -> ConsensusResult<()> {
+        if !transaction.is_shielded() {
+            return Ok(());
+        }
+        let daa = self.lkg_virtual_state.load().daa_score;
+        self.services
+            .transaction_validator
+            .preverify_shielded_bundle(transaction, daa)
+            .map_err(|e| ConsensusError::GeneralOwned(format!("shielded transaction rejected: {e}")))
+    }
+
     fn get_shielded_tree_frontier(&self, block: Hash) -> ConsensusResult<(u64, Option<[u8; 32]>, Vec<[u8; 32]>)> {
+        // Below the lowest block this node indexed itself a retained frontier is a peer-derived replay
+        // checkpoint: its leaf COUNT follows the peer's split of leaves between blocks, which nothing
+        // binds, so a wallet anchored there can start past its own note. The birthday locator already
+        // refuses these; an explicit request (or the RPC's forward search) must not reach them either.
+        //
+        // And only for a block on the selected chain: a reorged-away block keeps its frontier row, and a
+        // wallet anchored at it would build on a tree the chain never had.
+        if block != self.config.genesis.hash {
+            let own_base = self.pruning_meta_stores.read().shielded_history_own_base();
+            let sc = self.storage.selected_chain_store.read();
+            let Some(index) = sc.get_by_hash(block).optional().unwrap() else {
+                return Err(ConsensusError::GeneralOwned(format!("{block} is not on the selected chain")));
+            };
+            if own_base.and_then(|own| sc.get_by_hash(own).optional().unwrap()).is_some_and(|own_index| index < own_index) {
+                return Err(ConsensusError::GeneralOwned(format!(
+                    "{block} lies in peer-supplied history; this node serves no frontier there (scan from genesis)"
+                )));
+            }
+        }
         let fs = self
             .virtual_processor
             .shielded_frontier_retained(block)
@@ -791,11 +889,17 @@ impl ConsensusApi for Consensus {
         // Peer-supplied history is served only once it verified: between the backfill writing it and
         // the replay checking it (minutes to an hour) a wallet would otherwise scan unchecked records.
         // Blocks this node validated itself (those with a header) are always served.
+        // Judged by position, below the lowest block this node indexed itself: "has no header" both
+        // refused the node's own history below its pruning point and let a past pruning point (whose
+        // header is kept) open the unverified range above it.
         {
             let meta = self.pruning_meta_stores.read();
-            let unverified = meta.shielded_history_backfilled() && meta.shielded_history_verified_base().is_none();
+            let unverified_below = (meta.shielded_history_verified_base().is_none())
+                .then(|| meta.shielded_history_own_base())
+                .flatten()
+                .and_then(|own| sc_read.get_by_hash(own).optional().unwrap());
             drop(meta);
-            if unverified && self.headers_store.get_compact_header_data(low).is_err() {
+            if unverified_below.is_some_and(|own_index| low_index < own_index) {
                 return Err(ConsensusError::GeneralOwned(format!(
                     "shielded history below the pruning point is not verified yet; {low} cannot be served until it is"
                 )));
@@ -851,6 +955,18 @@ impl ConsensusApi for Consensus {
         }
         // `lo - 1` is the last block strictly below; walk back to one with a retained frontier.
         let mut index = lo - 1;
+        // Below the lowest block this node indexed itself every record is a peer's. Verification binds
+        // the leaf ORDER and the nullifier multiset, and pins DAA scores only at past pruning points; it
+        // does not bind how leaves are split between blocks. So a frontier checkpoint there can count a
+        // wallet's note as already behind it, and a restore starting from it never sees that note. Never
+        // start a wallet from such a checkpoint: anchor a full scan instead, which is slower and sees
+        // every leaf.
+        let own_base = self.pruning_meta_stores.read().shielded_history_own_base();
+        if let Some(own_index) = own_base.and_then(|own| sc.get_by_hash(own).optional().unwrap()) {
+            if index < own_index {
+                return Ok(None);
+            }
+        }
         for _ in 0..FRONTIER_SEARCH {
             let Some(hash) = sc.get_by_index(index).optional().unwrap() else { return Ok(None) };
             if matches!(self.virtual_processor.shielded_frontier_retained(hash), Ok(Some(_))) {
@@ -980,7 +1096,71 @@ impl ConsensusApi for Consensus {
         // At or above the anchor is our own validated range; ours is authoritative.
         let ours_from = anchor_index;
 
+        // Bind the per-block metadata the verification replay cannot: it proves the leaf sequence and
+        // the nullifier multiset, not the DAA or blue score a record claims, and those place a wallet's
+        // birthday (a record claiming too low a DAA starts a restore after the wallet's first note).
+        // Along the selected chain the blue score rises strictly with the index (so it is never below the
+        // genesis-based index) and the DAA score never falls (genesis and its child share one); every
+        // record must sit below the anchor's own scores; and a block whose
+        // header this node holds (past pruning points are kept for good) must agree with it.
+        // `verify_shielded_history` re-checks the whole range, anchored at every past pruning point.
+        let anchor_scores = match self.headers_store.get_compact_header_data(anchor).optional().unwrap() {
+            Some(h) => (h.blue_score, h.daa_score),
+            None => match self.virtual_processor.shielded_state_manager_ref().scan_block(anchor).unwrap_or(None) {
+                Some(d) => (d.blue_score, d.daa_score),
+                None => {
+                    return Err(ConsensusError::GeneralOwned(format!(
+                        "shielded history anchor {anchor} has neither a header nor a record; cannot bound the records below it"
+                    )));
+                }
+            },
+        };
+        {
+            let mut placed: Vec<&(u64, kaspa_consensus_core::api::ShieldedChainBlockData)> =
+                records.iter().filter(|(index, _)| *index <= ours_from).collect();
+            placed.sort_by_key(|(index, _)| *index);
+            let bad = |why: String| Err(ConsensusError::GeneralOwned(format!("backfill chunk refused: {why}")));
+            for pair in placed.windows(2) {
+                let ((i, a), (j, b)) = (pair[0], pair[1]);
+                if i == j {
+                    return bad(format!("index {i} appears twice"));
+                }
+                if a.blue_score >= b.blue_score || a.daa_score > b.daa_score {
+                    return bad(format!("scores do not rise along the chain between indexes {i} and {j}"));
+                }
+            }
+            for (index, r) in placed {
+                if r.blue_score < *index {
+                    return bad(format!("block {} claims a blue score below its chain index {index}", r.hash));
+                }
+                let at_anchor = *index == ours_from;
+                if at_anchor != (r.hash == anchor) {
+                    return bad(format!("block {} at index {index} disagrees with the anchor {anchor} at {ours_from}", r.hash));
+                }
+                if at_anchor {
+                    if (r.blue_score, r.daa_score) != anchor_scores {
+                        return bad(format!("the anchor's record disagrees with its known scores {anchor_scores:?}"));
+                    }
+                } else if r.blue_score >= anchor_scores.0 || r.daa_score > anchor_scores.1 {
+                    return bad(format!("block {} below the anchor claims scores at or above it", r.hash));
+                }
+                if let Some(h) = self.headers_store.get_compact_header_data(r.hash).optional().unwrap() {
+                    // Not the timestamp: records written before the wire carried it hold 0 there.
+                    if (h.blue_score, h.daa_score) != (r.blue_score, r.daa_score) {
+                        return bad(format!("block {} disagrees with its header", r.hash));
+                    }
+                }
+            }
+        }
+
         let mut batch = rocksdb::WriteBatch::default();
+        // The lowest block this node indexed itself: index 0 before the first chunk lands. Recorded
+        // with that chunk's writes, so the purge, the serving gate and the birthday locator know where
+        // peer-supplied history begins, whatever a restart later leaves at index 0.
+        let record_own_base = {
+            let meta = self.pruning_meta_stores.read();
+            (!meta.shielded_history_backfilled()).then(|| sc.get_by_index(0).optional().unwrap()).flatten()
+        };
         if shift > 0 {
             // Rebase highest-first so a shift never lands on an entry not yet moved.
             for i in (0..=local_tip).rev() {
@@ -1012,6 +1192,16 @@ impl ConsensusApi for Consensus {
                         r.hash
                     )));
                 }
+            }
+            // Commitments, when present, are one per output (`get(i)` on the serving side silently
+            // dropped extras).
+            if !r.coinbase_commitments.is_empty() && r.coinbase_commitments.len() != r.coinbase_outputs.len() {
+                return Err(ConsensusError::GeneralOwned(format!(
+                    "backfilled block {} carries {} coinbase commitments for {} outputs",
+                    r.hash,
+                    r.coinbase_commitments.len(),
+                    r.coinbase_outputs.len()
+                )));
             }
             // Every action blob must be a whole number of `CompactActionRecord`s. The frontier replay
             // that is supposed to bind this data reads it with `chunks_exact`, which silently DROPS a
@@ -1068,7 +1258,11 @@ impl ConsensusApi for Consensus {
             // without the flag that says so (see `get_shielded_history_status`). No lock-order
             // hazard with the pruning processor: it needs the pruning lock for WRITE, and IBD —
             // which this runs inside — holds it for read for its whole duration.
-            self.pruning_meta_stores.write().set_shielded_history_backfilled(&mut batch).unwrap();
+            let mut meta = self.pruning_meta_stores.write();
+            meta.set_shielded_history_backfilled(&mut batch).unwrap();
+            if let Some(own) = record_own_base {
+                meta.set_shielded_history_own_base(&mut batch, own).unwrap();
+            }
         }
         self.db.write(batch).unwrap();
         Ok((idx_written, rec_written))
@@ -1106,14 +1300,77 @@ impl ConsensusApi for Consensus {
         // blocking. That guard is also what keeps the index stable across this walk. The startup
         // `--verify-shielded-history` path holds no guard, but it runs once before any service
         // starts, so nothing is moving the index there either.
-        let sc = self.storage.selected_chain_store.read();
-        let Some(base_index) = sc.get_by_hash(base).optional().unwrap() else {
+        //
+        // The chain-index lock is taken per read, never across the replay: holding it for the whole
+        // walk (10-30 minutes) blocked `commit_virtual_state`, which needs its write side, so a synced
+        // node verifying a backfill stopped advancing its chain and building templates meanwhile.
+        // Everything read here lies at or below the pruning point, which only a pruning step moves.
+        let sc_store = &self.storage.selected_chain_store;
+        let index_of = |hash: Hash| sc_store.read().get_by_hash(hash).optional().unwrap();
+        let hash_at = |index: u64| sc_store.read().get_by_index(index);
+        let Some(base_index) = index_of(base) else {
             return Ok(ShieldedHistoryVerdict::Unverifiable { reason: format!("base {base} is not in the selected chain index") });
         };
         if base_index == 0 {
             return Ok(ShieldedHistoryVerdict::Unverifiable {
                 reason: "no history was backfilled below the base; nothing to verify".to_owned(),
             });
+        }
+
+        // The replay below proves the leaf sequence and the nullifier multiset; it says nothing about
+        // which block, DAA score or blue score each record claims, and those place a wallet's birthday.
+        // Bind them first: the blue score rises strictly along the chain index and the DAA score never
+        // falls, and every past pruning point
+        // (headers kept for good, chained by PoW back from this node's own pruning point) sits in the
+        // index with the scores of its header. A forger is then confined to monotone
+        // values between two consecutive pruning points, and the birthday locator never places a
+        // restore later than the last pruning point below the birthday
+        // (`get_shielded_frontier_block_below_daa`). Ingest already refused out-of-order chunks; this
+        // re-checks the whole range, including records written before that check existed.
+        {
+            let mut last: Option<(u64, u64, u64)> = None;
+            for index in 0..=base_index {
+                let Some(hash) = hash_at(index).optional().unwrap() else {
+                    return Ok(ShieldedHistoryVerdict::Unverifiable { reason: format!("chain index gap at {index}") });
+                };
+                let d = match sm.scan_block(hash) {
+                    Ok(Some(d)) => d,
+                    Ok(None) => continue,
+                    Err(e) => return Ok(ShieldedHistoryVerdict::Unverifiable { reason: format!("scan record read failed for {hash}: {e}") }),
+                };
+                if let Some((li, lb, ld)) = last {
+                    if d.blue_score <= lb || d.daa_score < ld {
+                        return Ok(ShieldedHistoryVerdict::Mismatch {
+                            reason: format!("record scores do not rise along the chain between indexes {li} and {index}"),
+                        });
+                    }
+                }
+                last = Some((index, d.blue_score, d.daa_score));
+            }
+            let mut last_pp_index: Option<u64> = None;
+            for (pp_hash, h) in self.pruning_point_compact_headers() {
+                let Some(index) = index_of(pp_hash) else {
+                    return Ok(ShieldedHistoryVerdict::Mismatch {
+                        reason: format!("past pruning point {pp_hash} is not on the backfilled chain"),
+                    });
+                };
+                if last_pp_index.is_some_and(|l| index <= l) {
+                    return Ok(ShieldedHistoryVerdict::Mismatch {
+                        reason: format!("past pruning point {pp_hash} is indexed out of order at {index}"),
+                    });
+                }
+                last_pp_index = Some(index);
+                if index > base_index {
+                    continue;
+                }
+                if let Ok(Some(d)) = sm.scan_block(pp_hash) {
+                    if (d.blue_score, d.daa_score) != (h.blue_score, h.daa_score) {
+                        return Ok(ShieldedHistoryVerdict::Mismatch {
+                            reason: format!("the record of past pruning point {pp_hash} disagrees with its header"),
+                        });
+                    }
+                }
+            }
         }
 
         let seed_activation = self.config.shielded_coinbase_seed_activation;
@@ -1201,7 +1458,7 @@ impl ConsensusApi for Consensus {
             let raw: Vec<Result<Option<(u64, Hash, ShieldedScanBlockData)>, String>> = chunk
                 .iter()
                 .map(|&index| {
-                    let hash = sc.get_by_index(index).map_err(|e| format!("chain index gap at {index}: {e}"))?;
+                    let hash = hash_at(index).map_err(|e| format!("chain index gap at {index}: {e}"))?;
                     // No record means the block contributed no leaves — a normal state, not a gap,
                     // so it must not abort the replay. Soundness is unaffected: if a block DID
                     // have leaves and the peer withheld its record, skipping it changes the leaf
@@ -1220,21 +1477,22 @@ impl ConsensusApi for Consensus {
                     // INDEX, not DAA score: DAA advances by a block's whole mergeset, so spacing
                     // on it leaves uneven and occasionally huge gaps between anchors.
                     let label = (index % SHIELDED_REPLAY_CHECKPOINT_INTERVAL == 0).then_some(hash);
-                    // Prefer the commitments consensus computed and stored. Deriving is the
-                    // fallback for records written before that field existed; it uses the SAME
-                    // function validation uses, gated on the same fork activation, so a replay
-                    // cannot drift from the chain.
-                    let coinbase = if !d.coinbase_commitments.is_empty() {
-                        d.coinbase_commitments.clone()
-                    } else {
-                        let outputs: Vec<(&[u8], u64)> = d.coinbase_outputs.iter().map(|(s, v)| (s.as_slice(), *v)).collect();
-                        let seed_block = seed_activation.is_active(d.daa_score).then_some(hash);
-                        coinbase_notes_from_outputs(d.coinbase_txid, &outputs, seed_block)
-                            .map_err(|e| format!("cannot derive coinbase commitments for {hash}: {e:?}"))?
-                            .iter()
-                            .map(|n| n.commitment.to_bytes())
-                            .collect()
-                    };
+                    // Always derived from the outputs, with the SAME function validation uses, gated on
+                    // the same fork activation, so a replay cannot drift from the chain. Stored
+                    // commitments must equal the derivation: the leaves alone bind only the commitments,
+                    // and a peer pairing real commitments with forged outputs (scripts, values) passed,
+                    // after which a wallet credited the forged outputs or halted on them. This is the
+                    // replay's main cost, paid once, in parallel.
+                    let outputs: Vec<(&[u8], u64)> = d.coinbase_outputs.iter().map(|(s, v)| (s.as_slice(), *v)).collect();
+                    let seed_block = seed_activation.is_active(d.daa_score).then_some(hash);
+                    let coinbase: Vec<[u8; 32]> = coinbase_notes_from_outputs(d.coinbase_txid, &outputs, seed_block)
+                        .map_err(|e| format!("cannot derive coinbase commitments for {hash}: {e:?}"))?
+                        .iter()
+                        .map(|n| n.commitment.to_bytes())
+                        .collect();
+                    if !d.coinbase_commitments.is_empty() && d.coinbase_commitments != coinbase {
+                        return Err(format!("the coinbase commitments of {hash} disagree with its outputs"));
+                    }
                     Ok((label, coinbase, d.accepted.iter().map(|t| t.action_bytes.clone()).collect()))
                 })
                 .collect::<Vec<_>>()
@@ -2492,6 +2750,20 @@ impl ConsensusApi for Consensus {
         {
             use crate::processes::shielded::PruningPointShieldedMetadata;
             let md = PruningPointShieldedMetadata::from_wire_bytes(&metadata.data).map_err(PruningImportError::ShieldedStateError)?;
+            // The peer pairs and scores are outside every root, so the binding below cannot bound
+            // them; their ceilings used to apply only after the whole nullifier stream was read and the
+            // blob decoded twice, so a padded blob cost gigabytes first. Refuse it before any of that.
+            {
+                use crate::processes::shielded::{MAX_IMPORTED_BURN_RECEIPTS, MAX_IMPORTED_IN_WINDOW_ANCHORS};
+                if md.in_window_anchors.len() > MAX_IMPORTED_IN_WINDOW_ANCHORS
+                    || md.in_window_anchor_source_scores.len() > MAX_IMPORTED_IN_WINDOW_ANCHORS
+                    || md.burns.receipts.len() > MAX_IMPORTED_BURN_RECEIPTS
+                {
+                    return Err(PruningImportError::ShieldedStateError(
+                        "pruning-point metadata exceeds a structural ceiling; refusing it before streaming".to_string(),
+                    ));
+                }
+            }
             // Unbound means unverified: nothing in the metadata is proven, and a post-fork import would
             // also replace the proven anchor window with none. The IBD flow already refuses this; the
             // import itself must too, so no caller can seed peer data the PoW does not cover.

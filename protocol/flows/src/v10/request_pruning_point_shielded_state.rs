@@ -20,7 +20,7 @@ use kaspa_hashes::Hash;
 use kaspa_p2p_lib::{
     IncomingRoute, Router,
     common::ProtocolError,
-    dequeue, make_message,
+    dequeue, dequeue_with_timeout, make_message,
     pb::{ShieldedMetadataMessage, ShieldedNullifierChunkMessage, UnexpectedPruningPointMessage, kaspad_message::Payload},
 };
 use std::sync::Arc;
@@ -138,7 +138,15 @@ impl RequestPruningPointShieldedStateFlow {
             // Flow-control round-trip; skip on the last window so the peer never has
             // to send a trailing RequestNext just to unblock us.
             if sent < nullifier_count && chunks_sent.is_multiple_of(SMT_FLOW_CONTROL_WINDOW) {
-                dequeue!(self.incoming_route, Payload::RequestNextPruningPointShieldedChunk)?;
+                // Bounded: a requester that never asks for the next window would otherwise hold this
+                // flow, and the blocking reader thread parked on the full channel, for the life of the
+                // connection.
+                // Generous: a small syncing node may take minutes between windows while it imports.
+                dequeue_with_timeout!(
+                    self.incoming_route,
+                    Payload::RequestNextPruningPointShieldedChunk,
+                    std::time::Duration::from_secs(600)
+                )?;
             }
         }
 

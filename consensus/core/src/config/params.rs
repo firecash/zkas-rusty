@@ -922,6 +922,14 @@ pub const ZKAS_DEV_FEE_PERMILLE: u64 = 50;
 /// upgrade; the second is ~110 days out (late January 2027).
 pub const ZKAS_DEV_FEE_END_DAA: u64 = 2 * 7_889_400;
 
+/// Mainnet DAA score of the security fork (`security_fork_activation`). Set 2026-10-07 at mainnet DAA
+/// 6,313,429: ~27.6 days out at 1 BPS (~4 November 2026), ~9 days after the first halving, 500 mod
+/// 1,000 so it is not a dev-payout block, and 7.08M DAA before the dev-fee end (the fork must activate,
+/// and its pruning point pass it, before the end: at least `pruning_depth + finality_depth`). The
+/// merge-mining tag ban starts `2 * finality_depth` earlier (8,614,100), so every node and pool must
+/// run this release by then. Moving it later is a full release; it can never move earlier.
+pub const ZKAS_SECURITY_FORK_DAA: u64 = 8_700_500;
+
 pub const MAINNET_PARAMS: Params = Params {
     // ZKas is a distinct network with its own genesis; it MUST NOT advertise or
     // dial Kaspa's DNS seeders (doing so would waste connections on genesis-mismatch
@@ -1034,7 +1042,7 @@ pub const MAINNET_PARAMS: Params = Params {
     // applies; since the July 2026 mainnet launch (fresh genesis), always() is the
     // intended, correct value. This is historical context, not a planned change.)
     merged_mining_activation: ForkActivation::always(),
-    security_fork_activation: ForkActivation::never(),
+    security_fork_activation: ForkActivation::new(ZKAS_SECURITY_FORK_DAA),
 
     // ZKas launch difficulty: the low-difficulty bootstrap schedule is DISABLED on mainnet
     // (both 0), so the chain launches under pure upstream KIP-0004 DAA from genesis — the
@@ -1252,7 +1260,10 @@ pub const DEVNET_PARAMS: Params = Params {
     pre_crescendo_target_time_per_block: TenBps::target_time_per_block(),
 
     crescendo_activation: ForkActivation::always(),
-    toccata_activation: ForkActivation::never(),
+    // Toccata from genesis, as on every other ZKas network. With it never active a devnet node
+    // advertised P2P protocol 9, peers registered the v8 flow set, which has no shielded-state
+    // flows, and a fresh node's shielded IBD request went unanswered and retried forever.
+    toccata_activation: ForkActivation::always(),
     shielded_anchor_multi_activation: ForkActivation::new(200),
     // F-02 is held for upgrade 2 (it forces every wallet client to ship a gated
     // scanner). Devnet therefore models UPGRADE 1 exactly: multi-producer anchors +
@@ -1290,14 +1301,23 @@ mod tests {
 
     /// kaspad refuses to start when `max_shielded_anchor_age >= finality_depth` (an anchor window
     /// deeper than the chain segment a fast-synced node holds below its pruning point). Every shipped
-    /// network must pass that check, and the security fork must be off on mainnet until a score is set.
+    /// network must pass that check, and the mainnet security fork must keep its rollout constraints.
     #[test]
     fn shipped_networks_keep_the_anchor_window_inside_finality() {
         for p in [MAINNET_PARAMS, TESTNET_PARAMS, SIMNET_PARAMS, DEVNET_PARAMS] {
             assert!(p.max_shielded_anchor_age() < p.finality_depth(), "{:?}", p.net);
             assert!(p.blockrate.shielded_anchor_depth < p.max_shielded_anchor_age(), "{:?}", p.net);
         }
-        assert!(!MAINNET_PARAMS.security_fork_activation.is_active(u64::MAX - 1));
+        // The mainnet security fork: set, after the coinbase-tag ban lead, before the dev-fee end with
+        // its pruning point past the fork (so `zkas_state_root1` binds the carried dev balance before the
+        // final note), and not on a dev-payout block.
+        let m = MAINNET_PARAMS;
+        let f = m.security_fork_activation.daa_score();
+        assert_eq!(f, ZKAS_SECURITY_FORK_DAA);
+        assert!(!m.security_fork_activation.is_active(f - 1) && m.security_fork_activation.is_active(f));
+        assert!(f + m.pruning_depth() + m.finality_depth() <= m.dev_fee_end_activation.daa_score());
+        assert_ne!(f % m.dev_fee_payout_interval, 0, "the fork block must not be a dev payout block");
+        assert_eq!(m.coinbase_commitment_ban_activation().daa_score(), f - 2 * m.finality_depth());
         // The miner accrual payout interval is about 100 seconds of blocks on every network.
         for p in [MAINNET_PARAMS, TESTNET_PARAMS, SIMNET_PARAMS, DEVNET_PARAMS] {
             let secs = p.miner_accrual_payout_interval * p.target_time_per_block() / 1000;

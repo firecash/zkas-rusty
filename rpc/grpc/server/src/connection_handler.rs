@@ -7,7 +7,6 @@ use crate::{
 use futures::{FutureExt, Stream};
 use kaspa_core::{debug, info, warn};
 use kaspa_grpc_core::{
-    RPC_MAX_MESSAGE_SIZE,
     protowire::{
         KaspadRequest, KaspadResponse,
         rpc_server::{Rpc, RpcServer},
@@ -47,6 +46,9 @@ use tokio::{
 };
 use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 use tonic::{Request, Response, codec::CompressionEncoding, transport::Server as TonicServer};
+
+/// Ceiling on one decoded gRPC request (after gzip), see `serve`.
+const RPC_MAX_REQUEST_SIZE: usize = 16 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct ServerContext {
@@ -136,7 +138,10 @@ impl ConnectionHandler {
             let protowire_server = RpcServer::new(connection_handler)
                 .accept_compressed(CompressionEncoding::Gzip)
                 .send_compressed(CompressionEncoding::Gzip)
-                .max_decoding_message_size(RPC_MAX_MESSAGE_SIZE);
+                // Requests, not responses: the largest legitimate request (a full block, a large
+                // address list) is a few MB. The shared 1 GB limit let one connection queue hundreds
+                // of gzip-inflated gigabyte requests (SubmitBlock alone queues 256) and exhaust memory.
+                .max_decoding_message_size(RPC_MAX_REQUEST_SIZE);
 
             // TODO: check whether we should set tcp_keepalive
             // const GRPC_KEEP_ALIVE_PING_INTERVAL: Duration = Duration::from_secs(5);
