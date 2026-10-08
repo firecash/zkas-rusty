@@ -51,16 +51,16 @@ discovery still dials `16111`, so the node syncs normally:
 This is the part people get wrong, because ZKas keeps **two** kinds of history — the public
 block data and the shielded note history — and they are pruned independently.
 
-| | Pruned (default) | `--shielded-history=on` (pruned) | `--archival` |
+| | Pruned (default) | Pruned + `--shielded-history=off` | `--archival` |
 |---|---|---|---|
 | Public block bodies below the pruning point | discarded | discarded | **kept** |
-| Notes/history from **before** the node first synced | **not fetched** | **fetched + kept** | **fetched + kept** |
+| Notes/history from **before** the node first synced | **fetched + verified + kept** | **not fetched** | **fetched + verified + kept** |
 | Notes/history from the node's **first sync onward** | **all kept forever** | all kept forever | all kept forever |
 | Can fully validate the chain & every spend | ✅ | ✅ | ✅ |
 | Serves wallet balances complete **since first sync** | ✅ | ✅ | ✅ |
-| Serves wallet balances complete **back to genesis** | ❌ | ✅ | ✅ |
+| Serves wallet balances complete **back to genesis** | ✅ | ❌ | ✅ |
 | Serves an explorer old **public** blocks/txs | ❌ | ❌ | ✅ |
-| Disk | light | light + note archive | **heavy** |
+| Disk | light + note archive | light | **heavy** |
 
 ### 1. Pruned node — the default, and what most people should run
 
@@ -86,25 +86,38 @@ only the aggregate shielded state (a frontier plus a nullifier MuHash), which re
 one's notes, so a pruned node has no per-note archive below its **initial** pruning point.
 A wallet that needs notes older than the node's first sync reads a **silently partial**
 balance there — the number looks final but is a lower bound. That window, and only that
-window, is what `--shielded-history` backfills. A fresh non-archival node still syncs
-genesis→tip to byte-identical state; archival is **not** required for validation or mining.
+window, is what `--shielded-history` backfills — and it is **on by default** (see 2). A fresh
+non-archival node still syncs genesis→tip to byte-identical state; archival is **not**
+required for validation or mining.
 
-### 2. Pruned + `--shielded-history=on` — a light wallet-serving node
+### 2. `--shielded-history` — on by default, so a pruned node serves complete history
 
 `--shielded-history=on|off` controls whether the node **fetches the shielded note history
-below its pruning point** from peers during IBD.
+below its pruning point** from peers during IBD. Since v1.0.7 it is **on for every node**,
+pruned or archival — it is no longer tied to `--archival`. The fetched records survive
+pruning like the rest of the scan archive, so a default pruned node serves wallets
+**complete** history — full, correct balances back to genesis — while still pruning the
+bulky public block bodies. That makes a plain pruned node the right shape for a wallet
+backend (`zkas-walletd`) or a hosted wallet that does not also need to serve an explorer;
+no extra flag is needed. The archive costs about 500 MB per ~1M chain blocks.
+
+The fetched history is **verified before any of it is served**: the node replays it and
+checks that it reproduces the node's own proof-of-work-committed shielded state, so a
+dishonest peer cannot make wallets report wrong balances. At startup the node logs
+`Shielded history: from DAA <n>, complete=<true|false>`; until the backfill logs
+`shielded history: VERIFIED`, wallets born before the node's first sync see a partial
+balance.
+
+Turn it off only on a node that will never serve wallets:
 
 ```bash
-./kaspad --appdir=./zkas-node --utxoindex --shielded-history=on
+./kaspad --appdir=./zkas-node --utxoindex --shielded-history=off
 ```
 
-With it on, the scan archive and chain index survive pruning, so this node serves wallets
-**complete** history — full, correct balances — while still pruning the bulky public block
-bodies. This is the right shape for a wallet backend (`zkas-walletd`) or a hosted wallet
-that does not also need to serve an explorer.
-
-Default: **on when `--archival` is set, off otherwise.** Add `--verify-shielded-history` to
-run the verification pass over the transferred history.
+`--verify-shielded-history` is a separate, manual check, not needed for the p2p backfill:
+on startup it replays the whole scan archive on disk against the node's anchored frontier
+and reports the result (it deletes nothing). Use it after restoring an archive offline with
+`zkas-scan-import`.
 
 ### 3. `--archival` — keep everything (explorers, full history)
 
@@ -114,7 +127,7 @@ run the verification pass over the transferred history.
 
 `--archival` stops the node from deleting **public** block data when the pruning point
 advances, so it retains the complete block/transaction history — what a block explorer
-needs. It also turns `--shielded-history` on by default, so an archival node serves both
+needs. Shielded history is on here too, as on every node, so an archival node serves both
 public and shielded history in full.
 
 Two caveats worth knowing:
@@ -139,8 +152,8 @@ Two caveats worth knowing:
 | `--addpeer=<ip:port>` | Add a persistent peer but still discover others (repeatable). |
 | `--utxoindex` (`KASPAD_UTXOINDEX`) | Build the UTXO index (needed for some RPCs and address queries). |
 | `--archival` (`KASPAD_ARCHIVAL`) | Retain old public block data past the pruning point. Heavy disk. |
-| `--shielded-history=on\|off` | Fetch shielded note history below the pruning point. Default: on with `--archival`, else off. |
-| `--verify-shielded-history` | Verify the transferred shielded history during IBD. |
+| `--shielded-history=on\|off` | Fetch (and verify) shielded note history below the pruning point. Default: on for every node; `off` only for a node that will never serve wallets. |
+| `--verify-shielded-history` | On startup, re-verify the whole scan archive on disk; reports only. For archives restored with `zkas-scan-import` — the p2p backfill always verifies itself. |
 | `--rocksdb-preset=default\|hdd` | Storage tuning; `hdd` for archival nodes on spinning disks. |
 | `--ram-scale=<f>` | Scale in-memory caches (e.g. `2.0` on a large box). |
 
@@ -153,11 +166,13 @@ Run `./kaspad --help` for the complete list.
 - **Node won't start / corrupt DB:** stop the node, move the appdir aside, resync from a
   peer. A pruned node resyncs quickly; an archival node is slow — snapshot it instead of
   resyncing where possible.
-- **Wallet balances look low for old coins after a resync:** the node is pruned and was not
-  given `--shielded-history=on` (or `--archival`), so it lacks note history from *before it
-  first synced*. Coins received since its first sync are complete; older ones read as a
-  lower bound. Re-run with shielded history enabled (or point the wallet at a node that has
-  it) and let the wallet rescan.
-- **A plain pruned node is fine for wallets whose coins are all newer than the node's first
-  sync** — it keeps every note from that point on. Only balances reaching below its initial
-  pruning point are partial.
+- **Wallet balances look low for old coins after a resync:** the node lacks note history
+  from *before it first synced* — it runs with `--shielded-history=off`, its backfill has
+  not logged `VERIFIED` yet or stopped short of genesis, or it is older than v1.0.7, where
+  the backfill was off by default on pruned nodes. Coins received since its first sync are
+  complete; older ones read as a lower bound. Check the startup `Shielded history: ...
+  complete=` line, let the backfill finish (one that stopped short is retried on a later
+  IBD) or point the wallet at a node with complete history, and let the wallet rescan.
+- **A node with `--shielded-history=off` is still fine for wallets whose coins are all newer
+  than the node's first sync** — it keeps every note from that point on. Only balances
+  reaching below its initial pruning point are partial.
