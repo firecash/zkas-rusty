@@ -4225,7 +4225,41 @@ fn ingest_shielded_chain_block(db: &mut WalletDb, blk: &RpcShieldedChainBlock) {
 /// otherwise — then ingests chain blocks up to `sink_blue − (anchor_depth + slack)` — so
 /// every recovered note is matured and `witness_path` roots at a matured,
 /// canonical chain-block anchor. `db` must be freshly constructed (seed or FVK).
-async fn replay_matured(client: &GrpcClient, genesis: RpcHash, mut db: WalletDb) -> Result<WalletDb, String> {
+/// Where a matured replay had to start when the node could not serve genesis.
+///
+/// The warning this records was already logged and was already exactly right about the
+/// consequence — "it may report insufficient funds against a wallet that in fact holds
+/// enough" — but it only ever went to the log. A user sending from the desktop wallet
+/// against their own pruned node saw nothing but a shortfall, and found the cause by
+/// trial: pointing the wallet at a public node made the same payment work. Reported
+/// 2026-10-12, for coins about three months old.
+#[derive(Clone, Copy, Debug)]
+pub struct ShortHistory {
+    /// DAA score of the oldest block the node would serve.
+    pub daa_score: u64,
+    /// Tree position at that block: every note below it is invisible to this spend.
+    pub position: u64,
+}
+
+/// One line for a spend error when the node behind this wallet cannot serve the history
+/// the wallet's older notes live in. Names the cause and the fix, because the fix is the
+/// user's to make — it is a node choice, not a wallet defect, and "contact support" sends
+/// someone away from the setting that would solve it in a click.
+fn short_history_hint(short: Option<ShortHistory>) -> String {
+    match short {
+        None => String::new(),
+        Some(h) => format!(
+            "; the node this wallet is using only keeps shielded history from DAA {} (tree position {}),              so coins received before that cannot be spent through it — switch the wallet's chain source              to a public node, or run your own node with --archival, and this payment will work",
+            h.daa_score, h.position
+        ),
+    }
+}
+
+async fn replay_matured(
+    client: &GrpcClient,
+    genesis: RpcHash,
+    mut db: WalletDb,
+) -> Result<(WalletDb, Option<ShortHistory>), String> {
     // Probe genesis first, exactly like `full_scan_entry`. Anchoring at the pruning
     // point unconditionally was this function's version of the 2026-07-28 amputation
     // bug: `--archival` pins the RETENTION ROOT (what block serving is gated on), not
@@ -4236,10 +4270,10 @@ async fn replay_matured(client: &GrpcClient, genesis: RpcHash, mut db: WalletDb)
     // ever minted was below the anchor. Here that is worse than a wrong balance —
     // both callers are SPEND paths, so an unseen note is a note the plan cannot select
     // and the user gets "insufficient funds" while holding the coins.
-    let (start, ts) = match client.get_shielded_tree_state(Some(genesis)).await {
+    let (start, ts, short) = match client.get_shielded_tree_state(Some(genesis)).await {
         Ok(ts) if ts.block_hash == genesis => {
             log::info!("matured replay anchored at GENESIS — this node serves the complete shielded history");
-            (genesis, ts)
+            (genesis, ts, None)
         }
         _ => {
             let dag = client.get_block_dag_info().await.map_err(|e| format!("get_block_dag_info failed: {e}"))?;
@@ -4258,7 +4292,8 @@ async fn replay_matured(client: &GrpcClient, genesis: RpcHash, mut db: WalletDb)
                 ts.daa_score,
                 ts.size
             );
-            (start, ts)
+            let short = Some(ShortHistory { daa_score: ts.daa_score, position: ts.size });
+            (start, ts, short)
         }
     };
     let fs = FrontierState {
@@ -4278,14 +4313,14 @@ async fn replay_matured(client: &GrpcClient, genesis: RpcHash, mut db: WalletDb)
         let mut advanced = false;
         for b in &resp.blocks {
             if b.blue_score > cutoff {
-                return Ok(db);
+                return Ok((db, short));
             }
             ingest_shielded_chain_block(&mut db, b);
             low = b.hash;
             advanced = true;
         }
         if !advanced {
-            return Ok(db);
+            return Ok((db, short));
         }
     }
 }
@@ -8890,6 +8925,19 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
             ),
         )
     };
+    // Same error, plus the node's history limit when a replay had to start above genesis.
+    // Without this the user is told they are short of funds they can see in their own
+    // balance, with nothing pointing at the node setting that explains it.
+    let short_insufficient = |have: u64, stranded: u64, short: Option<ShortHistory>| {
+        err(
+            StatusCode::CONFLICT,
+            format!(
+                "insufficient matured funds: have {have}, need {need}+ (amount {amount} + a {fee} fee per tx; funds must be ~10 min old to spend){}{}",
+                stranded_hint(stranded),
+                short_history_hint(short)
+            ),
+        )
+    };
 
     // Gather ALL matured candidates and plan the transactions. A standard tx fits
     // at most `max_per_tx` spends (transient-mass cap), so a large send is split
@@ -8978,12 +9026,15 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
             }
             log::warn!("send: fast path unavailable/insufficient; falling back to a matured chain replay (slow, one-off)");
             let fresh = WalletDb::from_seed(seed).ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "bad seed"))?;
-            let db = replay_matured(client, state.genesis, fresh).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+            let (db, short) = replay_matured(client, state.genesis, fresh).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
             let mut candidates = db.notes().to_vec();
             sort_candidates_for_spend(&mut candidates, amount, fee);
             let values: Vec<u64> = candidates.iter().map(|n| n.value()).collect();
             let have: u64 = values.iter().sum();
-            let plan = plan_chunks(&values, amount, fee, max_per_tx).ok_or_else(|| insufficient(have, 0))?;
+            // If the replay could not reach genesis, the shortfall is very likely the
+            // history the node is missing rather than the wallet's balance, so say which.
+            let plan = plan_chunks(&values, amount, fee, max_per_tx)
+                .ok_or_else(|| short_insufficient(have, 0, short))?;
             // The replayed `db` roots witnesses at its tip; batch all selected notes in
             // one pass, per-note fallback for any the batch declines.
             let matured_tip = db.size();
@@ -9847,6 +9898,9 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
     let mut inputs = Vec::new();
     let mut selected = 0u64;
     let mut have_total: Option<u64> = None;
+    // Set when a matured replay could not reach genesis, so the refusal below can say
+    // that the node's history — not the wallet's balance — is what is short.
+    let mut short_history: Option<ShortHistory> = None;
     // Security fork: the block the matured anchor belongs to (set on the tracked-wallet path).
     let mut anchor_block: Option<[u8; 32]> = None;
     // Set when the spend is planned from the live tracked-wallet view rather than
@@ -9996,7 +10050,8 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
         let db =
             WalletDb::from_fvk(&fvk_bytes).ok_or_else(|| err(StatusCode::BAD_REQUEST, "fvk_hex is not a valid full viewing key"))?;
         log::info!("non-custodial prepare: watch-only matured chain replay...");
-        let db = replay_matured(client, state.genesis, db).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        let (db, short) = replay_matured(client, state.genesis, db).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        short_history = short;
         let mut candidates = db.notes().to_vec();
         sort_candidates_for_spend(&mut candidates, amount, base_fee);
         have_total = Some(candidates.iter().map(|n| n.value()).sum());
@@ -10108,10 +10163,11 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
                     err(
                         StatusCode::CONFLICT,
                         format!(
-                            "insufficient matured funds: spendable {} ZKAS, need {} ZKAS (amount plus a {} ZKAS fee). Funds become spendable about 10 minutes after they are mined.",
+                            "insufficient matured funds: spendable {} ZKAS, need {} ZKAS (amount plus a {} ZKAS fee). Funds become spendable about 10 minutes after they are mined.{}",
                             fmt_fc(have as u128),
                             fmt_fc(need as u128),
                             fmt_fc(fee as u128),
+                            short_history_hint(short_history),
                         ),
                     )
                 }
@@ -12190,6 +12246,48 @@ mod idle_bound_tests {
         assert_eq!(resolve(None), None);
         assert_eq!(resolve(Some(0)), None);
         assert_eq!(resolve(Some(30)), Some(Duration::from_secs(1800)));
+    }
+}
+
+#[cfg(test)]
+mod short_history_tests {
+    use super::*;
+
+    /// A spend against a node that cannot serve genesis sees only the notes above that
+    /// node's retention root. `replay_matured` has always logged that, and has always
+    /// been right about the consequence — "it may report insufficient funds against a
+    /// wallet that in fact holds enough" — but the log is not where the person sending
+    /// is looking. Reported 2026-10-12: a desktop wallet could not spend coins about
+    /// three months old while running against the user's own node, and the same payment
+    /// succeeded after switching the chain source to a public one.
+    #[test]
+    fn a_node_that_serves_genesis_adds_nothing_to_the_error() {
+        assert_eq!(short_history_hint(None), "");
+    }
+
+    #[test]
+    fn a_short_history_names_the_cause_and_the_fix() {
+        let hint = short_history_hint(Some(ShortHistory { daa_score: 5_900_000, position: 589_776 }));
+        // The numbers a user can act on, and that make a support report diagnosable.
+        assert!(hint.contains("5900000"), "{hint}");
+        assert!(hint.contains("589776"), "{hint}");
+        // The remedy is the user's to apply, and is the one they found by trial.
+        assert!(hint.contains("public node"), "{hint}");
+        assert!(hint.contains("--archival"), "{hint}");
+        // It must not read as a wallet defect: that wording sent someone to support for
+        // a setting they could change themselves.
+        assert!(!hint.to_lowercase().contains("contact support"), "{hint}");
+        assert!(!hint.to_lowercase().contains("bug"), "{hint}");
+    }
+
+    /// The hint explains a shortfall; it must never claim funds are unspendable outright,
+    /// because through an archival node they are spendable and nothing is lost.
+    #[test]
+    fn it_does_not_claim_the_coins_are_lost() {
+        let hint = short_history_hint(Some(ShortHistory { daa_score: 1, position: 2 }));
+        for word in ["lost", "unrecoverable", "gone", "destroyed"] {
+            assert!(!hint.to_lowercase().contains(word), "{word} in {hint}");
+        }
     }
 }
 
