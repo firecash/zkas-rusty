@@ -401,6 +401,19 @@ impl PruningProofManager {
         if let Some((h, size)) = gd.blues_anticone_sizes.iter().find(|(_, size)| **size > k) {
             return bad(format!("blue {h} has anticone size {size} above k = {k}"));
         }
+        // Map coverage. Every locally computed row carries an anticone size for each of its
+        // blues, the selected parent included (`GhostdagData::new_with_selected_parent`), and
+        // honest pruning trims `mergeset_blues` and `blues_anticone_sizes` with the SAME
+        // predicate, so a kept blue keeps its entry. A row that lists a blue with no entry is
+        // therefore never honest, and storing one poisons every later ghostdag computation over
+        // this context: `blue_anticone_size` walks the selected-parent chain looking for the
+        // missing blue and, at genesis or ORIGIN, panics — which the fatal panic hook turns into
+        // process death. Refuse the row here, where the peer's bytes arrive.
+        for blue in gd.mergeset_blues.iter() {
+            if !gd.blues_anticone_sizes.contains_key(blue) {
+                return bad(format!("blue {blue} has no entry in blues_anticone_sizes"));
+            }
+        }
         Ok(())
     }
 }
@@ -430,7 +443,9 @@ mod trusted_ghostdag_tests {
         let k: KType = 18;
         PruningProofManager::check_trusted_ghostdag(h(9), &gd(&[1, 2], &[3], &[(1, 0), (2, 1)]), k).unwrap();
         // An honest pruned server rewrites the selected parent to ORIGIN; that must still pass.
-        let mut row = gd(&[1, 2], &[], &[]);
+        // Its blues keep their anticone entries (the same `keep_relations` predicate trims both),
+        // so the row stays map-covered.
+        let mut row = gd(&[1, 2], &[], &[(1, 0), (2, 1)]);
         row.selected_parent = ORIGIN;
         PruningProofManager::check_trusted_ghostdag(h(9), &row, k).unwrap();
     }
@@ -443,5 +458,17 @@ mod trusted_ghostdag_tests {
         assert!(err(gd(&[1, 1], &[], &[])), "duplicate blue");
         assert!(err(gd(&[1, 2, 3, 4, 5], &[], &[])), "more than k+1 blues");
         assert!(err(gd(&[1], &[], &[(1, 4)])), "anticone size above k");
+        assert!(err(gd(&[1, 2], &[], &[(1, 0)])), "blue 2 has no anticone entry");
+        assert!(err(gd(&[1], &[], &[])), "the single blue has no anticone entry");
+    }
+
+    /// The row that killed a syncing node: structurally plausible, one blue, and an empty
+    /// anticone map. It must be refused at import, because nothing downstream can survive it
+    /// -- `blue_anticone_size` panics on the missing entry and the panic hook exits the process.
+    #[test]
+    fn a_blue_with_no_anticone_entry_cannot_reach_the_store() {
+        let row = gd(&[7], &[], &[]);
+        let err = PruningProofManager::check_trusted_ghostdag(h(9), &row, 18).expect_err("must be refused");
+        assert!(format!("{err}").contains("blues_anticone_sizes"), "the refusal names the missing map: {err}");
     }
 }
