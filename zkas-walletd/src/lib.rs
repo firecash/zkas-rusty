@@ -1737,8 +1737,8 @@ fn save_checkpoint(
     if db.poisoned() {
         return Err(std::io::Error::other("refusing to checkpoint a wallet that ingested inconsistent data"));
     }
-    let buf = checkpoint_bytes(genesis, low, scanned, db, boundaries, sink_blue, blind_below);
-    write_checkpoint_bytes(dir, token, &buf)?;
+    let parts = checkpoint_bytes(genesis, low, scanned, db, boundaries, sink_blue, blind_below);
+    write_checkpoint_bytes(dir, token, &parts)?;
     save_anchor_blocks(dir, token, boundary_blocks);
     Ok(())
 }
@@ -1748,6 +1748,46 @@ fn save_checkpoint(
 /// lock and hand the bytes to a blocking thread: the blob copies every retained leaf
 /// (32 B each — tens to hundreds of MB mid-restore), and writing it inline held the
 /// lock AND a runtime worker for the whole `fs::write`.
+/// A serialised checkpoint, kept in THREE pieces instead of one blob.
+///
+/// It used to be concatenated into a single `Vec`, which meant the wallet's whole
+/// serialised stream existed TWICE at the same moment: once as `db.to_checkpoint()` and
+/// again inside the buffer it was copied into, on top of the live `WalletDb` both came
+/// from. For a wallet restoring the full chain that blob reaches ~150 MB, so the peak was
+/// ~300 MB of transient allocation.
+///
+/// It lands at the worst possible instant. Base compaction only runs once a wallet has
+/// caught up, so the retained stream is at its maximum exactly when `just_caught_up`
+/// forces a checkpoint — and on a phone, whose per-app heap is a few hundred MB, the
+/// process is killed there. Reported from a screen recording: the sync climbs 99.3,
+/// 99.5, then dies at 99.8 every time.
+///
+/// Three pieces cost one copy instead of two, and the file is identical on disk: the
+/// writer emits them in order. Serialisation still happens under the wallet lock (the
+/// bytes must describe one consistent state) and the I/O still happens off it.
+struct CheckpointParts {
+    head: Vec<u8>,
+    db_blob: Vec<u8>,
+    tail: Vec<u8>,
+}
+
+impl CheckpointParts {
+    /// Total encoded length — what the single buffer used to be.
+    fn len(&self) -> usize {
+        self.head.len() + self.db_blob.len() + self.tail.len()
+    }
+
+    /// One contiguous blob, for the few callers that need bytes rather than a file.
+    /// This reintroduces the second copy on purpose, so only use it off the hot path.
+    fn into_vec(self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(self.len());
+        buf.extend_from_slice(&self.head);
+        buf.extend_from_slice(&self.db_blob);
+        buf.extend_from_slice(&self.tail);
+        buf
+    }
+}
+
 fn checkpoint_bytes(
     genesis: &RpcHash,
     low: &RpcHash,
@@ -1756,24 +1796,24 @@ fn checkpoint_bytes(
     boundaries: &VecDeque<(u64, u64)>,
     sink_blue: u64,
     blind_below: u64,
-) -> Vec<u8> {
+) -> CheckpointParts {
     let db_blob = db.to_checkpoint();
-    let mut buf = Vec::with_capacity(SCAN_HEADER_LEN + 8 + db_blob.len() + 4 + boundaries.len() * 16 + 8);
-    buf.extend_from_slice(SCAN_MAGIC);
-    buf.push(SCAN_VERSION);
-    buf.extend_from_slice(&genesis.as_bytes());
-    buf.extend_from_slice(&low.as_bytes());
-    buf.extend_from_slice(&scanned.to_le_bytes());
-    buf.extend_from_slice(&(db_blob.len() as u64).to_le_bytes());
-    buf.extend_from_slice(&db_blob);
-    buf.extend_from_slice(&(boundaries.len() as u32).to_le_bytes());
+    let mut head = Vec::with_capacity(SCAN_HEADER_LEN + 8);
+    head.extend_from_slice(SCAN_MAGIC);
+    head.push(SCAN_VERSION);
+    head.extend_from_slice(&genesis.as_bytes());
+    head.extend_from_slice(&low.as_bytes());
+    head.extend_from_slice(&scanned.to_le_bytes());
+    head.extend_from_slice(&(db_blob.len() as u64).to_le_bytes());
+    let mut tail = Vec::with_capacity(4 + boundaries.len() * 16 + 16);
+    tail.extend_from_slice(&(boundaries.len() as u32).to_le_bytes());
     for (blue, leaves) in boundaries {
-        buf.extend_from_slice(&blue.to_le_bytes());
-        buf.extend_from_slice(&leaves.to_le_bytes());
+        tail.extend_from_slice(&blue.to_le_bytes());
+        tail.extend_from_slice(&leaves.to_le_bytes());
     }
-    buf.extend_from_slice(&sink_blue.to_le_bytes());
-    buf.extend_from_slice(&blind_below.to_le_bytes());
-    buf
+    tail.extend_from_slice(&sink_blue.to_le_bytes());
+    tail.extend_from_slice(&blind_below.to_le_bytes());
+    CheckpointParts { head, db_blob, tail }
 }
 
 /// Write a serialised checkpoint (from [`checkpoint_bytes`]) atomically: tmp + rename.
@@ -1782,13 +1822,33 @@ fn checkpoint_bytes(
 /// so it can overlap a write from the lock-holding paths (`/api/checkpoint` on app
 /// pause, the eviction sweep, the twin-clone flush); two writers on one shared
 /// `.tmp` would truncate each other and rename a torn blob into place.
-fn write_checkpoint_bytes(dir: &str, token: &str, buf: &[u8]) -> std::io::Result<()> {
+fn write_checkpoint_bytes(dir: &str, token: &str, parts: &CheckpointParts) -> std::io::Result<()> {
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let path = scan_path(dir, token);
     let tmp = format!("{path}.{}.tmp", SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
     // A unique name is never reused, so a failed write must clean up after itself or a
     // full disk grows a fresh partial `.tmp` on every retry.
-    std::fs::write(&tmp, buf).inspect_err(|_| {
+    //
+    // The three pieces go out in order rather than being concatenated first: that
+    // concatenation held the wallet's entire serialised stream a second time, and on a
+    // phone it is what killed the process at the end of a long sync (see
+    // `CheckpointParts`). The bytes on disk are byte-for-byte what the single buffer
+    // produced.
+    (|| -> std::io::Result<()> {
+        use std::io::Write;
+        let file = std::fs::File::create(&tmp)?;
+        // One buffered writer, so the many small `tail` fields are not one syscall each
+        // while the big `db_blob` still goes straight through.
+        let mut w = std::io::BufWriter::with_capacity(64 * 1024, file);
+        w.write_all(&parts.head)?;
+        w.write_all(&parts.db_blob)?;
+        w.write_all(&parts.tail)?;
+        w.flush()?;
+        // A checkpoint is the wallet's scan history; a rename over unflushed data can
+        // leave a valid-looking file of zeros after a crash or power loss.
+        w.into_inner().map_err(|e| std::io::Error::other(e.to_string()))?.sync_all()
+    })()
+    .inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
     })?;
     #[cfg(unix)]
@@ -12409,6 +12469,47 @@ mod sdk_api_tests {
     /// the clone must parse under EITHER key form (the desktop imported the seed;
     /// the phone registers only the FVK — same wallet, same checkpoint).
     #[test]
+    /// The checkpoint on disk must be byte-for-byte what the single-buffer version wrote.
+    ///
+    /// `write_checkpoint_bytes` stopped concatenating the three pieces before writing,
+    /// because that concatenation held the wallet's whole serialised stream a second time
+    /// and killed the app at the end of a long sync. The file is the wallet's entire scan
+    /// history, so a format that shifted by one byte would strand every existing wallet
+    /// on a rescan from birthday — the format staying identical is the whole safety of
+    /// that change, and it is not something to take on inspection.
+    #[test]
+    fn streamed_checkpoint_is_byte_identical_to_the_concatenated_form() {
+        let tmp = std::env::temp_dir().join(format!("zkas-ckpt-bytes-{}", std::process::id()));
+        let dir = tmp.to_string_lossy().to_string();
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let genesis = RpcHash::from_bytes([7u8; 32]);
+        let low = RpcHash::from_bytes([9u8; 32]);
+        let db = WalletDb::from_seed([0x5au8; 32]).expect("valid seed");
+        let mut boundaries: VecDeque<(u64, u64)> = VecDeque::new();
+        boundaries.push_back((11, 22));
+        boundaries.push_back((33, 44));
+
+        // What the old code would have produced: one contiguous buffer.
+        let expected = checkpoint_bytes(&genesis, &low, 777, &db, &boundaries, 100, 5).into_vec();
+        // What the writer now puts on disk, piece by piece.
+        let parts = checkpoint_bytes(&genesis, &low, 777, &db, &boundaries, 100, 5);
+        assert_eq!(parts.len(), expected.len(), "encoded length changed");
+        write_checkpoint_bytes(&dir, "t", &parts).unwrap();
+        let on_disk = std::fs::read(scan_path(&dir, "t")).unwrap();
+        assert_eq!(on_disk, expected, "the file is no longer the same bytes");
+
+        // And it still loads: the format is only as good as the reader's view of it.
+        let loaded = load_checkpoint(&dir, "t", WalletKey::Seed([0x5au8; 32]), &genesis, None);
+        let (_, lo, scanned, b, sink, blind) = loaded.expect("checkpoint must load");
+        assert_eq!(lo, low);
+        assert_eq!(scanned, 777);
+        assert_eq!(b, boundaries);
+        assert_eq!(sink, 100);
+        assert_eq!(blind, 5);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     fn twin_checkpoint_adoption_clones_and_verifies() {
         let tmp = std::env::temp_dir().join(format!("zkas-adopt-test-{}", std::process::id()));
         let dir = tmp.to_string_lossy().to_string();
