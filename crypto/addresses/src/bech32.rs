@@ -1,6 +1,6 @@
 use alloc::{string::String, vec, vec::Vec};
 
-use crate::{Address, AddressError, Prefix};
+use crate::{Address, AddressError, Prefix, Version};
 
 const CHARSET: &[u8] = b"qpzry9x8gf2tvdw0s3jn54khce6mua7l";
 const REV_CHARSET: [u8; 123] = [
@@ -145,6 +145,83 @@ impl Address {
         }
 
         let payload_u8 = conv5to8(payload_u5);
-        Ok(Self::new(prefix, payload_u8[0].try_into()?, payload_u8[1..].into()))
+
+        // A checksum is not authentication: anyone can compute one over any
+        // payload, so the version byte and the payload length still have to agree
+        // here. `Address::new` *asserts* that length, and the process-wide panic
+        // hook turns any panic into `exit(1)` — so without these two checks every
+        // caller that parses an address string (`getBalanceByAddress`,
+        // `getUtxosByAddresses`, walletd's send path, the explorer's search box)
+        // hands an unauthenticated peer a one-packet node kill.
+        let &version_byte = payload_u8.first().ok_or(AddressError::BadPayload)?;
+        let version: Version = version_byte.try_into()?;
+        if !prefix.is_test() && payload_u8.len() - 1 != version.public_key_len() {
+            return Err(AddressError::BadPayload);
+        }
+        Ok(Self::new(prefix, version, &payload_u8[1..]))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use super::*;
+    use alloc::{format, vec, vec::Vec};
+
+    /// Build an address string with a VALID checksum over an arbitrary 5-bit
+    /// payload — everything an attacker needs is the public charset.
+    fn forge(prefix: Prefix, payload_u5: &[u8]) -> String {
+        let fivebit_prefix = prefix.as_str().as_bytes().iter().copied().map(|c| c & 0x1fu8);
+        let cs = checksum(payload_u5, fivebit_prefix);
+        let body: Vec<u8> = payload_u5
+            .iter()
+            .copied()
+            .chain(conv8to5(&cs.to_be_bytes()[3..]))
+            .map(|c| CHARSET[c as usize])
+            .collect();
+        format!("{}:{}", prefix.as_str(), String::from_utf8(body).unwrap())
+    }
+
+    /// A checksum-valid string whose payload does not match its version byte is
+    /// an ERROR, never a panic: the panic hook exits the process, so a panic here
+    /// is a remote kill of every address-parsing service.
+    #[test]
+    fn checksum_valid_but_malformed_payload_is_an_error() {
+        // No payload at all: the string is nothing but its checksum.
+        assert_eq!(Address::try_from(forge(Prefix::Mainnet, &[]).as_str()), Err(AddressError::BadPayload));
+
+        // Known version byte, payload too short (PubKey wants 32 bytes).
+        let short = conv8to5(&[Version::PubKey as u8, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        assert_eq!(Address::try_from(forge(Prefix::Mainnet, &short).as_str()), Err(AddressError::BadPayload));
+
+        // Known version byte, payload too long (PubKeyECDSA wants 33 bytes).
+        let long = conv8to5(&[vec![Version::PubKeyECDSA as u8], vec![7u8; 64]].concat());
+        assert_eq!(Address::try_from(forge(Prefix::Mainnet, &long).as_str()), Err(AddressError::BadPayload));
+
+        // A shielded payload under a transparent version byte (43 vs 32).
+        let crossed = conv8to5(&[vec![Version::PubKey as u8], vec![3u8; 43]].concat());
+        assert_eq!(Address::try_from(forge(Prefix::Mainnet, &crossed).as_str()), Err(AddressError::BadPayload));
+
+        // An unknown version byte keeps reporting the version error.
+        let bad_version = conv8to5(&[vec![7u8], vec![0u8; 32]].concat());
+        assert_eq!(Address::try_from(forge(Prefix::Mainnet, &bad_version).as_str()), Err(AddressError::InvalidVersion(7)));
+
+        // The legacy HRP is no shortcut around the same checks.
+        assert_eq!(Address::try_from(format!("firecash:{}", &forge(Prefix::Mainnet, &short)[5..]).as_str()).is_err(), true);
+    }
+
+    /// Every well-formed version still round-trips, so the length check cannot
+    /// have been tightened past the real addresses.
+    #[test]
+    fn well_formed_addresses_still_decode() {
+        for (version, len) in
+            [(Version::PubKey, 32), (Version::PubKeyECDSA, 33), (Version::ScriptHash, 32), (Version::ShieldedOrchard, 43)]
+        {
+            let payload: Vec<u8> = (0..len).map(|i| (i as u8).wrapping_mul(11).wrapping_add(3)).collect();
+            let address = Address::new(Prefix::Mainnet, version, &payload);
+            let encoded: String = (&address).into();
+            assert_eq!(Address::try_from(encoded.as_str()).expect("round-trip"), address);
+        }
     }
 }
