@@ -355,6 +355,20 @@ pub fn create_core_with_runtime(runtime: &Runtime, args: &Args, fd_total_budget:
 
     // Print package name and version
     info!("{} v{}", env!("CARGO_PKG_NAME"), git::with_short_hash(version()));
+    // On a shielded network, say which circuit this build verifies against, once, beside the
+    // version. The identity line was only ever printed when the verifying-key check failed, so a
+    // healthy node never showed which Orchard stack it linked. The fingerprint is the one this
+    // build constructs; `VirtualStateProcessor::new` compares that same cached key to the pin and
+    // refuses to start on a mismatch, so a line that prints is a line that passed.
+    if config.shielded_coinbase {
+        info!(
+            "shielded circuit: {} vk_fingerprint={}",
+            kaspa_shielded_core::verify::circuit_identity(),
+            kaspa_shielded_core::verify::built_verifying_key_fingerprint()
+                .as_deref()
+                .unwrap_or("none (built without the circuit feature)")
+        );
+    }
 
     assert!(!db_dir.to_str().unwrap().is_empty());
     info!("Application directory: {}", app_dir.display());
