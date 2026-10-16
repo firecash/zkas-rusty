@@ -300,11 +300,11 @@ impl RequestTransactionsFlow {
                     self.ctx.mining_manager().clone().get_transaction(transaction_id, TransactionQuery::TransactionsOnly).await
                 {
                     // trace!("Send transaction {} to {}", mutable_tx.id(), self.router.identity());
-                    self.router.enqueue(make_message!(Payload::Transaction, (&*mutable_tx.tx).into())).await?;
+                    self.router.enqueue_paced(make_message!(Payload::Transaction, (&*mutable_tx.tx).into())).await?;
                 } else {
                     // trace!("Send transaction id {} not found to {}", transaction_id, self.router.identity());
                     self.router
-                        .enqueue(make_message!(
+                        .enqueue_paced(make_message!(
                             Payload::TransactionNotFound,
                             TransactionNotFoundMessage { id: Some(transaction_id.into()) }
                         ))

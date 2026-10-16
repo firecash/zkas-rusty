@@ -3687,7 +3687,9 @@ impl WalletDb {
             let witnessed_upto = r.u64()?;
             let lag_tree = read_tree(r)?;
             let n = r.u64()? as usize;
-            let mut ws = Vec::with_capacity(n);
+            // Only owned notes are witnessed, so a larger count is a corrupt section; the hint is
+            // clamped so it cannot drive the allocation, and the loop fails on the first short read.
+            let mut ws = Vec::with_capacity(n.min(owned.len()));
             for _ in 0..n {
                 let pos = r.u64()?;
                 let w = read_witness(r)?;
@@ -3815,7 +3817,14 @@ fn write_witness(out: &mut Vec<u8>, w: &IncrementalWitness<MerkleHashOrchard, TR
 /// drops the whole witness section and rebuilds paths on demand).
 fn read_witness(r: &mut Cursor<'_>) -> Option<IncrementalWitness<MerkleHashOrchard, TREE_DEPTH>> {
     let tree = read_tree(r)?;
-    let n = r.u64()? as usize;
+    // `filled` holds the ommers completed to the right of the witnessed leaf: at most one per tree
+    // level. Refuse more before allocating -- this reader also parses `/api/wallet/scan-receipt`
+    // bodies, and a declared count of 2^40 used to ask for 32 TiB up front, aborting the process.
+    let n = r.u64()?;
+    if n > u64::from(TREE_DEPTH) {
+        return None;
+    }
+    let n = n as usize;
     let mut filled = Vec::with_capacity(n);
     for _ in 0..n {
         filled.push(Option::<MerkleHashOrchard>::from(MerkleHashOrchard::from_bytes(&r.arr::<32>()?))?);
@@ -3954,6 +3963,22 @@ mod tests {
             while self.advance_base_capped(target, u64::MAX) {}
             self.notes = notes;
             self.pending_spends = pending;
+        }
+    }
+
+    /// A witness may declare at most one filled ommer per tree level. The count is read from
+    /// `/api/wallet/scan-receipt` bodies too, and used to size an allocation before any check.
+    #[test]
+    fn read_witness_refuses_more_filled_ommers_than_tree_levels() {
+        let mut tree_bytes = Vec::new();
+        write_tree(&mut tree_bytes, &CommitmentTree::empty());
+        // The tree prefix on its own parses, so a `None` below comes from the count.
+        assert!(read_tree(&mut Cursor { buf: &tree_bytes, pos: 0 }).is_some());
+
+        for declared in [u64::from(TREE_DEPTH) + 1, 1 << 40, u64::MAX] {
+            let mut buf = tree_bytes.clone();
+            buf.extend_from_slice(&declared.to_le_bytes());
+            assert!(read_witness(&mut Cursor { buf: &buf, pos: 0 }).is_none(), "declared {declared}");
         }
     }
 

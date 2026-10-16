@@ -1,4 +1,4 @@
-use crate::{flow_context::FlowContext, flow_trait::Flow};
+use crate::{flow_context::FlowContext, flow_trait::Flow, ibd::check_requested_blocks};
 use kaspa_core::debug;
 use kaspa_p2p_lib::{
     IncomingRoute, Router, common::ProtocolError, dequeue_with_request_id, make_response, pb::kaspad_message::Payload,
@@ -30,13 +30,14 @@ impl HandleBlockBodyRequests {
     async fn start_impl(&mut self) -> Result<(), ProtocolError> {
         loop {
             let (msg, request_id) = dequeue_with_request_id!(self.incoming_route, Payload::RequestBlockBodies)?;
+            check_requested_blocks("RequestBlockBodies", msg.hashes.len())?;
             let hashes: Vec<_> = msg.try_into()?;
             debug!("got request for {} blocks bodies", hashes.len());
             let session = self.ctx.consensus().unguarded_session();
 
             for hash in hashes {
                 let body = session.async_get_block_body(hash).await?;
-                self.router.enqueue(make_response!(Payload::BlockBody, body.as_ref().into(), request_id)).await?;
+                self.router.enqueue_paced(make_response!(Payload::BlockBody, body.as_ref().into(), request_id)).await?;
             }
         }
     }

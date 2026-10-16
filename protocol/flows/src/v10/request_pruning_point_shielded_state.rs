@@ -130,7 +130,9 @@ impl RequestPruningPointShieldedStateFlow {
         while let Some(batch) = rx.recv().await {
             let nullifiers: Vec<Vec<u8>> = batch.into_iter().map(|nf| nf.to_vec()).collect();
             let chunk_len = nullifiers.len() as u64;
-            self.router.enqueue(make_message!(Payload::ShieldedNullifierChunk, ShieldedNullifierChunkMessage { nullifiers })).await?;
+            self.router
+                .enqueue_paced(make_message!(Payload::ShieldedNullifierChunk, ShieldedNullifierChunkMessage { nullifiers }))
+                .await?;
 
             sent += chunk_len;
             chunks_sent += 1;

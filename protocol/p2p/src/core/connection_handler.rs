@@ -1,5 +1,6 @@
 use crate::common::ProtocolError;
 use crate::core::hub::HubEvent;
+use crate::core::router::outgoing_pipe;
 use crate::pb::{
     KaspadMessage, p2p_client::P2pClient as ProtoP2pClient, p2p_server::P2p as ProtoP2p, p2p_server::P2pServer as ProtoP2pServer,
 };
@@ -18,10 +19,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
-use tokio::sync::mpsc::{Sender as MpscSender, channel as mpsc_channel};
+use tokio::sync::mpsc::Sender as MpscSender;
 use tokio::sync::oneshot::{Sender as OneshotSender, channel as oneshot_channel};
 use tokio_stream::StreamExt;
-use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{Error as TonicError, Server as TonicServer};
 use tonic::{Request, Response, Status as TonicStatus, Streaming};
 
@@ -178,8 +178,8 @@ impl ConnectionHandler {
             .accept_compressed(tonic::codec::CompressionEncoding::Gzip)
             .max_decoding_message_size(P2P_MAX_MESSAGE_SIZE);
 
-        let (outgoing_route, outgoing_receiver) = mpsc_channel(Self::outgoing_network_channel_size());
-        let incoming_stream = client.message_stream(ReceiverStream::new(outgoing_receiver)).await?.into_inner();
+        let (outgoing_route, outgoing_stream) = outgoing_pipe(Self::outgoing_network_channel_size());
+        let incoming_stream = client.message_stream(outgoing_stream).await?.into_inner();
 
         let router = Router::new(socket_address, true, self.hub_sender.clone(), incoming_stream, outgoing_route).await;
 
@@ -273,7 +273,7 @@ impl ProtoP2p for ConnectionHandler {
                 .ok_or_else(|| TonicStatus::resource_exhausted("too many pending inbound handshakes"))?;
 
         // Build the in/out pipes
-        let (outgoing_route, outgoing_receiver) = mpsc_channel(Self::outgoing_network_channel_size());
+        let (outgoing_route, outgoing_stream) = outgoing_pipe(Self::outgoing_network_channel_size());
         let incoming_stream = request.into_inner();
 
         // Build the router object
@@ -308,7 +308,7 @@ impl ProtoP2p for ConnectionHandler {
         });
 
         // Give tonic a receiver stream (messages sent to it will be forwarded to the network peer)
-        Ok(Response::new(Box::pin(ReceiverStream::new(outgoing_receiver).map(Ok)) as Self::MessageStreamStream))
+        Ok(Response::new(Box::pin(outgoing_stream.map(Ok)) as Self::MessageStreamStream))
     }
 }
 

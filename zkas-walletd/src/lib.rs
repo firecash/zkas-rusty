@@ -5618,7 +5618,18 @@ impl AppState {
     }
 
     /// Mark a token active so the sync loop keeps it current (idle wallets are parked).
+    ///
+    /// Only a token that names a wallet is recorded. Both maps used to take ANY well-formed
+    /// token -- `/api/status` and every wallet route touch before they know whether the wallet
+    /// exists -- and `activity` is never pruned (it is the durable ranking, rewritten in full
+    /// to [`ACTIVITY_FILE`] every minute), so each made-up token grew memory and that file by
+    /// ~150 B for the life of the daemon. A loaded wallet answers from the map; only a miss pays
+    /// a file-existence check, which the request was about to make anyway.
     async fn touch(&self, token: &str) {
+        let known = self.wallets.lock().await.contains_key(token) || wallet_exists(&self.wallet_dir, token);
+        if !known {
+            return;
+        }
         self.last_touch.lock().await.insert(token.to_string(), std::time::Instant::now());
         self.activity.lock().await.insert(token.to_string(), now_unix());
     }
@@ -5898,8 +5909,7 @@ impl AppState {
     async fn get_wallet(self: &Arc<Self>, token: &str) -> Option<Wallet> {
         // Mark the wallet active so the sync loop keeps it current; idle wallets are
         // parked (see `sync_loop`).
-        self.last_touch.lock().await.insert(token.to_string(), std::time::Instant::now());
-        self.activity.lock().await.insert(token.to_string(), now_unix());
+        self.touch(token).await;
         {
             let map = self.wallets.lock().await;
             if let Some(w) = map.get(token) {
@@ -9910,7 +9920,11 @@ async fn wallet_prepare(
             ));
         }
         set.insert(guard_key.clone(), (std::time::Instant::now(), self_payment));
-        PreparingGuard { state: state.clone(), key: req.fvk_hex.clone() }
+        // Release under the SAME key it was inserted under. The guard used to carry the raw
+        // `fvk_hex` text, so a key sent in upper case or with surrounding whitespace was never
+        // removed: one map entry leaked per such request, and that wallet was refused with
+        // "still being prepared" until the daemon restarted.
+        PreparingGuard { state: state.clone(), key: guard_key }
     };
 
     let requested = match (req.amount_sompi, req.amount_fc) {
@@ -11671,7 +11685,10 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
     kaspa_grpc_client::set_node_socks_proxy(cfg.node_socks_proxy.clone());
     let wallet_dir = cfg.wallet_dir;
     // Read before `wallet_dir` is moved into the state below.
-    let activity_seed = load_activity(&wallet_dir);
+    // Only tokens that still name a wallet: ledgers written before `touch` checked that may
+    // hold any number of made-up tokens, and this map is never pruned.
+    let activity_seed: HashMap<String, u64> =
+        load_activity(&wallet_dir).into_iter().filter(|(token, _)| wallet_exists(&wallet_dir, token)).collect();
     let snap_seed = load_snaps(&wallet_dir);
     let _ = std::fs::create_dir_all(&wallet_dir);
 

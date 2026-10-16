@@ -103,27 +103,39 @@ pub(crate) trait Pool {
     }
 
     /// Fills owner transactions for a set of script public keys.
+    ///
+    /// One pass over the pool, looking every input and output script up in the requested set. The
+    /// pool used to be walked once PER requested script, under the mempool read lock: the RPC caller
+    /// chooses the number of scripts (~245k fit in one 16 MiB `GetMempoolEntriesByAddresses`), so
+    /// one request cost `scripts x pool size` while blocking every mempool writer. The result is the
+    /// same: every requested script gets an owner entry, matching or not.
     fn fill_owner_set_transactions(&self, script_public_keys: &ScriptPublicKeySet, owner_set: &mut GroupedOwnerTransactions) {
         script_public_keys.iter().for_each(|script_public_key| {
-            let owner = owner_set.owners.entry(script_public_key.clone()).or_default();
+            owner_set.owners.entry(script_public_key.clone()).or_default();
+        });
 
-            self.all().iter().for_each(|(id, transaction)| {
-                // Sending transactions
-                if transaction.mtx.entries.iter().any(|x| x.is_some() && x.as_ref().unwrap().script_public_key == *script_public_key) {
+        self.all().iter().for_each(|(id, transaction)| {
+            // Sending transactions
+            for entry in transaction.mtx.entries.iter().flatten() {
+                if script_public_keys.contains(&entry.script_public_key)
+                    && let Some(owner) = owner_set.owners.get_mut(&entry.script_public_key)
+                {
                     // Insert the mutable transaction in the owners object if not already present.
                     // Clone since the transaction leaves the mempool.
                     owner_set.transactions.entry(*id).or_insert_with(|| transaction.mtx.clone());
                     owner.sending_txs.insert(*id);
                 }
+            }
 
-                // Receiving transactions
-                if transaction.mtx.tx.outputs.iter().any(|x| x.script_public_key == *script_public_key) {
-                    // Insert the mutable transaction in the owners object if not already present.
-                    // Clone since the transaction leaves the mempool.
+            // Receiving transactions
+            for output in transaction.mtx.tx.outputs.iter() {
+                if script_public_keys.contains(&output.script_public_key)
+                    && let Some(owner) = owner_set.owners.get_mut(&output.script_public_key)
+                {
                     owner_set.transactions.entry(*id).or_insert_with(|| transaction.mtx.clone());
                     owner.receiving_txs.insert(*id);
                 }
-            });
+            }
         });
     }
 }

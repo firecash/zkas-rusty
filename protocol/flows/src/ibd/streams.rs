@@ -24,6 +24,52 @@ use tokio::time::timeout;
 
 pub const IBD_BATCH_SIZE: usize = 99;
 
+/// Most block hashes one `RequestIbdBlocks`, `RequestBlockBodies` or `RequestRelayBlocks` may name.
+///
+/// The serving flows answered whatever list arrived, one block per hash, and the only bound on the
+/// list was the 256 MB transport cap -- ~7.9M hashes, i.e. millions of block reads and responses
+/// from a single message. Every requester in this tree names at most [`IBD_BATCH_SIZE`] per message
+/// (IBD chunks its hash lists by it; relay and orphan resolution ask for one block at a time), so
+/// an honest peer never comes near this; the factor 2 is headroom, not a need.
+pub const MAX_REQUESTED_BLOCKS: usize = 2 * IBD_BATCH_SIZE;
+
+/// Refuses a block request naming more than [`MAX_REQUESTED_BLOCKS`] hashes. Checked on the decoded
+/// message before its hashes are converted, and before any block is read.
+pub fn check_requested_blocks(kind: &'static str, count: usize) -> Result<(), ProtocolError> {
+    if count > MAX_REQUESTED_BLOCKS {
+        return Err(ProtocolError::OtherOwned(format!("{kind} names {count} blocks, above the {MAX_REQUESTED_BLOCKS} ceiling")));
+    }
+    Ok(())
+}
+
+/// The `max_blocks` floor the `RequestHeaders` server walks per chunk (it uses
+/// `max(REQUEST_HEADERS_MAX_BLOCKS, mergeset_size_limit + 1)`).
+pub const REQUEST_HEADERS_MAX_BLOCKS: usize = 1 << 10;
+
+/// Most headers one `BlockHeaders` message may carry, for a network with `mergeset_size_limit`.
+///
+/// A syncer's header chunk was bounded only by the 256 MB transport cap (~1M headers), and each
+/// header in it becomes a concurrent validation job before the first one is judged. The honest
+/// senders are bounded by construction:
+/// * a `RequestHeaders` chunk holds at most `max(REQUEST_HEADERS_MAX_BLOCKS, mergeset + 1) + 1`
+///   headers (`antipast_hashes_between` stops before a chain block's mergeset would pass
+///   `max_blocks`, then appends the highest chain block reached);
+/// * a `RequestAntipast` reply holds at most `4 * mergeset` (its traversal limit, and the output
+///   is a subset of what it traverses).
+///
+/// `REQUEST_HEADERS_MAX_BLOCKS + 4 * mergeset + 2` is above both, and the factor 2 is headroom.
+/// Mainnet (`mergeset_size_limit` 180): 2 * (1024 + 720 + 2) = 3,492.
+pub fn max_headers_per_message(mergeset_size_limit: u64) -> usize {
+    let mergeset = usize::try_from(mergeset_size_limit).unwrap_or(usize::MAX);
+    REQUEST_HEADERS_MAX_BLOCKS.saturating_add(mergeset.saturating_mul(4)).saturating_add(2).saturating_mul(2)
+}
+
+/// UTXOs the pruning-point UTXO set server puts in one chunk.
+pub const PRUNING_POINT_UTXO_CHUNK_SIZE: usize = 1000;
+
+/// Most UTXOs one `PruningPointUtxoSetChunk` may carry: twice what an honest server sends.
+pub const MAX_PRUNING_POINT_UTXO_CHUNK_LEN: usize = 2 * PRUNING_POINT_UTXO_CHUNK_SIZE;
+
 /// Maximum number of SMT lane entries carried by a single `SmtLaneChunkMessage`.
 #[cfg(not(feature = "test-smt-small-chunks"))]
 pub const SMT_CHUNK_SIZE: usize = 4096;
@@ -106,12 +152,14 @@ pub struct HeadersChunkStream<'a, 'b> {
     router: &'a Router,
     incoming_route: &'b mut IncomingRoute,
     header_format: HeaderFormat,
+    /// See [`max_headers_per_message`].
+    max_headers: usize,
     i: usize,
 }
 
 impl<'a, 'b> HeadersChunkStream<'a, 'b> {
-    pub fn new(router: &'a Router, incoming_route: &'b mut IncomingRoute, header_format: HeaderFormat) -> Self {
-        Self { router, incoming_route, header_format, i: 0 }
+    pub fn new(router: &'a Router, incoming_route: &'b mut IncomingRoute, header_format: HeaderFormat, max_headers: usize) -> Self {
+        Self { router, incoming_route, header_format, max_headers, i: 0 }
     }
 
     pub async fn next(&mut self) -> Result<Option<HeadersChunk>, ProtocolError> {
@@ -123,6 +171,12 @@ impl<'a, 'b> HeadersChunkStream<'a, 'b> {
                             if payload.block_headers.is_empty() {
                                 // The syncer should have sent a done message if the search completed, and not an empty list
                                 Err(ProtocolError::Other("Received an empty headers message"))
+                            } else if payload.block_headers.len() > self.max_headers {
+                                Err(ProtocolError::OtherOwned(format!(
+                                    "Received a headers message of {} headers, above the {} ceiling",
+                                    payload.block_headers.len(),
+                                    self.max_headers
+                                )))
                             } else {
                                 Ok(Some(Versioned(self.header_format, payload).try_into()?))
                             }
@@ -173,7 +227,15 @@ impl<'a, 'b> PruningPointUtxosetChunkStream<'a, 'b> {
             Ok(op) => {
                 if let Some(msg) = op {
                     match msg.payload {
-                        Some(Payload::PruningPointUtxoSetChunk(payload)) => Ok(Some(payload.try_into()?)),
+                        Some(Payload::PruningPointUtxoSetChunk(payload)) => {
+                            if payload.outpoint_and_utxo_entry_pairs.len() > MAX_PRUNING_POINT_UTXO_CHUNK_LEN {
+                                return Err(ProtocolError::OtherOwned(format!(
+                                    "Received a UTXO set chunk of {} entries, above the {MAX_PRUNING_POINT_UTXO_CHUNK_LEN} ceiling",
+                                    payload.outpoint_and_utxo_entry_pairs.len()
+                                )));
+                            }
+                            Ok(Some(payload.try_into()?))
+                        }
                         Some(Payload::DonePruningPointUtxoSetChunks(_)) => {
                             info!("Finished receiving the UTXO set. Total UTXOs: {}", self.utxo_count);
                             Ok(None)
@@ -454,5 +516,35 @@ impl<'a, 'b> ShieldedStream<'a, 'b> {
 
     pub fn count(&self) -> u64 {
         self.nullifier_count
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn block_requests_up_to_the_ceiling_are_served() {
+        // What every requester in this tree sends, and the ceiling itself.
+        assert!(check_requested_blocks("RequestIbdBlocks", 1).is_ok());
+        assert!(check_requested_blocks("RequestIbdBlocks", IBD_BATCH_SIZE).is_ok());
+        assert!(check_requested_blocks("RequestIbdBlocks", MAX_REQUESTED_BLOCKS).is_ok());
+        assert!(check_requested_blocks("RequestIbdBlocks", MAX_REQUESTED_BLOCKS + 1).is_err());
+    }
+
+    #[test]
+    fn header_ceiling_covers_every_honest_sender() {
+        // Mainnet is 1 BPS (mergeset 180); `Bps::mergeset_size_limit` clamps every rate to [180, 512].
+        assert_eq!(max_headers_per_message(180), 3_492);
+        for mergeset in [180u64, 300, 512] {
+            let m = mergeset as usize;
+            let ceiling = max_headers_per_message(mergeset);
+            // `RequestHeaders`: `max(REQUEST_HEADERS_MAX_BLOCKS, m + 1)` plus the appended chain block.
+            assert!(ceiling >= REQUEST_HEADERS_MAX_BLOCKS.max(m + 1) + 1);
+            // `RequestAntipast`: at most its traversal limit.
+            assert!(ceiling >= 4 * m);
+        }
+        // An absurd configured value saturates instead of wrapping.
+        assert_eq!(max_headers_per_message(u64::MAX), usize::MAX);
     }
 }

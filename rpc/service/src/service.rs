@@ -63,7 +63,7 @@ use kaspa_rpc_core::{
     api::{
         connection::DynRpcConnection,
         ops::{RPC_API_REVISION, RPC_API_VERSION},
-        rpc::{MAX_SAFE_WINDOW_SIZE, RpcApi},
+        rpc::{MAX_SAFE_DAA_SCORE_ESTIMATES, MAX_SAFE_WINDOW_SIZE, RpcApi},
     },
     model::*,
     notify::connection::ChannelConnection,
@@ -1283,6 +1283,12 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         _connection: Option<&DynRpcConnection>,
         request: GetDaaScoreTimestampEstimateRequest,
     ) -> RpcResult<GetDaaScoreTimestampEstimateResponse> {
+        if !self.config.unsafe_rpc && request.daa_scores.len() > MAX_SAFE_DAA_SCORE_ESTIMATES {
+            return Err(RpcError::General(format!(
+                "{} DAA scores requested, above the {MAX_SAFE_DAA_SCORE_ESTIMATES} allowed without --unsaferpc",
+                request.daa_scores.len()
+            )));
+        }
         let session = self.consensus_manager.consensus().session().await;
         // TODO: cache samples based on sufficient recency of the data and append sink data
         let mut headers = session.async_get_chain_block_samples().await;

@@ -1,4 +1,8 @@
-use crate::{flow_context::FlowContext, flow_trait::Flow, ibd::IBD_BATCH_SIZE};
+use crate::{
+    flow_context::FlowContext,
+    flow_trait::Flow,
+    ibd::{IBD_BATCH_SIZE, PRUNING_POINT_UTXO_CHUNK_SIZE as CHUNK_SIZE},
+};
 use itertools::Itertools;
 use kaspa_consensus_core::errors::consensus::ConsensusError;
 use kaspa_core::debug;
@@ -43,10 +47,11 @@ impl RequestPruningPointUtxoSetFlow {
     }
 
     async fn handle_request(&mut self, expected_pp: Hash) -> Result<(), ProtocolError> {
-        const CHUNK_SIZE: usize = 1000;
         let mut from_outpoint = None;
         let mut chunks_sent = 0;
 
+        // Pace before taking the session: the wait is as long as the peer makes it.
+        self.router.pace_outgoing().await?;
         let consensus = self.ctx.consensus();
         let mut session = consensus.session().await;
 
@@ -75,6 +80,8 @@ impl RequestPruningPointUtxoSetFlow {
             chunks_sent += 1;
             if chunks_sent % IBD_BATCH_SIZE == 0 {
                 drop(session); // Avoid holding the session through dequeue calls
+                // The next window is requested by the peer, not earned by reading this one.
+                self.router.pace_outgoing().await?;
                 dequeue!(self.incoming_route, Payload::RequestNextPruningPointUtxoSetChunk)?;
                 session = consensus.session().await;
             }

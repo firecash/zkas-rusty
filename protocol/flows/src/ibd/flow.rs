@@ -42,7 +42,7 @@ use std::{
 };
 use tokio::time::sleep;
 
-use super::{HeadersChunk, IBD_BATCH_SIZE, PruningPointUtxosetChunkStream, progress::ProgressReporter};
+use super::{HeadersChunk, IBD_BATCH_SIZE, PruningPointUtxosetChunkStream, max_headers_per_message, progress::ProgressReporter};
 use std::collections::HashSet;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -751,6 +751,12 @@ impl IbdFlow {
         // TODO(optimization): this buffering can be heavy on RAM for large chain segments, but is acceptable
         // since syncee memory usage is still low at this phase.
         let mut entries = vec![pruning_point_entry];
+        // Every distinct body entry must have a ghostdag row in the package (`build_trusted_subdag`
+        // refuses one that does not, and drops duplicates), and an honest server sends each anticone
+        // block once -- so more entries than the package has rows can only be padding. That check
+        // used to run after the whole stream was buffered, so a peer could stream duplicate blocks
+        // without end into this vector; now the count is bounded as it arrives.
+        let max_trusted_body_entries = pkg.daa_window.len().saturating_add(pkg.ghostdag_window.len());
         let mut header_only_chain_segment = Vec::new();
         // Each selected-chain block contributes at least one blue score, so F blue-depth back is bounded
         // by F chain blocks (plus 2K for noise/robustness).
@@ -778,6 +784,11 @@ impl IbdFlow {
                 }
                 // We expect all header-only entries to be sent after all non-header-only entries
                 false if header_only_chain_segment.is_empty() => {
+                    if entries.len() >= max_trusted_body_entries {
+                        return Err(ProtocolError::OtherOwned(format!(
+                            "peer sent more than {max_trusted_body_entries} trusted block entries, the number of ghostdag rows it supplied"
+                        )));
+                    }
                     entries.push(entry);
                     if (entries.len() - 1).is_multiple_of(1000) {
                         info!("Downloaded {} blocks from the pruning point anticone", entries.len() - 1);
@@ -884,7 +895,8 @@ impl IbdFlow {
                 }
             ))
             .await?;
-        let mut chunk_stream = HeadersChunkStream::new(&self.router, &mut self.incoming_route, self.header_format);
+        let max_headers = max_headers_per_message(self.ctx.config.mergeset_size_limit());
+        let mut chunk_stream = HeadersChunkStream::new(&self.router, &mut self.incoming_route, self.header_format, max_headers);
 
         if let Some(chunk) = chunk_stream.next().await? {
             let (mut prev_daa_score, mut prev_timestamp) = {
@@ -1527,6 +1539,13 @@ impl IbdFlow {
             .await?;
 
         let msg = dequeue_with_timeout!(self.incoming_route, Payload::BlockHeaders)?;
+        let max_headers = max_headers_per_message(self.ctx.config.mergeset_size_limit());
+        if msg.block_headers.len() > max_headers {
+            return Err(ProtocolError::OtherOwned(format!(
+                "peer sent {} sink-antipast headers, above the {max_headers} ceiling",
+                msg.block_headers.len()
+            )));
+        }
         let chunk: HeadersChunk = Versioned(self.header_format, msg).try_into()?;
         let jobs: Vec<BlockValidationFuture> =
             chunk.into_iter().map(|h| consensus.validate_and_insert_block(Block::from_header_arc(h)).virtual_state_task).collect();

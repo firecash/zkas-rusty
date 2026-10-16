@@ -52,7 +52,7 @@ impl RequestIbdChainBlockLocatorFlow {
                 }?;
 
             self.router
-                .enqueue(make_response!(
+                .enqueue_paced(make_response!(
                     Payload::IbdChainBlockLocator,
                     IbdChainBlockLocatorMessage { block_locator_hashes: locator.into_iter().map(|hash| hash.into()).collect() },
                     request_id

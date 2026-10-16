@@ -121,7 +121,9 @@ impl RequestShieldedHistoryFlow {
             .collect::<Result<_, _>>()?;
 
         debug!("serving {} shielded history records below {} (done={})", entries.len(), anchor, done);
-        self.router.enqueue(make_message!(Payload::ShieldedHistoryChunk, ShieldedHistoryChunkMessage { entries, done, anchor_index })).await?;
+        self.router
+            .enqueue_paced(make_message!(Payload::ShieldedHistoryChunk, ShieldedHistoryChunkMessage { entries, done, anchor_index }))
+            .await?;
         Ok(())
     }
 }

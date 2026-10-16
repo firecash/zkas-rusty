@@ -120,7 +120,7 @@ impl RequestPruningPointSmtStateFlow {
                 .collect();
 
             let chunk_len = entries.len() as u64;
-            self.router.enqueue(make_message!(Payload::SmtLaneChunk, SmtLaneChunkMessage { entries })).await?;
+            self.router.enqueue_paced(make_message!(Payload::SmtLaneChunk, SmtLaneChunkMessage { entries })).await?;
 
             lanes_sent += chunk_len;
             chunks_sent += 1;

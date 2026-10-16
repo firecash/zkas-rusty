@@ -41,6 +41,8 @@ impl HandleAntipastRequests {
 
             debug!("received anticone request with block hash: {}, context hash: {} for peer {}", block, context, self.router);
 
+            // Pace before taking the session: the wait is as long as the peer makes it.
+            self.router.pace_outgoing().await?;
             let consensus = self.ctx.consensus();
             let session = consensus.session().await;
 

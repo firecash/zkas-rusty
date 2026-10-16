@@ -1397,11 +1397,15 @@ struct TxSearchReq {
 /// which of a block's txids are accepted. Everything in the recent ring is accepted
 /// chain data, so answer from the ring with each tx's accepting blue score.
 async fn transactions_search(State(s): State<Arc<AppState>>, Json(req): Json<TxSearchReq>) -> impl IntoResponse {
+    // A set, not a list scan per ring transaction: the id list is the client's, bounded only by
+    // the 2 MB body (~500k ids), and scanning it once for each of the ring's transactions made
+    // one request cost billions of string compares while holding the ring's read lock.
+    let wanted: std::collections::HashSet<&str> = req.transaction_ids.iter().map(String::as_str).collect();
     let recent = s.recent.read().await;
     let mut found = Vec::new();
     for b in recent.iter() {
         for t in &b.txs {
-            if req.transaction_ids.iter().any(|id| *id == t.tx_id) {
+            if wanted.contains(t.tx_id.as_str()) {
                 found.push(json!({
                     "transaction_id": t.tx_id,
                     "is_accepted": true,
