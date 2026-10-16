@@ -47,6 +47,8 @@ impl RequestPruningPointUtxoSetFlow {
         let mut from_outpoint = None;
         let mut chunks_sent = 0;
 
+        // Pace before taking the session: the wait is as long as the peer makes it.
+        self.router.pace_outgoing().await?;
         let consensus = self.ctx.consensus();
         let mut session = consensus.session().await;
 
@@ -75,6 +77,8 @@ impl RequestPruningPointUtxoSetFlow {
             chunks_sent += 1;
             if chunks_sent % IBD_BATCH_SIZE == 0 {
                 drop(session); // Avoid holding the session through dequeue calls
+                // The next window is requested by the peer, not earned by reading this one.
+                self.router.pace_outgoing().await?;
                 dequeue!(self.incoming_route, Payload::RequestNextPruningPointUtxoSetChunk)?;
                 session = consensus.session().await;
             }

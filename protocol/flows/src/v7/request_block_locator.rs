@@ -40,7 +40,7 @@ impl RequestBlockLocatorFlow {
                 self.ctx.consensus().session().await.async_create_block_locator_from_pruning_point(high, limit as usize).await?;
 
             self.router
-                .enqueue(make_response!(
+                .enqueue_paced(make_response!(
                     Payload::BlockLocator,
                     BlockLocatorMessage { hashes: locator.into_iter().map(|hash| hash.into()).collect() },
                     request_id

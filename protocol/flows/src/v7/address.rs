@@ -92,7 +92,7 @@ impl SendAddressesFlow {
                 .choose_multiple(&mut rand::thread_rng(), MAX_ADDRESSES_SEND)
                 .map(|addr| (addr.ip, addr.port).into())
                 .collect();
-            self.router.enqueue(make_message!(Payload::Addresses, AddressesMessage { address_list })).await?;
+            self.router.enqueue_paced(make_message!(Payload::Addresses, AddressesMessage { address_list })).await?;
         }
     }
 }

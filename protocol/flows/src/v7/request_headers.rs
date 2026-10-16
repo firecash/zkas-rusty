@@ -46,6 +46,8 @@ impl RequestHeadersFlow {
             let (msg, request_id) = dequeue_with_request_id!(self.incoming_route, Payload::RequestHeaders)?;
             let (high, mut low) = msg.try_into()?;
 
+            // Pace before taking the session: the wait is as long as the peer makes it.
+            self.router.pace_outgoing().await?;
             let consensus = self.ctx.consensus();
             let mut session = consensus.session().await;
 
@@ -71,7 +73,13 @@ impl RequestHeadersFlow {
                     session.spawn_blocking(move |c| Self::get_headers_between(c, low, high, max_blocks, header_format)).await?;
                 debug!("Got {} header hashes above {}", block_headers.len(), low);
                 low = last;
-                self.router.enqueue(make_response!(Payload::BlockHeaders, BlockHeadersMessage { block_headers }, request_id)).await?;
+                // A requester can send `RequestNextHeaders` without reading a single chunk, so each
+                // chunk is paced -- and the session is released first, since that wait (and the
+                // dequeue after it) lasts as long as the peer chooses.
+                drop(session);
+                self.router
+                    .enqueue_paced(make_response!(Payload::BlockHeaders, BlockHeadersMessage { block_headers }, request_id))
+                    .await?;
 
                 dequeue!(self.incoming_route, Payload::RequestNextHeaders)?;
                 session = consensus.session().await;

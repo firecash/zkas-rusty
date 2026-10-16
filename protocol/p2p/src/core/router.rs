@@ -1,7 +1,7 @@
 use crate::core::hub::HubEvent;
 use crate::pb::RejectMessage;
 use crate::pb::{KaspadMessage, kaspad_message::Payload as KaspadMessagePayload};
-use crate::{KaspadMessagePayloadType, common::ProtocolError};
+use crate::{KaspadMessagePayloadType, common::{DEFAULT_TIMEOUT, ProtocolError}};
 use crate::{Peer, make_message};
 use kaspa_core::{debug, error, info, trace, warn};
 use kaspa_utils::networking::PeerId;
@@ -10,10 +10,11 @@ use seqlock::SeqLock;
 use std::fmt::{Debug, Display};
 use std::net::SocketAddr;
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::Instant;
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 use std::{collections::HashMap, sync::Arc};
 use tokio::select;
+use tokio::sync::Notify;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{Receiver as MpscReceiver, Sender as MpscSender, channel as mpsc_channel};
 use tokio::sync::oneshot::{Sender as OneshotSender, channel as oneshot_channel};
@@ -89,6 +90,113 @@ impl From<KaspadMessagePayloadType> for IncomingRouteOverflowPolicy {
     }
 }
 
+/// How many encoded bytes a peer may leave queued and unread before the flows that SERVE its
+/// requests stop producing more for it (see [`Router::enqueue_paced`]).
+///
+/// The outgoing queue was bounded only in MESSAGES (`(1 << 17) + 256`), and every serving flow
+/// produced its response in full regardless of whether the peer read it. A peer that sends
+/// requests and never reads the replies could therefore park 131,328 full messages per connection
+/// in this node's memory -- one ~3 KB `RequestIbdBlocks` names 99 blocks, one `RequestTransactions`
+/// may name 131,072 ids that are all the same large mempool transaction, and a blind stream of
+/// `RequestNextHeaders` or `RequestPruningPointProof` needs no reading at all.
+///
+/// Pacing only delays: a serving flow waits for the backlog to drain under this mark, so an honest
+/// peer, which keeps reading, sees at most added latency. 32 MiB is above the bandwidth-delay
+/// product of any realistic link (1 Gbit/s x 250 ms = ~30 MiB), so a reading peer is not slowed.
+/// With it, what one connection can make this node hold is this mark plus one message per serving
+/// flow, instead of 131,328 messages.
+pub const OUTGOING_PACING_BYTES: usize = 32 * 1024 * 1024;
+
+/// How long a paced flow tolerates a backlog that is not shrinking at all. Progress -- any byte
+/// taken by the transport -- resets it, so a slow honest link is never cut by it; only a peer that
+/// stops reading entirely is.
+const OUTGOING_PACING_STALL: Duration = DEFAULT_TIMEOUT;
+
+/// How often a paced flow re-checks the backlog while it waits. Wake-ups also come from the
+/// transport when the backlog crosses [`OUTGOING_PACING_BYTES`]; the poll exists only to observe
+/// partial progress for the stall clock.
+const OUTGOING_PACING_POLL: Duration = Duration::from_secs(1);
+
+/// The bytes queued for one peer and not yet taken by the transport.
+#[derive(Debug, Default)]
+pub(crate) struct OutgoingBacklog {
+    bytes: AtomicUsize,
+    drained: Notify,
+}
+
+impl OutgoingBacklog {
+    fn charge(&self, len: usize) {
+        self.bytes.fetch_add(len, Ordering::SeqCst);
+    }
+
+    /// Called by the transport side for every message it takes off the queue, with the length
+    /// `enqueue` charged for it.
+    fn release(&self, len: usize) {
+        let before = self.bytes.fetch_sub(len, Ordering::SeqCst);
+        if before > OUTGOING_PACING_BYTES && before - len <= OUTGOING_PACING_BYTES {
+            self.drained.notify_waiters();
+        }
+    }
+
+    fn bytes(&self) -> usize {
+        self.bytes.load(Ordering::SeqCst)
+    }
+
+    /// Waits until at most [`OUTGOING_PACING_BYTES`] are queued. Fails if the backlog does not
+    /// shrink at all for `stall`, or once `closed()` reports the connection gone.
+    async fn wait_until_drained(&self, stall: Duration, closed: impl Fn() -> bool) -> Result<(), PaceError> {
+        let mut low_water = self.bytes();
+        let mut stalled_since = Instant::now();
+        loop {
+            // Register for the wake-up BEFORE checking, so a drain between the check and the wait
+            // is not missed (`notify_waiters` reaches every `Notified` that already exists).
+            let drained = self.drained.notified();
+            let queued = self.bytes();
+            if queued <= OUTGOING_PACING_BYTES {
+                return Ok(());
+            }
+            if closed() {
+                return Err(PaceError::Closed);
+            }
+            if queued < low_water {
+                low_water = queued;
+                stalled_since = Instant::now();
+            } else if stalled_since.elapsed() >= stall {
+                return Err(PaceError::Stalled(queued));
+            }
+            let _ = tokio::time::timeout(OUTGOING_PACING_POLL, drained).await;
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PaceError {
+    Closed,
+    Stalled(usize),
+}
+
+/// The sending half of a peer's outgoing pipe. Each message travels with the encoded length it was
+/// charged at, so the transport side releases exactly that.
+#[derive(Debug)]
+pub(crate) struct OutgoingRoute {
+    sender: MpscSender<(KaspadMessage, usize)>,
+    backlog: Arc<OutgoingBacklog>,
+}
+
+/// Builds a peer's outgoing pipe: the route the router enqueues into, and the stream the transport
+/// sends from. Taking a message off the stream releases its bytes from the backlog.
+pub(crate) fn outgoing_pipe(capacity: usize) -> (OutgoingRoute, impl tokio_stream::Stream<Item = KaspadMessage> + Send + 'static) {
+    use tokio_stream::StreamExt as _;
+    let (sender, receiver) = mpsc_channel(capacity);
+    let backlog = Arc::new(OutgoingBacklog::default());
+    let release = backlog.clone();
+    let stream = tokio_stream::wrappers::ReceiverStream::new(receiver).map(move |(msg, len): (KaspadMessage, usize)| {
+        release.release(len);
+        msg
+    });
+    (OutgoingRoute { sender, backlog }, stream)
+}
+
 #[derive(Debug, Default)]
 struct RouterMutableState {
     /// Used on router init to signal the router receive loop to start listening
@@ -132,7 +240,7 @@ pub struct Router {
     routing_map_by_id: RwLock<HashMap<u32, MpscSender<KaspadMessage>>>,
 
     /// The outgoing route for sending messages to this peer
-    outgoing_route: MpscSender<KaspadMessage>,
+    outgoing_route: OutgoingRoute,
 
     /// A channel sender for internal event management. Used to send information from each router to a central hub object
     hub_sender: MpscSender<HubEvent>,
@@ -178,7 +286,7 @@ impl Router {
         is_outbound: bool,
         hub_sender: MpscSender<HubEvent>,
         mut incoming_stream: Streaming<KaspadMessage>,
-        outgoing_route: MpscSender<KaspadMessage>,
+        outgoing_route: OutgoingRoute,
     ) -> Arc<Self> {
         let (start_sender, start_receiver) = oneshot_channel();
         let (shutdown_sender, mut shutdown_receiver) = oneshot_channel();
@@ -405,11 +513,51 @@ impl Router {
 
     /// Enqueues a locally-originated message to be sent to the network peer
     pub async fn enqueue(&self, msg: KaspadMessage) -> Result<(), ProtocolError> {
+        use prost::Message as _;
         assert!(msg.payload.is_some(), "Kaspad P2P message should always have a value");
-        match self.outgoing_route.try_send(msg) {
+        let len = msg.encoded_len();
+        // Charge before sending, so the transport's release can never run ahead of the charge.
+        self.outgoing_route.backlog.charge(len);
+        match self.outgoing_route.sender.try_send((msg, len)) {
             Ok(_) => Ok(()),
-            Err(TrySendError::Closed(_)) => Err(ProtocolError::ConnectionClosed),
-            Err(TrySendError::Full(_)) => Err(ProtocolError::OutgoingRouteCapacityReached(self.to_string())),
+            Err(err) => {
+                self.outgoing_route.backlog.release(len);
+                match err {
+                    TrySendError::Closed(_) => Err(ProtocolError::ConnectionClosed),
+                    TrySendError::Full(_) => Err(ProtocolError::OutgoingRouteCapacityReached(self.to_string())),
+                }
+            }
+        }
+    }
+
+    /// Enqueues a message produced in answer to this peer's REQUEST, after waiting for the peer to
+    /// have read its outgoing backlog down to [`OUTGOING_PACING_BYTES`].
+    ///
+    /// Every flow that serves a peer's requests must send through this (or call
+    /// [`Self::pace_outgoing`] before producing a response), because it is the peer that decides
+    /// how much those flows produce. Unsolicited traffic -- broadcasts, invs, our own requests --
+    /// keeps using [`Self::enqueue`], which never waits: a broadcast loop must not stall on one
+    /// slow peer.
+    ///
+    /// Never call this while holding a consensus session: the wait is as long as the peer chooses
+    /// to be slow, and a held session blocks staging commits for that long.
+    pub async fn enqueue_paced(&self, msg: KaspadMessage) -> Result<(), ProtocolError> {
+        self.pace_outgoing().await?;
+        self.enqueue(msg).await
+    }
+
+    /// Waits until this peer's unread outgoing backlog is at most [`OUTGOING_PACING_BYTES`].
+    ///
+    /// Fails only if the backlog makes no progress at all for [`OUTGOING_PACING_STALL`], or the
+    /// connection closes; a peer that reads, however slowly, is waited for.
+    pub async fn pace_outgoing(&self) -> Result<(), ProtocolError> {
+        match self.outgoing_route.backlog.wait_until_drained(OUTGOING_PACING_STALL, || self.is_closed()).await {
+            Ok(()) => Ok(()),
+            Err(PaceError::Closed) => Err(ProtocolError::ConnectionClosed),
+            Err(PaceError::Stalled(queued)) => Err(ProtocolError::OtherOwned(format!(
+                "peer {self} read none of its {queued} queued outgoing bytes in {}s",
+                OUTGOING_PACING_STALL.as_secs()
+            ))),
         }
     }
 
@@ -437,6 +585,8 @@ impl Router {
 
             if let Some(signal) = state.shutdown_signal.take() {
                 let _ = signal.send(());
+                // Release any flow waiting in `pace_outgoing`: nothing will drain the queue now.
+                self.outgoing_route.backlog.drained.notify_waiters();
             } else {
                 // This means the router was already closed
                 trace!("P2P, Router close was called more than once, router-id: {}", self.identity());
@@ -472,5 +622,68 @@ fn match_for_io_error(err_status: &tonic::Status) -> Option<&std::io::Error> {
         }
 
         err = err.source()?;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio_stream::StreamExt as _;
+
+    /// Queues one message charged at `len` bytes, the way `Router::enqueue` does.
+    fn queue(route: &OutgoingRoute, len: usize) {
+        route.backlog.charge(len);
+        route.sender.try_send((KaspadMessage::default(), len)).unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_transport_releases_what_enqueue_charged() {
+        let (route, stream) = outgoing_pipe(8);
+        let mut stream = Box::pin(stream);
+        queue(&route, 100);
+        queue(&route, 50);
+        assert_eq!(route.backlog.bytes(), 150);
+        stream.next().await.unwrap();
+        assert_eq!(route.backlog.bytes(), 50);
+        stream.next().await.unwrap();
+        assert_eq!(route.backlog.bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn pacing_does_not_wait_under_the_mark() {
+        let (route, _stream) = outgoing_pipe(8);
+        queue(&route, OUTGOING_PACING_BYTES);
+        assert_eq!(route.backlog.wait_until_drained(Duration::ZERO, || false).await, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn pacing_waits_for_a_peer_that_reads() {
+        let (route, stream) = outgoing_pipe(8);
+        let mut stream = Box::pin(stream);
+        queue(&route, OUTGOING_PACING_BYTES + 1);
+        let reader = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            stream.next().await.unwrap();
+        });
+        assert_eq!(route.backlog.wait_until_drained(Duration::from_secs(30), || false).await, Ok(()));
+        reader.await.unwrap();
+        assert_eq!(route.backlog.bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn pacing_gives_up_on_a_peer_that_reads_nothing() {
+        let (route, _stream) = outgoing_pipe(8);
+        queue(&route, OUTGOING_PACING_BYTES + 1);
+        assert_eq!(
+            route.backlog.wait_until_drained(Duration::ZERO, || false).await,
+            Err(PaceError::Stalled(OUTGOING_PACING_BYTES + 1))
+        );
+    }
+
+    #[tokio::test]
+    async fn pacing_stops_waiting_once_the_connection_closes() {
+        let (route, _stream) = outgoing_pipe(8);
+        queue(&route, OUTGOING_PACING_BYTES + 1);
+        assert_eq!(route.backlog.wait_until_drained(Duration::from_secs(30), || true).await, Err(PaceError::Closed));
     }
 }

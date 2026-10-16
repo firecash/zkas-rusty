@@ -40,7 +40,7 @@ impl RequestPruningPointProofFlow {
             debug!("Got pruning point proof request");
             let proof = self.ctx.consensus().unguarded_session().async_get_pruning_point_proof().await;
             self.router
-                .enqueue(make_response!(
+                .enqueue_paced(make_response!(
                     Payload::PruningPointProof,
                     PruningPointProofMessage { headers: proof.iter().map(|headers| (self.header_format, headers).into()).collect() },
                     request_id

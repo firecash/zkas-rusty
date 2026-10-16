@@ -24,6 +24,24 @@ use tokio::time::timeout;
 
 pub const IBD_BATCH_SIZE: usize = 99;
 
+/// Most block hashes one `RequestIbdBlocks`, `RequestBlockBodies` or `RequestRelayBlocks` may name.
+///
+/// The serving flows answered whatever list arrived, one block per hash, and the only bound on the
+/// list was the 256 MB transport cap -- ~7.9M hashes, i.e. millions of block reads and responses
+/// from a single message. Every requester in this tree names at most [`IBD_BATCH_SIZE`] per message
+/// (IBD chunks its hash lists by it; relay and orphan resolution ask for one block at a time), so
+/// an honest peer never comes near this; the factor 2 is headroom, not a need.
+pub const MAX_REQUESTED_BLOCKS: usize = 2 * IBD_BATCH_SIZE;
+
+/// Refuses a block request naming more than [`MAX_REQUESTED_BLOCKS`] hashes. Checked on the decoded
+/// message before its hashes are converted, and before any block is read.
+pub fn check_requested_blocks(kind: &'static str, count: usize) -> Result<(), ProtocolError> {
+    if count > MAX_REQUESTED_BLOCKS {
+        return Err(ProtocolError::OtherOwned(format!("{kind} names {count} blocks, above the {MAX_REQUESTED_BLOCKS} ceiling")));
+    }
+    Ok(())
+}
+
 /// Maximum number of SMT lane entries carried by a single `SmtLaneChunkMessage`.
 #[cfg(not(feature = "test-smt-small-chunks"))]
 pub const SMT_CHUNK_SIZE: usize = 4096;
@@ -454,5 +472,19 @@ impl<'a, 'b> ShieldedStream<'a, 'b> {
 
     pub fn count(&self) -> u64 {
         self.nullifier_count
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn block_requests_up_to_the_ceiling_are_served() {
+        // What every requester in this tree sends, and the ceiling itself.
+        assert!(check_requested_blocks("RequestIbdBlocks", 1).is_ok());
+        assert!(check_requested_blocks("RequestIbdBlocks", IBD_BATCH_SIZE).is_ok());
+        assert!(check_requested_blocks("RequestIbdBlocks", MAX_REQUESTED_BLOCKS).is_ok());
+        assert!(check_requested_blocks("RequestIbdBlocks", MAX_REQUESTED_BLOCKS + 1).is_err());
     }
 }

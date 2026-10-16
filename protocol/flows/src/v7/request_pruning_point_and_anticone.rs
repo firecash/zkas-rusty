@@ -48,6 +48,8 @@ impl PruningPointAndItsAnticoneRequestsFlow {
             let (_, request_id) = dequeue_with_request_id!(self.incoming_route, Payload::RequestPruningPointAndItsAnticone)?;
             debug!("Got request for pruning point and its anticone");
 
+            // Pace before taking the session: the wait is as long as the peer makes it.
+            self.router.pace_outgoing().await?;
             let consensus = self.ctx.consensus();
             let mut session = consensus.session().await;
 
@@ -108,6 +110,8 @@ impl PruningPointAndItsAnticoneRequestsFlow {
                     // No timeout here, as we don't care if the syncee takes its time computing,
                     // since it only blocks this dedicated flow
                     drop(session); // Avoid holding the session through dequeue calls
+                    // The next window is requested by the peer, not earned by reading this one.
+                    self.router.pace_outgoing().await?;
                     dequeue!(self.incoming_route, Payload::RequestNextPruningPointAndItsAnticoneBlocks)?;
                     session = consensus.session().await;
                 }

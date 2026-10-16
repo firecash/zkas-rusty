@@ -41,7 +41,7 @@ impl ReceivePingsFlow {
             let ping = dequeue!(self.incoming_route, Payload::Ping)?;
             debug!("P2P Flows, got ping request with nonce {}", ping.nonce);
             let pong = make_message!(Payload::Pong, PongMessage { nonce: ping.nonce });
-            self.router.enqueue(pong).await?;
+            self.router.enqueue_paced(pong).await?;
         }
     }
 }
