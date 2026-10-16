@@ -3407,7 +3407,11 @@ impl WalletDb {
 
         let size = r.u64()?;
         let n_leaves = r.u64()? as usize;
-        db.leaves.reserve(n_leaves);
+        // A hint only, clamped to what the rest of the blob can hold: the count is read from a
+        // `.scan` file, and a corrupt or truncated one used to ask for up to 2^64 leaves here --
+        // a capacity overflow panic or an allocation abort, which takes the whole daemon down
+        // instead of failing this one restore on its first short read below.
+        db.leaves.reserve(n_leaves.min(r.remaining() / 32));
         for _ in 0..n_leaves {
             // Stored verbatim — no point decompression here; that is what makes a restore
             // a memcpy instead of minutes of curve arithmetic.
@@ -3944,6 +3948,10 @@ impl Cursor<'_> {
     fn done(&self) -> bool {
         self.pos == self.buf.len()
     }
+    /// Bytes left to read: the most any declared count can still be backed by.
+    fn remaining(&self) -> usize {
+        self.buf.len().saturating_sub(self.pos)
+    }
 }
 
 #[cfg(test)]
@@ -3979,6 +3987,22 @@ mod tests {
             let mut buf = tree_bytes.clone();
             buf.extend_from_slice(&declared.to_le_bytes());
             assert!(read_witness(&mut Cursor { buf: &buf, pos: 0 }).is_none(), "declared {declared}");
+        }
+    }
+
+    /// The checkpoint leaf count only sizes a capacity hint, and the hint is clamped to what
+    /// the blob can still hold: a corrupt count fails the restore instead of asking the
+    /// allocator for 2^64 leaves (a capacity panic, or an abort no hook can catch).
+    #[test]
+    fn checkpoint_restore_with_an_absurd_leaf_count_fails_cleanly() {
+        for declared in [1u64 << 40, u64::MAX] {
+            let mut blob = vec![CHECKPOINT_VERSION];
+            blob.extend_from_slice(&0u64.to_le_bytes()); // base size
+            blob.push(0); // empty base frontier
+            blob.extend_from_slice(&0u64.to_le_bytes()); // size
+            blob.extend_from_slice(&declared.to_le_bytes()); // leaf count, backed by nothing
+            blob.extend_from_slice(&[0u8; 64]); // two leaves' worth, not 2^40
+            assert!(WalletDb::restore(WalletDb::from_seed([3u8; 32]).unwrap(), &blob, None).is_none(), "declared {declared}");
         }
     }
 
