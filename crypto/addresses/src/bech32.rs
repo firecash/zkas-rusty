@@ -1,6 +1,6 @@
 use alloc::{string::String, vec, vec::Vec};
 
-use crate::{Address, AddressError, Prefix, Version};
+use crate::{Address, AddressError, Prefix};
 
 const CHARSET: &[u8] = b"qpzry9x8gf2tvdw0s3jn54khce6mua7l";
 const REV_CHARSET: [u8; 123] = [
@@ -153,12 +153,8 @@ impl Address {
         // caller that parses an address string (`getBalanceByAddress`,
         // `getUtxosByAddresses`, walletd's send path, the explorer's search box)
         // hands an unauthenticated peer a one-packet node kill.
-        let &version_byte = payload_u8.first().ok_or(AddressError::BadPayload)?;
-        let version: Version = version_byte.try_into()?;
-        if !prefix.is_test() && payload_u8.len() - 1 != version.public_key_len() {
-            return Err(AddressError::BadPayload);
-        }
-        Ok(Self::new(prefix, version, &payload_u8[1..]))
+        let (&version_byte, payload) = payload_u8.split_first().ok_or(AddressError::BadPayload)?;
+        Self::try_new(prefix, version_byte.try_into()?, payload)
     }
 }
 
@@ -167,6 +163,7 @@ mod tests {
     extern crate std;
 
     use super::*;
+    use crate::Version;
     use alloc::{format, vec, vec::Vec};
 
     /// Build an address string with a VALID checksum over an arbitrary 5-bit
@@ -191,17 +188,21 @@ mod tests {
         // No payload at all: the string is nothing but its checksum.
         assert_eq!(Address::try_from(forge(Prefix::Mainnet, &[]).as_str()), Err(AddressError::BadPayload));
 
+        let bad_length = |payload_u5: &[u8]| {
+            matches!(Address::try_from(forge(Prefix::Mainnet, payload_u5).as_str()), Err(AddressError::InvalidPayloadLength { .. }))
+        };
+
         // Known version byte, payload too short (PubKey wants 32 bytes).
         let short = conv8to5(&[Version::PubKey as u8, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
-        assert_eq!(Address::try_from(forge(Prefix::Mainnet, &short).as_str()), Err(AddressError::BadPayload));
+        assert!(bad_length(&short), "payload too short");
 
         // Known version byte, payload too long (PubKeyECDSA wants 33 bytes).
         let long = conv8to5(&[vec![Version::PubKeyECDSA as u8], vec![7u8; 64]].concat());
-        assert_eq!(Address::try_from(forge(Prefix::Mainnet, &long).as_str()), Err(AddressError::BadPayload));
+        assert!(bad_length(&long), "payload too long");
 
         // A shielded payload under a transparent version byte (43 vs 32).
         let crossed = conv8to5(&[vec![Version::PubKey as u8], vec![3u8; 43]].concat());
-        assert_eq!(Address::try_from(forge(Prefix::Mainnet, &crossed).as_str()), Err(AddressError::BadPayload));
+        assert!(bad_length(&crossed), "shielded payload under a transparent version");
 
         // An unknown version byte keeps reporting the version error.
         let bad_version = conv8to5(&[vec![7u8], vec![0u8; 32]].concat());

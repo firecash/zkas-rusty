@@ -57,6 +57,8 @@ pub enum AddressError {
     BadChecksum,
     #[error("The address payload is invalid")]
     BadPayload,
+    #[error("The address payload length is invalid: expected {expected} bytes, got {actual}")]
+    InvalidPayloadLength { expected: usize, actual: usize },
     #[error("The address is invalid")]
     InvalidAddress,
     #[error("The address array is invalid")]
@@ -258,11 +260,25 @@ impl fmt::Debug for Address {
 }
 
 impl Address {
+    /// Panics on a payload whose length does not match `version`. Use
+    /// [`Self::try_new`] for any payload that came off the wire: the panic hook
+    /// turns a panic into `process::exit(1)`, so a caller that trusts attacker
+    /// bytes here hands out a remote kill.
     pub fn new(prefix: Prefix, version: Version, payload: &[u8]) -> Self {
         if !prefix.is_test() {
             assert_eq!(payload.len(), version.public_key_len());
         }
         Self { prefix, payload: PayloadVec::from_slice(payload), version }
+    }
+
+    /// The fallible constructor: same invariant as [`Self::new`], reported
+    /// instead of asserted.
+    pub fn try_new(prefix: Prefix, version: Version, payload: &[u8]) -> Result<Self, AddressError> {
+        let expected = version.public_key_len();
+        if !prefix.is_test() && payload.len() != expected {
+            return Err(AddressError::InvalidPayloadLength { expected, actual: payload.len() });
+        }
+        Ok(Self { prefix, payload: PayloadVec::from_slice(payload), version })
     }
 
     pub fn short(&self, n: usize) -> String {
@@ -298,7 +314,12 @@ impl BorshDeserialize for Address {
         let prefix: Prefix = borsh::BorshDeserialize::deserialize_reader(reader)?;
         let version: Version = borsh::BorshDeserialize::deserialize_reader(reader)?;
         let payload: Vec<u8> = borsh::BorshDeserialize::deserialize_reader(reader)?;
-        Ok(Self::new(prefix, version, &payload))
+        // Borsh bytes are attacker bytes wherever the borsh wRPC listener is on
+        // (`--rpclisten-borsh`, which the embedded daemon enables), so the length
+        // invariant is reported here, not asserted: `Self::new` would panic and
+        // the panic hook would exit the process.
+        Self::try_new(prefix, version, &payload)
+            .map_err(|err| borsh::io::Error::new(borsh::io::ErrorKind::InvalidData, err.to_string()))
     }
 }
 
@@ -627,5 +648,27 @@ mod tests {
         let address: Result<Address, AddressError> = address_str.try_into();
         assert_eq!(Err(AddressError::BadChecksum), address);
         // cspell:enable
+    }
+
+    /// A borsh-encoded address whose payload length contradicts its version is an
+    /// ERROR, never a panic. `Address::new` asserts that length and the panic hook
+    /// exits the process, so this decode sat on the borsh wRPC surface as a remote
+    /// kill of every node that enables it.
+    #[test]
+    fn borsh_decode_of_a_malformed_payload_is_an_error() {
+        use borsh::{BorshDeserialize, BorshSerialize};
+
+        // Encode by hand in the exact shape `BorshSerialize for Address` writes,
+        // but with a payload too short for the version byte.
+        let mut buf = Vec::new();
+        BorshSerialize::serialize(&Prefix::Mainnet, &mut buf).unwrap();
+        BorshSerialize::serialize(&Version::PubKey, &mut buf).unwrap();
+        BorshSerialize::serialize(&alloc::vec![0u8; 31], &mut buf).unwrap();
+        assert!(Address::try_from_slice(&buf).is_err(), "a 31-byte PubKey payload must be refused");
+
+        // ...and the honest shape still round-trips.
+        let address = Address::new(Prefix::Mainnet, Version::PubKey, &[9u8; 32]);
+        let good = borsh::to_vec(&address).unwrap();
+        assert_eq!(Address::try_from_slice(&good).unwrap(), address);
     }
 }
