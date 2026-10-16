@@ -7,7 +7,10 @@ use kaspa_hashes::Hash;
 
 /// Shared utility function to keep the "within threshold" definition consistent across callers.
 pub fn seq_commit_within_threshold(high_blue_score: u64, low_blue_score: u64, threshold: u64) -> bool {
-    low_blue_score + threshold > high_blue_score
+    // Exact for every input: a sum past u64::MAX is above any `high_blue_score`. A plain `+`
+    // panicked under the release build's overflow checks on a peer-supplied blue score (the
+    // pruning-point chain segment walk reads headers a syncer sent), and the panic hook exits.
+    low_blue_score.checked_add(threshold).is_none_or(|sum| sum > high_blue_score)
 }
 
 #[derive(Copy, Clone)]
@@ -47,5 +50,20 @@ impl<'a> kaspa_txscript::SeqCommitAccessor for SeqCommitAccessor<'a> {
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod threshold_tests {
+    use super::seq_commit_within_threshold;
+
+    #[test]
+    fn within_threshold_is_exact_and_never_overflows() {
+        assert!(seq_commit_within_threshold(10, 10, 1));
+        assert!(!seq_commit_within_threshold(11, 10, 1));
+        assert!(seq_commit_within_threshold(10, 9, 2));
+        // A sum past u64::MAX is above every high score; this used to panic.
+        assert!(seq_commit_within_threshold(u64::MAX - 1, u64::MAX, 5));
+        assert!(seq_commit_within_threshold(0, u64::MAX, u64::MAX));
     }
 }

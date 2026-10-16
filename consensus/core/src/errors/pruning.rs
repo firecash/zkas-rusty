@@ -9,6 +9,9 @@ pub enum PruningImportError {
     #[error("trusted ghostdag data for {0} is malformed: {1}")]
     InvalidTrustedGhostdag(kaspa_hashes::Hash, String),
 
+    #[error("imported header {0} claims blue score {1} / DAA score {2}, above the plausible ceiling {3}")]
+    ImplausibleImportedScores(Hash, u64, u64, u64),
+
     #[error("pruning proof doesn't have {0} levels")]
     ProofNotEnoughLevels(usize),
 

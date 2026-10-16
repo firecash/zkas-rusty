@@ -131,7 +131,9 @@ impl MiningRuleEngine {
         let synced_threshold = self.config.expected_difficulty_window_duration_in_milliseconds() / 4;
 
         // Roughly 10mins in all networks
-        unix_now() < sink_timestamp + synced_threshold
+        // Saturating: the sink right after a headers-proof IBD is the pruning point, whose timestamp
+        // was read from the proof and never checked against the clock.
+        unix_now() < sink_timestamp.saturating_add(synced_threshold)
     }
 
     fn has_sufficient_peer_connectivity(&self) -> bool {
