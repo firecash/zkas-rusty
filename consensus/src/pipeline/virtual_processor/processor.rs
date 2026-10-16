@@ -274,6 +274,18 @@ pub(crate) enum ReorgFailpoint {
 #[cfg(test)]
 pub(crate) type ReorgFailpointMatcher = Box<dyn Fn(&ReorgFailpoint) -> bool + Send>;
 
+/// A pruning-point shielded import that passed every check, ready to be staged. Holding one means
+/// only that the data is proven; whether the node may still replace its live state with it is decided
+/// when it is staged (see `Consensus::import_pruning_point_shielded`).
+pub struct VerifiedShieldedImport {
+    pp: Hash,
+    md: crate::processes::shielded::PruningPointShieldedMetadata,
+    window: Option<kaspa_shielded_core::anchor_window::AnchorLog>,
+    proven_entries: Vec<(kaspa_shielded_core::anchor_window::WindowEntry, kaspa_shielded_core::anchor_window::AnchorLog)>,
+    nullifiers: Vec<[u8; 32]>,
+    n: usize,
+}
+
 impl VirtualStateProcessor {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -704,7 +716,9 @@ impl VirtualStateProcessor {
     /// Verifies the imported pruning-point state and stages, into `batch`, the clear of the old
     /// state followed by the seed of the new one. Nothing is written here: the caller writes the
     /// batch once, so there is no moment at which the node holds an empty nullifier set, and a
-    /// failed verification leaves the old state untouched.
+    /// failed verification leaves the old state untouched. [`Self::verify_pruning_point_shielded_import`]
+    /// followed by [`Self::stage_verified_shielded_import`]; a caller that must exclude concurrent
+    /// writers of the live set calls the two halves itself, so the lock covers only the second.
     pub fn seed_pruning_point_shielded(
         &self,
         batch: &mut WriteBatch,
@@ -713,6 +727,19 @@ impl VirtualStateProcessor {
         expected_state_root: Option<[u8; 32]>,
         nullifiers: Vec<[u8; 32]>,
     ) -> Result<usize, String> {
+        let verified = self.verify_pruning_point_shielded_import(pp, metadata, expected_state_root, nullifiers)?;
+        self.stage_verified_shielded_import(batch, verified)
+    }
+
+    /// Verify an imported pruning-point state completely, reading nothing the live chain walk writes
+    /// (only headers and the PoW binding), so it can run while the node keeps processing blocks.
+    pub fn verify_pruning_point_shielded_import(
+        &self,
+        pp: kaspa_hashes::Hash,
+        metadata: kaspa_consensus_core::api::ShieldedExportMetadata,
+        expected_state_root: Option<[u8; 32]>,
+        nullifiers: Vec<[u8; 32]>,
+    ) -> Result<VerifiedShieldedImport, String> {
         use crate::processes::shielded::{PruningPointShieldedMetadata, ShieldedStateManager};
         let mut md = PruningPointShieldedMetadata::from_wire_bytes(&metadata.data)?;
         // F-02: reject the import before seeding if it does not match the
@@ -764,6 +791,15 @@ impl VirtualStateProcessor {
         if n as u64 != metadata.nullifier_count {
             return Err(format!("nullifier count mismatch: metadata says {}, streamed {}", metadata.nullifier_count, n));
         }
+        Ok(VerifiedShieldedImport { pp, md, window, proven_entries, nullifiers, n })
+    }
+
+    /// Stage a verified import into `batch`: the clear of the old state, then the seed. The clear
+    /// enumerates the LIVE nullifier set, so the caller must hold a lock that excludes every writer of
+    /// that set (the virtual write lock) from here until the batch is written; otherwise a nullifier a
+    /// concurrent chain walk inserts after the enumeration survives the clear.
+    pub fn stage_verified_shielded_import(&self, batch: &mut WriteBatch, verified: VerifiedShieldedImport) -> Result<usize, String> {
+        let VerifiedShieldedImport { pp, md, window, proven_entries, nullifiers, n } = verified;
         // Clear first, then seed, in the same batch. Every seed write is an overwrite, and a
         // WriteBatch applies in order, so a nullifier in both the old and the new set ends present.
         self.shielded_state_manager
