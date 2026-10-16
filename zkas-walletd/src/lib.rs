@@ -5661,8 +5661,11 @@ impl AppState {
     /// ~150 B for the life of the daemon. A loaded wallet answers from the map; only a miss pays
     /// a file-existence check, which the request was about to make anyway.
     async fn touch(&self, token: &str) {
-        let known = self.wallets.lock().await.contains_key(token) || wallet_exists(&self.wallet_dir, token);
-        if !known {
+        // Two statements, not one `||`: the guard of a lock taken inside an expression lives to
+        // the end of the statement, so the existence stat used to run with the global map
+        // locked -- on every status poll naming an unknown token, stalling every wallet route.
+        let loaded = self.wallets.lock().await.contains_key(token);
+        if !loaded && !wallet_exists(&self.wallet_dir, token) {
             return;
         }
         self.last_touch.lock().await.insert(token.to_string(), std::time::Instant::now());
@@ -6046,6 +6049,13 @@ impl AppState {
             //
             // This buys time; it is not the fix. Weak tokens need rotating and the seed
             // endpoint needs a second factor.
+            //
+            // The load permit goes back first. The gate admits only a few loads at once, so
+            // a request that slept on its permit held a real wallet's load back by the full
+            // delay, and a handful of junk tokens in flight stalled every load behind them.
+            // The token's own load lock is still held, which only serialises guesses at
+            // that one token.
+            drop(_permit);
             tokio::time::sleep(UNKNOWN_TOKEN_DELAY).await;
             return None;
         };
