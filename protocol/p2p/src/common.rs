@@ -49,6 +49,12 @@ pub enum ProtocolError {
     #[error("misbehaving peer: {0}")]
     MisbehavingPeer(String),
 
+    /// The peer's address is in the ban store. A refusal this node CHOSE, and one a banned peer
+    /// meets on every redial, so it is logged quietly (see the inbound handler) rather than as a
+    /// failed handshake.
+    #[error("peer {0} is banned")]
+    PeerBanned(String),
+
     #[error("peer connection is closed")]
     ConnectionClosed,
 
@@ -131,6 +137,7 @@ impl ProtocolError {
             | Self::Other(_)
             | Self::OtherOwned(_)
             | Self::MisbehavingPeer(_)
+            | Self::PeerBanned(_)
             | Self::ConnectionClosed
             | Self::IncomingRouteCapacityReached(_, _)
             | Self::OutgoingRouteCapacityReached(_)

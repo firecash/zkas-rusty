@@ -305,6 +305,7 @@ impl ProtoP2p for ConnectionHandler {
                     match err {
                         ProtocolError::LoopbackConnection(_)
                         | ProtocolError::PeerAlreadyExists(_)
+                        | ProtocolError::PeerBanned(_)
                         | ProtocolError::VersionMismatch(_, ..=9) => {
                             // version 9 and below is prior toccata, silencing logs on deprecated versions
                             debug!("P2P, handshake failed for inbound peer {}: {}", router, err);

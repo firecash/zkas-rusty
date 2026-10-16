@@ -1,4 +1,4 @@
-use crate::ban_policy::{AutoBanBudget, auto_ban_may_target};
+use crate::ban_policy::{AutoBanBudget, auto_ban_may_target, is_fork_reject_reason};
 use crate::flowcontext::{
     orphans::{OrphanBlocksPool, OrphanOutput},
     process_queue::ProcessQueue,
@@ -460,12 +460,35 @@ impl FlowContext {
     /// and both the permanent-request check and `ConnectionManager::ban` take that lock, so
     /// awaiting them here would deadlock the connection loop.
     pub(crate) fn ban_if_protocol_violation(&self, router: &Router, err: &ProtocolError) {
-        if !self.config.enable_banning || !err.is_auto_ban_eligible() {
+        if !self.config.enable_banning {
             return;
         }
+        // A peer that rejected what WE sent closes the connection with its reason, and every flow
+        // then ends here with `ConnectionClosed`; the router hands the reason to the first of them.
+        // Only one reason counts: see `is_fork_reject_reason`.
+        if let Some(reason) = router.take_peer_reject_reason() {
+            if is_fork_reject_reason(&reason) {
+                self.spawn_auto_ban(router, format!("it rejects our blocks as \"{reason}\", i.e. it follows the pre-fork rules"), true);
+            }
+            return;
+        }
+        if !err.is_auto_ban_eligible() {
+            return;
+        }
+        self.spawn_auto_ban(router, err.to_string(), false);
+    }
+
+    /// The shared tail of `ban_if_protocol_violation`: exemptions, budget, then the ban.
+    ///
+    /// `fork_reject` adds two conditions the reason alone cannot carry. The security fork must be
+    /// active at this node's own virtual DAA score: before it, a peer calling our PoW invalid means
+    /// something else entirely. And this node must be nearly synced: a node that was fed a chain
+    /// nobody mined is rejected by every honest peer for exactly this reason, and must never answer
+    /// that by banning them.
+    fn spawn_auto_ban(&self, router: &Router, reason: String, fork_reject: bool) {
         let ip = router.net_address().ip();
         if !auto_ban_may_target(ip) {
-            debug!("P2P, not auto-banning peer {} ({}): its address is not publicly routable", router, err);
+            debug!("P2P, not auto-banning peer {} ({}): its address is not publicly routable", router, reason);
             return;
         }
         let Some(connection_manager) = self.connection_manager() else {
@@ -473,14 +496,29 @@ impl FlowContext {
         };
         let ctx = self.clone();
         let peer = router.to_string();
-        let reason = err.to_string();
         tokio::spawn(async move {
+            if fork_reject {
+                let session = ctx.consensus().unguarded_session();
+                if !ctx.config.security_fork_activation.is_active(session.get_virtual_daa_score()) {
+                    debug!("P2P, not auto-banning peer {} ({}): the security fork is not active here yet", peer, reason);
+                    return;
+                }
+                if !ctx.is_nearly_synced(&session).await {
+                    info!("P2P, not auto-banning peer {} ({}): this node is not synced, so it cannot tell whose chain is wrong", peer, reason);
+                    return;
+                }
+            }
             // Both spellings: a permanent request names the IPv4 address, but the same peer dialing
             // in on a dual-stack listener arrives as `::ffff:a.b.c.d`.
             if connection_manager.ip_has_permanent_connection(ip).await
                 || connection_manager.ip_has_permanent_connection(ip.to_canonical()).await
             {
-                info!("P2P, not auto-banning peer {} ({}): it is an --addpeer/--connect peer", peer, reason);
+                // A pre-fork --addpeer redials every few seconds; its reject is already logged.
+                if fork_reject {
+                    debug!("P2P, not auto-banning peer {} ({}): it is an --addpeer/--connect peer", peer, reason);
+                } else {
+                    info!("P2P, not auto-banning peer {} ({}): it is an --addpeer/--connect peer", peer, reason);
+                }
                 return;
             }
             let granted = ctx.auto_ban_budget.lock().try_take(Instant::now());
@@ -877,7 +915,7 @@ impl FlowContext {
         // cannot be called here: an outbound permanent connection runs this initializer while the
         // connection manager holds the request lock that function takes.
         if self.address_manager.lock().is_banned(router.net_address().ip().into()) {
-            return Err(ProtocolError::OtherOwned(format!("peer {router} is banned")));
+            return Err(ProtocolError::PeerBanned(router.to_string()));
         }
 
         // Build the handshake object and subscribe to handshake messages

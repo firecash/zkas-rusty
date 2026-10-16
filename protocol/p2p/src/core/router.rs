@@ -222,6 +222,10 @@ struct RouterMutableState {
 
     /// Duration of the last ping to this peer
     last_ping_duration: u64,
+
+    /// The reason the peer gave when it rejected something we sent, if it did. Set by the receive
+    /// loop right before it closes the connection, and taken once (see `take_peer_reject_reason`).
+    peer_reject_reason: Option<String>,
 }
 
 impl RouterMutableState {
@@ -337,7 +341,12 @@ impl Router {
                                 Err(e) => {
                                     match e {
                                         ProtocolError::IgnorableReject(reason) => debug!("P2P, got reject message: {} from peer: {}", reason, router),
-                                        ProtocolError::Rejected(reason) => warn!("P2P, got reject message: {} from peer: {}", reason, router),
+                                        ProtocolError::Rejected(reason) => {
+                                            warn!("P2P, got reject message: {} from peer: {}", reason, router);
+                                            // Recorded BEFORE the loop breaks and closes the router, so it is
+                                            // there by the time the flows see `ConnectionClosed`.
+                                            router.mutable_state.lock().peer_reject_reason = Some(reason);
+                                        }
                                         e => warn!("P2P, route error: {} for peer: {}", e, router),
                                     }
                                     break;
@@ -364,6 +373,15 @@ impl Router {
         });
 
         router_clone
+    }
+
+    /// The reason this peer gave for rejecting something we sent, at most once per connection.
+    ///
+    /// When a peer's reject closes the connection, every flow on it ends with `ConnectionClosed`
+    /// at about the same moment; taking (not reading) the reason means exactly one of them acts on
+    /// it.
+    pub fn take_peer_reject_reason(&self) -> Option<String> {
+        self.mutable_state.lock().peer_reject_reason.take()
     }
 
     /// Internal identity of this peer

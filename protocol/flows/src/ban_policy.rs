@@ -8,6 +8,22 @@ use kaspa_utils::networking::IpAddress;
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
+/// Whether a peer's reject reason marks it as following the pre-fork rules.
+///
+/// After the security fork our blocks carry the bound (`ZKM1`) merged-mining witness, which the
+/// legacy rule cannot read, so an un-upgraded node rejects every one of them as
+/// `RuleError::InvalidPoW` and disconnects -- and, with no backoff, redials within seconds, forever.
+/// Measured on mainnet 2026-10-16: 33 such addresses, ~3,200 rejects an hour, each connection
+/// handshaken, flow-registered and served a block before the reject.
+///
+/// The match is exact, against the consensus error's own text, so a reason that merely mentions
+/// proof of work does not qualify. The reason is the peer's word, but the only address it can get
+/// banned is its own. Whether to act on it at all (fork active, this node synced) is decided by the
+/// caller.
+pub(crate) fn is_fork_reject_reason(reason: &str) -> bool {
+    reason == kaspa_consensus_core::errors::block::RuleError::InvalidPoW.to_string()
+}
+
 /// Length of one auto-ban budget window.
 pub(crate) const AUTO_BAN_WINDOW: Duration = Duration::from_secs(60 * 60);
 
@@ -59,6 +75,22 @@ impl AutoBanBudget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_exact_invalid_pow_reason_marks_a_pre_fork_peer() {
+        // The text un-upgraded mainnet nodes actually send (from a live node's log).
+        assert!(is_fork_reject_reason("block has invalid proof-of-work"));
+        for other in [
+            "",
+            "block has invalid proof-of-work extra",
+            "Block has invalid proof-of-work",
+            "Network mismatch - local: kaspa-mainnet, remote: zkas-mainnet",
+            "timeout expired after 4s",
+            "invalid proof-of-work",
+        ] {
+            assert!(!is_fork_reject_reason(other), "{other:?} must not trigger a fork ban");
+        }
+    }
     use std::net::{Ipv4Addr, Ipv6Addr};
 
     #[test]
