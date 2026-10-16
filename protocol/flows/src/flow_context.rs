@@ -790,6 +790,27 @@ impl FlowContext {
 #[async_trait]
 impl ConnectionInitializer for FlowContext {
     async fn initialize_connection(&self, router: Arc<Router>) -> Result<(), ProtocolError> {
+        // An operator's ban was only ever a kick. `ConnectionManager::ban` terminates the peer's
+        // current connections and persists the IP, and `is_banned` was written to read that back --
+        // but nothing called it, on any path. The banned peer reconnected on its next dial and the
+        // ban meant one dropped connection and nothing more. Consult it here, where every
+        // connection passes exactly once, inbound and outbound alike, before any handshake work is
+        // spent on its behalf.
+        //
+        // Every ban in this store is operator-issued: there are no automatic ban triggers anywhere
+        // in this codebase, and this does not add any. That is deliberate rather than pending --
+        // the two `MisbehavingPeer` sites in tx relay are the right place for them, but a fork has
+        // just split the network and dozens of honest peers are failing to agree with us, so
+        // arming an automatic ban now would be a good mechanism introduced at the worst moment. A
+        // refusal here is therefore always something a person asked for, and it expires with the
+        // store's own 24-hour window.
+        //
+        // A ban outranks `--addpeer`/`--connect` for the same IP: both are operator instructions
+        // and the ban is the later one.
+        if self.address_manager.lock().is_banned(router.net_address().ip().into()) {
+            return Err(ProtocolError::OtherOwned(format!("peer {router} is banned")));
+        }
+
         // Build the handshake object and subscribe to handshake messages
         let mut handshake = KaspadHandshake::new(&router);
 
