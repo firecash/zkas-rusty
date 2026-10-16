@@ -139,7 +139,18 @@ impl RequestPruningPointSmtStateFlow {
             Err(e) => return Err(ProtocolError::OtherOwned(format!("SMT lane reader task panicked: {e}"))),
         };
 
-        assert!(lanes_sent == reader_count && lanes_sent == expected_count);
+        // The metadata (count) and the lane stream come from two separate consensus calls, made
+        // without a session held across them, and the stream filters lanes by a canonicality check
+        // read live. A concurrent virtual update can therefore leave the two disagreeing. This was an
+        // `assert!`, so a peer that simply asked for the SMT state at the wrong moment exited the
+        // node through the panic hook. Abort the transfer instead: the requester sees a torn stream
+        // and retries, exactly as the shielded-state flow beside this one already does (F-03).
+        if lanes_sent != reader_count || lanes_sent != expected_count {
+            return Err(ProtocolError::OtherOwned(format!(
+                "SMT lane stream for pruning point {expected_pp} drifted during transfer: \
+                 sent {lanes_sent}, reader streamed {reader_count}, metadata declared {expected_count}; aborting"
+            )));
+        }
 
         info!("Finished sending SMT state for pruning point {}: {} lanes in {} chunks", expected_pp, lanes_sent, chunks_sent);
         Ok(())
