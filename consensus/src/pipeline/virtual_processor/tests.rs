@@ -987,8 +987,8 @@ enum CrashWindow {
     /// After the down-walk batch: the abandoned branch's nullifiers are gone, the virtual state still
     /// names the abandoned tip, so the set is short of the sink's.
     AfterDownWalk,
-    /// After the commit of the new-branch block that applies the spend: the set holds a nullifier the
-    /// persisted sink never spent.
+    /// After the commit of the new-branch chain block that applies the spend, with a further chain
+    /// block of the walk still to come: the set holds a nullifier the persisted sink never spent.
     AfterSpendingBlockCommit,
     /// After every block of the walk, before the virtual state commit: the set is the new branch's,
     /// the persisted sink the old one.
@@ -1007,8 +1007,15 @@ enum CrashWindow {
 ///
 /// In `AfterDownWalk` both branches spend note N (only A's spend is lost by the crash); in the other
 /// two only B spends it (B's spend is what the crash leaves behind).
+///
+/// The reorg is made deterministic: A is three blocks, B's first two are lighter than A3, and B3
+/// merges a side block X so it outweighs A3 by a whole block. Blue work never ties, so the hash of
+/// the (randomised) proof cannot decide which insert reorgs. Every block is built before the image is
+/// armed, so the image is taken by `resolve_virtual` while it inserts B3, never by the test block
+/// builder's own walk.
 async fn reorg_crash_window_recovers(window: CrashWindow) {
     use super::processor::{ReorgFailpoint, ReorgFailpointMatcher};
+    use crate::model::stores::ghostdag::GhostdagStoreReader;
     use kaspa_consensus_core::subnets::SUBNETWORK_ID_NATIVE;
     use kaspa_consensus_core::tx::TX_VERSION_SHIELDED;
     use kaspa_database::prelude::ConnBuilder;
@@ -1065,46 +1072,60 @@ async fn reorg_crash_window_recovers(window: CrashWindow) {
     .expect("wallet builds a real spend bundle");
     spend_tx.finalize();
 
-    // B1 (the spend) is built while the common chain is selected, as in the F-01 test.
+    // B1 (the spend) is built while the common chain is selected, as in the F-01 test. X is an empty
+    // sibling of A1 and B1 that only B3 will merge.
     let b1 = ctx.mine_real_pow_block_on(vec![split], vec![spend_tx.clone()]);
     let b1_hash = b1.header.hash;
+    let x = ctx.mine_real_pow_block_on(vec![split], vec![]);
+    let x_hash = x.header.hash;
     let a1 = ctx.mine_real_pow_block_on(vec![split], if a_spends { vec![spend_tx.clone()] } else { vec![] });
     let a1_hash = a1.header.hash;
     ctx.consensus.validate_and_insert_block(a1).virtual_state_task.await.unwrap();
     let a2 = ctx.mine_real_pow_block_on(vec![a1_hash], vec![]);
     let a2_hash = a2.header.hash;
     ctx.consensus.validate_and_insert_block(a2).virtual_state_task.await.unwrap();
-    assert_eq!(ctx.consensus.get_sink(), a2_hash, "branch A is selected before B arrives");
+    let a3 = ctx.mine_real_pow_block_on(vec![a2_hash], vec![]);
+    let a3_hash = a3.header.hash;
+    ctx.consensus.validate_and_insert_block(a3).virtual_state_task.await.unwrap();
+    assert_eq!(ctx.consensus.get_sink(), a3_hash, "branch A is selected before B arrives");
 
     ctx.consensus.validate_and_insert_block(b1).virtual_state_task.await.unwrap();
-    assert_eq!(ctx.consensus.get_sink(), a2_hash, "B1 alone is lighter than A");
+    ctx.consensus.validate_and_insert_block(x).virtual_state_task.await.unwrap();
+    assert_eq!(ctx.consensus.get_sink(), a3_hash, "B1 and X alone are lighter than A");
     let b2 = ctx.mine_real_pow_block_on(vec![b1_hash], vec![]);
     let b2_hash = b2.header.hash;
+    ctx.consensus.validate_and_insert_block(b2.clone()).virtual_state_task.await.unwrap();
+    assert_eq!(ctx.consensus.get_sink(), a3_hash, "B2 is one block lighter than A3");
+    // B2 is B3's selected parent (one block heavier than X), and X is blue in B3's mergeset, so B3
+    // outweighs A3 by one block. In the chain split -> B1 -> B2 -> B3, B1's spend is accepted by B2
+    // (a chain block applies the transactions of its mergeset, its selected parent's included), and
+    // B3 is committed after it: B2's commit is the middle of the walk, not its end.
+    let b3 = ctx.mine_real_pow_block_on(vec![b2_hash, x_hash], vec![]);
+    let b3_hash = b3.header.hash;
+    let bw = |h: Hash| ctx.consensus.ghostdag_store().get_blue_work(h).unwrap();
+    assert!(bw(b2_hash) < bw(a3_hash), "B2 cannot take the chain");
 
-    // Arm the crash image. B2 ties A and B3 outweighs it; whichever insert moves the sink off A runs
-    // the walk, so the matchers key on the walk, not on the insert.
+    // Arm the crash image only now: nothing is built from here on, so the only walk that can reach a
+    // failpoint is `resolve_virtual` moving the sink from A3 to B3.
     let image_dir = kaspa_database::utils::get_kaspa_tempdir();
     let image = image_dir.path().join("crash");
     let legacy_image = image_dir.path().join("crash-without-cursor");
     let matcher: ReorgFailpointMatcher = match window {
         CrashWindow::AfterDownWalk => Box::new(move |fp: &ReorgFailpoint| {
-            matches!(*fp, ReorgFailpoint::AfterDownWalk { from, split } if from == a2_hash && split != a2_hash)
+            matches!(*fp, ReorgFailpoint::AfterDownWalk { from, split: at } if from == a3_hash && at == split)
         }),
-        // B2 merges B1, so B2's own commit is the one that applies the spend.
         CrashWindow::AfterSpendingBlockCommit => {
             Box::new(move |fp: &ReorgFailpoint| matches!(*fp, ReorgFailpoint::AfterChainBlockCommit(block) if block == b2_hash))
         }
         CrashWindow::BeforeVirtualCommit => Box::new(move |fp: &ReorgFailpoint| {
-            matches!(*fp, ReorgFailpoint::BeforeVirtualCommit { prev_sink, new_sink } if prev_sink == a2_hash && new_sink != a2_hash)
+            matches!(*fp, ReorgFailpoint::BeforeVirtualCommit { prev_sink, new_sink } if prev_sink == a3_hash && new_sink == b3_hash)
         }),
     };
     ctx.consensus.virtual_processor().arm_crash_image(matcher, image.clone());
 
-    ctx.consensus.validate_and_insert_block(b2.clone()).virtual_state_task.await.unwrap();
-    let b3 = ctx.mine_real_pow_block_on(vec![b2_hash], vec![]);
-    let b3_hash = b3.header.hash;
     ctx.consensus.validate_and_insert_block(b3.clone()).virtual_state_task.await.unwrap();
-    assert_eq!(ctx.consensus.get_sink(), b3_hash, "branch B took over");
+    assert_eq!(ctx.consensus.get_sink(), b3_hash, "branch B took over on B3");
+    assert!(bw(b3_hash) > bw(a3_hash), "B3 is strictly heavier than A3");
     assert!(!ctx.consensus.virtual_processor().crash_image_pending(), "the walk reached the {window:?} failpoint");
 
     // The never-crashed control receives one more block on B.
@@ -1127,21 +1148,33 @@ async fn reorg_crash_window_recovers(window: CrashWindow) {
         let (sender, _receiver) = async_channel::unbounded();
         let node = TestConsensus::with_db(db, &reopen_config, sender);
         let sm = node.virtual_processor().shielded_state_manager_ref();
-        assert_eq!(node.get_sink(), a2_hash, "the crash landed before the virtual state moved off A");
+        assert_eq!(node.get_sink(), a3_hash, "the crash landed before the virtual state moved off A");
         assert!(
-            !sm.global_set_matches_snapshot(a2_hash).unwrap().0,
+            !sm.global_set_matches_snapshot(a3_hash).unwrap().0,
             "{window:?}: the crash left the set off the persisted sink (what the self-check used to latch on)"
         );
-        assert_ne!(sm.nullifier_cursor().unwrap(), Some(a2_hash), "the cursor records where the set really is");
+        // The cursor records exactly where the walk stopped.
+        let (stopped_at, b3_committed) = match window {
+            CrashWindow::AfterDownWalk => (split, false),
+            CrashWindow::AfterSpendingBlockCommit => (b2_hash, false),
+            CrashWindow::BeforeVirtualCommit => (b3_hash, true),
+        };
+        assert_eq!(sm.nullifier_cursor().unwrap(), Some(stopped_at), "{window:?}: the cursor records where the set really is");
+        assert_eq!(
+            node.get_block_status(b3_hash) == Some(BlockStatus::StatusUTXOValid),
+            b3_committed,
+            "{window:?}: B3's commit is in the image exactly when the walk had finished"
+        );
 
-        // Restart: the reconcile runs before the processors.
+        // Restart, part 1: the reconcile alone, before any processor (and so before the self-check
+        // thread, which could otherwise repair the set itself and hide a broken reconcile).
+        node.virtual_processor().reconcile_nullifier_set_at_startup();
+        assert!(sm.global_set_matches_snapshot(a3_hash).unwrap().0, "{window:?}: the reconcile brought the set to the sink");
+        assert_eq!(sm.nullifier_cursor().unwrap(), Some(a3_hash));
+
+        // Part 2: the processors start; delivering the rest of B finishes the reorg exactly as on the
+        // node that never crashed.
         let mut restarted = TestContext::new(node);
-        let sm = restarted.consensus.virtual_processor().shielded_state_manager_ref();
-        assert!(sm.global_set_matches_snapshot(a2_hash).unwrap().0, "{window:?}: startup brought the set to the sink");
-        assert_eq!(sm.nullifier_cursor().unwrap(), Some(a2_hash));
-
-        // Delivering the rest of B finishes the reorg exactly as on the node that never crashed. (B3 is
-        // absent from the image when the crash came while B2 was being resolved.)
         for block in [b2.clone(), b3.clone(), c.clone()] {
             if restarted.consensus.get_block_status(block.hash()).is_none_or(|status| !status.has_block_body()) {
                 restarted.validate_and_insert_block(block).await;
@@ -1165,11 +1198,11 @@ async fn reorg_crash_window_recovers(window: CrashWindow) {
         sm.delete_nullifier_cursor_for_test(&mut batch).unwrap();
         vp.write_batch_for_test(batch);
         vp.reconcile_nullifier_set_at_startup();
-        assert!(!sm.global_set_matches_snapshot(a2_hash).unwrap().0, "without a cursor the reconcile has nothing to go on");
-        let (removed, restored) = vp.rebuild_nullifier_set(a2_hash, node.pruning_point()).expect("rebuilt from the diffs");
+        assert!(!sm.global_set_matches_snapshot(a3_hash).unwrap().0, "without a cursor the reconcile has nothing to go on");
+        let (removed, restored) = vp.rebuild_nullifier_set(a3_hash, node.pruning_point()).expect("rebuilt from the diffs");
         assert!(removed + restored > 0, "{window:?}: the rebuild changed something");
-        assert!(sm.global_set_matches_snapshot(a2_hash).unwrap().0, "{window:?}: the rebuilt set matches the snapshot");
-        assert_eq!(sm.nullifier_cursor().unwrap(), Some(a2_hash), "the rebuild records where the set now is");
+        assert!(sm.global_set_matches_snapshot(a3_hash).unwrap().0, "{window:?}: the rebuilt set matches the snapshot");
+        assert_eq!(sm.nullifier_cursor().unwrap(), Some(a3_hash), "the rebuild records where the set now is");
         drop(node);
         drop(lifetime);
     }
@@ -1276,7 +1309,13 @@ async fn self_check_rebuilds_a_damaged_set_and_refuses_what_it_cannot_prove() {
     let mut batch = rocksdb::WriteBatch::default();
     sm.stage_nullifier_set_repair(&mut batch, &[], &[stray], cursor).unwrap();
     vp.write_batch_for_test(batch);
-    assert!(vp.rebuild_nullifier_set(sink, pp).is_err(), "damage outside every diff is reported, not papered over");
+    // Damage outside every diff is reported, not papered over: the refusal is the snapshot mismatch
+    // (not a read failure), and the restore above left nothing else for it to find.
+    let err = vp.rebuild_nullifier_set(sink, pp).expect_err("damage outside every diff is reported, not papered over");
+    assert!(
+        err.contains("still does not match") && err.ends_with("(0 stale and 0 missing entries were found above it)"),
+        "the rebuild is refused on the snapshot check: {err}"
+    );
     assert!(sm.is_nullifier_spent(&stray).unwrap(), "a refused rebuild leaves the set exactly as it was");
 }
 
