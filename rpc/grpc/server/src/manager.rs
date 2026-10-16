@@ -85,14 +85,22 @@ impl Manager {
             return Err(RegistrationError::CapacityReached(self.max_connections));
         }
 
-        // Per-IP cap: prevent one source from exhausting the slot pool. Loopback
-        // is exempt (local self-hosted clients legitimately open many).
+        // Per-IP cap: prevent one source from exhausting the slot pool.
+        //
+        // Loopback gets a LOOSER cap, not an exemption. The exemption was written for
+        // self-hosted clients that legitimately open many connections at once (walletd, the
+        // pool bridge, the explorer backend), and it assumed loopback means local. Behind a
+        // port forwarder it does not: a public RPC fronted by `socat` -- which is how ours is
+        // fronted -- rewrites every remote to 127.0.0.1, so the exemption handed any single
+        // internet client the entire slot pool, and the first thing locked out is walletd's own
+        // node connection. Half the pool is still far more than every local service together,
+        // and it bounds one source. (A forwarder that preserves the client address is the other
+        // half of this fix, and belongs in the deployment rather than here.)
         let ip = connection.net_address().ip();
-        if !ip.is_loopback() {
-            let per_ip = connections_write.values().filter(|c| c.net_address().ip() == ip).count();
-            if per_ip >= self.max_per_ip {
-                return Err(RegistrationError::PerIpCapacityReached(ip, self.max_per_ip));
-            }
+        let cap = if ip.is_loopback() { std::cmp::max(self.max_connections / 2, self.max_per_ip) } else { self.max_per_ip };
+        let per_ip = connections_write.values().filter(|c| c.net_address().ip() == ip).count();
+        if per_ip >= cap {
+            return Err(RegistrationError::PerIpCapacityReached(ip, cap));
         }
 
         debug!("GRPC, Registering a new connection from {connection}");
