@@ -828,7 +828,18 @@ impl VirtualStateProcessor {
     /// enumerates the LIVE nullifier set, so the caller must hold a lock that excludes every writer of
     /// that set (the virtual write lock) from here until the batch is written; otherwise a nullifier a
     /// concurrent chain walk inserts after the enumeration survives the clear.
+    ///
+    /// On `Err` the caller drops `batch`; the writes already staged into it are also forgotten by the
+    /// store caches here, since `CachedDbAccess` caches a write when it is staged.
     pub fn stage_verified_shielded_import(&self, batch: &mut WriteBatch, verified: VerifiedShieldedImport) -> Result<usize, String> {
+        let res = self.stage_verified_shielded_import_inner(batch, verified);
+        if res.is_err() {
+            self.shielded_state_manager.discard_cached_shielded_writes();
+        }
+        res
+    }
+
+    fn stage_verified_shielded_import_inner(&self, batch: &mut WriteBatch, verified: VerifiedShieldedImport) -> Result<usize, String> {
         let VerifiedShieldedImport { pp, md, window, proven_entries, nullifiers, n } = verified;
         // Clear first, then seed, in the same batch. Every seed write is an overwrite, and a
         // WriteBatch applies in order, so a nullifier in both the old and the new set ends present.
@@ -872,6 +883,12 @@ impl VirtualStateProcessor {
     /// a finality point is pruned. That matters because a missing diff reads back as "added no
     /// nullifiers", which would make the move silently wrong instead of failing. Refused otherwise.
     ///
+    /// Above the floor, "no diff row" is still ambiguous: `persist` writes a row only for a block that
+    /// added nullifiers, so a block that was never UTXO-validated here reads exactly like one that
+    /// spent nothing. The marker that a block's diff WAS written is its `StatusUTXOValid`, which
+    /// `commit_utxo_state` sets in the same batch as `persist`. So every block the move reverts or
+    /// re-applies must carry it, or the move is refused before anything is written.
+    ///
     /// One batch is safe here (unlike the walk in `calculate_utxo_state_relatively`) because nothing
     /// reads the set between the staged reverts and re-applies: the caller holds the virtual
     /// upgradable lock, which every other writer of the set also holds. Reverts are staged first, so a
@@ -893,22 +910,48 @@ impl VirtualStateProcessor {
             }
         }
         let mut batch = WriteBatch::default();
+        if let Err(e) = self.stage_nullifier_set_move(&mut batch, cursor, target) {
+            // `CachedDbAccess` caches a write when it is STAGED, not when the batch lands. The batch is
+            // dropped here, so whatever was staged into it must not survive in the caches either: a
+            // re-applied nullifier would read as spent and the cursor would claim the move happened.
+            sm.discard_cached_shielded_writes();
+            return Err(e);
+        }
+        self.db.write(batch).unwrap();
+        Ok(Some(cursor))
+    }
+
+    /// The staging half of [`Self::move_nullifier_set_to`]; the caller has checked both ends against
+    /// the floor and drops the caches if this fails.
+    fn stage_nullifier_set_move(&self, batch: &mut WriteBatch, cursor: Hash, target: Hash) -> Result<(), String> {
+        let sm = &self.shielded_state_manager;
+        let reach = &self.reachability_service;
+        let diff_held = |block: Hash| -> Result<(), String> {
+            match self.statuses_store.read().get(block) {
+                Ok(StatusUTXOValid) => Ok(()),
+                Ok(status) => Err(format!(
+                    "{block} was never UTXO-validated here ({status:?}), so a missing nullifier diff cannot be told from an \
+                     empty one"
+                )),
+                Err(e) => Err(format!("reading the status of {block}: {e}")),
+            }
+        };
         let mut split = None;
         for current in reach.default_backward_chain_iterator(cursor) {
             if reach.is_chain_ancestor_of(current, target) {
                 split = Some(current);
                 break;
             }
-            sm.revert_nullifiers_from_store(&mut batch, current).map_err(|e| format!("reverting {current}: {e}"))?;
+            diff_held(current)?;
+            sm.revert_nullifiers_from_store(batch, current).map_err(|e| format!("reverting {current}: {e}"))?;
         }
         // `floor` is a chain ancestor of both ends, so the walk meets `target`'s chain at or above it.
         let split = split.ok_or_else(|| format!("the chains of {cursor} and {target} do not meet"))?;
         for current in reach.forward_chain_iterator(split, target, true).skip(1) {
-            sm.apply_nullifiers_from_store(&mut batch, current).map_err(|e| format!("re-applying {current}: {e}"))?;
+            diff_held(current)?;
+            sm.apply_nullifiers_from_store(batch, current).map_err(|e| format!("re-applying {current}: {e}"))?;
         }
-        sm.set_nullifier_cursor(&mut batch, target).map_err(|e| format!("staging the cursor: {e}"))?;
-        self.db.write(batch).unwrap();
-        Ok(Some(cursor))
+        sm.set_nullifier_cursor(batch, target).map_err(|e| format!("staging the cursor: {e}"))
     }
 
     /// Startup half of the nullifier-set cursor: before any processor runs, bring the global set to the
@@ -3106,9 +3149,16 @@ impl VirtualStateProcessor {
         }
 
         {
-            // Copy the pruning-point UTXO set into virtual's UTXO set
-            let pruning_meta_read = self.pruning_meta_stores.read();
+            // Copy the pruning-point UTXO set into virtual's UTXO set.
+            //
+            // Virtual lock FIRST, pruning-meta lock second: that is the order everything else nesting
+            // the two uses (a chain walk holds the virtual upgradable lock and takes the pruning-meta
+            // write lock to lower the shielded-stable flag on a shielded disqualification; the shielded
+            // import and its clear take the virtual write lock and then the pruning-meta write lock).
+            // Taken the other way round, a walk hitting that disqualification while this import waits
+            // for the virtual write lock deadlocks both: each holds what the other is waiting for.
             let mut virtual_write = self.virtual_stores.write();
+            let pruning_meta_read = self.pruning_meta_stores.read();
 
             virtual_write.utxo_set.clear().unwrap();
             for chunk in &pruning_meta_read.utxo_set.iterator().map(|iter_result| iter_result.unwrap()).chunks(1000) {

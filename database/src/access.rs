@@ -322,6 +322,16 @@ where
         })
     }
 
+    /// Forget every cached entry; reads fall through to the database until they repopulate it.
+    ///
+    /// [`Self::write`] and [`Self::write_many`] cache the data when the write is STAGED into a
+    /// `WriteBatch`, not when the batch lands. A caller that stages writes and then drops the batch
+    /// (an error after the first staged write) leaves the cache claiming data the database does not
+    /// hold, and must call this before anyone reads the store again.
+    pub fn clear_cache(&self) {
+        self.cache.remove_all();
+    }
+
     pub fn write(&self, mut writer: impl DbWriter, key: TKey, data: TData) -> Result<(), StoreError>
     where
         TKey: Clone + AsRef<[u8]>,
@@ -510,6 +520,21 @@ mod tests {
         assert_eq!(16, access.iterator().count());
         db.write(batch).unwrap();
         assert_eq!(0, access.iterator().count());
+    }
+
+    #[test]
+    fn test_clear_cache_forgets_a_dropped_batch() {
+        let (_lifetime, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
+        let access = CachedDbAccess::<Hash, u64>::new(db.clone(), CachePolicy::Count(16), vec![1, 2]);
+        let key: Hash = 7u64.into();
+        let mut batch = WriteBatch::default();
+        access.write(BatchDbWriter::new(&mut batch), key, 3).unwrap();
+        drop(batch);
+        // The write was cached when it was staged, although it never reached the database.
+        assert!(access.has(key).unwrap());
+        access.clear_cache();
+        assert!(!access.has(key).unwrap());
+        assert!(matches!(access.read(key), Err(StoreError::KeyNotFound(_))));
     }
 
     #[test]

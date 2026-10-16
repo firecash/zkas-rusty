@@ -1,7 +1,7 @@
 use crate::{
     flow_context::FlowContext,
     flow_trait::Flow,
-    ibd::{SHIELDED_CHUNK_SIZE, SMT_FLOW_CONTROL_WINDOW},
+    ibd::{EXPORT_NEXT_WINDOW_TIMEOUT, EXPORT_READ_AHEAD_CHUNKS, SHIELDED_CHUNK_SIZE, SMT_FLOW_CONTROL_WINDOW},
 };
 use kaspa_consensus_core::{api::ShieldedExportMetadata, errors::consensus::ConsensusError};
 
@@ -94,7 +94,9 @@ impl RequestPruningPointShieldedStateFlow {
             return Ok(());
         }
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<[u8; 32]>>(256);
+        // Read-ahead is bounded to what the send loop needs: this channel is invisible to the
+        // router's byte budget (see `EXPORT_READ_AHEAD_CHUNKS`).
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<[u8; 32]>>(EXPORT_READ_AHEAD_CHUNKS);
 
         let session_for_reader = consensus.unguarded_session();
         let stream = match session_for_reader.open_pruning_point_shielded_nullifier_stream(expected_pp) {
@@ -140,15 +142,8 @@ impl RequestPruningPointShieldedStateFlow {
             // Flow-control round-trip; skip on the last window so the peer never has
             // to send a trailing RequestNext just to unblock us.
             if sent < nullifier_count && chunks_sent.is_multiple_of(SMT_FLOW_CONTROL_WINDOW) {
-                // Bounded: a requester that never asks for the next window would otherwise hold this
-                // flow, and the blocking reader thread parked on the full channel, for the life of the
-                // connection.
-                // Generous: a small syncing node may take minutes between windows while it imports.
-                dequeue_with_timeout!(
-                    self.incoming_route,
-                    Payload::RequestNextPruningPointShieldedChunk,
-                    std::time::Duration::from_secs(600)
-                )?;
+                // Bounded: see `EXPORT_NEXT_WINDOW_TIMEOUT`.
+                dequeue_with_timeout!(self.incoming_route, Payload::RequestNextPruningPointShieldedChunk, EXPORT_NEXT_WINDOW_TIMEOUT)?;
             }
         }
 

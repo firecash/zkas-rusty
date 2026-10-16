@@ -891,6 +891,28 @@ impl ShieldedStateManager {
         self.nullifier_cursor.set_batch(batch, block)
     }
 
+    /// Forget the cache of every store this manager writes. Call after staging writes into a batch
+    /// that is then dropped instead of written: `CachedDbAccess` caches a write when it is staged, so
+    /// without this the caches would keep serving what never reached the database (a nullifier read
+    /// as spent, a cursor naming a block the set was never moved to). Only costs re-reads.
+    pub fn discard_cached_shielded_writes(&self) {
+        self.nullifiers.clear_cache();
+        self.nullifier_diffs.clear_cache();
+        self.nullifier_cursor.clear_cache();
+        self.tree_store.clear_cache();
+        self.supply_store.clear_cache();
+        self.dev_accrued_store.clear_cache();
+        self.miner_accrual_store.clear_cache();
+        self.nullifier_muhash.clear_cache();
+        self.anchor_block.clear_cache();
+        self.anchor_gc.clear_cache();
+        self.anchor_producers.clear_cache();
+        self.scan_block.clear_cache();
+        self.burn_store.clear_cache();
+        self.anchor_source_scores.clear_cache();
+        self.anchor_window.clear_cache();
+    }
+
     /// Test helper: make the database look like one an older build wrote (no cursor).
     #[cfg(test)]
     pub fn delete_nullifier_cursor_for_test(&self, batch: &mut WriteBatch) -> StoreResult<()> {
