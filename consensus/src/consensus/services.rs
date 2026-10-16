@@ -202,6 +202,7 @@ impl ConsensusServices {
             params.toccata_activation,
             params.merged_mining_activation,
             params.security_fork_activation,
+            params.fresh_sync_proof_work_floor,
             is_consensus_exiting,
         ));
 
