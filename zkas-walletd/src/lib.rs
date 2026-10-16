@@ -2225,7 +2225,8 @@ pub fn diagnose_wallets(dir: &str, secret: Option<&str>) -> String {
             continue;
         };
         let stranded = db.stranded_notes();
-        let stranded_value: u64 = stranded.iter().map(|n| n.value()).sum();
+        // Summed in u128 like `balance()`: a report over a corrupt file must not overflow.
+        let stranded_value: u128 = stranded.iter().map(|n| n.value() as u128).sum();
         out.push_str(&format!(
             "{token}: notes={} balance={} scanned={} base={} size={} stranded={} stranded_value={}{}\n",
             db.notes().len(),
@@ -2234,7 +2235,7 @@ pub fn diagnose_wallets(dir: &str, secret: Option<&str>) -> String {
             db.base_size(),
             db.size(),
             stranded.len(),
-            fmt_fc(stranded_value as u128),
+            fmt_fc(stranded_value),
             if stranded.is_empty() {
                 String::new()
             } else {
@@ -8757,9 +8758,9 @@ fn sort_candidates_for_spend<T: std::borrow::Borrow<OwnedNote>>(candidates: &mut
     candidates.sort_unstable_by_key(|n| spend_order_key(n.borrow().value(), target));
 }
 
-fn matured_candidates(db: &WalletDb, matured: u64) -> (Vec<&OwnedNote>, u64) {
+fn matured_candidates(db: &WalletDb, matured: u64) -> Result<(Vec<&OwnedNote>, u64), (StatusCode, Json<serde_json::Value>)> {
     let stranded = db.stranded_notes();
-    let stranded_value: u64 = stranded.iter().map(|n| n.value()).sum();
+    let stranded_value = sum_note_values(stranded.iter().map(|n| n.value()))?;
     if stranded_value > 0 {
         log::warn!(
             "spend selection: skipping {} stranded note(s) worth {} sompi (below base {}, no witness) — recoverable only by grafting older wallet state",
@@ -8770,7 +8771,25 @@ fn matured_candidates(db: &WalletDb, matured: u64) -> (Vec<&OwnedNote>, u64) {
     }
     let skip: HashSet<u64> = stranded.iter().map(|n| n.position).collect();
     let candidates = db.notes().iter().filter(|n| n.position < matured && !skip.contains(&n.position)).collect();
-    (candidates, stranded_value)
+    Ok((candidates, stranded_value))
+}
+
+/// The total of a set of note values, refused past `u64::MAX` instead of overflowing.
+///
+/// Chain state cannot get there -- every value is a committed note and the supply is far
+/// below 2^64 -- but the values a request sums are read back from the wallet's `.scan`
+/// checkpoint, which is not re-derived from the chain on load. A plain `.sum()` over a
+/// corrupt one panics under the release profile's overflow checks, and with walletd
+/// embedded in the node that panic reaches the node's exit-on-panic hook. Every partial sum
+/// a send takes afterwards is over a subset of the same notes, so checking the total once
+/// bounds those too.
+fn sum_note_values(values: impl IntoIterator<Item = u64>) -> Result<u64, (StatusCode, Json<serde_json::Value>)> {
+    values.into_iter().try_fold(0u64, |acc, v| acc.checked_add(v)).ok_or_else(|| {
+        err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "this wallet's notes add up to more than any chain can hold; its checkpoint is corrupt -- rescan the wallet",
+        )
+    })
 }
 
 /// One line of honesty appended to "insufficient funds" errors when part of the
@@ -9134,10 +9153,10 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
         fork_now = security_fork_active(e.chain_len.max(e.scanned as u64));
         if let Some(matured) = e.boundaries.iter().rev().find(|(bs, _)| *bs <= cutoff_blue).map(|&(_, lc)| lc) {
             anchor_block = e.send_anchor_block(matured)?;
-            let (mut candidates, stranded_value) = matured_candidates(&e.db, matured);
+            let (mut candidates, stranded_value) = matured_candidates(&e.db, matured)?;
             sort_candidates_for_spend(&mut candidates, amount, fee);
             let values: Vec<u64> = candidates.iter().map(|n| n.value()).collect();
-            let have: u64 = values.iter().sum();
+            let have = sum_note_values(values.iter().copied())?;
             match plan_chunks(&values, amount, fee, max_per_tx) {
                 Some(plan) => {
                     // All notes the plan will spend are candidates[0..total]; witness them
@@ -9193,7 +9212,7 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
             let mut candidates = db.notes().to_vec();
             sort_candidates_for_spend(&mut candidates, amount, fee);
             let values: Vec<u64> = candidates.iter().map(|n| n.value()).collect();
-            let have: u64 = values.iter().sum();
+            let have = sum_note_values(values.iter().copied())?;
             // If the replay could not reach genesis, the shortfall is very likely the
             // history the node is missing rather than the wallet's balance, so say which.
             let plan = plan_chunks(&values, amount, fee, max_per_tx)
@@ -9502,9 +9521,9 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
         tokio::task::block_in_place(|| e.advance_spend_witnesses_bounded(shared_covers, shared_base));
         let matured = e.matured_leaves().ok_or_else(|| err(StatusCode::CONFLICT, "wallet has no matured anchor yet"))?;
         anchor_block = e.send_anchor_block(matured)?;
-        let (mut candidates, stranded) = matured_candidates(&e.db, matured);
+        let (mut candidates, stranded) = matured_candidates(&e.db, matured)?;
         sort_candidates_for_spend(&mut candidates, requested, base_fee);
-        let have: u64 = candidates.iter().map(|n| n.value()).sum();
+        let have = sum_note_values(candidates.iter().map(|n| n.value()))?;
 
         // Walk the groups, consuming notes in spend order as each is covered. The
         // per-tx fee is priced on the bundle's ACTION count — `max(spends, payees+1)` —
@@ -9768,7 +9787,7 @@ async fn consolidate_once(
             return Err(err(StatusCode::CONFLICT, "wallet is still syncing the maturity window; try again shortly"));
         };
         let anchor_block = e.send_anchor_block(matured)?;
-        let (mut candidates, _stranded) = matured_candidates(&e.db, matured);
+        let (mut candidates, _stranded) = matured_candidates(&e.db, matured)?;
         if heal {
             // Oldest first: spending the lowest-position notes lets the fast-sync base
             // roll forward past them (`advance_base_capped`), shortening every later
@@ -9779,7 +9798,7 @@ async fn consolidate_once(
             candidates.sort_by_key(|n| n.value());
         }
         candidates.truncate(max_spends_per_tx());
-        let sum: u64 = candidates.iter().map(|n| n.value()).sum();
+        let sum = sum_note_values(candidates.iter().map(|n| n.value()))?;
         if candidates.len() < 2 {
             return Err(err(StatusCode::CONFLICT, "nothing to consolidate: fewer than 2 matured notes"));
         }
@@ -10127,9 +10146,9 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
                 let cutoff_blue = e.sink_blue.saturating_sub(DEFAULT_ANCHOR_DEPTH + ANCHOR_SLACK);
                 if let Some(matured) = e.boundaries.iter().rev().find(|(bs, _)| *bs <= cutoff_blue).map(|&(_, lc)| lc) {
                     anchor_block = e.send_anchor_block(matured)?;
-                    let (mut candidates, _stranded) = matured_candidates(&e.db, matured);
+                    let (mut candidates, _stranded) = matured_candidates(&e.db, matured)?;
                     sort_candidates_for_spend(&mut candidates, amount, base_fee);
-                    have_total = Some(candidates.iter().map(|n| n.value()).sum());
+                    have_total = Some(sum_note_values(candidates.iter().map(|n| n.value()))?);
                     fast_path = true;
                     let values: Vec<u64> = candidates.iter().map(|n| n.value()).collect();
                     let (mut take, mut dyn_fee) = select_spend_count(&values, amount, base_fee, max_per_tx);
@@ -10221,7 +10240,7 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
         short_history = short;
         let mut candidates = db.notes().to_vec();
         sort_candidates_for_spend(&mut candidates, amount, base_fee);
-        have_total = Some(candidates.iter().map(|n| n.value()).sum());
+        have_total = Some(sum_note_values(candidates.iter().map(|n| n.value()))?);
         let values: Vec<u64> = candidates.iter().map(|n| n.value()).collect();
         let (mut take, mut dyn_fee) = select_spend_count(&values, amount, base_fee, max_per_tx);
         // A SELF-payment tells us its fee budget by what it held back.
