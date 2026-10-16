@@ -1,7 +1,7 @@
 use crate::{
     flow_context::FlowContext,
     flow_trait::Flow,
-    ibd::{SMT_CHUNK_SIZE, SMT_FLOW_CONTROL_WINDOW},
+    ibd::{EXPORT_NEXT_WINDOW_TIMEOUT, EXPORT_READ_AHEAD_CHUNKS, SMT_CHUNK_SIZE, SMT_FLOW_CONTROL_WINDOW},
 };
 use kaspa_consensus_core::{
     api::{ImportLane, SmtExportMetadata},
@@ -12,7 +12,7 @@ use kaspa_hashes::Hash;
 use kaspa_p2p_lib::{
     IncomingRoute, Router,
     common::ProtocolError,
-    dequeue, make_message,
+    dequeue, dequeue_with_timeout, make_message,
     pb::{SmtLaneChunkMessage, SmtLaneEntry, SmtMetadataMessage, UnexpectedPruningPointMessage, kaspad_message::Payload},
 };
 use std::sync::Arc;
@@ -74,7 +74,9 @@ impl RequestPruningPointSmtStateFlow {
             return Ok(());
         }
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<ImportLane>>(256);
+        // Read-ahead is bounded to what the send loop needs: this channel is invisible to the
+        // router's byte budget (see `EXPORT_READ_AHEAD_CHUNKS`).
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<ImportLane>>(EXPORT_READ_AHEAD_CHUNKS);
 
         let session_for_reader = consensus.unguarded_session();
         let stream = match session_for_reader.open_pruning_point_smt_lane_stream(expected_pp) {
@@ -128,7 +130,8 @@ impl RequestPruningPointSmtStateFlow {
             // Flow-control round-trip. Skip it on the last window so the peer
             // never has to send a trailing RequestNext just to unblock us.
             if lanes_sent < expected_count && chunks_sent.is_multiple_of(SMT_FLOW_CONTROL_WINDOW) {
-                dequeue!(self.incoming_route, Payload::RequestNextPruningPointSmtChunk)?;
+                // Bounded like the shielded-state server's: see `EXPORT_NEXT_WINDOW_TIMEOUT`.
+                dequeue_with_timeout!(self.incoming_route, Payload::RequestNextPruningPointSmtChunk, EXPORT_NEXT_WINDOW_TIMEOUT)?;
             }
         }
 

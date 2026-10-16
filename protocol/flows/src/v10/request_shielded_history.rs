@@ -105,6 +105,10 @@ impl RequestShieldedHistoryFlow {
     }
 
     async fn handle_request(&mut self, anchor: kaspa_hashes::Hash, max_blocks: usize) -> Result<(), ProtocolError> {
+        // Pace BEFORE building the chunk (up to 128 MiB, `HISTORY_CHUNK_MAX_BYTES` in consensus) and
+        // before taking the session: pacing after building held a finished chunk for as long as the
+        // peer chose not to read, one per request it sent blind.
+        self.router.pace_outgoing().await?;
         let session = self.ctx.consensus().session().await;
         let (records, done, anchor_index) = session.async_get_shielded_history_indexed_below(anchor, max_blocks).await?;
         drop(session);
@@ -122,7 +126,7 @@ impl RequestShieldedHistoryFlow {
 
         debug!("serving {} shielded history records below {} (done={})", entries.len(), anchor, done);
         self.router
-            .enqueue_paced(make_message!(Payload::ShieldedHistoryChunk, ShieldedHistoryChunkMessage { entries, done, anchor_index }))
+            .enqueue(make_message!(Payload::ShieldedHistoryChunk, ShieldedHistoryChunkMessage { entries, done, anchor_index }))
             .await?;
         Ok(())
     }

@@ -91,6 +91,23 @@ pub const SHIELDED_CHUNK_SIZE: usize = 4096;
 #[cfg(feature = "test-smt-small-chunks")]
 pub const SHIELDED_CHUNK_SIZE: usize = 4;
 
+/// Chunks a pruning-point export server (SMT lanes, shielded nullifiers) may have read from disk
+/// ahead of the one it is sending.
+///
+/// The export is read on a blocking thread and handed to the flow through a channel that sits
+/// BEFORE `Router::enqueue_paced`, so the router's per-connection byte budget never sees what is
+/// buffered in it. With 256 slots of 4096 entries it read ~34 MB (more for SMT lanes with proofs)
+/// ahead of a peer that asked for the export and then never requested the next window. The flow
+/// only ever sends one chunk at a time, so one chunk of read-ahead keeps the disk read overlapped
+/// with the send and nothing more.
+pub const EXPORT_READ_AHEAD_CHUNKS: usize = 1;
+
+/// How long a pruning-point export server waits for the peer's request for the next window.
+/// Generous: a small syncing node may take minutes between windows while it imports. Bounded: a
+/// requester that never asks would otherwise hold the flow, its open store iterator and the
+/// blocking reader thread for the life of the connection.
+pub const EXPORT_NEXT_WINDOW_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
 pub struct TrustedEntryStream<'a, 'b> {
     router: &'a Router,
     incoming_route: &'b mut IncomingRoute,
