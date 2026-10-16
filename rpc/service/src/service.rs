@@ -128,6 +128,24 @@ pub struct RpcCoreService {
 
 const RPC_CORE: &str = "rpc-core";
 
+/// Refuse to answer when the startup self-check found this node's live nullifier set and the
+/// snapshot its committed state root covers to disagree.
+///
+/// The latch used to cover `get_block_template` only, on the reasoning that a diverged node must
+/// not mine. But the same divergence means this node judges double-spends differently from the
+/// network, and the reads below are exactly how a wallet learns its balance and history: serving
+/// them from a state we have already found wrong hands the user a confident wrong answer, which is
+/// worse than an error, and it is the shape of failure that takes longest to notice. The node says
+/// so instead, on every surface that depends on that state.
+fn refuse_if_shielded_state_diverged(action: &str) -> RpcResult<()> {
+    if kaspa_consensus_core::SHIELDED_STATE_DIVERGED.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err(RpcError::General(format!(
+            "this node's shielded nullifier set failed its self-check; it refuses to {action} until resynced"
+        )));
+    }
+    Ok(())
+}
+
 impl RpcCoreService {
     pub const IDENT: &'static str = "rpc-core-service";
 
@@ -402,11 +420,7 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         }
         let script_public_key = kaspa_txscript::pay_to_address_script(&request.pay_address);
         let extra_data = version().as_bytes().iter().chain(once(&(b'/'))).chain(&request.extra_data).cloned().collect::<Vec<_>>();
-        if kaspa_consensus_core::SHIELDED_STATE_DIVERGED.load(std::sync::atomic::Ordering::SeqCst) {
-            return Err(RpcError::General(
-                "this node's shielded nullifier set failed its self-check; it refuses to build templates until resynced".to_string(),
-            ));
-        }
+        refuse_if_shielded_state_diverged("build templates")?;
         let miner_data: MinerData = MinerData::new(script_public_key, extra_data);
         let block_template = self.mining_manager.clone().get_block_template(&session, miner_data).await?;
 
@@ -797,6 +811,7 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         _connection: Option<&DynRpcConnection>,
         request: GetShieldedTreeStateRequest,
     ) -> RpcResult<GetShieldedTreeStateResponse> {
+        refuse_if_shielded_state_diverged("serve shielded tree state")?;
         let session = self.consensus_manager.consensus().unguarded_session();
         // Default checkpoint = the finality point: the most *recent* block that can
         // never be reorged (so a wallet can safely base its tree there), and its
@@ -857,6 +872,7 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         _connection: Option<&DynRpcConnection>,
         request: GetShieldedBlocksRequest,
     ) -> RpcResult<GetShieldedBlocksResponse> {
+        refuse_if_shielded_state_diverged("serve shielded blocks")?;
         const DEFAULT_LIMIT: usize = 500;
         const MAX_LIMIT: usize = 2000;
         let limit = match request.limit as usize {
@@ -973,6 +989,7 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         _connection: Option<&DynRpcConnection>,
         request: GetShieldedSupplyRequest,
     ) -> RpcResult<GetShieldedSupplyResponse> {
+        refuse_if_shielded_state_diverged("serve shielded supply")?;
         fn sompi(value: u128, field: &str) -> RpcResult<u64> {
             u64::try_from(value).map_err(|_| RpcError::General(format!("shielded {field} ({value}) exceeds u64 sompi")))
         }
