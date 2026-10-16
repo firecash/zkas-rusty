@@ -191,6 +191,12 @@ impl ProofContext {
             let mut selected_tip =
                 proof[level_idx].first().map(|header| header.hash).ok_or(PruningImportError::PruningProofNotEnoughHeaders)?;
             for (i, header) in proof[level_idx].iter().enumerate() {
+                // Only genesis has no parents. A fabricated proof is built out of headers whose
+                // parent structure is whatever the sender wanted, so refuse the degenerate
+                // shape before anything is derived from it. (Upstream rusty-kaspa 2a47b249.)
+                if header.parents_by_level.is_empty() && header.hash != ppm.genesis_hash {
+                    return Err(PruningImportError::NonGenesisParentlessHeader(header.hash));
+                }
                 let (header_level, pow_passes) = calc_block_level_check_pow_gated(
                     header,
                     ppm.max_block_level,
@@ -419,11 +425,29 @@ impl PruningProofManager {
             }
         }
 
-        if defender.pp_header.hash == self.genesis_hash {
-            // If the challenger has better tips and the defender's pruning point is still
-            // genesis, we consider the challenger to be better.
-            return Ok(());
-        }
+        // There used to be an unconditional `Ok(())` here for a defender whose pruning point is
+        // still genesis -- a node that has just started. It was reachable with a proof carrying
+        // no work at all: Step 1 above skips every level whose CHALLENGER blue score is under
+        // 2M, so a proof of two headers (genesis plus one crafted block with easy declared bits
+        // and a declared blue work of the attacker's choosing) never reached a single
+        // comparison, fell through to the waiver, and was adopted -- with its DECLARED work
+        // installed. Whoever was the fresh node's sync source could hand it a chain nobody
+        // mined, for free, and it would then refuse the real one.
+        //
+        // Removing the waiver does not make a fresh node unable to sync: it falls through to
+        // the rule written just below for every other defender, and that rule already says
+        // exactly the right thing for a defender holding nothing. An honest challenger either
+        // shares genesis with the defender -- Step 2 then compares blue work from it, and the
+        // defender's is zero on both terms, so the challenger wins -- or it has no common
+        // ancestor (a mature chain's level-0 segment does not reach back to genesis) and wins
+        // in the loop below, where a genesis-only defender cannot have a 2M level. What no
+        // longer passes is a proof that has neither: a structurally empty one.
+        //
+        // This raises the price of the attack from two headers to a structurally complete
+        // proof; it does NOT make the proof's work real, because the headers are still checked
+        // only against their own declared bits. Closing that needs an absolute work floor or a
+        // checkpoint for the fresh-node case -- a consensus-policy decision, and one upstream
+        // has not taken either (the waiver is still in rusty-kaspa master).
 
         // If we got here it means there's no level with shared blocks
         // between the challenger and the defender. In this case we
