@@ -975,7 +975,13 @@ pub const ZKAS_DEV_FEE_END_DAA: u64 = ZKAS_SECURITY_FORK_DAA;
 /// least significant word first. Use a pruning point, not the tip: it is final, so the number is one
 /// every honest proof keeps exceeding. Do not round it up and do not add a margin: the check already
 /// accepts half of it.
-pub const MAINNET_FRESH_SYNC_PROOF_WORK_FLOOR: Option<BlueWorkType> = None;
+///
+/// Filled 2026-10-16 from mainnet pruning point
+/// `584ca71cc473243343ddfb708fe7e197e78f6c73511d686c31a683d5ea72ddce` (blue score 6,955,203,
+/// DAA 6,978,426): blue work 264,190,953,337,335,558,097,855 = `0x37f1_d1fdbca54646cbbf`. An honest
+/// mainnet proof attests about this much at its deepest genesis-rooted level (~1,800 headers at
+/// level 36, ~2.5% sampling noise) and more every day; the check requires half.
+pub const MAINNET_FRESH_SYNC_PROOF_WORK_FLOOR: Option<BlueWorkType> = Some(kaspa_math::Uint192([0xd1fd_bca5_4646_cbbf, 0x37f1, 0]));
 
 pub const MAINNET_PARAMS: Params = Params {
     // ZKas is a distinct network with its own genesis; it MUST NOT advertise or
