@@ -1926,6 +1926,9 @@ async fn node_reaches(client: &GrpcClient, cursor_daa: u64, timeout: std::time::
 /// Take `token`'s `.scan.stale-<ts>` quarantine copies out of `restore_quarantined`'s
 /// reach by renaming them `.rescanned` (kept for forensics, never auto-restored). Called
 /// by `/rescan`, whose whole point is to rebuild rather than resume.
+///
+/// Every caller has just dropped the live `.scan` too, so nothing this token holds any
+/// longer descends from a scan receipt: its receipt marker goes with them.
 fn retire_quarantine_copies(dir: &str, token: &str) {
     let prefix = format!("{token}.scan.stale-");
     let Ok(rd) = std::fs::read_dir(dir) else { return };
@@ -1934,6 +1937,31 @@ fn retire_quarantine_copies(dir: &str, token: &str) {
             let _ = std::fs::rename(format!("{dir}/{name}"), format!("{dir}/{name}.rescanned"));
         }
     }
+    let _ = std::fs::remove_file(receipt_mark_path(dir, token));
+}
+
+/// Marker that `token`'s scan state was adopted from a scan receipt rather than built from
+/// the chain by this daemon (see `wallet_scan_receipt_import`).
+///
+/// A receipt is checked note by note and its frontier against the node, but nothing can
+/// show it is COMPLETE: a receipt that leaves notes out imports as a wallet that never sees
+/// them. That is the importer's own choice for its own token. It must not spread to another
+/// token through `adopt_twin_checkpoint`, which hands a same-key checkpoint to any later
+/// registration of that key -- and a viewing key is not a secret from everyone (it is
+/// shared for watch-only use and printed by `/api/wallet/sign`). Whoever holds it could
+/// otherwise watch it here, post a receipt with the owner's notes left out, and have the
+/// owner's next registration adopt that view.
+///
+/// The marker outlives every later checkpoint of the token (they all extend the receipt's
+/// view) and is cleared only with the scan itself, by `retire_quarantine_copies`.
+fn receipt_mark_path(dir: &str, token: &str) -> String {
+    format!("{dir}/{token}.scan.receipt")
+}
+
+/// Whether `token`'s checkpoint descends from a scan receipt (see [`receipt_mark_path`]).
+/// Such a checkpoint is never a twin donor.
+fn scan_is_receipt_derived(dir: &str, token: &str) -> bool {
+    std::path::Path::new(&receipt_mark_path(dir, token)).exists()
 }
 
 /// Load a wallet's scan checkpoint if present and still valid for
@@ -2085,6 +2113,11 @@ fn adopt_twin_checkpoint(
         if checkpoint_cursor(dir, donor, genesis).is_none() {
             continue;
         }
+        // A view imported from a scan receipt is only as complete as whoever posted it, and
+        // that may not be this key's owner (see `receipt_mark_path`). Never hand it on.
+        if scan_is_receipt_derived(dir, donor) {
+            continue;
+        }
         let Some((key, donor_birthday, donor_history)) = load_wallet_meta(dir, donor, secret) else { continue };
         if key.fvk_bytes() != Some(*fvk) {
             continue;
@@ -2192,7 +2225,8 @@ pub fn diagnose_wallets(dir: &str, secret: Option<&str>) -> String {
             continue;
         };
         let stranded = db.stranded_notes();
-        let stranded_value: u64 = stranded.iter().map(|n| n.value()).sum();
+        // Summed in u128 like `balance()`: a report over a corrupt file must not overflow.
+        let stranded_value: u128 = stranded.iter().map(|n| n.value() as u128).sum();
         out.push_str(&format!(
             "{token}: notes={} balance={} scanned={} base={} size={} stranded={} stranded_value={}{}\n",
             db.notes().len(),
@@ -2201,7 +2235,7 @@ pub fn diagnose_wallets(dir: &str, secret: Option<&str>) -> String {
             db.base_size(),
             db.size(),
             stranded.len(),
-            fmt_fc(stranded_value as u128),
+            fmt_fc(stranded_value),
             if stranded.is_empty() {
                 String::new()
             } else {
@@ -5628,8 +5662,11 @@ impl AppState {
     /// ~150 B for the life of the daemon. A loaded wallet answers from the map; only a miss pays
     /// a file-existence check, which the request was about to make anyway.
     async fn touch(&self, token: &str) {
-        let known = self.wallets.lock().await.contains_key(token) || wallet_exists(&self.wallet_dir, token);
-        if !known {
+        // Two statements, not one `||`: the guard of a lock taken inside an expression lives to
+        // the end of the statement, so the existence stat used to run with the global map
+        // locked -- on every status poll naming an unknown token, stalling every wallet route.
+        let loaded = self.wallets.lock().await.contains_key(token);
+        if !loaded && !wallet_exists(&self.wallet_dir, token) {
             return;
         }
         self.last_touch.lock().await.insert(token.to_string(), std::time::Instant::now());
@@ -5757,6 +5794,11 @@ impl AppState {
             let idx = self.fvk_index.lock().await;
             idx.get(fvk)?.iter().filter(|t| t.as_str() != token).cloned().collect()
         };
+        // Only twins `adopt_twin_checkpoint` would actually donate from. Counting a
+        // receipt-derived one here would make a wallet prefer a twin it is then refused,
+        // and drop its own checkpoint for a rescan.
+        let candidates: Vec<String> =
+            candidates.into_iter().filter(|t| !scan_is_receipt_derived(&self.wallet_dir, t)).collect();
         if candidates.is_empty() {
             return None;
         }
@@ -6008,6 +6050,13 @@ impl AppState {
             //
             // This buys time; it is not the fix. Weak tokens need rotating and the seed
             // endpoint needs a second factor.
+            //
+            // The load permit goes back first. The gate admits only a few loads at once, so
+            // a request that slept on its permit held a real wallet's load back by the full
+            // delay, and a handful of junk tokens in flight stalled every load behind them.
+            // The token's own load lock is still held, which only serialises guesses at
+            // that one token.
+            drop(_permit);
             tokio::time::sleep(UNKNOWN_TOKEN_DELAY).await;
             return None;
         };
@@ -8276,11 +8325,16 @@ async fn proof_verify(
 
 /// The chain block at exactly `daa`, via the node's DAA locator.
 async fn chain_block_at_daa(client: &GrpcClient, daa: u64) -> Option<RpcHash> {
+    Some(chain_tree_state_at_daa(client, daa).await?.block_hash)
+}
+
+/// The node's shielded tree state at the chain block at exactly `daa`.
+async fn chain_tree_state_at_daa(client: &GrpcClient, daa: u64) -> Option<kaspa_rpc_core::GetShieldedTreeStateResponse> {
     // `daa` is client-supplied (`/api/proof/verify`, `/api/wallet/scan-receipt`); `u64::MAX + 1`
     // overflowed under release overflow checks, which kills the whole node when walletd is embedded.
     let req = kaspa_rpc_core::GetShieldedTreeStateRequest { block_hash: None, below_daa_score: Some(daa.checked_add(1)?) };
     match tokio::time::timeout(SYNC_RPC_TIMEOUT, client.get_shielded_tree_state_call(None, req)).await {
-        Ok(Ok(ts)) if ts.daa_score == daa => Some(ts.block_hash),
+        Ok(Ok(ts)) if ts.daa_score == daa => Some(ts),
         _ => None,
     }
 }
@@ -8480,9 +8534,12 @@ async fn wallet_scan_receipt_export(
 /// stopped instead of rescanning from its birthday.
 ///
 /// The receipt is parsed with this wallet's own key, so one belonging to a different key
-/// simply yields nothing. Every note in it is checked against the anchor it names before
-/// being kept (see `WalletDb::from_scan_receipt_fvk`): a sender cannot invent a note, only
-/// omit one, and an omission shows up as a balance lower than a later full scan finds.
+/// simply yields nothing. Every note in it must pay this key and root to the anchor the
+/// receipt names (see `WalletDb::from_scan_receipt_fvk`), and that anchor -- tree size AND
+/// root -- must be the node's own at the block the receipt resumes from. Together those
+/// mean a sender cannot invent a note. It can still OMIT one, and nothing shows that short
+/// of a rescan: so a wallet built this way is marked (`receipt_mark_path`) and never handed
+/// to another token as a twin checkpoint.
 async fn wallet_scan_receipt_import(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -8521,14 +8578,47 @@ async fn wallet_scan_receipt_import(
         .request_client()
         .await
         .ok_or_else(|| err(StatusCode::BAD_GATEWAY, "node unreachable; a receipt cannot be placed without it"))?;
-    let low = chain_block_at_daa(&client, meta.scanned_daa)
+    let ts = chain_tree_state_at_daa(&client, meta.scanned_daa)
         .await
         .ok_or_else(|| err(StatusCode::BAD_GATEWAY, "the node cannot serve the chain block this receipt resumes from"))?;
+    let low = ts.block_hash;
+    // The receipt's frontier is its own claim, and every note in it was verified against
+    // that claim -- so a forged frontier could carry forged notes. Bind it to the node's
+    // tree at the very block the scan resumes from, exactly as `load_checkpoint` binds a
+    // checkpoint to its cursor.
+    let node_fs = FrontierState {
+        size: ts.size,
+        leaf: (ts.size > 0).then(|| ts.leaf.as_bytes()),
+        ommers: ts.ommers.iter().map(|o| o.as_bytes()).collect(),
+    };
+    let node_anchor = GlobalTree::from_state(&node_fs)
+        .map_err(|_| err(StatusCode::BAD_GATEWAY, "the node served a malformed tree frontier for this receipt's block"))?
+        .anchor()
+        .to_bytes();
+    if db.size() != ts.size || db.anchor() != node_anchor {
+        log::warn!(
+            "wallet {token}: refused a scan receipt at DAA {}: receipt size/root {}/{}, node size/root {}/{}",
+            meta.scanned_daa,
+            db.size(),
+            hex(&db.anchor()),
+            ts.size,
+            hex(&node_anchor),
+        );
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "this receipt's commitment tree does not match the chain at the block it resumes from",
+        ));
+    }
 
     let mut e = w.lock().await;
     if e.scanned > was_scanned {
         return Err(err(StatusCode::CONFLICT, "the wallet advanced while the receipt was being checked; retry"));
     }
+    // Marked BEFORE the state is swapped in, so no checkpoint of the receipt's view is ever
+    // on disk without it (the sync loop saves under this same entry lock).
+    std::fs::write(receipt_mark_path(&state.wallet_dir, &token), meta.scanned_daa.to_string()).map_err(|why| {
+        err(StatusCode::INTERNAL_SERVER_ERROR, format!("cannot record the receipt's provenance, so it is not adopted: {why}"))
+    })?;
     let balance = db.balance();
     let notes = db.notes().len();
     e.db = db;
@@ -8668,9 +8758,9 @@ fn sort_candidates_for_spend<T: std::borrow::Borrow<OwnedNote>>(candidates: &mut
     candidates.sort_unstable_by_key(|n| spend_order_key(n.borrow().value(), target));
 }
 
-fn matured_candidates(db: &WalletDb, matured: u64) -> (Vec<&OwnedNote>, u64) {
+fn matured_candidates(db: &WalletDb, matured: u64) -> Result<(Vec<&OwnedNote>, u64), (StatusCode, Json<serde_json::Value>)> {
     let stranded = db.stranded_notes();
-    let stranded_value: u64 = stranded.iter().map(|n| n.value()).sum();
+    let stranded_value = sum_note_values(stranded.iter().map(|n| n.value()))?;
     if stranded_value > 0 {
         log::warn!(
             "spend selection: skipping {} stranded note(s) worth {} sompi (below base {}, no witness) — recoverable only by grafting older wallet state",
@@ -8681,7 +8771,25 @@ fn matured_candidates(db: &WalletDb, matured: u64) -> (Vec<&OwnedNote>, u64) {
     }
     let skip: HashSet<u64> = stranded.iter().map(|n| n.position).collect();
     let candidates = db.notes().iter().filter(|n| n.position < matured && !skip.contains(&n.position)).collect();
-    (candidates, stranded_value)
+    Ok((candidates, stranded_value))
+}
+
+/// The total of a set of note values, refused past `u64::MAX` instead of overflowing.
+///
+/// Chain state cannot get there -- every value is a committed note and the supply is far
+/// below 2^64 -- but the values a request sums are read back from the wallet's `.scan`
+/// checkpoint, which is not re-derived from the chain on load. A plain `.sum()` over a
+/// corrupt one panics under the release profile's overflow checks, and with walletd
+/// embedded in the node that panic reaches the node's exit-on-panic hook. Every partial sum
+/// a send takes afterwards is over a subset of the same notes, so checking the total once
+/// bounds those too.
+fn sum_note_values(values: impl IntoIterator<Item = u64>) -> Result<u64, (StatusCode, Json<serde_json::Value>)> {
+    values.into_iter().try_fold(0u64, |acc, v| acc.checked_add(v)).ok_or_else(|| {
+        err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "this wallet's notes add up to more than any chain can hold; its checkpoint is corrupt -- rescan the wallet",
+        )
+    })
 }
 
 /// One line of honesty appended to "insufficient funds" errors when part of the
@@ -9045,10 +9153,10 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
         fork_now = security_fork_active(e.chain_len.max(e.scanned as u64));
         if let Some(matured) = e.boundaries.iter().rev().find(|(bs, _)| *bs <= cutoff_blue).map(|&(_, lc)| lc) {
             anchor_block = e.send_anchor_block(matured)?;
-            let (mut candidates, stranded_value) = matured_candidates(&e.db, matured);
+            let (mut candidates, stranded_value) = matured_candidates(&e.db, matured)?;
             sort_candidates_for_spend(&mut candidates, amount, fee);
             let values: Vec<u64> = candidates.iter().map(|n| n.value()).collect();
-            let have: u64 = values.iter().sum();
+            let have = sum_note_values(values.iter().copied())?;
             match plan_chunks(&values, amount, fee, max_per_tx) {
                 Some(plan) => {
                     // All notes the plan will spend are candidates[0..total]; witness them
@@ -9104,7 +9212,7 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
             let mut candidates = db.notes().to_vec();
             sort_candidates_for_spend(&mut candidates, amount, fee);
             let values: Vec<u64> = candidates.iter().map(|n| n.value()).collect();
-            let have: u64 = values.iter().sum();
+            let have = sum_note_values(values.iter().copied())?;
             // If the replay could not reach genesis, the shortfall is very likely the
             // history the node is missing rather than the wallet's balance, so say which.
             let plan = plan_chunks(&values, amount, fee, max_per_tx)
@@ -9413,9 +9521,9 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
         tokio::task::block_in_place(|| e.advance_spend_witnesses_bounded(shared_covers, shared_base));
         let matured = e.matured_leaves().ok_or_else(|| err(StatusCode::CONFLICT, "wallet has no matured anchor yet"))?;
         anchor_block = e.send_anchor_block(matured)?;
-        let (mut candidates, stranded) = matured_candidates(&e.db, matured);
+        let (mut candidates, stranded) = matured_candidates(&e.db, matured)?;
         sort_candidates_for_spend(&mut candidates, requested, base_fee);
-        let have: u64 = candidates.iter().map(|n| n.value()).sum();
+        let have = sum_note_values(candidates.iter().map(|n| n.value()))?;
 
         // Walk the groups, consuming notes in spend order as each is covered. The
         // per-tx fee is priced on the bundle's ACTION count — `max(spends, payees+1)` —
@@ -9679,7 +9787,7 @@ async fn consolidate_once(
             return Err(err(StatusCode::CONFLICT, "wallet is still syncing the maturity window; try again shortly"));
         };
         let anchor_block = e.send_anchor_block(matured)?;
-        let (mut candidates, _stranded) = matured_candidates(&e.db, matured);
+        let (mut candidates, _stranded) = matured_candidates(&e.db, matured)?;
         if heal {
             // Oldest first: spending the lowest-position notes lets the fast-sync base
             // roll forward past them (`advance_base_capped`), shortening every later
@@ -9690,7 +9798,7 @@ async fn consolidate_once(
             candidates.sort_by_key(|n| n.value());
         }
         candidates.truncate(max_spends_per_tx());
-        let sum: u64 = candidates.iter().map(|n| n.value()).sum();
+        let sum = sum_note_values(candidates.iter().map(|n| n.value()))?;
         if candidates.len() < 2 {
             return Err(err(StatusCode::CONFLICT, "nothing to consolidate: fewer than 2 matured notes"));
         }
@@ -10038,9 +10146,9 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
                 let cutoff_blue = e.sink_blue.saturating_sub(DEFAULT_ANCHOR_DEPTH + ANCHOR_SLACK);
                 if let Some(matured) = e.boundaries.iter().rev().find(|(bs, _)| *bs <= cutoff_blue).map(|&(_, lc)| lc) {
                     anchor_block = e.send_anchor_block(matured)?;
-                    let (mut candidates, _stranded) = matured_candidates(&e.db, matured);
+                    let (mut candidates, _stranded) = matured_candidates(&e.db, matured)?;
                     sort_candidates_for_spend(&mut candidates, amount, base_fee);
-                    have_total = Some(candidates.iter().map(|n| n.value()).sum());
+                    have_total = Some(sum_note_values(candidates.iter().map(|n| n.value()))?);
                     fast_path = true;
                     let values: Vec<u64> = candidates.iter().map(|n| n.value()).collect();
                     let (mut take, mut dyn_fee) = select_spend_count(&values, amount, base_fee, max_per_tx);
@@ -10132,7 +10240,7 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
         short_history = short;
         let mut candidates = db.notes().to_vec();
         sort_candidates_for_spend(&mut candidates, amount, base_fee);
-        have_total = Some(candidates.iter().map(|n| n.value()).sum());
+        have_total = Some(sum_note_values(candidates.iter().map(|n| n.value()))?);
         let values: Vec<u64> = candidates.iter().map(|n| n.value()).collect();
         let (mut take, mut dyn_fee) = select_spend_count(&values, amount, base_fee, max_per_tx);
         // A SELF-payment tells us its fee budget by what it held back.
@@ -12528,6 +12636,42 @@ mod sdk_api_tests {
         assert_eq!(b, boundaries);
         assert_eq!(sink, 100);
         assert_eq!(blind, 5);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A checkpoint adopted from a scan receipt is never cloned to another registration of
+    /// the same key: the receipt may have come from anyone holding the viewing key, and an
+    /// omitted note cannot be detected. Retiring the token's scan (a rescan, a new key)
+    /// clears the marker, and the rebuilt checkpoint donates again.
+    #[test]
+    fn receipt_derived_checkpoint_is_never_a_twin_donor() {
+        let tmp = std::env::temp_dir().join(format!("zkas-receipt-twin-{}", std::process::id()));
+        let dir = tmp.to_string_lossy().to_string();
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let genesis = RpcHash::from_bytes([7u8; 32]);
+        let seed = [0x5bu8; 32];
+        let db = WalletDb::from_seed(seed).expect("valid seed");
+        let fvk = db.fvk().to_bytes();
+        save_seed(&dir, "watcher", "mainnet", &seed, 4242, None).unwrap();
+        let boundaries: VecDeque<(u64, u64)> = VecDeque::from([(100, 0)]);
+        save_checkpoint(&dir, "watcher", &genesis, &RpcHash::from_bytes([9u8; 32]), 777, &db, &boundaries, &HashMap::new(), 100, 0)
+            .unwrap();
+        let candidates = vec!["watcher".to_string()];
+
+        std::fs::write(receipt_mark_path(&dir, "watcher"), "777").unwrap();
+        assert!(scan_is_receipt_derived(&dir, "watcher"));
+        assert!(
+            adopt_twin_checkpoint(&dir, "owner", &fvk, 0, false, &genesis, None, &candidates).is_none(),
+            "a receipt-derived checkpoint must not be handed to another token"
+        );
+        assert!(!std::path::Path::new(&scan_path(&dir, "owner")).exists(), "nothing was cloned");
+
+        retire_quarantine_copies(&dir, "watcher");
+        assert!(!scan_is_receipt_derived(&dir, "watcher"), "retiring the scan clears its provenance");
+        let (donor, _) =
+            adopt_twin_checkpoint(&dir, "owner", &fvk, 0, false, &genesis, None, &candidates).expect("a scanned twin donates");
+        assert_eq!(donor, "watcher");
         std::fs::remove_dir_all(&dir).ok();
     }
 

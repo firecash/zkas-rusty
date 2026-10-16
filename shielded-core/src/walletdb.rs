@@ -3083,13 +3083,18 @@ impl WalletDb {
     /// key it belongs to.
     ///
     /// **Every note is verified, not trusted.** A receipt arrives from another machine,
-    /// so the importer treats it as a claim: each note's witness must root to the
-    /// receipt's own anchor frontier, with the commitment recomputed from the note's
-    /// fields. A sender cannot forge a path to a root it does not control, so the only
-    /// thing a dishonest receipt can do is *omit* — and an omission shows up as a balance
-    /// lower than a later full scan finds, never as money that is not there. The caller
-    /// should additionally check the anchor frontier against its own node's
-    /// `GetShieldedTreeState`; do that and a receipt is worth exactly as much as a scan.
+    /// so the importer treats it as a claim: each note must pay an address of THIS key,
+    /// and its witness must root to the receipt's anchor frontier, with the commitment
+    /// recomputed from the note's fields.
+    ///
+    /// That anchor is the receipt's own claim, so on its own this proves nothing: a
+    /// sender who writes the frontier writes the root every path is checked against, and
+    /// can fit any note under it. **The caller MUST compare the returned wallet's
+    /// `size()` and `anchor()` with its own node's `GetShieldedTreeState` at the block
+    /// the receipt resumes from** and discard it on any difference. Only with that check
+    /// is a forged note impossible. An *omitted* note is not detectable at all: a receipt
+    /// that leaves notes out imports as a wallet that never sees them until a rescan, so
+    /// a receipt is only as complete as the daemon that wrote it was honest.
     ///
     /// The nullifiers are recomputed here from `fvk_bytes`. Taking the sender's would let
     /// a bad receipt mark a note unspendable, or hide that one was already spent.
@@ -3137,6 +3142,10 @@ impl WalletDb {
             let rho = Option::<Rho>::from(Rho::from_bytes(&r.arr()?))?;
             let rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes(r.arr()?, &rho))?;
             let addr = Option::<Address>::from(Address::from_raw_address_bytes(&recipient))?;
+            // A note paid to an address this key does not derive is not this wallet's, and a
+            // scan would never have found it: it used to be kept all the same, with a nullifier
+            // this key could never spend under. Dropped like a note whose witness fails.
+            let to_this_key = db.fvk.scope_for_address(&addr).is_some();
             let note = Option::<Note>::from(Note::from_parts(
                 addr,
                 NoteValue::from_raw(value),
@@ -3144,6 +3153,9 @@ impl WalletDb {
                 rseed,
                 orchard::note::NoteVersion::V2,
             ))?;
+            if !to_this_key {
+                continue;
+            }
             // Ours to derive, never the sender's to assert.
             let nullifier = note.nullifier(&db.fvk).to_bytes();
             notes.push(OwnedNote { note, position, nullifier });
@@ -3407,7 +3419,11 @@ impl WalletDb {
 
         let size = r.u64()?;
         let n_leaves = r.u64()? as usize;
-        db.leaves.reserve(n_leaves);
+        // A hint only, clamped to what the rest of the blob can hold: the count is read from a
+        // `.scan` file, and a corrupt or truncated one used to ask for up to 2^64 leaves here --
+        // a capacity overflow panic or an allocation abort, which takes the whole daemon down
+        // instead of failing this one restore on its first short read below.
+        db.leaves.reserve(n_leaves.min(r.remaining() / 32));
         for _ in 0..n_leaves {
             // Stored verbatim — no point decompression here; that is what makes a restore
             // a memcpy instead of minutes of curve arithmetic.
@@ -3944,6 +3960,10 @@ impl Cursor<'_> {
     fn done(&self) -> bool {
         self.pos == self.buf.len()
     }
+    /// Bytes left to read: the most any declared count can still be backed by.
+    fn remaining(&self) -> usize {
+        self.buf.len().saturating_sub(self.pos)
+    }
 }
 
 #[cfg(test)]
@@ -3980,6 +4000,52 @@ mod tests {
             buf.extend_from_slice(&declared.to_le_bytes());
             assert!(read_witness(&mut Cursor { buf: &buf, pos: 0 }).is_none(), "declared {declared}");
         }
+    }
+
+    /// The checkpoint leaf count only sizes a capacity hint, and the hint is clamped to what
+    /// the blob can still hold: a corrupt count fails the restore instead of asking the
+    /// allocator for 2^64 leaves (a capacity panic, or an abort no hook can catch).
+    #[test]
+    fn checkpoint_restore_with_an_absurd_leaf_count_fails_cleanly() {
+        for declared in [1u64 << 40, u64::MAX] {
+            let mut blob = vec![CHECKPOINT_VERSION];
+            blob.extend_from_slice(&0u64.to_le_bytes()); // base size
+            blob.push(0); // empty base frontier
+            blob.extend_from_slice(&0u64.to_le_bytes()); // size
+            blob.extend_from_slice(&declared.to_le_bytes()); // leaf count, backed by nothing
+            blob.extend_from_slice(&[0u8; 64]); // two leaves' worth, not 2^40
+            assert!(WalletDb::restore(WalletDb::from_seed([3u8; 32]).unwrap(), &blob, None).is_none(), "declared {declared}");
+        }
+    }
+
+    /// A scan receipt keeps only notes paid to the importing key. Their witnesses root to
+    /// the receipt's anchor all the same, so the anchor check alone used to keep them: a
+    /// wallet adopting another key's receipt showed that key's balance under nullifiers it
+    /// could never spend with.
+    #[test]
+    fn scan_receipt_keeps_only_notes_paid_to_the_importing_key() {
+        let owner = [74u8; 32];
+        let stranger = [75u8; 32];
+        let genesis = [0xceu8; 32];
+
+        let mut theirs = WalletDb::from_seed(owner).unwrap();
+        for i in 0..3u8 {
+            let meta = BlockMeta { coinbase_txid: [0x44; 32], txids: vec![], timestamp_ms: 1_000, daa_score: 100 + i as u64 };
+            theirs.ingest_block_with_meta(&[coinbase_for(address_of(owner), &[b'r', i], 7_000)], &[], Some(&meta));
+        }
+        theirs.advance_witnesses(theirs.size());
+        assert_eq!(theirs.balance(), 21_000);
+        let receipt = theirs.to_scan_receipt(genesis, 102).expect("a fully witnessed wallet exports");
+
+        let (own, _) = WalletDb::from_scan_receipt(owner, genesis, &receipt).expect("the owner's key imports it");
+        assert_eq!(own.balance(), 21_000, "every note pays the owner and roots to the anchor");
+        assert_eq!(own.anchor(), theirs.anchor(), "the imported tree is the anchor the receipt names");
+        assert_eq!(own.size(), theirs.size());
+
+        assert!(
+            WalletDb::from_scan_receipt(stranger, genesis, &receipt).is_none(),
+            "another key's notes are not this wallet's, however well they are witnessed"
+        );
     }
 
     /// A coinbase note description for `seed` paid to `address`, plus its value —
