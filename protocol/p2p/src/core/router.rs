@@ -183,6 +183,18 @@ pub(crate) struct OutgoingRoute {
     backlog: Arc<OutgoingBacklog>,
 }
 
+impl OutgoingRoute {
+    /// Charges `msg`'s encoded length and queues it, or releases the charge again if the queue is
+    /// full or closed, so a refused message leaves nothing behind in the backlog.
+    fn try_send(&self, msg: KaspadMessage) -> Result<(), TrySendError<(KaspadMessage, usize)>> {
+        use prost::Message as _;
+        let len = msg.encoded_len();
+        // Charge before sending, so the transport's release can never run ahead of the charge.
+        self.backlog.charge(len);
+        self.sender.try_send((msg, len)).inspect_err(|_| self.backlog.release(len))
+    }
+}
+
 /// Builds a peer's outgoing pipe: the route the router enqueues into, and the stream the transport
 /// sends from. Taking a message off the stream releases its bytes from the backlog.
 pub(crate) fn outgoing_pipe(capacity: usize) -> (OutgoingRoute, impl tokio_stream::Stream<Item = KaspadMessage> + Send + 'static) {
@@ -513,20 +525,11 @@ impl Router {
 
     /// Enqueues a locally-originated message to be sent to the network peer
     pub async fn enqueue(&self, msg: KaspadMessage) -> Result<(), ProtocolError> {
-        use prost::Message as _;
         assert!(msg.payload.is_some(), "Kaspad P2P message should always have a value");
-        let len = msg.encoded_len();
-        // Charge before sending, so the transport's release can never run ahead of the charge.
-        self.outgoing_route.backlog.charge(len);
-        match self.outgoing_route.sender.try_send((msg, len)) {
-            Ok(_) => Ok(()),
-            Err(err) => {
-                self.outgoing_route.backlog.release(len);
-                match err {
-                    TrySendError::Closed(_) => Err(ProtocolError::ConnectionClosed),
-                    TrySendError::Full(_) => Err(ProtocolError::OutgoingRouteCapacityReached(self.to_string())),
-                }
-            }
+        match self.outgoing_route.try_send(msg) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Closed(_)) => Err(ProtocolError::ConnectionClosed),
+            Err(TrySendError::Full(_)) => Err(ProtocolError::OutgoingRouteCapacityReached(self.to_string())),
         }
     }
 
@@ -647,6 +650,31 @@ mod tests {
         assert_eq!(route.backlog.bytes(), 50);
         stream.next().await.unwrap();
         assert_eq!(route.backlog.bytes(), 0);
+    }
+
+    fn ping(nonce: u64) -> KaspadMessage {
+        make_message!(KaspadMessagePayload::Ping, crate::pb::PingMessage { nonce })
+    }
+
+    /// The path `Router::enqueue` sends through: a refused message (queue full, or the transport
+    /// gone) releases its charge, so the backlog that paces serving flows never counts bytes that
+    /// were not queued. A leaked charge would never be released and would stall every paced flow.
+    #[tokio::test]
+    async fn a_refused_enqueue_releases_its_charge() {
+        use prost::Message as _;
+        let (route, stream) = outgoing_pipe(1);
+        let queued = ping(1);
+        let len = queued.encoded_len();
+        assert!(len > 0);
+        route.try_send(queued).unwrap();
+        assert_eq!(route.backlog.bytes(), len, "a queued message is charged");
+
+        assert!(matches!(route.try_send(ping(2)), Err(TrySendError::Full(_))));
+        assert_eq!(route.backlog.bytes(), len, "a message refused on a full queue is not charged");
+
+        drop(stream);
+        assert!(matches!(route.try_send(ping(3)), Err(TrySendError::Closed(_))));
+        assert_eq!(route.backlog.bytes(), len, "a message refused on a closed queue is not charged");
     }
 
     #[tokio::test]
