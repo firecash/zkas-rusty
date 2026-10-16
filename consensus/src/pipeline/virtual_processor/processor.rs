@@ -76,7 +76,7 @@ use kaspa_consensus_notify::{
 };
 use kaspa_consensusmanager::SessionLock;
 use kaspa_core::{debug, info, time::unix_now, trace, warn};
-use kaspa_database::prelude::{StoreError, StoreResultExt, StoreResultUnitExt};
+use kaspa_database::prelude::{StoreError, StoreErrorPredicates, StoreResultExt, StoreResultUnitExt};
 use kaspa_hashes::{Hash, ZERO_HASH};
 use kaspa_muhash::MuHash;
 use kaspa_notify::{events::EventType, notifier::Notify};
@@ -1249,17 +1249,34 @@ impl VirtualStateProcessor {
         //
         // So consult the blue scores the pruning-point peer attested for exactly those in-window
         // sources. Still not fail-open: a source nobody attested is rejected as before.
+        //
+        // ABSENT data and UNREADABLE data are different answers and must not share a spelling.
+        // `Err(_)` here meant "pruned" for every `StoreError` kind, so a transient RocksDB IO
+        // fault or a corrupt SST at this one read dropped a spend that every healthy node kept:
+        // the merging block's expected coinbase then came out short by that spend's fee, the
+        // block went `BadCoinbaseTransaction` and was permanently disqualified ON THIS NODE
+        // ONLY, and every block after it inherited that. A silent node-local consensus
+        // divergence with no repair path -- which is why every sibling read in this function
+        // already panics with "refusing to treat an IO error as an unknown anchor". Only
+        // `KeyNotFound` is absence; anything else dies loud, so the network converges on one
+        // truth instead of forking quietly.
         let (source_blue_score, attested) = match self.ghostdag_store.get_blue_score(source) {
             Ok(s) => (s, false),
+            Err(err) if !err.is_key_not_found() => {
+                panic!("ghostdag read for anchor source {source} failed; refusing to treat an IO error as an unknown anchor: {err}")
+            }
             Err(_) => match self.shielded_state_manager.attested_source_blue_score(source) {
                 Ok(Some(s)) => (s, true),
-                _ => {
+                Ok(None) => {
                     return AnchorVerdict {
                         source: Some(source),
                         reject_reason: Some("source ghostdag data pruned and no attested blue score"),
                         ..Default::default()
                     };
                 }
+                Err(err) => panic!(
+                    "attested blue-score read for anchor source {source} failed; refusing to treat an IO error as an unknown anchor: {err}"
+                ),
             },
         };
         // Canonical: the source block is on this block's selected chain. Use the
