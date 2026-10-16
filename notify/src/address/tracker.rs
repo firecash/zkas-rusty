@@ -206,7 +206,6 @@ impl Indexer for IndexSet {
     }
 }
 
-#[derive(Debug)]
 /// The address a tracked script was built from.
 ///
 /// Every script in the tracker is `pay_to_address_script(address)` of a subscribed address
@@ -224,6 +223,7 @@ fn address_of_tracked_spk(spk: &ScriptPublicKey, prefix: Prefix) -> Option<Addre
     (pay_to_address_script(&address) == *spk).then_some(address)
 }
 
+#[derive(Debug)]
 struct Inner {
     /// Index-based map of [`ScriptPublicKey`] to its reference count
     ///
