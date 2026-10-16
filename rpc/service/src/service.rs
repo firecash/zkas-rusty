@@ -758,9 +758,16 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
 
         let transaction: Transaction = request.transaction.try_into()?;
         let transaction_id = transaction.id();
+        // Mempool admission of a shielded spend is judged against the live nullifier set
+        // (`check_mempool_shielded_appliable`), which is exactly the set the self-check found wrong:
+        // the answer here would be a confident "accepted" for a spend the network drops, or a
+        // refusal of a valid one. Transparent transactions do not touch that set.
+        if transaction.is_shielded() {
+            refuse_if_shielded_state_diverged("accept shielded transactions")?;
+        }
         let session = self.consensus_manager.consensus().unguarded_session();
         // A shielded proof is checked here, outside every consensus lock, before the mempool sees the
-        // transaction: an RPC caller (unlike a relay peer, who is banned for a bad proof) could submit
+        // transaction: an RPC caller (unlike a relay peer, who is disconnected for a bad proof) could submit
         // fresh junk bundles that each cost a full Halo 2 verification while the virtual state lock was
         // held, delaying every chain update. A success is cached, so the mempool's check is a hit.
         if transaction.is_shielded() {
@@ -789,6 +796,10 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
     ) -> RpcResult<SubmitTransactionReplacementResponse> {
         let transaction: Transaction = request.transaction.try_into()?;
         let transaction_id = transaction.id();
+        // Same reason as `submit_transaction_call`.
+        if transaction.is_shielded() {
+            refuse_if_shielded_state_diverged("accept shielded transactions")?;
+        }
         let session = self.consensus_manager.consensus().unguarded_session();
         let replaced_transaction =
             self.flow_context.submit_rpc_transaction_replacement(&session, transaction).await.map_err(|err| {
