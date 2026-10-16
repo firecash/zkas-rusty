@@ -3106,9 +3106,16 @@ impl VirtualStateProcessor {
         }
 
         {
-            // Copy the pruning-point UTXO set into virtual's UTXO set
-            let pruning_meta_read = self.pruning_meta_stores.read();
+            // Copy the pruning-point UTXO set into virtual's UTXO set.
+            //
+            // Virtual lock FIRST, pruning-meta lock second: that is the order everything else nesting
+            // the two uses (a chain walk holds the virtual upgradable lock and takes the pruning-meta
+            // write lock to lower the shielded-stable flag on a shielded disqualification; the shielded
+            // import and its clear take the virtual write lock and then the pruning-meta write lock).
+            // Taken the other way round, a walk hitting that disqualification while this import waits
+            // for the virtual write lock deadlocks both: each holds what the other is waiting for.
             let mut virtual_write = self.virtual_stores.write();
+            let pruning_meta_read = self.pruning_meta_stores.read();
 
             virtual_write.utxo_set.clear().unwrap();
             for chunk in &pruning_meta_read.utxo_set.iterator().map(|iter_result| iter_result.unwrap()).chunks(1000) {
