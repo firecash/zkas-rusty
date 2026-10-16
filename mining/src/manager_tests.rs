@@ -1502,6 +1502,42 @@ mod tests {
         }
     }
 
+    /// `get_transactions_by_addresses` walks the pool once and looks scripts up, rather than walking
+    /// it once per requested script; the grouping it returns must be unchanged by that.
+    #[test]
+    fn test_get_transactions_by_addresses_groups_by_script() {
+        let consensus = Arc::new(ConsensusMock::new());
+        let mining_manager = default_mining_manager();
+        let transactions = (0..3).map(|i| create_transaction_with_utxo_entry(i, 0)).collect::<Vec<_>>();
+        for transaction in transactions.iter() {
+            mining_manager
+                .validate_and_insert_mutable_transaction(
+                    consensus.as_ref(),
+                    transaction.clone(),
+                    Priority::Low,
+                    Orphan::Allowed,
+                    RbfPolicy::Forbidden,
+                )
+                .unwrap();
+        }
+        let (paying_script, _) = op_true_script();
+        let unrelated_script = ScriptPublicKey::new(0, scriptvec![0x51, 0x51]);
+        let requested: crate::model::owner_txs::ScriptPublicKeySet =
+            [paying_script.clone(), unrelated_script.clone()].into_iter().collect();
+
+        let grouped = mining_manager.get_transactions_by_addresses(&requested, TransactionQuery::TransactionsOnly);
+
+        assert_eq!(grouped.owners.len(), 2, "every requested script gets an owner entry, matching or not");
+        assert_eq!(grouped.transactions.len(), 3);
+        let owner = &grouped.owners[&paying_script];
+        for transaction in transactions.iter() {
+            assert!(owner.sending_txs.contains(&transaction.id()));
+            assert!(owner.receiving_txs.contains(&transaction.id()));
+        }
+        let unrelated = &grouped.owners[&unrelated_script];
+        assert!(unrelated.sending_txs.is_empty() && unrelated.receiving_txs.is_empty());
+    }
+
     fn create_transaction_with_utxo_entry(i: u32, block_daa_score: u64) -> MutableTransaction {
         let previous_outpoint = TransactionOutpoint::new(Hash::default(), i);
         let (script_public_key, redeem_script) = op_true_script();
