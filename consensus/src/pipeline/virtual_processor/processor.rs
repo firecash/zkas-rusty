@@ -883,6 +883,12 @@ impl VirtualStateProcessor {
     /// a finality point is pruned. That matters because a missing diff reads back as "added no
     /// nullifiers", which would make the move silently wrong instead of failing. Refused otherwise.
     ///
+    /// Above the floor, "no diff row" is still ambiguous: `persist` writes a row only for a block that
+    /// added nullifiers, so a block that was never UTXO-validated here reads exactly like one that
+    /// spent nothing. The marker that a block's diff WAS written is its `StatusUTXOValid`, which
+    /// `commit_utxo_state` sets in the same batch as `persist`. So every block the move reverts or
+    /// re-applies must carry it, or the move is refused before anything is written.
+    ///
     /// One batch is safe here (unlike the walk in `calculate_utxo_state_relatively`) because nothing
     /// reads the set between the staged reverts and re-applies: the caller holds the virtual
     /// upgradable lock, which every other writer of the set also holds. Reverts are staged first, so a
@@ -920,17 +926,29 @@ impl VirtualStateProcessor {
     fn stage_nullifier_set_move(&self, batch: &mut WriteBatch, cursor: Hash, target: Hash) -> Result<(), String> {
         let sm = &self.shielded_state_manager;
         let reach = &self.reachability_service;
+        let diff_held = |block: Hash| -> Result<(), String> {
+            match self.statuses_store.read().get(block) {
+                Ok(StatusUTXOValid) => Ok(()),
+                Ok(status) => Err(format!(
+                    "{block} was never UTXO-validated here ({status:?}), so a missing nullifier diff cannot be told from an \
+                     empty one"
+                )),
+                Err(e) => Err(format!("reading the status of {block}: {e}")),
+            }
+        };
         let mut split = None;
         for current in reach.default_backward_chain_iterator(cursor) {
             if reach.is_chain_ancestor_of(current, target) {
                 split = Some(current);
                 break;
             }
+            diff_held(current)?;
             sm.revert_nullifiers_from_store(batch, current).map_err(|e| format!("reverting {current}: {e}"))?;
         }
         // `floor` is a chain ancestor of both ends, so the walk meets `target`'s chain at or above it.
         let split = split.ok_or_else(|| format!("the chains of {cursor} and {target} do not meet"))?;
         for current in reach.forward_chain_iterator(split, target, true).skip(1) {
+            diff_held(current)?;
             sm.apply_nullifiers_from_store(batch, current).map_err(|e| format!("re-applying {current}: {e}"))?;
         }
         sm.set_nullifier_cursor(batch, target).map_err(|e| format!("staging the cursor: {e}"))

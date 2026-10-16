@@ -1280,6 +1280,106 @@ async fn self_check_rebuilds_a_damaged_set_and_refuses_what_it_cannot_prove() {
     assert!(sm.is_nullifier_spent(&stray).unwrap(), "a refused rebuild leaves the set exactly as it was");
 }
 
+/// A move of the nullifier set re-applies blocks from their stored diffs, and a block that was never
+/// UTXO-validated here has no diff row, which reads exactly like "spent nothing". The move must refuse
+/// such a block instead of moving the set past it, and must leave nothing of what it had staged in the
+/// store caches (they cache a write when it is staged, and the refused batch is dropped).
+#[tokio::test]
+async fn nullifier_set_move_refuses_a_block_never_validated_and_forgets_what_it_staged() {
+    use crate::model::stores::statuses::StatusesStore;
+    let mut params = MAINNET_PARAMS.clone();
+    params.shielded_coinbase = true;
+    params.dev_fee_recipient = None;
+    let config = ConfigBuilder::new(params)
+        .edit_consensus_params(|p| {
+            p.genesis.bits = 0x207fffff;
+            p.blockrate.finality_depth = 5;
+            p.blockrate.shielded_anchor_depth = 3;
+        })
+        .build();
+    let net = config.genesis.hash.as_bytes();
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+    let miner_seed = [7u8; 32];
+    let miner_addr = kaspa_shielded_core::wallet::address_bytes_from_seed(miner_seed).expect("orchard address");
+    ctx.miner_data = MinerData::new(ScriptPublicKey::new(0, ScriptVec::from_slice(&miner_addr)), vec![]);
+    let mut block1 = None;
+    for _ in 0..2 {
+        let b = ctx.mine_real_pow_block();
+        ctx.consensus.validate_and_insert_block(b.clone()).virtual_state_task.await.unwrap();
+        block1 = Some(b);
+    }
+    let block1 = block1.unwrap();
+    let cb_txid = block1.transactions[0].id();
+    let note_value = block1.transactions[0].outputs[0].value;
+    for _ in 0..5 {
+        let b = ctx.mine_real_pow_block();
+        ctx.consensus.validate_and_insert_block(b).virtual_state_task.await.unwrap();
+    }
+    let recipient_addr = kaspa_shielded_core::wallet::address_bytes_from_seed([9u8; 32]).unwrap();
+    let mut spend_tx = Transaction::new(
+        kaspa_consensus_core::tx::TX_VERSION_SHIELDED,
+        vec![],
+        vec![],
+        0,
+        kaspa_consensus_core::subnets::SUBNETWORK_ID_NATIVE,
+        0,
+        vec![],
+    );
+    let tx_ctx = spend_tx.shielded_sighash_context();
+    spend_tx.payload = kaspa_shielded_core::wallet::build::build_singleleaf_coinbase_spend(
+        miner_seed,
+        cb_txid.as_bytes(),
+        0,
+        note_value,
+        recipient_addr,
+        note_value - 2_000,
+        &net,
+        &tx_ctx,
+    )
+    .expect("wallet builds a real spend bundle");
+    spend_tx.finalize();
+    // `split` <- S (the spend) <- T1 <- T2 (the sink).
+    let split = ctx.consensus.get_sink();
+    let s = ctx.mine_real_pow_block_on(vec![split], vec![spend_tx]);
+    let s_hash = s.header.hash;
+    ctx.consensus.validate_and_insert_block(s).virtual_state_task.await.unwrap();
+    for _ in 0..2 {
+        let b = ctx.mine_real_pow_block();
+        ctx.consensus.validate_and_insert_block(b).virtual_state_task.await.unwrap();
+    }
+    let sink = ctx.consensus.get_sink();
+    assert_ne!(sink, s_hash);
+
+    let vp = ctx.consensus.virtual_processor();
+    let sm = vp.shielded_state_manager_ref();
+    assert_eq!(sm.nullifier_cursor().unwrap(), Some(sink));
+    let spent = sm.nullifier_set_snapshot().unwrap();
+    assert!(!spent.is_empty(), "the spend's nullifiers are in the set");
+
+    // Put the set where it stood at `split`: the only spends on this chain are S's.
+    let mut batch = rocksdb::WriteBatch::default();
+    sm.stage_nullifier_set_repair(&mut batch, &spent, &[], split).unwrap();
+    vp.write_batch_for_test(batch);
+    assert!(!sm.is_nullifier_spent(&spent[0]).unwrap());
+
+    // The sink claims it was never UTXO-validated: the move would re-apply S and T1 and then reach a
+    // block whose missing diff proves nothing.
+    ctx.consensus.statuses_store.write().set(sink, BlockStatus::StatusUTXOPendingVerification).unwrap();
+    vp.reconcile_nullifier_set_at_startup();
+    assert_eq!(sm.nullifier_cursor().unwrap(), Some(split), "the refused move did not move the cursor");
+    assert!(
+        !sm.is_nullifier_spent(&spent[0]).unwrap(),
+        "S's re-apply was staged before the refusal; the cache must not keep serving it"
+    );
+
+    // Control: with the status back, the same move goes through, so the refusal above was the status.
+    ctx.consensus.statuses_store.write().set(sink, BlockStatus::StatusUTXOValid).unwrap();
+    vp.reconcile_nullifier_set_at_startup();
+    assert_eq!(sm.nullifier_cursor().unwrap(), Some(sink));
+    assert!(sm.is_nullifier_spent(&spent[0]).unwrap());
+    assert!(sm.global_set_matches_snapshot(sink).unwrap().0);
+}
+
 #[tokio::test]
 async fn block_template_version_changes_to_v2_upon_activation() {
     let activation = MAINNET_PARAMS.genesis.daa_score + 10;
