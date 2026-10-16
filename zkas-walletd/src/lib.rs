@@ -12593,11 +12593,6 @@ mod sdk_api_tests {
         std::fs::remove_dir_all(&dir3).ok();
     }
 
-    /// "Enter the seed on a second device → synced at once": a registration whose
-    /// viewing key another token already scanned must clone that checkpoint, and
-    /// the clone must parse under EITHER key form (the desktop imported the seed;
-    /// the phone registers only the FVK — same wallet, same checkpoint).
-    #[test]
     /// The checkpoint on disk must be byte-for-byte what the single-buffer version wrote.
     ///
     /// `write_checkpoint_bytes` stopped concatenating the three pieces before writing,
@@ -12675,6 +12670,11 @@ mod sdk_api_tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// "Enter the seed on a second device → synced at once": a registration whose
+    /// viewing key another token already scanned must clone that checkpoint, and
+    /// the clone must parse under EITHER key form (the desktop imported the seed;
+    /// the phone registers only the FVK — same wallet, same checkpoint).
+    #[test]
     fn twin_checkpoint_adoption_clones_and_verifies() {
         let tmp = std::env::temp_dir().join(format!("zkas-adopt-test-{}", std::process::id()));
         let dir = tmp.to_string_lossy().to_string();
