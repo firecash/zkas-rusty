@@ -56,11 +56,14 @@ pub struct ServerContext {
     pub core_service: DynRpcService,
     /// The notifier relaying RPC core notifications to connections
     pub notifier: Arc<Notifier<Notification, Connection>>,
+    /// `--unsaferpc`. Request methods are gated inside `core_service`; subscriptions go to
+    /// `notifier` and never reach it, so the subscription rule is applied from here.
+    pub unsafe_rpc: bool,
 }
 
 impl ServerContext {
-    pub fn new(core_service: DynRpcService, notifier: Arc<Notifier<Notification, Connection>>) -> Self {
-        Self { core_service, notifier }
+    pub fn new(core_service: DynRpcService, notifier: Arc<Notifier<Notification, Connection>>, unsafe_rpc: bool) -> Self {
+        Self { core_service, notifier, unsafe_rpc }
     }
 }
 
@@ -91,6 +94,7 @@ impl ConnectionHandler {
         subscription_context: SubscriptionContext,
         broadcasters: usize,
         counters: Arc<TowerConnectionCounters>,
+        unsafe_rpc: bool,
     ) -> Self {
         // This notifier UTXOs subscription granularity to rpc-core notifier
         let policies = MutationPolicies::new(UtxosChangedMutationPolicy::AddressSet);
@@ -116,7 +120,7 @@ impl ConnectionHandler {
             broadcasters,
             policies,
         ));
-        let server_context = ServerContext::new(core_service, notifier);
+        let server_context = ServerContext::new(core_service, notifier, unsafe_rpc);
         let interface = Arc::new(Factory::new_interface(server_context.clone(), network_bps));
         let running = Default::default();
 

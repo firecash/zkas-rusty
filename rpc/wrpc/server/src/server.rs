@@ -173,6 +173,12 @@ impl Server {
     }
 
     pub async fn start_notify(&self, connection: &Connection, scope: Scope) -> RpcResult<()> {
+        // `--unsaferpc` gates some subscriptions, and this server subscribes its own notifier to
+        // the core one rather than calling `RpcCoreService::start_notify`, so it has to apply the
+        // rule itself. In proxy mode (no `rpc_core`) the gRPC node behind us applies it.
+        if let Some(rpc_core) = &self.inner.rpc_core {
+            rpc_core.service.check_subscription_allowed(&scope)?;
+        }
         let listener_id = if let Some(listener_id) = connection.listener_id() {
             listener_id
         } else {

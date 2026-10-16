@@ -57,6 +57,11 @@ pub struct Config {
     /// Enable RPC commands which affect the state of the node
     pub unsafe_rpc: bool,
 
+    /// Ban (for the address store's 24 hours) a peer whose error proves it broke the wire protocol
+    /// itself, as opposed to disagreeing with us. Off by default; see
+    /// `ProtocolError::is_auto_ban_eligible` for what qualifies and why consensus rejections never do.
+    pub enable_banning: bool,
+
     /// Allow the node to accept blocks from RPC while not synced
     /// (required when initiating a new network from genesis)
     pub enable_unsynced_mining: bool,
@@ -130,6 +135,7 @@ impl Config {
             enable_sanity_checks: false,
             utxoindex: false,
             unsafe_rpc: false,
+            enable_banning: false,
             enable_unsynced_mining: false,
             enable_mainnet_mining: false,
             user_agent_comments: Default::default(),

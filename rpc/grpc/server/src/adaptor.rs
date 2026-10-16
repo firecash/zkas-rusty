@@ -40,6 +40,7 @@ impl Adaptor {
         subscription_context: SubscriptionContext,
         broadcasters: usize,
         counters: Arc<TowerConnectionCounters>,
+        unsafe_rpc: bool,
     ) -> Arc<Self> {
         let (manager_sender, manager_receiver) = mpsc_channel(Self::manager_channel_size());
         let connection_handler = ConnectionHandler::new(
@@ -50,6 +51,7 @@ impl Adaptor {
             subscription_context,
             broadcasters,
             counters,
+            unsafe_rpc,
         );
         let server_termination = connection_handler.serve(serve_address);
         let adaptor = Arc::new(Adaptor::new(Some(server_termination), connection_handler, manager, serve_address));

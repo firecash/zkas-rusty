@@ -92,6 +92,56 @@ impl ProtocolError {
         !matches!(self, Self::ConnectionClosed | Self::OutgoingRouteCapacityReached(_))
     }
 
+    /// Whether this error proves the peer broke the wire protocol itself -- something no honest
+    /// peer of ANY version can do -- rather than disagreeing with us. Only these may end in an
+    /// automatic ban (`--enablebanning`); every other error disconnects and nothing more.
+    ///
+    /// The bar is "no honest peer of any version", not "probably malicious", because of what the
+    /// excluded errors look like on a live network:
+    ///
+    /// * Consensus rejections (`RuleError`, `ConsensusError`, `PruningImportError`, and the
+    ///   `MisbehavingPeer` sites in tx relay, which fire on a mempool rule rejection or a failed
+    ///   shielded proof) are exactly what an honest peer on the other side of a rule change sends.
+    ///   After a fork that is most of the network for a while, and banning them turns a transient
+    ///   partition into a permanent one. This is why tx relay carries its "discuss a banning
+    ///   process" TODO rather than a ban.
+    /// * Size and pacing limits (`IncomingRouteCapacityReached`, the shielded-history byte and
+    ///   record bounds) move between versions -- the history chunk bound was tightened in this
+    ///   release, so an un-upgraded server can exceed it honestly -- and a full route is as often our
+    ///   own slowness as the peer's flooding.
+    /// * Unknown or unroutable message types (`NoRouteForMessageType`, an empty payload, an
+    ///   `UnexpectedMessage`) are what a NEWER peer's messages look like to an older node.
+    /// * Timeouts, rejects, version and network mismatches are not misbehaviour at all.
+    ///
+    /// What is left is a fixed-width field at the wrong width (see
+    /// `ConversionError::is_malformed_fixed_width_field`). The match is exhaustive on purpose, so a
+    /// new variant cannot become ban-eligible -- or escape this decision -- without being read here.
+    pub fn is_auto_ban_eligible(&self) -> bool {
+        match self {
+            Self::ConversionError(err) => err.is_malformed_fixed_width_field(),
+            Self::IdentityError(_) => true,
+            Self::Timeout(_)
+            | Self::VersionMismatch(_, _)
+            | Self::WrongNetwork(_, _)
+            | Self::UnexpectedMessage(_, _)
+            | Self::RuleError(_)
+            | Self::PruningImportError(_)
+            | Self::ConsensusError(_)
+            | Self::MiningManagerError(_)
+            | Self::Other(_)
+            | Self::OtherOwned(_)
+            | Self::MisbehavingPeer(_)
+            | Self::ConnectionClosed
+            | Self::IncomingRouteCapacityReached(_, _)
+            | Self::OutgoingRouteCapacityReached(_)
+            | Self::NoRouteForMessageType(_)
+            | Self::PeerAlreadyExists(_)
+            | Self::LoopbackConnection(_)
+            | Self::Rejected(_)
+            | Self::IgnorableReject(_) => false,
+        }
+    }
+
     pub fn to_reject_message(&self) -> String {
         match self {
             Self::LoopbackConnection(_) => LOOPBACK_CONNECTION_MESSAGE.to_owned(),
@@ -218,4 +268,79 @@ macro_rules! dequeue {
 #[macro_export]
 macro_rules! dequeue_with_request_id {
     ($receiver:expr, $pattern:path) => {{ $crate::unwrap_message_with_request_id!($receiver.recv().await, $pattern) }};
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ProtocolError;
+    use crate::{KaspadMessagePayloadType, convert::error::ConversionError};
+    use kaspa_consensus_core::{
+        errors::{block::RuleError, tx::TxRuleError},
+        subnets::SubnetworkConversionError,
+        tx::TransactionId,
+    };
+    use kaspa_mining_errors::{manager::MiningManagerError, mempool::RuleError as MempoolRuleError};
+    use std::time::Duration;
+
+    fn slice_error() -> std::array::TryFromSliceError {
+        <[u8; 32]>::try_from(&[0u8; 31][..]).unwrap_err()
+    }
+
+    fn uuid_error() -> uuid::Error {
+        uuid::Uuid::from_slice(&[0u8; 15]).unwrap_err()
+    }
+
+    #[test]
+    fn wrong_width_fixed_fields_are_ban_eligible() {
+        let eligible = [
+            ProtocolError::ConversionError(ConversionError::ArrayBytesSizeError(slice_error())),
+            ProtocolError::ConversionError(ConversionError::UintBytesSizeError(kaspa_math::uint::TryFromSliceError)),
+            ProtocolError::ConversionError(ConversionError::IllegalIPLength(5)),
+            ProtocolError::ConversionError(ConversionError::IdentityError(uuid_error())),
+            ProtocolError::ConversionError(ConversionError::SubnetParsingError(SubnetworkConversionError::SliceError(slice_error()))),
+            ProtocolError::IdentityError(uuid_error()),
+        ];
+        for err in eligible {
+            assert!(err.is_auto_ban_eligible(), "{err} must be ban-eligible");
+        }
+    }
+
+    /// The errors an honest peer DOES send -- across a rule change, across a version gap, or just
+    /// under load -- must never be ban-eligible. The first three are the live-network cases this
+    /// gate exists for: a consensus rejection after the fork, and the two tx-relay
+    /// `MisbehavingPeer` sites, which fire on mempool rule rejections.
+    #[test]
+    fn honest_disagreement_is_never_ban_eligible() {
+        let not_eligible = [
+            ProtocolError::RuleError(RuleError::NoParents),
+            ProtocolError::MisbehavingPeer(format!("rejected invalid transaction {}", TransactionId::from_bytes([1; 32]))),
+            ProtocolError::MisbehavingPeer("relayed a shielded transaction with an invalid proof: x".to_string()),
+            ProtocolError::MiningManagerError(MiningManagerError::MempoolError(MempoolRuleError::RejectInvalid(
+                TransactionId::from_bytes([2; 32]),
+            ))),
+            ProtocolError::MiningManagerError(MiningManagerError::MempoolError(MempoolRuleError::RejectTxRule(
+                TxRuleError::InvalidShieldedProof("x".to_string()),
+            ))),
+            ProtocolError::ConversionError(ConversionError::NoneValue),
+            ProtocolError::ConversionError(ConversionError::General),
+            ProtocolError::ConversionError(ConversionError::IntCastingError(u8::try_from(256u16).unwrap_err())),
+            ProtocolError::ConversionError(ConversionError::AuxPowDecodeError("x".to_string())),
+            ProtocolError::Timeout(Duration::from_secs(1)),
+            ProtocolError::VersionMismatch(10, 9),
+            ProtocolError::WrongNetwork("a".to_string(), "b".to_string()),
+            ProtocolError::UnexpectedMessage("Verack", Some(KaspadMessagePayloadType::Version)),
+            ProtocolError::UnexpectedMessage("Verack", None),
+            ProtocolError::NoRouteForMessageType(KaspadMessagePayloadType::Version),
+            ProtocolError::IncomingRouteCapacityReached(KaspadMessagePayloadType::Block, "p".to_string()),
+            ProtocolError::OutgoingRouteCapacityReached("p".to_string()),
+            ProtocolError::Other("received kaspad p2p message with empty payload"),
+            ProtocolError::OtherOwned("history chunk exceeds byte bound".to_string()),
+            ProtocolError::ConnectionClosed,
+            ProtocolError::Rejected("x".to_string()),
+            ProtocolError::IgnorableReject("x".to_string()),
+        ];
+        for err in not_eligible {
+            assert!(!err.is_auto_ban_eligible(), "{err} must not be ban-eligible");
+        }
+    }
 }
