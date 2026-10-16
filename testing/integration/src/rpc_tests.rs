@@ -515,6 +515,25 @@ async fn sanity_test() {
                     assert_eq!(response.entries[0].address, addresses[0]);
                     assert!(response.entries[0].receiving.is_empty());
                     assert!(response.entries[0].sending.is_empty());
+
+                    // A shielded address is a valid owner whose script has no transparent inverse; converting
+                    // it back with an `expect` exited the node (1da1e6a). Each owner is answered under the
+                    // address it was requested as.
+                    let shielded = Address::new(Prefix::Simnet, Version::ShieldedOrchard, &[7u8; 43]);
+                    let mixed = vec![addresses[0].clone(), shielded.clone()];
+                    let response = rpc_client
+                        .get_mempool_entries_by_addresses_call(None, GetMempoolEntriesByAddressesRequest::new(mixed, true, false))
+                        .await
+                        .unwrap();
+                    assert_eq!(response.entries.len(), 2);
+                    let mut answered = response.entries.iter().map(|e| e.address.clone()).collect::<Vec<_>>();
+                    answered.sort();
+                    let mut expected = vec![addresses[0].clone(), shielded];
+                    expected.sort();
+                    assert_eq!(answered, expected);
+                    assert!(response.entries.iter().all(|e| e.receiving.is_empty() && e.sending.is_empty()));
+                    // The node is still up.
+                    rpc_client.ping_call(None, PingRequest {}).await.unwrap();
                 })
             }
 
