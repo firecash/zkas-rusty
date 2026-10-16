@@ -220,10 +220,18 @@ impl Consensus {
         let (tip, _) = sc.get_tip().map_err(|e| ConsensusError::GeneralOwned(format!("cannot read chain tip: {e}")))?;
 
         let mut discarded = 0u64;
+        // Only a hole (`KeyNotFound`) is skipped below. An unreadable entry or record used to be
+        // skipped too, so the purge left that unverified record in place, cleared the backfill flag
+        // in the same batch, and the node then served it as its own history. Abort instead: the
+        // batch is not written, and the flag still says the range needs purging.
+        let read_err =
+            |what: &str, e: kaspa_database::prelude::StoreError| ConsensusError::GeneralOwned(format!("cannot read {what}: {e}"));
         // Drop the backfilled range: records and index entries, in lockstep.
         for index in 0..base_index {
-            if let Ok(hash) = sc.get_by_index(index) {
-                if self.virtual_processor.shielded_state_manager_ref().scan_block(hash).unwrap_or(None).is_some() {
+            if let Some(hash) = sc.get_by_index(index).optional().map_err(|e| read_err("index entry", e))? {
+                let record =
+                    self.virtual_processor.shielded_state_manager_ref().scan_block(hash).map_err(|e| read_err("scan record", e))?;
+                if record.is_some() {
                     self.virtual_processor
                         .shielded_state_manager_ref()
                         .delete_backfilled_scan(&mut batch, hash)
@@ -237,7 +245,7 @@ impl Consensus {
         // Shift what remains back down. Ascending order, so a move never lands on an entry that
         // has not been vacated yet — the mirror of the highest-first rule the backfill shifts by.
         for index in base_index..=tip {
-            if let Ok(hash) = sc.get_by_index(index) {
+            if let Some(hash) = sc.get_by_index(index).optional().map_err(|e| read_err("index entry", e))? {
                 sc.rebase_entry(&mut batch, index, hash, index - base_index)
                     .map_err(|e| ConsensusError::GeneralOwned(format!("cannot rebase index entry: {e}")))?;
             }
@@ -983,7 +991,9 @@ impl ConsensusApi for Consensus {
     fn get_shielded_history_base(&self) -> Hash {
         let _guard = self.pruning_lock.blocking_read();
         let sc = self.storage.selected_chain_store.read();
-        sc.get_by_index(0).unwrap_or_else(|_| self.config.genesis.hash)
+        // An empty index means genesis. An unreadable one does not: the IBD flow purges below this
+        // base after a failed backfill, and genesis there purges nothing.
+        sc.get_by_index(0).optional().unwrap().unwrap_or(self.config.genesis.hash)
     }
 
     fn get_shielded_history_status(&self) -> ConsensusResult<(u64, bool)> {
@@ -993,7 +1003,9 @@ impl ConsensusApi for Consensus {
         // it can serve: a wallet reaches history through `get_shielded_chain_range`, which
         // resolves its start block through this index. Holding records without index entries
         // still answers "cannot find header".
-        let Ok(base) = sc.get_by_index(0) else {
+        let Some(base) =
+            sc.get_by_index(0).optional().map_err(|e| ConsensusError::GeneralOwned(format!("cannot read history base: {e}")))?
+        else {
             // No index at all: nothing below the pruning point is servable.
             return Ok((0, false));
         };
@@ -1012,10 +1024,18 @@ impl ConsensusApi for Consensus {
         // pruning point has a scan record and no header — reading the header here would fail on
         // exactly the nodes this field exists to describe.
         let sm = self.virtual_processor.shielded_state_manager_ref();
-        let daa = match sm.scan_block(base) {
-            Ok(Some(d)) => d.daa_score,
+        // A read failure is an error, not a floor of DAA 0: wallets place their scan start by this.
+        let base_record =
+            sm.scan_block(base).map_err(|e| ConsensusError::GeneralOwned(format!("cannot read history base record: {e}")))?;
+        let daa = match base_record {
+            Some(d) => d.daa_score,
             // Fall back to the header for a node whose base is its own pruning point.
-            _ => self.headers_store.get_compact_header_data(base).map(|h| h.daa_score).unwrap_or(0),
+            None => self
+                .headers_store
+                .get_compact_header_data(base)
+                .optional()
+                .map_err(|e| ConsensusError::GeneralOwned(format!("cannot read history base header: {e}")))?
+                .map_or(0, |h| h.daa_score),
         };
         Ok((daa, complete))
     }
@@ -1107,7 +1127,12 @@ impl ConsensusApi for Consensus {
         // `verify_shielded_history` re-checks the whole range, anchored at every past pruning point.
         let anchor_scores = match self.headers_store.get_compact_header_data(anchor).optional().unwrap() {
             Some(h) => (h.blue_score, h.daa_score),
-            None => match self.virtual_processor.shielded_state_manager_ref().scan_block(anchor).unwrap_or(None) {
+            None => match self
+                .virtual_processor
+                .shielded_state_manager_ref()
+                .scan_block(anchor)
+                .map_err(|e| ConsensusError::GeneralOwned(format!("cannot read the record of history anchor {anchor}: {e}")))?
+            {
                 Some(d) => (d.blue_score, d.daa_score),
                 None => {
                     return Err(ConsensusError::GeneralOwned(format!(
@@ -1220,8 +1245,15 @@ impl ConsensusApi for Consensus {
         };
         if shift > 0 {
             // Rebase highest-first so a shift never lands on an entry not yet moved.
+            // A hole is skipped. An unreadable entry was skipped too, so it stayed where the shift
+            // then overwrote it and the index was numbered two ways at once; refuse the chunk
+            // instead (nothing is written, and the caller purges and retries).
             for i in (0..=local_tip).rev() {
-                if let Ok(h) = sc.get_by_index(i) {
+                if let Some(h) = sc
+                    .get_by_index(i)
+                    .optional()
+                    .map_err(|e| ConsensusError::GeneralOwned(format!("backfill chunk refused: cannot read index entry {i}: {e}")))?
+                {
                     sc.rebase_entry(&mut batch, i, h, i + shift).unwrap();
                 }
             }
@@ -1244,7 +1276,17 @@ impl ConsensusApi for Consensus {
                 sc.write_entry(&mut batch, *index, r.hash).unwrap();
                 idx_written += 1;
             }
-            if self.virtual_processor.shielded_state_manager_ref().scan_block(r.hash).unwrap_or(None).is_none() {
+            // Only a MISSING record is written. `unwrap_or(None)` read an unreadable one as missing
+            // and overwrote this node's own record with the peer's.
+            if self
+                .virtual_processor
+                .shielded_state_manager_ref()
+                .scan_block(r.hash)
+                .map_err(|e| {
+                    ConsensusError::GeneralOwned(format!("backfill chunk refused: cannot read the record of {}: {e}", r.hash))
+                })?
+                .is_none()
+            {
                 let accepted = r
                     .accepted_actions
                     .iter()
@@ -1377,7 +1419,17 @@ impl ConsensusApi for Consensus {
                 if index > base_index {
                     continue;
                 }
-                if let Ok(Some(d)) = sm.scan_block(pp_hash) {
+                // A read failure is "cannot judge", not "nothing to compare": skipping it let a
+                // record that disagrees with its header pass into a `Verified` verdict.
+                let record = match sm.scan_block(pp_hash) {
+                    Ok(record) => record,
+                    Err(e) => {
+                        return Ok(ShieldedHistoryVerdict::Unverifiable {
+                            reason: format!("scan record read failed for past pruning point {pp_hash}: {e}"),
+                        });
+                    }
+                };
+                if let Some(d) = record {
                     if (d.blue_score, d.daa_score) != (h.blue_score, h.daa_score) {
                         return Ok(ShieldedHistoryVerdict::Mismatch {
                             reason: format!("the record of past pruning point {pp_hash} disagrees with its header"),
