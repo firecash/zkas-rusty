@@ -1,7 +1,33 @@
 use super::rocksdb_preset::RocksDbPreset;
 use crate::db::DB;
-use rocksdb::{DBWithThreadMode, MultiThreaded};
-use std::{path::PathBuf, sync::Arc};
+use rocksdb::{DBWithThreadMode, MultiThreaded, Options};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+
+/// Open the database, or die saying why.
+///
+/// A bare `unwrap()` here reported the most common operator mistake -- a second node started on
+/// the same `--appdir` -- as an unwrapped `Err` carrying a RocksDB LOCK path, with no hint of
+/// what had happened or what to do about it. The data is safe either way: the lock is what
+/// refused. So this still ends the process; it just says what went wrong first.
+fn open_or_die(opts: &Options, path: &Path) -> DBWithThreadMode<MultiThreaded> {
+    let Some(path_str) = path.to_str() else {
+        panic!("the database path {} is not valid UTF-8", path.display())
+    };
+    <DBWithThreadMode<MultiThreaded>>::open(opts, path_str).unwrap_or_else(|err| {
+        let message = err.to_string();
+        if message.contains("lock file") || message.contains("Resource temporarily unavailable") {
+            panic!(
+                "cannot open the database at {}: another node is already running on this data \
+                 directory, or a previous one has not released it yet -- {message}",
+                path.display()
+            )
+        }
+        panic!("cannot open the database at {}: {message}", path.display())
+    })
+}
 
 #[derive(Debug)]
 pub struct Unspecified;
@@ -164,7 +190,7 @@ macro_rules! default_opts {
 impl ConnBuilder<PathBuf, false, Unspecified, i32> {
     pub fn build(self) -> Result<Arc<DB>, kaspa_utils::fd_budget::Error> {
         let (opts, guard) = default_opts!(self)?;
-        let db = Arc::new(DB::new(<DBWithThreadMode<MultiThreaded>>::open(&opts, self.db_path.to_str().unwrap()).unwrap(), guard));
+        let db = Arc::new(DB::new(open_or_die(&opts, &self.db_path), guard));
         Ok(db)
     }
 
@@ -188,7 +214,7 @@ impl ConnBuilder<PathBuf, true, Unspecified, i32> {
     pub fn build(self) -> Result<Arc<DB>, kaspa_utils::fd_budget::Error> {
         let (mut opts, guard) = default_opts!(self)?;
         opts.enable_statistics();
-        let db = Arc::new(DB::new(<DBWithThreadMode<MultiThreaded>>::open(&opts, self.db_path.to_str().unwrap()).unwrap(), guard));
+        let db = Arc::new(DB::new(open_or_die(&opts, &self.db_path), guard));
         Ok(db)
     }
 }
@@ -199,7 +225,7 @@ impl ConnBuilder<PathBuf, true, u32, i32> {
         opts.enable_statistics();
         opts.set_report_bg_io_stats(true);
         opts.set_stats_dump_period_sec(self.stats_period);
-        let db = Arc::new(DB::new(<DBWithThreadMode<MultiThreaded>>::open(&opts, self.db_path.to_str().unwrap()).unwrap(), guard));
+        let db = Arc::new(DB::new(open_or_die(&opts, &self.db_path), guard));
         Ok(db)
     }
 }
