@@ -828,7 +828,18 @@ impl VirtualStateProcessor {
     /// enumerates the LIVE nullifier set, so the caller must hold a lock that excludes every writer of
     /// that set (the virtual write lock) from here until the batch is written; otherwise a nullifier a
     /// concurrent chain walk inserts after the enumeration survives the clear.
+    ///
+    /// On `Err` the caller drops `batch`; the writes already staged into it are also forgotten by the
+    /// store caches here, since `CachedDbAccess` caches a write when it is staged.
     pub fn stage_verified_shielded_import(&self, batch: &mut WriteBatch, verified: VerifiedShieldedImport) -> Result<usize, String> {
+        let res = self.stage_verified_shielded_import_inner(batch, verified);
+        if res.is_err() {
+            self.shielded_state_manager.discard_cached_shielded_writes();
+        }
+        res
+    }
+
+    fn stage_verified_shielded_import_inner(&self, batch: &mut WriteBatch, verified: VerifiedShieldedImport) -> Result<usize, String> {
         let VerifiedShieldedImport { pp, md, window, proven_entries, nullifiers, n } = verified;
         // Clear first, then seed, in the same batch. Every seed write is an overwrite, and a
         // WriteBatch applies in order, so a nullifier in both the old and the new set ends present.
@@ -893,22 +904,36 @@ impl VirtualStateProcessor {
             }
         }
         let mut batch = WriteBatch::default();
+        if let Err(e) = self.stage_nullifier_set_move(&mut batch, cursor, target) {
+            // `CachedDbAccess` caches a write when it is STAGED, not when the batch lands. The batch is
+            // dropped here, so whatever was staged into it must not survive in the caches either: a
+            // re-applied nullifier would read as spent and the cursor would claim the move happened.
+            sm.discard_cached_shielded_writes();
+            return Err(e);
+        }
+        self.db.write(batch).unwrap();
+        Ok(Some(cursor))
+    }
+
+    /// The staging half of [`Self::move_nullifier_set_to`]; the caller has checked both ends against
+    /// the floor and drops the caches if this fails.
+    fn stage_nullifier_set_move(&self, batch: &mut WriteBatch, cursor: Hash, target: Hash) -> Result<(), String> {
+        let sm = &self.shielded_state_manager;
+        let reach = &self.reachability_service;
         let mut split = None;
         for current in reach.default_backward_chain_iterator(cursor) {
             if reach.is_chain_ancestor_of(current, target) {
                 split = Some(current);
                 break;
             }
-            sm.revert_nullifiers_from_store(&mut batch, current).map_err(|e| format!("reverting {current}: {e}"))?;
+            sm.revert_nullifiers_from_store(batch, current).map_err(|e| format!("reverting {current}: {e}"))?;
         }
         // `floor` is a chain ancestor of both ends, so the walk meets `target`'s chain at or above it.
         let split = split.ok_or_else(|| format!("the chains of {cursor} and {target} do not meet"))?;
         for current in reach.forward_chain_iterator(split, target, true).skip(1) {
-            sm.apply_nullifiers_from_store(&mut batch, current).map_err(|e| format!("re-applying {current}: {e}"))?;
+            sm.apply_nullifiers_from_store(batch, current).map_err(|e| format!("re-applying {current}: {e}"))?;
         }
-        sm.set_nullifier_cursor(&mut batch, target).map_err(|e| format!("staging the cursor: {e}"))?;
-        self.db.write(batch).unwrap();
-        Ok(Some(cursor))
+        sm.set_nullifier_cursor(batch, target).map_err(|e| format!("staging the cursor: {e}"))
     }
 
     /// Startup half of the nullifier-set cursor: before any processor runs, bring the global set to the

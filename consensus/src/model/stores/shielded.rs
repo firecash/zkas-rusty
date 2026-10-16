@@ -82,6 +82,11 @@ impl DbNullifierSetStore {
         Self { db: Arc::clone(&db), access: CachedDbAccess::new(db, cache_policy, DatabaseStorePrefixes::ShieldedNullifiers.into()) }
     }
 
+    /// Forget every cached entry (see `CachedDbAccess::clear_cache`).
+    pub fn clear_cache(&self) {
+        self.access.clear_cache();
+    }
+
     pub fn clone_with_new_cache(&self, cache_policy: CachePolicy) -> Self {
         Self::new(Arc::clone(&self.db), cache_policy)
     }
@@ -145,6 +150,11 @@ impl DbNullifierDiffStore {
             db: Arc::clone(&db),
             access: CachedDbAccess::new(db, cache_policy, DatabaseStorePrefixes::ShieldedNullifierDiffs.into()),
         }
+    }
+
+    /// Forget every cached entry (see `CachedDbAccess::clear_cache`).
+    pub fn clear_cache(&self) {
+        self.access.clear_cache();
     }
 
     pub fn clone_with_new_cache(&self, cache_policy: CachePolicy) -> Self {
@@ -218,6 +228,11 @@ impl DbNullifierCursorStore {
         Self { access: CachedDbAccess::new(db, cache_policy, DatabaseStorePrefixes::ShieldedNullifierCursor.into()) }
     }
 
+    /// Forget every cached entry (see `CachedDbAccess::clear_cache`).
+    pub fn clear_cache(&self) {
+        self.access.clear_cache();
+    }
+
     /// `None` when this database has never recorded one (written by an older build).
     pub fn get(&self) -> StoreResult<Option<Hash>> {
         match self.access.read(NullifierCursorKey) {
@@ -263,6 +278,11 @@ pub struct DbShieldedTreeStore {
 impl DbShieldedTreeStore {
     pub fn new(db: Arc<DB>, cache_policy: CachePolicy) -> Self {
         Self { db: Arc::clone(&db), access: CachedDbAccess::new(db, cache_policy, DatabaseStorePrefixes::ShieldedTreeFrontier.into()) }
+    }
+
+    /// Forget every cached entry (see `CachedDbAccess::clear_cache`).
+    pub fn clear_cache(&self) {
+        self.access.clear_cache();
     }
 
     pub fn clone_with_new_cache(&self, cache_policy: CachePolicy) -> Self {
@@ -327,6 +347,11 @@ impl DbShieldedSupplyStore {
         Self { db: Arc::clone(&db), access: CachedDbAccess::new(db, cache_policy, DatabaseStorePrefixes::ShieldedSupply.into()) }
     }
 
+    /// Forget every cached entry (see `CachedDbAccess::clear_cache`).
+    pub fn clear_cache(&self) {
+        self.access.clear_cache();
+    }
+
     pub fn clone_with_new_cache(&self, cache_policy: CachePolicy) -> Self {
         Self::new(Arc::clone(&self.db), cache_policy)
     }
@@ -383,6 +408,11 @@ impl DbShieldedDevAccruedStore {
         Self { db: Arc::clone(&db), access: CachedDbAccess::new(db, cache_policy, DatabaseStorePrefixes::ShieldedDevAccrued.into()) }
     }
 
+    /// Forget every cached entry (see `CachedDbAccess::clear_cache`).
+    pub fn clear_cache(&self) {
+        self.access.clear_cache();
+    }
+
     pub fn clone_with_new_cache(&self, cache_policy: CachePolicy) -> Self {
         Self::new(Arc::clone(&self.db), cache_policy)
     }
@@ -422,6 +452,11 @@ impl MemSizeEstimator for StoredMinerAccrual {}
 impl DbShieldedMinerAccrualStore {
     pub fn new(db: Arc<DB>, cache_policy: CachePolicy) -> Self {
         Self { db: Arc::clone(&db), access: CachedDbAccess::new(db, cache_policy, DatabaseStorePrefixes::ShieldedMinerAccrual.into()) }
+    }
+
+    /// Forget every cached entry (see `CachedDbAccess::clear_cache`).
+    pub fn clear_cache(&self) {
+        self.access.clear_cache();
     }
 
     pub fn clone_with_new_cache(&self, cache_policy: CachePolicy) -> Self {
@@ -471,6 +506,11 @@ impl DbShieldedAnchorSourceScoreStore {
             db: Arc::clone(&db),
             access: CachedDbAccess::new(db, cache_policy, DatabaseStorePrefixes::ShieldedAnchorSourceScore.into()),
         }
+    }
+
+    /// Forget every cached entry (see `CachedDbAccess::clear_cache`).
+    pub fn clear_cache(&self) {
+        self.access.clear_cache();
     }
 
     pub fn clone_with_new_cache(&self, cache_policy: CachePolicy) -> Self {
@@ -531,6 +571,12 @@ impl DbAnchorWindowStore {
             windows: CachedDbAccess::new(Arc::clone(&db), cache_policy, DatabaseStorePrefixes::ShieldedAnchorWindow.into()),
             entries: CachedDbAccess::new(db, cache_policy, DatabaseStorePrefixes::ShieldedWindowEntry.into()),
         }
+    }
+
+    /// Forget every cached entry (see `CachedDbAccess::clear_cache`).
+    pub fn clear_cache(&self) {
+        self.windows.clear_cache();
+        self.entries.clear_cache();
     }
 
     pub fn clone_with_new_cache(&self, cache_policy: CachePolicy) -> Self {
@@ -636,6 +682,11 @@ impl DbShieldedBurnStore {
         Self { db: Arc::clone(&db), access: CachedDbAccess::new(db, cache_policy, DatabaseStorePrefixes::ShieldedBurns.into()) }
     }
 
+    /// Forget every cached entry (see `CachedDbAccess::clear_cache`).
+    pub fn clear_cache(&self) {
+        self.access.clear_cache();
+    }
+
     pub fn clone_with_new_cache(&self, cache_policy: CachePolicy) -> Self {
         Self::new(Arc::clone(&self.db), cache_policy)
     }
@@ -693,6 +744,11 @@ impl DbShieldedNullifierMuHashStore {
             db: Arc::clone(&db),
             access: CachedDbAccess::new(db, cache_policy, DatabaseStorePrefixes::ShieldedNullifierMuHash.into()),
         }
+    }
+
+    /// Forget every cached entry (see `CachedDbAccess::clear_cache`).
+    pub fn clear_cache(&self) {
+        self.access.clear_cache();
     }
 
     pub fn clone_with_new_cache(&self, cache_policy: CachePolicy) -> Self {
@@ -799,6 +855,11 @@ impl DbAnchorGcQueueStore {
         Self { db: Arc::clone(&db), access: CachedDbAccess::new(db, cache_policy, DatabaseStorePrefixes::ShieldedAnchorGcQueue.into()) }
     }
 
+    /// Forget every cached entry (see `CachedDbAccess::clear_cache`).
+    pub fn clear_cache(&self) {
+        self.access.clear_cache();
+    }
+
     pub fn clone_with_new_cache(&self, cache_policy: CachePolicy) -> Self {
         Self::new(Arc::clone(&self.db), cache_policy)
     }
@@ -878,6 +939,11 @@ impl DbAnchorProducersStore {
             db: Arc::clone(&db),
             access: CachedDbAccess::new(db, cache_policy, DatabaseStorePrefixes::ShieldedAnchorProducers.into()),
         }
+    }
+
+    /// Forget every cached entry (see `CachedDbAccess::clear_cache`).
+    pub fn clear_cache(&self) {
+        self.access.clear_cache();
     }
 
     pub fn clone_with_new_cache(&self, cache_policy: CachePolicy) -> Self {
@@ -977,6 +1043,11 @@ pub struct DbAnchorBlockStore {
 impl DbAnchorBlockStore {
     pub fn new(db: Arc<DB>, cache_policy: CachePolicy) -> Self {
         Self { db: Arc::clone(&db), access: CachedDbAccess::new(db, cache_policy, DatabaseStorePrefixes::ShieldedAnchors.into()) }
+    }
+
+    /// Forget every cached entry (see `CachedDbAccess::clear_cache`).
+    pub fn clear_cache(&self) {
+        self.access.clear_cache();
     }
 
     pub fn clone_with_new_cache(&self, cache_policy: CachePolicy) -> Self {
@@ -1113,6 +1184,11 @@ pub struct DbShieldedScanBlockStore {
 impl DbShieldedScanBlockStore {
     pub fn new(db: Arc<DB>, cache_policy: CachePolicy) -> Self {
         Self { db: Arc::clone(&db), access: CachedDbAccess::new(db, cache_policy, DatabaseStorePrefixes::ShieldedScanBlock.into()) }
+    }
+
+    /// Forget every cached entry (see `CachedDbAccess::clear_cache`).
+    pub fn clear_cache(&self) {
+        self.access.clear_cache();
     }
 
     pub fn clone_with_new_cache(&self, cache_policy: CachePolicy) -> Self {
