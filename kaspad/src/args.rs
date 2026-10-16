@@ -610,9 +610,12 @@ impl Args {
             enable_unsynced_mining: arg_match_unwrap_or::<bool>(&m, "enable-unsynced-mining", defaults.enable_unsynced_mining),
             enable_mainnet_mining: arg_match_unwrap_or::<bool>(&m, "enable-mainnet-mining", defaults.enable_mainnet_mining),
             utxoindex: arg_match_unwrap_or::<bool>(&m, "utxoindex", defaults.utxoindex),
-            consensus_diag: m.get_one::<String>("consensus-diag").cloned(),
-            verify_shielded_history: m.get_one::<bool>("verify-shielded-history").cloned().unwrap_or(false),
-            shielded_history: m.get_one::<String>("shielded-history").map(|v| v != "off"),
+            // These five used to read the command line only, so the same keys in a `--configfile`
+            // parsed (the struct accepts them; unknown keys are refused) and were then dropped.
+            // `verify-shielded-history = true` in a config file meant no verification, silently.
+            consensus_diag: m.get_one::<String>("consensus-diag").cloned().or(defaults.consensus_diag),
+            verify_shielded_history: arg_match_unwrap_or::<bool>(&m, "verify-shielded-history", defaults.verify_shielded_history),
+            shielded_history: m.get_one::<String>("shielded-history").map(|v| v != "off").or(defaults.shielded_history),
             testnet: arg_match_unwrap_or::<bool>(&m, "testnet", defaults.testnet),
             testnet_suffix: arg_match_unwrap_or::<u32>(&m, "netsuffix", defaults.testnet_suffix),
             devnet: arg_match_unwrap_or::<bool>(&m, "devnet", defaults.devnet),
@@ -622,7 +625,7 @@ impl Args {
             yes: arg_match_unwrap_or::<bool>(&m, "yes", defaults.yes),
             user_agent_comments: arg_match_many_unwrap_or::<String>(&m, "user_agent_comments", defaults.user_agent_comments),
             ua_rule: arg_match_many_unwrap_or::<String>(&m, "ua_rule", defaults.ua_rule),
-            externalip: m.get_one::<ContextualNetAddress>("externalip").cloned(),
+            externalip: m.get_one::<ContextualNetAddress>("externalip").cloned().or(defaults.externalip),
             perf_metrics: arg_match_unwrap_or::<bool>(&m, "perf-metrics", defaults.perf_metrics),
             perf_metrics_interval_sec: arg_match_unwrap_or::<u64>(&m, "perf-metrics-interval-sec", defaults.perf_metrics_interval_sec),
             // Note: currently used programmatically by benchmarks and not exposed to CLI users
@@ -642,7 +645,7 @@ impl Args {
             prealloc_address: m.get_one::<String>("prealloc-address").cloned(),
             #[cfg(feature = "devnet-prealloc")]
             prealloc_amount: arg_match_unwrap_or::<u64>(&m, "prealloc-amount", defaults.prealloc_amount),
-            override_params_file: m.get_one::<String>("override-params-file").cloned(),
+            override_params_file: m.get_one::<String>("override-params-file").cloned().or(defaults.override_params_file),
             rocksdb_preset: m.get_one::<String>("rocksdb-preset").cloned().or(defaults.rocksdb_preset),
             rocksdb_wal_dir: m.get_one::<String>("rocksdb-wal-dir").cloned().or(defaults.rocksdb_wal_dir),
             rocksdb_cache_size: m.get_one::<usize>("rocksdb-cache-size").cloned().or(defaults.rocksdb_cache_size),
@@ -689,6 +692,23 @@ mod tests {
         let args = Args::parse(["kaspad", r"--ua-rule=allow;regex:(^|/)kaspad:", r"--ua-rule=reject;ver:kaspad<1.1.1"]).unwrap();
 
         assert_eq!(args.ua_rule, vec![r"allow;regex:(^|/)kaspad:", r"reject;ver:kaspad<1.1.1"]);
+    }
+
+    #[test]
+    fn config_file_values_are_not_dropped() {
+        let path = std::env::temp_dir().join(format!("kaspad-args-test-{}.toml", std::process::id()));
+        std::fs::write(
+            &path,
+            "verify-shielded-history = true\nshielded-history = false\nconsensus-diag = \"/tmp/diag\"\nenablebanning = true\n",
+        )
+        .unwrap();
+        let args = Args::parse(["kaspad".to_string(), format!("--configfile={}", path.display())]);
+        let _ = std::fs::remove_file(&path);
+        let args = args.unwrap();
+        assert!(args.verify_shielded_history);
+        assert_eq!(args.shielded_history, Some(false));
+        assert_eq!(args.consensus_diag.as_deref(), Some("/tmp/diag"));
+        assert!(args.enable_banning);
     }
 
     #[test]
