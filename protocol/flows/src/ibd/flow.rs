@@ -1338,23 +1338,8 @@ impl IbdFlow {
                 return Ok(());
             }
 
-            // F-15 SAFETY: the re-import below clears the global nullifier set. If the pruning
-            // point's selected child was already UTXO-validated locally, validated chain blocks
-            // above the pruning point have contributed nullifiers to that set which a clear
-            // would destroy without revalidation. An honest node in that situation matches the
-            // committed root (handled above), so reaching here means the local state is corrupt
-            // AND has validated descendants — no in-place re-import can repair that, and
-            // clearing would trade a detectable wedge for silent state loss.
-            if consensus
-                .async_get_block_status(child)
-                .await
-                .is_some_and(|s| s == kaspa_consensus_core::blockstatus::BlockStatus::StatusUTXOValid)
-            {
-                return Err(ProtocolError::OtherOwned(format!(
-                    "local shielded state at pruning point {pruning_point} does not match the PoW-committed root, but chain \
-                     blocks above it are already validated; refusing to clear live shielded state — a full resync is required"
-                )));
-            }
+            // F-15 SAFETY: never clear live shielded state under validated descendants.
+            refuse_if_validated_above(consensus, child, pruning_point).await?;
         }
 
         // The clear is no longer issued here. It is staged in the same write as the verified seed
@@ -1375,6 +1360,11 @@ impl IbdFlow {
 
         // Metadata frame. Empty `data` => the pruning point has no shielded state.
         let md = stream.recv_metadata().await?;
+        // Again, now that the peer has answered: the node kept processing blocks while it waited, and a
+        // chain walk may have validated the child since the check above. From here on the importer
+        // itself watches for that (it records the child's status before consuming the stream and
+        // re-checks it under the lock it swaps the state in).
+        refuse_if_validated_above(consensus, child, pruning_point).await?;
         if md.data.is_empty() {
             // F-02: the "empty" claim must also match the PoW commitment — a peer that claims
             // empty while the selected child commits a non-empty root is misbehaving.
@@ -1877,6 +1867,23 @@ fn validate_pruning_point_freshness_for_toccata(
     Ok(())
 }
 
+/// F-15 SAFETY: the shielded re-import clears the global nullifier set. If the pruning point's selected
+/// child was already UTXO-validated locally, validated chain blocks above the pruning point have
+/// contributed nullifiers to that set which a clear would destroy without revalidation. An honest node
+/// in that situation matches the committed root (the import is skipped), so reaching the import means
+/// the local state is corrupt AND has validated descendants — no in-place re-import can repair that, and
+/// clearing would trade a detectable wedge for silent state loss.
+async fn refuse_if_validated_above(consensus: &ConsensusProxy, child: Hash, pruning_point: Hash) -> Result<(), ProtocolError> {
+    use kaspa_consensus_core::blockstatus::BlockStatus;
+    if consensus.async_get_block_status(child).await.is_some_and(|s| s == BlockStatus::StatusUTXOValid) {
+        return Err(ProtocolError::OtherOwned(format!(
+            "local shielded state at pruning point {pruning_point} does not match the PoW-committed root, but chain blocks \
+             above it are already validated; refusing to clear live shielded state — a full resync is required"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1982,3 +1989,4 @@ mod tests {
         );
     }
 }
+

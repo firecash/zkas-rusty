@@ -981,6 +981,305 @@ async fn reorg_nullifier_revert_is_visible_to_rejoining_spend() {
     );
 }
 
+/// Where a crash lands inside one virtual-chain move (each is the gap between two atomic writes).
+#[derive(Clone, Copy, Debug)]
+enum CrashWindow {
+    /// After the down-walk batch: the abandoned branch's nullifiers are gone, the virtual state still
+    /// names the abandoned tip, so the set is short of the sink's.
+    AfterDownWalk,
+    /// After the commit of the new-branch block that applies the spend: the set holds a nullifier the
+    /// persisted sink never spent.
+    AfterSpendingBlockCommit,
+    /// After every block of the walk, before the virtual state commit: the set is the new branch's,
+    /// the persisted sink the old one.
+    BeforeVirtualCommit,
+}
+
+/// Crash injection over the reorg windows (audit F9). A heavier branch B takes over from branch A; at
+/// the chosen window a RocksDB checkpoint is taken, which is exactly what a node killed there leaves
+/// on disk. The image is reopened as a fresh node and must:
+///   * really be inside the window (the live set does not match the snapshot at its persisted sink,
+///     the state that used to latch "resync this node" for good);
+///   * be brought back to its sink by the startup reconcile, before anything reads the set;
+///   * finish the reorg when the next block arrives with exactly the never-crashed node's set;
+///   * on a copy with the cursor removed (a database an older build wrote), be rebuilt by the
+///     self-check from the per-block diffs instead of only latching.
+///
+/// In `AfterDownWalk` both branches spend note N (only A's spend is lost by the crash); in the other
+/// two only B spends it (B's spend is what the crash leaves behind).
+async fn reorg_crash_window_recovers(window: CrashWindow) {
+    use super::processor::{ReorgFailpoint, ReorgFailpointMatcher};
+    use kaspa_consensus_core::subnets::SUBNETWORK_ID_NATIVE;
+    use kaspa_consensus_core::tx::TX_VERSION_SHIELDED;
+    use kaspa_database::prelude::ConnBuilder;
+
+    let a_spends = matches!(window, CrashWindow::AfterDownWalk);
+    let mut params = MAINNET_PARAMS.clone();
+    params.shielded_coinbase = true;
+    params.dev_fee_recipient = None;
+    let config = ConfigBuilder::new(params)
+        .edit_consensus_params(|p| {
+            p.genesis.bits = 0x207fffff;
+            p.blockrate.finality_depth = 5;
+            p.blockrate.shielded_anchor_depth = 3;
+        })
+        .build();
+    let net = config.genesis.hash.as_bytes();
+
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+    let miner_seed = [7u8; 32];
+    let miner_addr = kaspa_shielded_core::wallet::address_bytes_from_seed(miner_seed).expect("orchard address");
+    ctx.miner_data = MinerData::new(ScriptPublicKey::new(0, ScriptVec::from_slice(&miner_addr)), vec![]);
+
+    // Common chain: block 1 mints note N; extend until its anchor matures.
+    let mut block1 = None;
+    for _ in 0..2 {
+        let b = ctx.mine_real_pow_block();
+        ctx.consensus.validate_and_insert_block(b.clone()).virtual_state_task.await.unwrap();
+        block1 = Some(b);
+    }
+    let block1 = block1.unwrap();
+    let cb = &block1.transactions[0];
+    let cb_txid = cb.id();
+    let note_value = cb.outputs[0].value;
+    let mut split = block1.header.hash;
+    for _ in 0..5 {
+        let b = ctx.mine_real_pow_block();
+        split = b.header.hash;
+        ctx.consensus.validate_and_insert_block(b).virtual_state_task.await.unwrap();
+    }
+
+    let recipient_addr = kaspa_shielded_core::wallet::address_bytes_from_seed([9u8; 32]).unwrap();
+    let mut spend_tx = Transaction::new(TX_VERSION_SHIELDED, vec![], vec![], 0, SUBNETWORK_ID_NATIVE, 0, vec![]);
+    let tx_ctx = spend_tx.shielded_sighash_context();
+    spend_tx.payload = kaspa_shielded_core::wallet::build::build_singleleaf_coinbase_spend(
+        miner_seed,
+        cb_txid.as_bytes(),
+        0,
+        note_value,
+        recipient_addr,
+        note_value - 2_000,
+        &net,
+        &tx_ctx,
+    )
+    .expect("wallet builds a real spend bundle");
+    spend_tx.finalize();
+
+    // B1 (the spend) is built while the common chain is selected, as in the F-01 test.
+    let b1 = ctx.mine_real_pow_block_on(vec![split], vec![spend_tx.clone()]);
+    let b1_hash = b1.header.hash;
+    let a1 = ctx.mine_real_pow_block_on(vec![split], if a_spends { vec![spend_tx.clone()] } else { vec![] });
+    let a1_hash = a1.header.hash;
+    ctx.consensus.validate_and_insert_block(a1).virtual_state_task.await.unwrap();
+    let a2 = ctx.mine_real_pow_block_on(vec![a1_hash], vec![]);
+    let a2_hash = a2.header.hash;
+    ctx.consensus.validate_and_insert_block(a2).virtual_state_task.await.unwrap();
+    assert_eq!(ctx.consensus.get_sink(), a2_hash, "branch A is selected before B arrives");
+
+    ctx.consensus.validate_and_insert_block(b1).virtual_state_task.await.unwrap();
+    assert_eq!(ctx.consensus.get_sink(), a2_hash, "B1 alone is lighter than A");
+    let b2 = ctx.mine_real_pow_block_on(vec![b1_hash], vec![]);
+    let b2_hash = b2.header.hash;
+
+    // Arm the crash image. B2 ties A and B3 outweighs it; whichever insert moves the sink off A runs
+    // the walk, so the matchers key on the walk, not on the insert.
+    let image_dir = kaspa_database::utils::get_kaspa_tempdir();
+    let image = image_dir.path().join("crash");
+    let legacy_image = image_dir.path().join("crash-without-cursor");
+    let matcher: ReorgFailpointMatcher = match window {
+        CrashWindow::AfterDownWalk => Box::new(move |fp: &ReorgFailpoint| {
+            matches!(*fp, ReorgFailpoint::AfterDownWalk { from, split } if from == a2_hash && split != a2_hash)
+        }),
+        // B2 merges B1, so B2's own commit is the one that applies the spend.
+        CrashWindow::AfterSpendingBlockCommit => {
+            Box::new(move |fp: &ReorgFailpoint| matches!(*fp, ReorgFailpoint::AfterChainBlockCommit(block) if block == b2_hash))
+        }
+        CrashWindow::BeforeVirtualCommit => Box::new(move |fp: &ReorgFailpoint| {
+            matches!(*fp, ReorgFailpoint::BeforeVirtualCommit { prev_sink, new_sink } if prev_sink == a2_hash && new_sink != a2_hash)
+        }),
+    };
+    ctx.consensus.virtual_processor().arm_crash_image(matcher, image.clone());
+
+    ctx.consensus.validate_and_insert_block(b2.clone()).virtual_state_task.await.unwrap();
+    let b3 = ctx.mine_real_pow_block_on(vec![b2_hash], vec![]);
+    let b3_hash = b3.header.hash;
+    ctx.consensus.validate_and_insert_block(b3.clone()).virtual_state_task.await.unwrap();
+    assert_eq!(ctx.consensus.get_sink(), b3_hash, "branch B took over");
+    assert!(!ctx.consensus.virtual_processor().crash_image_pending(), "the walk reached the {window:?} failpoint");
+
+    // The never-crashed control receives one more block on B.
+    let c = ctx.mine_real_pow_block_on(vec![b3_hash], vec![]);
+    let c_hash = c.header.hash;
+    ctx.consensus.validate_and_insert_block(c.clone()).virtual_state_task.await.unwrap();
+    assert_eq!(ctx.consensus.get_sink(), c_hash);
+    let control_sm = ctx.consensus.virtual_processor().shielded_state_manager_ref();
+    assert!(control_sm.global_set_matches_snapshot(c_hash).unwrap().0, "the control's set matches its sink");
+    let control_set = control_sm.nullifier_set_snapshot().unwrap();
+
+    // A node reopened on the image must not process genesis again.
+    let mut reopen_config = config.clone();
+    reopen_config.process_genesis = false;
+
+    {
+        let (lifetime, db) = kaspa_database::load_existing_db!(&image, ConnBuilder::default().with_files_limit(10));
+        // A second image of the same crash, for the older-build case below.
+        rocksdb::checkpoint::Checkpoint::new(&**db).unwrap().create_checkpoint(&legacy_image).unwrap();
+        let (sender, _receiver) = async_channel::unbounded();
+        let node = TestConsensus::with_db(db, &reopen_config, sender);
+        let sm = node.virtual_processor().shielded_state_manager_ref();
+        assert_eq!(node.get_sink(), a2_hash, "the crash landed before the virtual state moved off A");
+        assert!(
+            !sm.global_set_matches_snapshot(a2_hash).unwrap().0,
+            "{window:?}: the crash left the set off the persisted sink (what the self-check used to latch on)"
+        );
+        assert_ne!(sm.nullifier_cursor().unwrap(), Some(a2_hash), "the cursor records where the set really is");
+
+        // Restart: the reconcile runs before the processors.
+        let mut restarted = TestContext::new(node);
+        let sm = restarted.consensus.virtual_processor().shielded_state_manager_ref();
+        assert!(sm.global_set_matches_snapshot(a2_hash).unwrap().0, "{window:?}: startup brought the set to the sink");
+        assert_eq!(sm.nullifier_cursor().unwrap(), Some(a2_hash));
+
+        // Delivering the rest of B finishes the reorg exactly as on the node that never crashed. (B3 is
+        // absent from the image when the crash came while B2 was being resolved.)
+        for block in [b2.clone(), b3.clone(), c.clone()] {
+            if restarted.consensus.get_block_status(block.hash()).is_none_or(|status| !status.has_block_body()) {
+                restarted.validate_and_insert_block(block).await;
+            }
+        }
+        assert_eq!(restarted.consensus.get_sink(), c_hash);
+        let sm = restarted.consensus.virtual_processor().shielded_state_manager_ref();
+        assert!(sm.global_set_matches_snapshot(c_hash).unwrap().0, "{window:?}: the finished reorg matches its sink");
+        assert_eq!(sm.nullifier_set_snapshot().unwrap(), control_set, "{window:?}: same set as the node that never crashed");
+        drop(restarted);
+        drop(lifetime);
+    }
+
+    {
+        let (lifetime, db) = kaspa_database::load_existing_db!(&legacy_image, ConnBuilder::default().with_files_limit(10));
+        let (sender, _receiver) = async_channel::unbounded();
+        let node = TestConsensus::with_db(db, &reopen_config, sender);
+        let vp = node.virtual_processor();
+        let sm = vp.shielded_state_manager_ref();
+        let mut batch = rocksdb::WriteBatch::default();
+        sm.delete_nullifier_cursor_for_test(&mut batch).unwrap();
+        vp.write_batch_for_test(batch);
+        vp.reconcile_nullifier_set_at_startup();
+        assert!(!sm.global_set_matches_snapshot(a2_hash).unwrap().0, "without a cursor the reconcile has nothing to go on");
+        let (removed, restored) = vp.rebuild_nullifier_set(a2_hash, node.pruning_point()).expect("rebuilt from the diffs");
+        assert!(removed + restored > 0, "{window:?}: the rebuild changed something");
+        assert!(sm.global_set_matches_snapshot(a2_hash).unwrap().0, "{window:?}: the rebuilt set matches the snapshot");
+        assert_eq!(sm.nullifier_cursor().unwrap(), Some(a2_hash), "the rebuild records where the set now is");
+        drop(node);
+        drop(lifetime);
+    }
+}
+
+#[tokio::test]
+async fn reorg_crash_after_the_down_walk_recovers() {
+    reorg_crash_window_recovers(CrashWindow::AfterDownWalk).await;
+}
+
+#[tokio::test]
+async fn reorg_crash_after_a_new_branch_block_commit_recovers() {
+    reorg_crash_window_recovers(CrashWindow::AfterSpendingBlockCommit).await;
+}
+
+#[tokio::test]
+async fn reorg_crash_before_the_virtual_commit_recovers() {
+    reorg_crash_window_recovers(CrashWindow::BeforeVirtualCommit).await;
+}
+
+/// A set left above the pruning point by something other than a crashed walk (here: one nullifier
+/// dropped and one stray added behind the processor's back, with no cursor change) is outside what
+/// the cursor can describe. The self-check rebuild still restores it, because the result is checked
+/// against the committed snapshot; damage it cannot account for is refused, never written.
+#[tokio::test]
+async fn self_check_rebuilds_a_damaged_set_and_refuses_what_it_cannot_prove() {
+    let mut params = MAINNET_PARAMS.clone();
+    params.shielded_coinbase = true;
+    params.dev_fee_recipient = None;
+    let config = ConfigBuilder::new(params)
+        .edit_consensus_params(|p| {
+            p.genesis.bits = 0x207fffff;
+            p.blockrate.finality_depth = 5;
+            p.blockrate.shielded_anchor_depth = 3;
+        })
+        .build();
+    let net = config.genesis.hash.as_bytes();
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+    let miner_seed = [7u8; 32];
+    let miner_addr = kaspa_shielded_core::wallet::address_bytes_from_seed(miner_seed).expect("orchard address");
+    ctx.miner_data = MinerData::new(ScriptPublicKey::new(0, ScriptVec::from_slice(&miner_addr)), vec![]);
+    let mut block1 = None;
+    for _ in 0..2 {
+        let b = ctx.mine_real_pow_block();
+        ctx.consensus.validate_and_insert_block(b.clone()).virtual_state_task.await.unwrap();
+        block1 = Some(b);
+    }
+    let block1 = block1.unwrap();
+    let cb_txid = block1.transactions[0].id();
+    let note_value = block1.transactions[0].outputs[0].value;
+    for _ in 0..5 {
+        let b = ctx.mine_real_pow_block();
+        ctx.consensus.validate_and_insert_block(b).virtual_state_task.await.unwrap();
+    }
+    let recipient_addr = kaspa_shielded_core::wallet::address_bytes_from_seed([9u8; 32]).unwrap();
+    let mut spend_tx = Transaction::new(
+        kaspa_consensus_core::tx::TX_VERSION_SHIELDED,
+        vec![],
+        vec![],
+        0,
+        kaspa_consensus_core::subnets::SUBNETWORK_ID_NATIVE,
+        0,
+        vec![],
+    );
+    let tx_ctx = spend_tx.shielded_sighash_context();
+    spend_tx.payload = kaspa_shielded_core::wallet::build::build_singleleaf_coinbase_spend(
+        miner_seed,
+        cb_txid.as_bytes(),
+        0,
+        note_value,
+        recipient_addr,
+        note_value - 2_000,
+        &net,
+        &tx_ctx,
+    )
+    .expect("wallet builds a real spend bundle");
+    spend_tx.finalize();
+    let b = ctx.mine_real_pow_block_on(vec![ctx.consensus.get_sink()], vec![spend_tx]);
+    ctx.consensus.validate_and_insert_block(b).virtual_state_task.await.unwrap();
+    let b = ctx.mine_real_pow_block();
+    ctx.consensus.validate_and_insert_block(b).virtual_state_task.await.unwrap();
+
+    let vp = ctx.consensus.virtual_processor();
+    let sm = vp.shielded_state_manager_ref();
+    let sink = ctx.consensus.get_sink();
+    let pp = ctx.consensus.pruning_point();
+    let live = sm.nullifier_set_snapshot().unwrap();
+    assert!(!live.is_empty(), "the spend's nullifiers are in the set");
+    let spent = live[0];
+    assert!(sm.global_set_matches_snapshot(sink).unwrap().0);
+
+    // A spent nullifier of the sink's chain goes missing: restored from its block's diff (nothing
+    // else is off, so exactly one entry changes).
+    let mut batch = rocksdb::WriteBatch::default();
+    let cursor = sm.nullifier_cursor().unwrap().expect("a fresh database records a cursor");
+    sm.stage_nullifier_set_repair(&mut batch, &[spent], &[], cursor).unwrap();
+    vp.write_batch_for_test(batch);
+    assert!(!sm.global_set_matches_snapshot(sink).unwrap().0);
+    assert_eq!(vp.rebuild_nullifier_set(sink, pp), Ok((0, 1)));
+    assert!(sm.global_set_matches_snapshot(sink).unwrap().0);
+
+    // A stray no block's diff accounts for: the rebuild cannot prove anything, so it writes nothing.
+    let stray = [0xabu8; 32];
+    let mut batch = rocksdb::WriteBatch::default();
+    sm.stage_nullifier_set_repair(&mut batch, &[], &[stray], cursor).unwrap();
+    vp.write_batch_for_test(batch);
+    assert!(vp.rebuild_nullifier_set(sink, pp).is_err(), "damage outside every diff is reported, not papered over");
+    assert!(sm.is_nullifier_spent(&stray).unwrap(), "a refused rebuild leaves the set exactly as it was");
+}
+
 #[tokio::test]
 async fn block_template_version_changes_to_v2_upon_activation() {
     let activation = MAINNET_PARAMS.genesis.daa_score + 10;

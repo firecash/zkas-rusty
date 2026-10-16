@@ -249,6 +249,41 @@ pub struct VirtualStateProcessor {
 
     // Mining Rule
     _mining_rules: Arc<MiningRules>,
+
+    /// Test-only crash injection: when a reached [`ReorgFailpoint`] matches, a RocksDB checkpoint of
+    /// the database is taken right there, which is exactly what a process killed at that point leaves
+    /// on disk. Processing then continues; the test reopens the image to prove recovery.
+    #[cfg(test)]
+    pub(crate) crash_image_at: Mutex<Option<(ReorgFailpointMatcher, std::path::PathBuf)>>,
+}
+
+/// The points between the separate writes of one virtual-chain move. Each write is atomic; a crash can
+/// only land between them.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ReorgFailpoint {
+    /// The down-walk batch (reverts of the abandoned branch) is written; nothing of the new branch is.
+    /// Reached on every walk; `split == from` when nothing was abandoned.
+    AfterDownWalk { from: Hash, split: Hash },
+    /// One chain block's own batch (its validation commit, or its re-apply) is written.
+    AfterChainBlockCommit(Hash),
+    /// Every chain block of the walk is written; the virtual state naming the new sink is not.
+    BeforeVirtualCommit { prev_sink: Hash, new_sink: Hash },
+}
+
+#[cfg(test)]
+pub(crate) type ReorgFailpointMatcher = Box<dyn Fn(&ReorgFailpoint) -> bool + Send>;
+
+/// A pruning-point shielded import that passed every check, ready to be staged. Holding one means
+/// only that the data is proven; whether the node may still replace its live state with it is decided
+/// when it is staged (see `Consensus::import_pruning_point_shielded`).
+pub struct VerifiedShieldedImport {
+    pp: Hash,
+    md: crate::processes::shielded::PruningPointShieldedMetadata,
+    window: Option<kaspa_shielded_core::anchor_window::AnchorLog>,
+    proven_entries: Vec<(kaspa_shielded_core::anchor_window::WindowEntry, kaspa_shielded_core::anchor_window::AnchorLog)>,
+    nullifiers: Vec<[u8; 32]>,
+    n: usize,
 }
 
 impl VirtualStateProcessor {
@@ -362,6 +397,8 @@ impl VirtualStateProcessor {
             pp_nullifier_export_cache: Mutex::new(None),
             pp_export_metadata_cache: Mutex::new(None),
             _mining_rules: mining_rules,
+            #[cfg(test)]
+            crash_image_at: Mutex::new(None),
             finality_depth: params.finality_depth(),
             shielded_anchor_depth: params.shielded_anchor_depth(),
             max_shielded_anchor_age: params.max_shielded_anchor_age(),
@@ -709,7 +746,9 @@ impl VirtualStateProcessor {
     /// Verifies the imported pruning-point state and stages, into `batch`, the clear of the old
     /// state followed by the seed of the new one. Nothing is written here: the caller writes the
     /// batch once, so there is no moment at which the node holds an empty nullifier set, and a
-    /// failed verification leaves the old state untouched.
+    /// failed verification leaves the old state untouched. [`Self::verify_pruning_point_shielded_import`]
+    /// followed by [`Self::stage_verified_shielded_import`]; a caller that must exclude concurrent
+    /// writers of the live set calls the two halves itself, so the lock covers only the second.
     pub fn seed_pruning_point_shielded(
         &self,
         batch: &mut WriteBatch,
@@ -718,6 +757,19 @@ impl VirtualStateProcessor {
         expected_state_root: Option<[u8; 32]>,
         nullifiers: Vec<[u8; 32]>,
     ) -> Result<usize, String> {
+        let verified = self.verify_pruning_point_shielded_import(pp, metadata, expected_state_root, nullifiers)?;
+        self.stage_verified_shielded_import(batch, verified)
+    }
+
+    /// Verify an imported pruning-point state completely, reading nothing the live chain walk writes
+    /// (only headers and the PoW binding), so it can run while the node keeps processing blocks.
+    pub fn verify_pruning_point_shielded_import(
+        &self,
+        pp: kaspa_hashes::Hash,
+        metadata: kaspa_consensus_core::api::ShieldedExportMetadata,
+        expected_state_root: Option<[u8; 32]>,
+        nullifiers: Vec<[u8; 32]>,
+    ) -> Result<VerifiedShieldedImport, String> {
         use crate::processes::shielded::{PruningPointShieldedMetadata, ShieldedStateManager};
         let mut md = PruningPointShieldedMetadata::from_wire_bytes(&metadata.data)?;
         // F-02: reject the import before seeding if it does not match the
@@ -769,6 +821,15 @@ impl VirtualStateProcessor {
         if n as u64 != metadata.nullifier_count {
             return Err(format!("nullifier count mismatch: metadata says {}, streamed {}", metadata.nullifier_count, n));
         }
+        Ok(VerifiedShieldedImport { pp, md, window, proven_entries, nullifiers, n })
+    }
+
+    /// Stage a verified import into `batch`: the clear of the old state, then the seed. The clear
+    /// enumerates the LIVE nullifier set, so the caller must hold a lock that excludes every writer of
+    /// that set (the virtual write lock) from here until the batch is written; otherwise a nullifier a
+    /// concurrent chain walk inserts after the enumeration survives the clear.
+    pub fn stage_verified_shielded_import(&self, batch: &mut WriteBatch, verified: VerifiedShieldedImport) -> Result<usize, String> {
+        let VerifiedShieldedImport { pp, md, window, proven_entries, nullifiers, n } = verified;
         // Clear first, then seed, in the same batch. Every seed write is an overwrite, and a
         // WriteBatch applies in order, so a nullifier in both the old and the new set ends present.
         self.shielded_state_manager
@@ -800,11 +861,85 @@ impl VirtualStateProcessor {
         }
     }
 
+    /// Move the global nullifier set from the chain block its cursor names to `target`, in one batch:
+    /// revert the diffs along the cursor's chain down to where it meets `target`'s, re-apply
+    /// `target`'s chain up from there, and record `target` as the new position. Returns the position
+    /// it moved from, or `None` when there is nothing to move (already there, or no cursor recorded on
+    /// a database an older build wrote).
+    ///
+    /// Walks only where every diff it reads is guaranteed to be on disk: `floor` (a finality point)
+    /// must be on the selected chain of both ends, so the walk never goes below it, and nothing above
+    /// a finality point is pruned. That matters because a missing diff reads back as "added no
+    /// nullifiers", which would make the move silently wrong instead of failing. Refused otherwise.
+    ///
+    /// One batch is safe here (unlike the walk in `calculate_utxo_state_relatively`) because nothing
+    /// reads the set between the staged reverts and re-applies: the caller holds the virtual
+    /// upgradable lock, which every other writer of the set also holds. Reverts are staged first, so a
+    /// nullifier both branches spent ends present.
+    fn move_nullifier_set_to(&self, target: Hash, floor: Hash) -> Result<Option<Hash>, String> {
+        let sm = &self.shielded_state_manager;
+        let Some(cursor) = sm.nullifier_cursor().map_err(|e| format!("reading the nullifier-set cursor: {e}"))? else {
+            return Ok(None);
+        };
+        if cursor == target {
+            return Ok(None);
+        }
+        let reach = &self.reachability_service;
+        for end in [cursor, target] {
+            if !reach.try_is_chain_ancestor_of(floor, end).unwrap_or(false) {
+                return Err(format!(
+                    "{end} is not above the finality point {floor}; the diffs between {cursor} and {target} are not all held"
+                ));
+            }
+        }
+        let mut batch = WriteBatch::default();
+        let mut split = None;
+        for current in reach.default_backward_chain_iterator(cursor) {
+            if reach.is_chain_ancestor_of(current, target) {
+                split = Some(current);
+                break;
+            }
+            sm.revert_nullifiers_from_store(&mut batch, current).map_err(|e| format!("reverting {current}: {e}"))?;
+        }
+        // `floor` is a chain ancestor of both ends, so the walk meets `target`'s chain at or above it.
+        let split = split.ok_or_else(|| format!("the chains of {cursor} and {target} do not meet"))?;
+        for current in reach.forward_chain_iterator(split, target, true).skip(1) {
+            sm.apply_nullifiers_from_store(&mut batch, current).map_err(|e| format!("re-applying {current}: {e}"))?;
+        }
+        sm.set_nullifier_cursor(&mut batch, target).map_err(|e| format!("staging the cursor: {e}"))?;
+        self.db.write(batch).unwrap();
+        Ok(Some(cursor))
+    }
+
+    /// Startup half of the nullifier-set cursor: before any processor runs, bring the global set to the
+    /// persisted sink, which is where the first walk after startup assumes it is. Repairs every crash
+    /// window of a chain walk (after the down-walk, after any chain block of the up-walk, before the
+    /// virtual state commit): each of those leaves the set at a recorded chain block above the
+    /// finality point. Judged only on stable state; a node mid-IBD is legitimately not at its sink.
+    pub fn reconcile_nullifier_set_at_startup(&self) {
+        // Read before the virtual lock: `intrusive_pruning_point_store_writes` takes the pruning-point
+        // store and then the virtual stores, so reading the former under the latter can deadlock.
+        let pruning_point = self.pruning_point_store.read().pruning_point().unwrap();
+        let virtual_state = self.lkg_virtual_state.load();
+        let sink = virtual_state.ghostdag_data.selected_parent;
+        let floor = self.virtual_finality_point(&virtual_state.ghostdag_data, pruning_point);
+        let _guard = self.virtual_stores.upgradable_read();
+        match self.move_nullifier_set_to(sink, floor) {
+            Ok(Some(was)) => warn!(
+                "shielded: an interrupted chain walk left the nullifier set at {was}; moved it to the sink {sink} from the \
+                 per-block diffs"
+            ),
+            Ok(None) => {}
+            Err(e) => warn!("shielded: could not move the nullifier set to the sink {sink} ({e}); the self-check decides"),
+        }
+    }
+
     /// Startup self-check: the live nullifier set must hash to the snapshot at the sink, which is the
     /// set the committed state root covers. They are two representations of one set, written on
-    /// different paths (a crash inside a rejected reorg can leave them apart), and nothing else
-    /// reconciles them. On mismatch the node refuses block templates and says so loudly; it never
-    /// repairs itself. Holds the virtual read lock so blocks are not committed mid-scan.
+    /// different paths, and only the snapshot is intrinsic to a block. On a mismatch the set is
+    /// rebuilt from the per-block diffs and written only if the rebuilt set hashes to the snapshot
+    /// (`rebuild_nullifier_set`); if it cannot be rebuilt the node refuses templates and wallet reads
+    /// and says so loudly. Holds the virtual upgradable lock so blocks are not committed mid-scan.
     pub fn check_nullifier_set_consistency(&self) {
         // Only a node whose shielded state is marked stable is judged: one restarted mid-import (or
         // a staging consensus during IBD) is legitimately not at its sink yet, and a false alarm
@@ -812,6 +947,8 @@ impl VirtualStateProcessor {
         if !self.shielded_coinbase || !self.pruning_meta_stores.read().pruning_shielded_stable_flag() {
             return;
         }
+        // Before the virtual lock, for the lock order explained in `reconcile_nullifier_set_at_startup`.
+        let pruning_point = self.pruning_point_store.read().pruning_point().unwrap();
         // UPGRADABLE read, not a plain read: `resolve_virtual` holds the upgradable lock while it
         // persists new chain blocks' nullifiers into the global set, and moves the sink only later
         // under the write lock. A plain read does not exclude that window, so a block resolved
@@ -826,15 +963,94 @@ impl VirtualStateProcessor {
                 info!("shielded self-check: live nullifier set ({count}) matches the committed snapshot at {sink} ({:.1?})", started.elapsed())
             }
             Ok((false, count)) => {
-                kaspa_consensus_core::SHIELDED_STATE_DIVERGED.store(true, std::sync::atomic::Ordering::SeqCst);
-                kaspa_core::error!(
-                    "shielded self-check FAILED: the live nullifier set ({count}) does not match the snapshot the committed \
-                     state root covers at {sink}. This node would judge double-spends differently from the network. Block \
-                     templates are refused. Resync this node."
+                warn!(
+                    "shielded self-check: the live nullifier set ({count}) does not match the snapshot the committed state root \
+                     covers at {sink}; rebuilding it from the per-block diffs"
                 );
+                match self.rebuild_nullifier_set(sink, pruning_point) {
+                    Ok((removed, restored)) => warn!(
+                        "shielded self-check: rebuilt the nullifier set at {sink} ({removed} stale entries removed, {restored} \
+                         restored); it now matches the committed snapshot ({:.1?})",
+                        started.elapsed()
+                    ),
+                    Err(e) => {
+                        kaspa_consensus_core::SHIELDED_STATE_DIVERGED.store(true, std::sync::atomic::Ordering::SeqCst);
+                        kaspa_core::error!(
+                            "shielded self-check FAILED: the live nullifier set ({count}) does not match the snapshot the \
+                             committed state root covers at {sink}, and it cannot be rebuilt here: {e}. This node would judge \
+                             double-spends differently from the network. Block templates and wallet reads are refused. Resync \
+                             this node."
+                        );
+                    }
+                }
             }
             Err(e) => warn!("shielded self-check could not run: {e}"),
         }
+    }
+
+    /// Rebuild the global nullifier set as of `sink` from what the node holds, and write it only if
+    /// the result hashes to the snapshot the committed state root covers at `sink`. Returns how many
+    /// entries were removed and restored.
+    ///
+    /// What is held: the live set, and a per-block diff for every chain block validated above the
+    /// pruning point (both those on the sink's chain and those of abandoned branches). Any set this
+    /// node's own walks can leave behind is the union of the diffs along SOME chain through the
+    /// pruning point, so it differs from the sink's set only in diffs of blocks above the pruning
+    /// point: entries of off-chain blocks that the sink's chain did not also spend are dropped, and
+    /// entries of the sink's chain are restored. The snapshot check makes this safe whatever the
+    /// damage was: MuHash is collision resistant, so a set that hashes to the snapshot is the set.
+    ///
+    /// What is not held, and so cannot be rebuilt: the set below the pruning point exists only as the
+    /// live set itself (an IBD import seeds it whole and keeps no copy, and the pruner deletes the
+    /// diffs below the pruning point). Damage there fails the snapshot check and is reported.
+    pub(super) fn rebuild_nullifier_set(&self, sink: Hash, pruning_point: Hash) -> Result<(usize, usize), String> {
+        use std::collections::HashSet;
+        let sm = &self.shielded_state_manager;
+        let reach = &self.reachability_service;
+        let mut on_chain: HashSet<[u8; 32]> = HashSet::new();
+        let mut off_chain: HashSet<[u8; 32]> = HashSet::new();
+        for entry in sm.nullifier_diffs_iter() {
+            let (block, nullifiers) = entry.map_err(|e| format!("reading the per-block nullifier diffs: {e}"))?;
+            match reach.try_is_chain_ancestor_of(block, sink) {
+                Ok(true) => on_chain.extend(nullifiers),
+                // Only blocks with the pruning point on their own chain: their diffs hold nothing the
+                // set below the pruning point holds, so dropping them cannot remove an older spend.
+                Ok(false) if reach.try_is_chain_ancestor_of(pruning_point, block).unwrap_or(false) => off_chain.extend(nullifiers),
+                // Off the pruning point's chain, or already pruned (no reachability data): not used.
+                _ => {}
+            }
+        }
+        let mut acc = MuHash::new();
+        for nf in sm.nullifiers().iter_all() {
+            acc.add_element(&nf.map_err(|e| format!("reading the live set: {e}"))?);
+        }
+        let mut remove = Vec::new();
+        for nf in off_chain.difference(&on_chain) {
+            if sm.is_nullifier_spent(nf).map_err(|e| format!("reading the live set: {e}"))? {
+                acc.remove_element(nf);
+                remove.push(*nf);
+            }
+        }
+        let mut restore = Vec::new();
+        for nf in &on_chain {
+            if !sm.is_nullifier_spent(nf).map_err(|e| format!("reading the live set: {e}"))? {
+                acc.add_element(nf);
+                restore.push(*nf);
+            }
+        }
+        let snapshot = sm.nullifier_muhash_at(sink).map_err(|e| format!("reading the snapshot at {sink}: {e}"))?.finalize();
+        if acc.finalize() != snapshot {
+            return Err(format!(
+                "the set rebuilt from the diffs above the pruning point {pruning_point} still does not match, so the damage \
+                 is below it, where this node keeps no copy of the set ({} stale and {} missing entries were found above it)",
+                remove.len(),
+                restore.len()
+            ));
+        }
+        let mut batch = WriteBatch::default();
+        sm.stage_nullifier_set_repair(&mut batch, &remove, &restore, sink).map_err(|e| format!("staging the repair: {e}"))?;
+        self.db.write(batch).unwrap();
+        Ok((remove.len(), restore.len()))
     }
 
     /// Whether `block`'s own state is described by the post-fork root. Decided by the block's own
@@ -1015,6 +1231,8 @@ impl VirtualStateProcessor {
 
         let sink_multiset = self.utxo_multisets_store.get(new_sink).unwrap();
         let chain_path = self.dag_traversal_manager.calculate_chain_path(prev_sink, new_sink, None);
+        #[cfg(test)]
+        self.failpoint(ReorgFailpoint::BeforeVirtualCommit { prev_sink, new_sink });
         let sink_ghostdag_data = Lazy::new(|| self.ghostdag_store.get_data(new_sink).unwrap());
         // Cache the DAA and Median time windows of the sink for future use, as well as prepare for virtual's window calculations
         self.cache_sink_windows(new_sink, prev_sink, &sink_ghostdag_data);
@@ -1137,6 +1355,28 @@ impl VirtualStateProcessor {
     #[cfg(test)]
     pub(super) fn write_batch_for_test(&self, batch: WriteBatch) {
         self.db.write(batch).unwrap();
+    }
+
+    /// Arm a crash image: the first reached failpoint `matches` accepts gets the database
+    /// checkpointed to `path` (which must not exist yet).
+    #[cfg(test)]
+    pub(crate) fn arm_crash_image(&self, matches: ReorgFailpointMatcher, path: std::path::PathBuf) {
+        *self.crash_image_at.lock() = Some((matches, path));
+    }
+
+    /// Whether an armed crash image is still waiting for its failpoint.
+    #[cfg(test)]
+    pub(crate) fn crash_image_pending(&self) -> bool {
+        self.crash_image_at.lock().is_some()
+    }
+
+    #[cfg(test)]
+    fn failpoint(&self, point: ReorgFailpoint) {
+        let mut armed = self.crash_image_at.lock();
+        if armed.as_ref().is_some_and(|(matches, _)| matches(&point)) {
+            let (_, path) = armed.take().unwrap();
+            rocksdb::checkpoint::Checkpoint::new(&**self.db).unwrap().create_checkpoint(&path).unwrap();
+        }
     }
 
     /// Test helper: replace `block`'s scan record, as a backfilling peer could have written it.
@@ -1425,10 +1665,30 @@ impl VirtualStateProcessor {
     /// The function returns the top-most UTXO-valid block on `chain(to)` which is ideally
     /// `to` itself (with the exception of returning `from` if `to` is already known to be UTXO disqualified).
     /// When returning it is guaranteed that `diff` holds the diff of the returned block from virtual
-    fn calculate_utxo_state_relatively(&self, stores: &VirtualStores, diff: &mut UtxoDiff, from: Hash, to: Hash) -> Hash {
+    ///
+    /// `finality_point` bounds the walk from below (see the PRUNE SAFETY note in `resolve_virtual`).
+    fn calculate_utxo_state_relatively(
+        &self,
+        stores: &VirtualStores,
+        diff: &mut UtxoDiff,
+        from: Hash,
+        to: Hash,
+        finality_point: Hash,
+    ) -> Hash {
         // Avoid reorging if disqualified status is already known
         if self.statuses_store.read().get(to).unwrap() == StatusDisqualifiedFromChain {
             return from;
+        }
+
+        // The walk below assumes the global nullifier set reflects `from`. A walk that ran to the end in
+        // this process leaves it so, but the virtual state can also move without the set moving with
+        // it: a pruning-point UTXO import resets the sink, and an IBD that found the local shielded
+        // state already matching keeps the set where the old chain left it. The cursor records where
+        // the set really is, so bring it to `from` first. A no-op (one cached read) in the steady state.
+        match self.move_nullifier_set_to(from, finality_point) {
+            Ok(Some(was)) => warn!("shielded: the nullifier set reflected {was}, not the walk's start {from}; moved it there first"),
+            Ok(None) => {}
+            Err(e) => debug!("shielded: nullifier set not moved to {from} before walking: {e}"),
         }
 
         let mut split_point: Option<Hash> = None;
@@ -1446,16 +1706,19 @@ impl VirtualStateProcessor {
         // consensus divergence between nodes that reorged and nodes that never saw the abandoned
         // branch (audit finding F-01).
         //
-        // Batch 2 (committed at the end of the walk, as before) holds the up-walk re-applies of the
-        // rejoining branch's nullifiers. Inserts are cache-visible immediately, so within-walk
-        // reads are unaffected; the batch still lands atomically at the end of the walk so a crash
-        // mid-reorg can never leave the global nullifier set desynced from the selected chain
-        // (there is no header commitment to detect such a split).
+        // After it, every chain block of the up-walk is its own batch (a re-apply, or the block's
+        // validation commit), for the reason given at the re-apply below. The virtual state naming
+        // the new sink is written later still, by `commit_virtual_state`.
         //
-        // Crash consistency: both batches are idempotent (deleting an absent key and re-inserting a
-        // present key are no-ops in RocksDB) and the walk re-executes from the last committed
-        // virtual state on restart, so a crash between batch 1 and batch 2 simply re-walks: reverts
-        // are no-op deletes and re-applies re-run.
+        // Crash consistency: the set therefore moves in several atomic steps while the persisted sink
+        // moves once, so a crash between them leaves the set reflecting some chain block other than
+        // the sink. Re-walking on restart does not repair that: the restart walks from the persisted
+        // sink, and the blocks between it and where the set really stood are not on that walk (a set
+        // stopped mid-way up branch B stays B's after the node settles back on A, and one stopped
+        // right after the down-walk stays short of A's nullifiers). So every one of these batches also
+        // records which chain block the set now reflects (the nullifier-set cursor), and the set is
+        // brought to the walk's start from that record before anything reads it: at startup
+        // (`reconcile_nullifier_set_at_startup`) and at the top of this function.
         let mut shielded_revert_batch = WriteBatch::default();
 
         // Walk down to the reorg split point
@@ -1475,17 +1738,20 @@ impl VirtualStateProcessor {
             self.shielded_state_manager.revert_nullifiers_from_store(&mut shielded_revert_batch, current).unwrap();
         }
 
+        let split_point = split_point.expect("chain iterator was expected to reach the reorg split point");
+        debug!("VIRTUAL PROCESSOR, found split point: {split_point}");
+
         // Commit the down-walk reverts NOW: RocksDB deletes staged in a batch are invisible to
         // store reads until the batch is written (see the F-01 comment above), and the up-walk
-        // must observe the abandoned branch's nullifiers as unspent.
+        // must observe the abandoned branch's nullifiers as unspent. The set now reflects the split.
+        self.shielded_state_manager.set_nullifier_cursor(&mut shielded_revert_batch, split_point).unwrap();
         self.db.write(shielded_revert_batch).unwrap();
+        #[cfg(test)]
+        self.failpoint(ReorgFailpoint::AfterDownWalk { from, split: split_point });
 
         // NOTE: the up-walk no longer defers shielded writes into a batch — each re-apply is
         // committed inline (see below), because validation of new blocks in this same loop reads
         // the nullifier store directly and must observe them.
-
-        let split_point = split_point.expect("chain iterator was expected to reach the reorg split point");
-        debug!("VIRTUAL PROCESSOR, found split point: {split_point}");
 
         // A variable holding the most recent UTXO-valid block on `chain(to)` (note that it's maintained such
         // that 'diff' is always its UTXO diff from virtual)
@@ -1531,7 +1797,10 @@ impl VirtualStateProcessor {
                     // up-walk was not.
                     let mut apply_batch = WriteBatch::default();
                     self.shielded_state_manager.apply_nullifiers_from_store(&mut apply_batch, current).unwrap();
+                    self.shielded_state_manager.set_nullifier_cursor(&mut apply_batch, current).unwrap();
                     self.db.write(apply_batch).unwrap();
+                    #[cfg(test)]
+                    self.failpoint(ReorgFailpoint::AfterChainBlockCommit(current));
                 }
                 Err(StoreError::KeyNotFound(_)) => {
                     if self.statuses_store.read().get(current).unwrap() == StatusDisqualifiedFromChain {
@@ -1622,10 +1891,6 @@ impl VirtualStateProcessor {
             self.counters.chain_disqualified_counts.fetch_add(chain_disqualified_counter, Ordering::Relaxed);
         }
 
-        // Commit the up-walk's nullifier re-applies atomically at the end of the walk (batch 2 of
-        // the two-batch F-01 scheme; the down-walk reverts were already committed before the
-        // up-walk). Empty (no shielded nullifiers touched) is a cheap no-op write.
-
         diff_point
     }
 
@@ -1699,10 +1964,15 @@ impl VirtualStateProcessor {
         }
         // The miner accrual slot rides the same batch for the same reason (empty slots write nothing).
         self.shielded_state_manager.set_miner_accrual(&mut batch, current, miner_accrual).unwrap();
+        // `persist` above moved the global nullifier set onto this block; record that in the same
+        // write (also when it added nothing: the walk's position is this block either way).
+        self.shielded_state_manager.set_nullifier_cursor(&mut batch, current).unwrap();
         let write_guard = self.statuses_store.set_batch(&mut batch, current, StatusUTXOValid).unwrap();
         self.db.write(batch).unwrap();
         // Calling the drops explicitly after the batch is written in order to avoid possible errors.
         drop(write_guard);
+        #[cfg(test)]
+        self.failpoint(ReorgFailpoint::AfterChainBlockCommit(current));
     }
 
     fn calculate_and_commit_virtual_state(
@@ -2224,7 +2494,7 @@ impl VirtualStateProcessor {
         loop {
             let candidate = heap.pop().expect("valid sink must exist").hash;
             if self.reachability_service.is_chain_ancestor_of(finality_point, candidate) {
-                diff_point = self.calculate_utxo_state_relatively(stores, diff, diff_point, candidate);
+                diff_point = self.calculate_utxo_state_relatively(stores, diff, diff_point, candidate, finality_point);
                 if diff_point == candidate {
                     // This indicates that candidate has valid UTXO state and that `diff` represents its diff from virtual
 

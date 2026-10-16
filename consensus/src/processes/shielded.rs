@@ -37,7 +37,8 @@ use kaspa_muhash::MuHash;
 use crate::model::stores::shielded::{DbAnchorGcQueueStore, DbAnchorWindowStore};
 use crate::model::stores::shielded::{
     AnchorBlockStoreReader, AnchorProducersStoreReader, BurnReceipts, DbAnchorBlockStore, DbAnchorProducersStore,
-    DbNullifierDiffStore, DbNullifierSetStore, DbShieldedAnchorSourceScoreStore, DbShieldedBurnStore, DbShieldedDevAccruedStore,
+    DbNullifierCursorStore, DbNullifierDiffStore, DbNullifierSetStore, DbShieldedAnchorSourceScoreStore, DbShieldedBurnStore,
+    DbShieldedDevAccruedStore,
     DbShieldedMinerAccrualStore,
     DbShieldedNullifierMuHashStore,
     DbShieldedScanBlockStore, DbShieldedSupplyStore, DbShieldedTreeStore, NullifierDiffStoreReader, NullifierSetStore,
@@ -569,6 +570,8 @@ impl PartitionOutcome {
 pub struct ShieldedStateManager {
     nullifiers: DbNullifierSetStore,
     nullifier_diffs: DbNullifierDiffStore,
+    /// Which chain block `nullifiers` reflects; see [`DbNullifierCursorStore`].
+    nullifier_cursor: DbNullifierCursorStore,
     tree_store: DbShieldedTreeStore,
     supply_store: DbShieldedSupplyStore,
     dev_accrued_store: DbShieldedDevAccruedStore,
@@ -596,6 +599,7 @@ impl ShieldedStateManager {
         Self {
             nullifiers: DbNullifierSetStore::new(Arc::clone(&db), cache_policy),
             nullifier_diffs: DbNullifierDiffStore::new(Arc::clone(&db), cache_policy),
+            nullifier_cursor: DbNullifierCursorStore::new(Arc::clone(&db), cache_policy),
             tree_store: DbShieldedTreeStore::new(Arc::clone(&db), cache_policy),
             supply_store: DbShieldedSupplyStore::new(Arc::clone(&db), cache_policy),
             dev_accrued_store: DbShieldedDevAccruedStore::new(Arc::clone(&db), cache_policy),
@@ -873,6 +877,53 @@ impl ShieldedStateManager {
     /// Read-only access to the nullifier store (for validation / queries).
     pub fn nullifiers(&self) -> &DbNullifierSetStore {
         &self.nullifiers
+    }
+
+    /// The chain block the global nullifier set reflects, `None` on a database an older build wrote
+    /// and that has not committed a chain block since. See [`DbNullifierCursorStore`].
+    pub fn nullifier_cursor(&self) -> StoreResult<Option<Hash>> {
+        self.nullifier_cursor.get()
+    }
+
+    /// Record, in the batch that moves the global set, the chain block it then reflects. Every write
+    /// that changes the global set must carry this in the same batch.
+    pub fn set_nullifier_cursor(&self, batch: &mut WriteBatch, block: Hash) -> StoreResult<()> {
+        self.nullifier_cursor.set_batch(batch, block)
+    }
+
+    /// Test helper: make the database look like one an older build wrote (no cursor).
+    #[cfg(test)]
+    pub fn delete_nullifier_cursor_for_test(&self, batch: &mut WriteBatch) -> StoreResult<()> {
+        self.nullifier_cursor.delete_batch(batch)
+    }
+
+    /// Whether `nf` is in the global spent set.
+    pub fn is_nullifier_spent(&self, nf: &[u8; 32]) -> StoreResult<bool> {
+        self.nullifiers.contains(nf)
+    }
+
+    /// Every stored per-block nullifier diff (blocks above the pruning point, plus any the pruner has
+    /// not reached yet).
+    pub fn nullifier_diffs_iter(&self) -> impl Iterator<Item = StoreResult<(Hash, Vec<[u8; 32]>)>> + '_ {
+        self.nullifier_diffs.iter_all()
+    }
+
+    /// Stage a verified repair of the global set: drop `remove`, restore `restore`, and record that the
+    /// set now reflects `at`. Deletes are staged first, so a nullifier in both lists ends present.
+    pub fn stage_nullifier_set_repair(
+        &self,
+        batch: &mut WriteBatch,
+        remove: &[[u8; 32]],
+        restore: &[[u8; 32]],
+        at: Hash,
+    ) -> StoreResult<()> {
+        for nf in remove {
+            self.nullifiers.delete_batch(batch, *nf)?;
+        }
+        for nf in restore {
+            self.nullifiers.insert_batch(batch, *nf)?;
+        }
+        self.nullifier_cursor.set_batch(batch, at)
     }
 
     /// DIAGNOSTIC: does the live global nullifier set still agree with the per-block muhash
@@ -1602,6 +1653,8 @@ impl ShieldedStateManager {
         for nf in nullifiers {
             self.nullifiers.insert_batch(batch, *nf)?;
         }
+        // The seeded set is the set as of the pruning point, and it says so in the same write.
+        self.nullifier_cursor.set_batch(batch, block)?;
         Ok(())
     }
 
@@ -1673,6 +1726,10 @@ impl ShieldedStateManager {
         self.anchor_block.delete_all_batch(batch)?;
         self.anchor_producers.delete_all_batch(batch)?;
         self.anchor_source_scores.delete_all_batch(batch)?;
+        // An empty set is the set as of a pruning point with no shielded spends below it, which is
+        // what a clear is followed by: either the seed staged after it (which writes the same cursor)
+        // or a verified-empty pruning point.
+        self.nullifier_cursor.set_batch(batch, pruning_point)?;
         Ok(())
     }
 }

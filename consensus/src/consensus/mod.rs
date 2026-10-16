@@ -513,6 +513,17 @@ impl Consensus {
                 );
             }
         }
+        // An interrupted chain walk leaves the global nullifier set at some chain block other than the
+        // sink, and records which. Move it to the sink before any processor reads it. Only on stable
+        // state: mid-IBD the virtual state is not a sink the set was ever walked to.
+        if self.config.params.shielded_coinbase {
+            let meta = self.pruning_meta_stores.read();
+            let stable = meta.pruning_shielded_stable_flag() && meta.pruning_utxoset_stable_flag();
+            drop(meta);
+            if stable {
+                self.virtual_processor.reconcile_nullifier_set_at_startup();
+            }
+        }
         // Spawn the asynchronous processors.
         let header_processor = self.header_processor.clone();
         let body_processor = self.body_processor.clone();
@@ -615,6 +626,21 @@ impl Consensus {
             .chain(once(pruning_point))
             .map(|hash| (hash, self.headers_store.get_compact_header_data(hash).unwrap()))
             .collect_vec()
+    }
+
+    fn is_utxo_valid(&self, block: Hash) -> bool {
+        self.statuses_store.read().get(block).optional().unwrap() == Some(BlockStatus::StatusUTXOValid)
+    }
+
+    /// The pruning point's selected child on the header selected chain, the block whose coinbase binds
+    /// the pruning point's shielded state (the same choice `shielded_pp_commitment` in the IBD flow
+    /// makes). `None` when no such child is known yet.
+    fn pruning_point_selected_child(&self, pruning_point: Hash) -> Option<Hash> {
+        let headers_selected_tip = self.headers_selected_tip_store.read().get().unwrap().hash;
+        self.get_block_children(pruning_point)?.into_iter().find(|&child| {
+            self.ghostdag_store.get_selected_parent(child).optional().unwrap() == Some(pruning_point)
+                && self.services.reachability_service.try_is_chain_ancestor_of(child, headers_selected_tip).unwrap_or(false)
+        })
     }
 
     /// See: intrusive_pruning_point_update implementation below for details
@@ -2878,6 +2904,11 @@ impl ConsensusApi for Consensus {
                 )));
             }
         }
+        // Whether the pruning point's selected child was already validated before the stream, which
+        // arrives at the peer's pace. The IBD flow refuses to import in that case; what this records is
+        // the case the flow's check cannot see, a chain walk validating it while the data streams.
+        let selected_child = self.pruning_point_selected_child(new_pruning_point);
+        let child_validated_before = selected_child.is_some_and(|child| self.is_utxo_valid(child));
         let mut nullifiers: Vec<[u8; 32]> = Vec::new();
         for batch in nullifier_batches {
             nullifiers.extend(batch);
@@ -2888,15 +2919,39 @@ impl ConsensusApi for Consensus {
                 )));
             }
         }
-        // One write: clear of the old state, seed of the verified new state, stable flag false
-        // (the flow sets it true after this returns). A failure anywhere above changes nothing.
+        // Stage, then swap. Everything above and the verification below run with no lock held: the data
+        // arrives at the peer's pace, and a lock held across it would hand a slow peer a stall of block
+        // processing. (The pruning lock in particular cannot be taken here at all: the IBD flow holds a
+        // session, a read guard on that same lock, across this call, so a write lock would deadlock.)
+        let verified = self
+            .virtual_processor
+            .verify_pruning_point_shielded_import(new_pruning_point, metadata, expected_state_root, nullifiers)
+            .map_err(PruningImportError::ShieldedStateError)?;
+        // The swap: one write (clear of the old state, seed of the verified new state, stable flag
+        // false; the flow sets it true after this returns) under the virtual write lock, which every
+        // chain walk holds (upgradably) while it moves the live set. The clear enumerates the live set,
+        // so without the lock a nullifier a walk inserted after the enumeration survived the clear and
+        // a block the walk committed above the pruning point lost its nullifiers to it.
+        let virtual_write = self.virtual_stores.write();
+        // A walk validated the child while the data streamed: its nullifiers (and those of every chain
+        // block above it) are in the live set, and the clear would destroy them without revalidation.
+        if !child_validated_before
+            && let Some(child) = selected_child
+            && self.is_utxo_valid(child)
+        {
+            return Err(PruningImportError::ShieldedStateError(format!(
+                "chain block {child} above pruning point {new_pruning_point} was validated while the shielded state was \
+                 streaming; refusing to clear live shielded state"
+            )));
+        }
         let mut batch = rocksdb::WriteBatch::default();
         let n = self
             .virtual_processor
-            .seed_pruning_point_shielded(&mut batch, new_pruning_point, metadata, expected_state_root, nullifiers)
+            .stage_verified_shielded_import(&mut batch, verified)
             .map_err(PruningImportError::ShieldedStateError)?;
         self.pruning_meta_stores.write().set_pruning_shielded_stable_flag(&mut batch, false).unwrap();
         self.db.write(batch).unwrap();
+        drop(virtual_write);
         info!("Imported shielded state for pruning point {}: {} nullifiers imported", new_pruning_point, n);
         Ok(())
     }
@@ -2919,11 +2974,16 @@ impl ConsensusApi for Consensus {
     /// revalidation); the IBD flow enforces both preconditions.
     fn clear_pruning_shielded_stores(&self) {
         let pruning_point = self.pruning_point_store.read().pruning_point().unwrap();
+        // The clear enumerates the live nullifier set: hold the virtual write lock from the
+        // enumeration to the write, as the import does, so no chain walk inserts behind it.
+        let virtual_write = self.virtual_stores.write();
         let mut batch = rocksdb::WriteBatch::default();
         self.virtual_processor.clear_shielded_state_for_pruning_reimport(&mut batch, pruning_point).unwrap();
         let mut pruning_meta_write = self.pruning_meta_stores.write();
         pruning_meta_write.set_pruning_shielded_stable_flag(&mut batch, false).unwrap();
         self.db.write(batch).unwrap();
+        drop(pruning_meta_write);
+        drop(virtual_write);
     }
 
     fn set_pruning_shielded_stable_flag(&self, val: bool) {
