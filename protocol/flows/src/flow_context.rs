@@ -1,3 +1,4 @@
+use crate::ban_policy::{AutoBanBudget, auto_ban_may_target};
 use crate::flowcontext::{
     orphans::{OrphanBlocksPool, OrphanOutput},
     process_queue::ProcessQueue,
@@ -289,6 +290,9 @@ pub struct FlowContextInner {
     /// peer is no longer connected, so it cannot grow without bound.
     relay_credit: Mutex<HashMap<PeerKey, u64>>,
 
+    /// Rate limit on `--enablebanning`, see `ban_if_protocol_violation`.
+    auto_ban_budget: Mutex<AutoBanBudget>,
+
     bps: usize,
 
     // Orphan parameters
@@ -398,6 +402,7 @@ impl FlowContext {
                 user_agent_rules,
                 block_event_logger: Some(BlockEventLogger::new(bps, CountdownActivation::toccata(config.toccata_activation))),
                 relay_credit: Default::default(),
+                auto_ban_budget: Default::default(),
                 bps,
                 orphan_resolution_range,
                 max_orphans,
@@ -435,6 +440,57 @@ impl FlowContext {
 
     pub fn connection_manager(&self) -> Option<Arc<ConnectionManager>> {
         self.connection_manager.read().clone()
+    }
+
+    /// `--enablebanning`: ban the peer behind `router` if `err` proves it broke the wire protocol
+    /// itself. Called for every failed connection: by the handshake, and by `Flow::launch` for
+    /// every flow error.
+    ///
+    /// Off by default, and narrow when on. `ProtocolError::is_auto_ban_eligible` admits only errors
+    /// no honest peer of any version can produce; consensus rejections never qualify, because
+    /// after a rule change they are what honest peers on the other side send, and banning them
+    /// would turn a transient partition into a permanent one. `auto_ban_may_target` refuses
+    /// addresses a port forwarder hides many peers behind. An IP with an `--addpeer`/`--connect`
+    /// request is never auto-banned: the operator chose that peer by name, and an automatic rule
+    /// should not overrule a person (`ConnectionManager::ban` enforces this as well). And
+    /// `AutoBanBudget` bounds how many rows a stream of fresh addresses can make us persist.
+    ///
+    /// The ban runs on its own task. An outbound connection is initialized while the connection
+    /// manager holds its request lock (`handle_connection_requests` awaits the connect under it),
+    /// and both the permanent-request check and `ConnectionManager::ban` take that lock, so
+    /// awaiting them here would deadlock the connection loop.
+    pub(crate) fn ban_if_protocol_violation(&self, router: &Router, err: &ProtocolError) {
+        if !self.config.enable_banning || !err.is_auto_ban_eligible() {
+            return;
+        }
+        let ip = router.net_address().ip();
+        if !auto_ban_may_target(ip) {
+            debug!("P2P, not auto-banning peer {} ({}): its address is not publicly routable", router, err);
+            return;
+        }
+        let Some(connection_manager) = self.connection_manager() else {
+            return;
+        };
+        let ctx = self.clone();
+        let peer = router.to_string();
+        let reason = err.to_string();
+        tokio::spawn(async move {
+            // Both spellings: a permanent request names the IPv4 address, but the same peer dialing
+            // in on a dual-stack listener arrives as `::ffff:a.b.c.d`.
+            if connection_manager.ip_has_permanent_connection(ip).await
+                || connection_manager.ip_has_permanent_connection(ip.to_canonical()).await
+            {
+                info!("P2P, not auto-banning peer {} ({}): it is an --addpeer/--connect peer", peer, reason);
+                return;
+            }
+            let granted = ctx.auto_ban_budget.lock().try_take(Instant::now());
+            if !granted {
+                warn!("P2P, not auto-banning peer {} ({}): this hour's automatic ban budget is spent", peer, reason);
+                return;
+            }
+            warn!("P2P, banning peer {} for 24 hours: {}", peer, reason);
+            connection_manager.ban(ip).await;
+        });
     }
 
     pub fn consensus(&self) -> ConsensusInstance {
@@ -790,6 +846,18 @@ impl FlowContext {
 #[async_trait]
 impl ConnectionInitializer for FlowContext {
     async fn initialize_connection(&self, router: Arc<Router>) -> Result<(), ProtocolError> {
+        let res = self.initialize_connection_inner(router.clone()).await;
+        if let Err(err) = &res {
+            // A malformed version message is the handshake's share of `--enablebanning`; the flows
+            // report their own errors from `Flow::launch`.
+            self.ban_if_protocol_violation(&router, err);
+        }
+        res
+    }
+}
+
+impl FlowContext {
+    async fn initialize_connection_inner(&self, router: Arc<Router>) -> Result<(), ProtocolError> {
         // An operator's ban was only ever a kick. `ConnectionManager::ban` terminates the peer's
         // current connections and persists the IP, and `is_banned` was written to read that back --
         // but nothing called it, on any path. The banned peer reconnected on its next dial and the
@@ -797,16 +865,17 @@ impl ConnectionInitializer for FlowContext {
         // connection passes exactly once, inbound and outbound alike, before any handshake work is
         // spent on its behalf.
         //
-        // Every ban in this store is operator-issued: there are no automatic ban triggers anywhere
-        // in this codebase, and this does not add any. That is deliberate rather than pending --
-        // the two `MisbehavingPeer` sites in tx relay are the right place for them, but a fork has
-        // just split the network and dozens of honest peers are failing to agree with us, so
-        // arming an automatic ban now would be a good mechanism introduced at the worst moment. A
-        // refusal here is therefore always something a person asked for, and it expires with the
-        // store's own 24-hour window.
+        // By default every ban in this store is operator-issued. `--enablebanning` (off by default)
+        // adds automatic ones, but only for errors no honest peer of any version can produce --
+        // never for a consensus rejection, which after a fork is what most honest peers send; see
+        // `ban_if_protocol_violation`. Either way a ban expires with the store's 24-hour window.
         //
-        // A ban outranks `--addpeer`/`--connect` for the same IP: both are operator instructions
-        // and the ban is the later one.
+        // A stored ban refuses an `--addpeer`/`--connect` address too. Neither ban path creates
+        // one for such an address (`ConnectionManager::ban` and the Ban RPC both refuse an IP with
+        // a permanent request), so it only happens when the ban predates the request, and
+        // `Unban` clears it. `ConnectionManager::is_banned`, which exempts permanent requests,
+        // cannot be called here: an outbound permanent connection runs this initializer while the
+        // connection manager holds the request lock that function takes.
         if self.address_manager.lock().is_banned(router.net_address().ip().into()) {
             return Err(ProtocolError::OtherOwned(format!("peer {router} is banned")));
         }
@@ -923,7 +992,7 @@ impl ConnectionInitializer for FlowContext {
 
         // Launch all flows. Note we launch only after the ready signal was exchanged
         for flow in flows {
-            flow.launch();
+            flow.launch(self.clone());
         }
 
         if router.is_outbound() || peer_version.address.is_some() {
