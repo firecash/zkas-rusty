@@ -96,6 +96,16 @@ impl ComputeCommit {
         !Self::version_expects_compute_budget_field(version)
     }
 
+    /// Whether this is the commitment a transaction of `version` carries: `SigopCount` before
+    /// version 1, `ComputeBudget` from it. The mass calculator and the version-aware serde both
+    /// `expect` the matching variant, so every decoder of untrusted bytes must check this.
+    pub fn matches_version(self, version: u16) -> bool {
+        match self {
+            Self::SigopCount(_) => Self::version_expects_sig_op_count_field(version),
+            Self::ComputeBudget(_) => Self::version_expects_compute_budget_field(version),
+        }
+    }
+
     /// Returns the total script units this input mass allows the engine to consume, including a free per-input budget.
     pub fn allowed_script_units(self) -> ScriptUnits {
         let script_units = ScriptUnits::from(self);
@@ -255,7 +265,7 @@ impl BorshSerialize for TransactionMass {
 pub const TX_VERSION_SHIELDED: u16 = 2;
 
 /// Represents a Kaspa transaction
-#[derive(Debug, Clone, PartialEq, Eq, Default, BorshSerialize, BorshDeserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, BorshSerialize)]
 pub struct Transaction {
     pub version: u16,
     pub inputs: Vec<TransactionInput>,
@@ -271,6 +281,39 @@ pub struct Transaction {
     // A field that is used to cache the transaction ID.
     // Always use the corresponding self.id() instead of accessing this field directly
     id: TransactionId,
+}
+
+/// Hand-written rather than derived, so that a decoded transaction always carries the input
+/// commitment its version calls for.
+///
+/// Every other constructor of a `Transaction` from outside data enforces that by construction: the
+/// p2p and RPC conversions pick `SigopCount` or `ComputeBudget` from the version, and the
+/// version-aware serde impl does the same. Derived borsh read the `ComputeCommit` tag straight off
+/// the wire. The one place the node borsh-decodes a transaction is the parent coinbase of a
+/// merged-mining witness, and that witness is outside the header hash, so any relaying peer may
+/// swap it. A version-0 coinbase with a `ComputeBudget` input then rode an honest, natively mined
+/// header into the header store, whose bincode `Serialize` `expect`s the matching variant (as does
+/// the mass calculator), and the panic hook turned that into `process::exit(1)`: one relayed
+/// header killed every node that accepted it, for no proof of work at all.
+impl BorshDeserialize for Transaction {
+    fn deserialize_reader<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let version = u16::deserialize_reader(reader)?;
+        let inputs = Vec::<TransactionInput>::deserialize_reader(reader)?;
+        if let Some(index) = inputs.iter().position(|input| !input.compute_commit.matches_version(version)) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("transaction input {index} carries a mass commitment that version {version} does not use"),
+            ));
+        }
+        let outputs = Vec::<TransactionOutput>::deserialize_reader(reader)?;
+        let lock_time = u64::deserialize_reader(reader)?;
+        let subnetwork_id = SubnetworkId::deserialize_reader(reader)?;
+        let gas = u64::deserialize_reader(reader)?;
+        let payload = Vec::<u8>::deserialize_reader(reader)?;
+        let storage_mass = TransactionMass::deserialize_reader(reader)?;
+        let id = TransactionId::deserialize_reader(reader)?;
+        Ok(Self { version, inputs, outputs, lock_time, subnetwork_id, gas, payload, storage_mass, id })
+    }
 }
 
 impl Transaction {
@@ -1112,6 +1155,45 @@ version = 1
         let bin = borsh::to_vec(&spk).unwrap();
         let spk2: ScriptPublicKey = BorshDeserialize::try_from_slice(&bin).unwrap();
         assert_eq!(spk, spk2);
+    }
+
+    /// A borsh-encoded transaction whose input commitment contradicts its version is an ERROR, never
+    /// a value. Such a value is not inert: the header store's bincode `Serialize` and the mass
+    /// calculator both `expect` the matching variant, and the panic hook turns that into
+    /// `process::exit(1)`. Borsh is how the parent coinbase of a merged-mining witness arrives, from
+    /// any peer, stapled to any header.
+    #[test]
+    fn borsh_decode_refuses_a_commitment_its_version_does_not_use() {
+        let outpoint = TransactionOutpoint::new(Hash::from_u64_word(7), 0);
+
+        // Version 0 carrying a version-1 commitment, and version 1 carrying a version-0 one.
+        for (version, input) in [
+            (0u16, TransactionInput::new_with_compute_budget(outpoint, vec![], 0, 5)),
+            (1u16, TransactionInput::new(outpoint, vec![], 0, 1)),
+        ] {
+            let tx = Transaction::new(version, vec![input], vec![], 0, SUBNETWORK_ID_NATIVE, 0, vec![]);
+            let bytes = borsh::to_vec(&tx).unwrap();
+            assert!(
+                <Transaction as BorshDeserialize>::try_from_slice(&bytes).is_err(),
+                "a version-{version} transaction with the other version's commitment must be refused"
+            );
+        }
+
+        // The honest shapes still round-trip, and what comes back serializes through bincode (the
+        // header store's encoding) instead of panicking in it.
+        for (version, input) in [
+            (0u16, TransactionInput::new(outpoint, vec![], 0, 1)),
+            (1u16, TransactionInput::new_with_compute_budget(outpoint, vec![], 0, 5)),
+        ] {
+            let tx = Transaction::new(version, vec![input], vec![], 0, SUBNETWORK_ID_NATIVE, 0, vec![1, 2, 3]);
+            let back = <Transaction as BorshDeserialize>::try_from_slice(&borsh::to_vec(&tx).unwrap()).expect("honest shape decodes");
+            assert_eq!(back, tx);
+            bincode::serialize(&back).expect("a decoded transaction always serializes");
+        }
+
+        // A transaction with no inputs (every real coinbase) is unaffected by the check.
+        let coinbase = Transaction::new(1, vec![], vec![], 0, SUBNETWORK_ID_NATIVE, 0, vec![9; 40]);
+        assert_eq!(<Transaction as BorshDeserialize>::try_from_slice(&borsh::to_vec(&coinbase).unwrap()).unwrap(), coinbase);
     }
 
     fn tx_for_genesis_covenant_population(num_inputs: usize, num_outputs: usize) -> Transaction {
