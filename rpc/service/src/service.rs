@@ -149,6 +149,19 @@ fn refuse_if_shielded_state_diverged(action: &str) -> RpcResult<()> {
 impl RpcCoreService {
     pub const IDENT: &'static str = "rpc-core-service";
 
+    /// Apply the `--unsaferpc` subscription rule (`kaspa_rpc_core::api::safe_mode`).
+    ///
+    /// This used to live only inside this service's own `start_notify`, which neither public
+    /// transport calls: the gRPC and wRPC servers each subscribe their own notifier to the core
+    /// notifier directly. So a blanket `UtxosChanged` -- restricted to unsafe mode because it is
+    /// the most expensive stream a client can request -- was refused to in-process callers and
+    /// granted to every remote one. Both servers now call this before subscribing.
+    pub fn check_subscription_allowed(&self, scope: &Scope) -> RpcResult<()> {
+        kaspa_rpc_core::api::safe_mode::check_subscription_allowed(self.config.unsafe_rpc, scope).inspect_err(|_| {
+            warn!("RPC subscription to {scope} refused: the node is in safe RPC mode (run with --unsaferpc to allow it)");
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         consensus_manager: Arc<ConsensusManager>,
@@ -1835,22 +1848,10 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
 
     /// Start sending notifications of some type to a listener.
     async fn start_notify(&self, id: ListenerId, scope: Scope) -> RpcResult<()> {
-        match scope {
-            Scope::UtxosChanged(ref utxos_changed_scope) if !self.config.unsafe_rpc && utxos_changed_scope.addresses.is_empty() => {
-                // The subscription to blanket UtxosChanged notifications is restricted to unsafe mode only
-                // since the notifications yielded are highly resource intensive.
-                //
-                // Please note that unsubscribing to blanket UtxosChanged is always allowed and cancels
-                // the whole subscription no matter if blanket or targeting specified addresses.
-
-                warn!("RPC subscription to blanket UtxosChanged called while node in safe RPC mode -- ignoring.");
-                Err(RpcError::UnavailableInSafeMode)
-            }
-            _ => {
-                self.notifier.clone().start_notify(id, scope).await?;
-                Ok(())
-            }
-        }
+        // Unsubscribing is always allowed and cancels the whole subscription, blanket or not.
+        self.check_subscription_allowed(&scope)?;
+        self.notifier.clone().start_notify(id, scope).await?;
+        Ok(())
     }
 
     /// Stop sending notifications of some type to a listener.

@@ -13,8 +13,12 @@ use crate::{
 };
 use kaspa_grpc_core::protowire::{kaspad_request::Payload, *};
 use kaspa_grpc_core::{ops::KaspadPayloadOps, protowire::NotifyFinalityConflictResponseMessage};
-use kaspa_notify::{scope::FinalityConflictResolvedScope, subscriber::SubscriptionManager};
-use kaspa_rpc_core::{SubmitBlockRejectReason, SubmitBlockResponse};
+use kaspa_notify::{
+    scope::{FinalityConflictResolvedScope, Scope},
+    subscriber::SubscriptionManager,
+    subscription::Command,
+};
+use kaspa_rpc_core::{SubmitBlockRejectReason, SubmitBlockResponse, api::safe_mode::check_subscription_allowed};
 use kaspa_rpc_macros::build_grpc_server_interface;
 
 pub struct Factory {}
@@ -142,6 +146,45 @@ impl Factory {
             })
         });
         interface.replace_method(KaspadPayloadOps::NotifyFinalityConflict, method);
+
+        // Manually reimplementing the NotifyUtxosChangedRequest method so `--unsaferpc` gates it.
+        // Subscriptions go to this server's own notifier, never through `RpcCoreService::start_notify`
+        // where the rule used to live alone, so a blanket UtxosChanged was refused to nobody remote.
+        // Unsubscribing (`Stop` here, or the separate `StopNotifyingUtxosChanged` op) stays allowed.
+        let method: KaspadMethod = Method::new(|server_ctx: ServerContext, connection: Connection, request: KaspadRequest| {
+            Box::pin(async move {
+                let mut response: KaspadResponse = match request.payload {
+                    Some(Payload::NotifyUtxosChangedRequest(ref request)) => {
+                        match kaspa_rpc_core::NotifyUtxosChangedRequest::try_from(request) {
+                            Ok(request) => {
+                                let command = request.command;
+                                let scope: Scope = request.into();
+                                let allowed = match command {
+                                    Command::Start => check_subscription_allowed(server_ctx.unsafe_rpc, &scope),
+                                    Command::Stop => Ok(()),
+                                };
+                                match allowed {
+                                    Ok(()) => {
+                                        let listener_id = connection.get_or_register_listener_id()?;
+                                        let result =
+                                            server_ctx.notifier.clone().execute_subscribe_command(listener_id, scope, command).await;
+                                        NotifyUtxosChangedResponseMessage::from(result).into()
+                                    }
+                                    Err(err) => NotifyUtxosChangedResponseMessage::from(err).into(),
+                                }
+                            }
+                            Err(err) => NotifyUtxosChangedResponseMessage::from(err).into(),
+                        }
+                    }
+                    _ => {
+                        return Err(GrpcServerError::InvalidRequestPayload);
+                    }
+                };
+                response.id = request.id;
+                Ok(response)
+            })
+        });
+        interface.replace_method(KaspadPayloadOps::NotifyUtxosChanged, method);
 
         // Methods with special properties
         let network_bps = network_bps as usize;
