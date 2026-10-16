@@ -6260,7 +6260,9 @@ impl AppState {
         };
         let restored = match restored {
             Some(r) if !prefer_twin => Some(r),
-            _ => match key.fvk_bytes() {
+            // `mine` is this wallet's own checkpoint when a twin was merely PREFERRED (it is
+            // already loaded and verified), else `None`.
+            mine => match key.fvk_bytes() {
                 Some(fvk) => match self.adopt_twin(token, &fvk, birthday, recoverable_history).await {
                     Some((donor, keep_birthday)) => {
                         // The copied file carries the DONOR's cursor. Verify it against the
@@ -6313,9 +6315,16 @@ impl AppState {
                             }
                         }
                     }
-                    None => None,
+                    // No twin was adopted after all: `adopt_twin` applies the history and
+                    // blind-spot filters `best_twin_scanned` does not, and can fail to link or
+                    // copy. That used to fall to `None`, which discarded this wallet's OWN
+                    // checkpoint -- loaded and verified a few lines up -- and sent it to a rescan
+                    // from its birthday merely because a twin had LOOKED further ahead. Keep it.
+                    // (Its file may be gone if a copy failed midway; the next checkpoint save
+                    // writes it back from this in-memory state.)
+                    None => mine,
                 },
-                None => None,
+                None => mine,
             },
         };
         // A wallet that keeps history but whose checkpoint has notes and NO rows was
