@@ -85,22 +85,21 @@ impl Manager {
             return Err(RegistrationError::CapacityReached(self.max_connections));
         }
 
-        // Per-IP cap: prevent one source from exhausting the slot pool.
+        // Per-IP cap: prevent one source from exhausting the slot pool. Loopback is exempt.
         //
-        // Loopback gets a LOOSER cap, not an exemption. The exemption was written for
-        // self-hosted clients that legitimately open many connections at once (walletd, the
-        // pool bridge, the explorer backend), and it assumed loopback means local. Behind a
-        // port forwarder it does not: a public RPC fronted by `socat` -- which is how ours is
-        // fronted -- rewrites every remote to 127.0.0.1, so the exemption handed any single
-        // internet client the entire slot pool, and the first thing locked out is walletd's own
-        // node connection. Half the pool is still far more than every local service together,
-        // and it bounds one source. (A forwarder that preserves the client address is the other
-        // half of this fix, and belongs in the deployment rather than here.)
+        // That exemption is deliberate, and a per-loopback cap (tried in 13d874d) is worse. Behind a
+        // port forwarder every public client arrives as 127.0.0.1, so a loopback cap does not single
+        // out one source: it caps the whole public at that number and makes the node's own local
+        // services (walletd, the explorer backend, the pool bridge) race the public for what is left.
+        // On a forwarded node the bound that matters lives in the forwarder: keep its child limit
+        // below `--rpcmaxclients` (e.g. `socat ... max-children=480` with `--rpcmaxclients=512`), and
+        // the difference is reserved for local services by construction.
         let ip = connection.net_address().ip();
-        let cap = if ip.is_loopback() { std::cmp::max(self.max_connections / 2, self.max_per_ip) } else { self.max_per_ip };
-        let per_ip = connections_write.values().filter(|c| c.net_address().ip() == ip).count();
-        if per_ip >= cap {
-            return Err(RegistrationError::PerIpCapacityReached(ip, cap));
+        if !ip.is_loopback() {
+            let per_ip = connections_write.values().filter(|c| c.net_address().ip() == ip).count();
+            if per_ip >= self.max_per_ip {
+                return Err(RegistrationError::PerIpCapacityReached(ip, self.max_per_ip));
+            }
         }
 
         debug!("GRPC, Registering a new connection from {connection}");
