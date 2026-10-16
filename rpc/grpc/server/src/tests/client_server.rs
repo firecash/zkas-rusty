@@ -36,6 +36,33 @@ async fn test_client_server_sanity_check() {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 }
 
+/// Every client here connects from loopback, as every public client does behind a port forwarder.
+/// Loopback is exempt from the per-IP cap (`Manager::new(16)` sets it to 8), so all 16 register
+/// through the real connection path.
+#[tokio::test]
+async fn test_loopback_clients_fill_every_slot_past_the_per_ip_cap() {
+    let rpc_core_service = Arc::new(RpcCoreMock::new());
+    rpc_core_service.start();
+    let server = create_server_with_capacity(rpc_core_service.clone(), 16);
+
+    let mut clients = Vec::with_capacity(16);
+    for _ in 0..16 {
+        clients.push(create_client(server.serve_address()).await);
+    }
+    let active = server.active_connections();
+    assert_eq!(active.len(), 16, "every loopback client registered, twice the per-IP cap");
+    assert!(active.iter().all(|a| a.ip().is_loopback()), "the clients arrived from loopback: {active:?}");
+
+    for client in clients.iter() {
+        assert!(client.disconnect().await.is_ok());
+    }
+    rpc_core_service.join().await;
+    assert!(server.stop().await.is_ok(), "error stopping the server");
+    drop(clients);
+    drop(server);
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+}
+
 #[tokio::test]
 async fn test_client_server_connections() {
     enum ClosingEnd {
@@ -189,7 +216,11 @@ async fn test_client_server_notifications() {
 }
 
 fn create_server(core_service: Arc<RpcCoreMock>) -> Arc<Adaptor> {
-    let manager = Manager::new(128);
+    create_server_with_capacity(core_service, 128)
+}
+
+fn create_server_with_capacity(core_service: Arc<RpcCoreMock>, max_connections: usize) -> Arc<Adaptor> {
+    let manager = Manager::new(max_connections);
     Adaptor::server(
         get_free_net_address(),
         1,
