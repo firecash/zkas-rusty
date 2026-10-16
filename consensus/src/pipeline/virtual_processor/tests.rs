@@ -1124,7 +1124,18 @@ async fn reorg_crash_window_recovers(window: CrashWindow) {
     ctx.consensus.virtual_processor().arm_crash_image(matcher, image.clone());
 
     ctx.consensus.validate_and_insert_block(b3.clone()).virtual_state_task.await.unwrap();
-    assert_eq!(ctx.consensus.get_sink(), b3_hash, "branch B took over on B3");
+    let sink = ctx.consensus.get_sink();
+    assert_eq!(
+        sink,
+        b3_hash,
+        "branch B took over on B3 (sink is {}; bw a3={} b2={} b3={}; b3 status {:?}; x blue in b3: {})",
+        if sink == a3_hash { "a3".to_string() } else { sink.to_string() },
+        bw(a3_hash),
+        bw(b2_hash),
+        bw(b3_hash),
+        ctx.consensus.get_block_status(b3_hash),
+        ctx.consensus.ghostdag_store().get_data(b3_hash).unwrap().mergeset_blues.contains(&x_hash),
+    );
     assert!(bw(b3_hash) > bw(a3_hash), "B3 is strictly heavier than A3");
     assert!(!ctx.consensus.virtual_processor().crash_image_pending(), "the walk reached the {window:?} failpoint");
 
