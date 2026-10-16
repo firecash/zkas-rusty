@@ -94,3 +94,69 @@ impl<E: StoreErrorPredicates> StoreResultUnitExt<E> for Result<(), E> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn not_found() -> StoreError {
+        StoreError::KeyNotFound(DbKey::prefix_only(b"missing"))
+    }
+
+    /// Every error that is NOT a missing key. Each one is a store that could not answer, and
+    /// none of them may come out of `optional()` as "absent".
+    fn unreadable() -> Vec<StoreError> {
+        vec![
+            StoreError::DataInconsistency("corrupt row".to_owned()),
+            StoreError::DeserializationError(Box::new(bincode::ErrorKind::Custom("truncated value".to_owned()))),
+            StoreError::KeyAlreadyExists("dup".to_owned()),
+            StoreError::HashAlreadyExists(Hash::from_bytes([7; 32])),
+        ]
+    }
+
+    #[test]
+    fn optional_maps_only_key_not_found_to_absent() {
+        assert!(matches!(StoreResult::Ok(5u64).optional(), Ok(Some(5))));
+        assert!(matches!(StoreResult::<u64>::Err(not_found()).optional(), Ok(None)));
+        for err in unreadable() {
+            let shown = format!("{err:?}");
+            match StoreResult::<u64>::Err(err).optional() {
+                Err(e) => assert_eq!(format!("{e:?}"), shown, "the error must come back unchanged"),
+                Ok(v) => panic!("{shown} was folded into {v:?}; an unreadable store is not an absent key"),
+            }
+        }
+    }
+
+    #[test]
+    fn optional_then_default_keeps_errors_out_of_the_default() {
+        // The shape every verdict-path caller uses: absence picks the default, an IO fault
+        // propagates. `unwrap_or(default)` on the raw result would have picked the default for both.
+        let read = |r: StoreResult<u64>| r.optional().map(|v| v.unwrap_or(0));
+        assert_eq!(read(Ok(9)).unwrap(), 9);
+        assert_eq!(read(Err(not_found())).unwrap(), 0);
+        for err in unreadable() {
+            assert!(read(Err(err)).is_err());
+        }
+    }
+
+    #[test]
+    fn predicates_partition_the_error_kinds() {
+        assert!(not_found().is_key_not_found());
+        assert!(!not_found().is_already_exists());
+        for err in unreadable() {
+            assert!(!err.is_key_not_found(), "{err:?} is not a missing key");
+        }
+        assert!(StoreError::KeyAlreadyExists("k".to_owned()).is_already_exists());
+        assert!(StoreError::HashAlreadyExists(Hash::from_bytes([1; 32])).is_already_exists());
+        assert!(!StoreError::DataInconsistency("x".to_owned()).is_already_exists());
+    }
+
+    #[test]
+    fn idempotent_absorbs_only_duplicate_writes() {
+        assert!(Ok::<(), StoreError>(()).idempotent().is_ok());
+        assert!(Err::<(), StoreError>(StoreError::KeyAlreadyExists("k".to_owned())).idempotent().is_ok());
+        assert!(Err::<(), StoreError>(StoreError::HashAlreadyExists(Hash::from_bytes([2; 32]))).idempotent().is_ok());
+        assert!(Err::<(), StoreError>(not_found()).idempotent().is_err());
+        assert!(Err::<(), StoreError>(StoreError::DataInconsistency("x".to_owned())).idempotent().is_err());
+    }
+}

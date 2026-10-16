@@ -828,8 +828,17 @@ impl PruningProcessor {
 
     /// Check if `block_hash` is canonical for SMT lookups at `selected_parent`.
     /// ZERO_HASH is always canonical because it marks IBD-imported entries.
+    ///
+    /// A pruned block (`KeyNotFound`) is non-canonical; any other reachability error panics rather
+    /// than hide a live lane version (see `VirtualStateProcessor::is_smt_canonical`).
     fn is_smt_canonical(&self, block_hash: Hash, selected_parent: Hash) -> bool {
-        block_hash == ZERO_HASH || matches!(self.reachability_service.try_is_chain_ancestor_of(block_hash, selected_parent), Ok(true))
+        block_hash == ZERO_HASH
+            || self
+                .reachability_service
+                .try_is_chain_ancestor_of(block_hash, selected_parent)
+                .optional()
+                .unwrap_or_else(|err| panic!("reachability read for SMT lane version block {block_hash} failed: {err:?}"))
+                .unwrap_or(false)
     }
 
     fn assert_smt_rebuilding(&self, new_pruning_point: Hash, pruning_point_blue_score: u64) {

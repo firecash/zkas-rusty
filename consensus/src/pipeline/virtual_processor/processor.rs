@@ -453,8 +453,19 @@ impl VirtualStateProcessor {
             let sc_read = self.selected_chain_store.read();
             match sc_read.get_by_hash(pp).optional()? {
                 Some(pp_index) => {
+                    // A hole in the index (`KeyNotFound`) is a block we cannot name and simply do not
+                    // claim. An unreadable index is not a hole: `.ok()` here used to read an IO fault
+                    // as one, so a transient fault shipped a syncing peer a window with pairs missing,
+                    // and that peer then dropped the spends proving against them and disqualified the
+                    // blocks merging those spends. Fail the export instead; the peer retries.
                     let low_index = pp_index.saturating_sub(window);
-                    (low_index..pp_index).filter_map(|i| sc_read.get_by_index(i).optional().ok().flatten()).collect()
+                    let mut blocks = BlockHashSet::default();
+                    for i in low_index..pp_index {
+                        if let Some(hash) = sc_read.get_by_index(i).optional()? {
+                            blocks.insert(hash);
+                        }
+                    }
+                    blocks
                 }
                 None => BlockHashSet::default(),
             }
@@ -477,7 +488,9 @@ impl VirtualStateProcessor {
                 }
                 // Skip rather than fail on a source we cannot score: partial attestation still
                 // helps, and claiming a score we do not have would be worse than claiming none.
-                if let Ok(blue_score) = self.ghostdag_store.get_blue_score(*source) {
+                // "Cannot score" means pruned ghostdag (`KeyNotFound`) only; an IO fault fails the
+                // export rather than silently attesting less than this node holds.
+                if let Some(blue_score) = self.ghostdag_store.get_blue_score(*source).optional()? {
                     scores.push((*source, blue_score));
                 }
             }
@@ -589,20 +602,37 @@ impl VirtualStateProcessor {
         let pp_bs = self.headers_store.get_blue_score(pp).map_err(|e| format!("pruning point header {pp}: {e}"))?;
         let lo = pp_bs.saturating_sub(self.max_shielded_anchor_age);
         let mut proven: kaspa_consensus_core::BlockHashMap<u64> = kaspa_consensus_core::BlockHashMap::default();
-        let before = md.in_window_anchors.len();
-        md.in_window_anchors.retain(|(_, source)| {
-            if let Some(bs) = proven.get(source) {
-                return *bs >= lo;
+        // Judge each distinct source once, BEFORE filtering, so a store fault can abort the import.
+        // A source this node holds no header or reachability for (`KeyNotFound`) is unprovable and
+        // its pair is dropped, as before. An unreadable store is not that: dropping on any error
+        // used to discard honest pairs on a transient fault, after which this node alone dropped
+        // the spends proving against them and disqualified the blocks merging those spends. The
+        // import is refused instead and retried, as for every other failure here.
+        let mut judged: BlockHashSet = BlockHashSet::default();
+        for (_, source) in md.in_window_anchors.iter() {
+            if !judged.insert(*source) {
+                continue;
             }
-            let Ok(bs) = self.headers_store.get_blue_score(*source) else { return false };
-            let ok = bs >= lo
-                && bs <= pp_bs
-                && matches!(self.reachability_service.try_is_chain_ancestor_of(*source, pp), Ok(true));
-            if ok {
+            let Some(bs) =
+                self.headers_store.get_blue_score(*source).optional().map_err(|e| format!("header of anchor source {source}: {e}"))?
+            else {
+                continue;
+            };
+            if bs < lo || bs > pp_bs {
+                continue;
+            }
+            let on_chain = self
+                .reachability_service
+                .try_is_chain_ancestor_of(*source, pp)
+                .optional()
+                .map_err(|e| format!("reachability of anchor source {source}: {e:?}"))?
+                .unwrap_or(false);
+            if on_chain {
                 proven.insert(*source, bs);
             }
-            ok
-        });
+        }
+        let before = md.in_window_anchors.len();
+        md.in_window_anchors.retain(|(_, source)| proven.contains_key(source));
         md.in_window_anchor_source_scores = proven.into_iter().collect();
         let dropped = before - md.in_window_anchors.len();
         if dropped > 0 {
@@ -1283,8 +1313,9 @@ impl VirtualStateProcessor {
         // pruning-aware `try_is_chain_ancestor_of` (not the panicking `is_chain_ancestor_of`)
         // so a source whose reachability data has been pruned since the blue-score read can
         // never crash the virtual processor here either. With the age window, an in-window
-        // source's reachability is never pruned, so `Err` means out-of-window/abandoned —
-        // fail closed (F-04); only an explicit `Ok(true)` is canonical.
+        // source's reachability is never pruned, so a MISSING row means out-of-window/abandoned —
+        // fail closed (F-04); only an explicit `Ok(true)` is canonical. An UNREADABLE row is not
+        // a missing one and panics, for the same reason as the ghostdag read above.
         //
         // An ATTESTED source is the exception, and it needs no reachability lookup: it would
         // have none either, for the same reason it had no ghostdag. Ancestry is implied by how
@@ -1295,7 +1326,16 @@ impl VirtualStateProcessor {
         // later on the identical missing-data problem.
         let is_chain_ancestor = attested
             || source == selected_parent
-            || matches!(self.reachability_service.try_is_chain_ancestor_of(source, selected_parent), Ok(true));
+            || self
+                .reachability_service
+                .try_is_chain_ancestor_of(source, selected_parent)
+                .optional()
+                .unwrap_or_else(|err| {
+                    panic!(
+                        "reachability read for anchor source {source} failed; refusing to treat an IO error as an unknown anchor: {err:?}"
+                    )
+                })
+                .unwrap_or(false);
         if !is_chain_ancestor {
             return AnchorVerdict {
                 source: Some(source),
@@ -1909,8 +1949,18 @@ impl VirtualStateProcessor {
     /// remain but they are no longer canonical. `Err(KeyNotFound)` from
     /// `try_is_chain_ancestor_of` means the block's reachability was pruned,
     /// so it is definitively outside `future(retention_root)` and non-canonical.
+    ///
+    /// Only `KeyNotFound` means that. Any other reachability error panics: reading it as
+    /// non-canonical would hide a live lane version, give this node a lanes root no other node
+    /// computes, and fail the sequencing commitment of a valid block on this node only.
     pub fn is_smt_canonical(&self, block_hash: Hash, selected_parent: Hash) -> bool {
-        block_hash == ZERO_HASH || matches!(self.reachability_service.try_is_chain_ancestor_of(block_hash, selected_parent), Ok(true))
+        block_hash == ZERO_HASH
+            || self
+                .reachability_service
+                .try_is_chain_ancestor_of(block_hash, selected_parent)
+                .optional()
+                .unwrap_or_else(|err| panic!("reachability read for SMT lane version block {block_hash} failed: {err:?}"))
+                .unwrap_or(false)
     }
 
     /// KIP-21: block hash of the highest chain block at
@@ -2038,7 +2088,11 @@ impl VirtualStateProcessor {
     /// When the parent has no stored metadata (e.g. pre-toccata or origin predecessor),
     /// returns `(empty_root, 0)`.
     pub(super) fn get_parent_lanes_root_and_count(&self, selected_parent: Hash, parent_blue_score: u64) -> (Hash, u64) {
-        let active_lanes_count = self.smt_metadata_store.get(selected_parent).map(|meta| meta.active_lanes_count()).unwrap_or(0);
+        // No metadata row (`KeyNotFound`) is the documented `0`. An unreadable row is not: folding
+        // it into 0 gave this node alone a different active-lane count, hence a different
+        // sequencing commitment, and failed a valid block here only.
+        let active_lanes_count =
+            self.smt_metadata_store.get(selected_parent).optional().unwrap().map(|meta| meta.active_lanes_count()).unwrap_or(0);
         let lanes_root = self.smt_stores.get_lanes_root(SmtReadBounds::for_pov(parent_blue_score, self.finality_depth), |bh| {
             self.is_smt_canonical(bh, selected_parent)
         });
