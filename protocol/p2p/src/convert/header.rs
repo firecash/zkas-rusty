@@ -238,6 +238,31 @@ mod tests {
         }
     }
 
+    /// A witness whose parent coinbase carries an input commitment its version does not use is
+    /// DROPPED, and the header survives.
+    ///
+    /// Before borsh refused that shape, the witness decoded, passed `validate_structure`, and was
+    /// attached to an honest, natively mined header. The header store then bincode-serialized it,
+    /// the version-aware `Serialize` hit `expect("v0 transaction inputs must carry a SigopCount
+    /// mass")`, and the panic hook exited the process. The witness is outside `H_fc`, so this needed
+    /// no proof of work: any peer could staple it onto a fresh block and relay it.
+    #[test]
+    fn an_aux_witness_whose_coinbase_contradicts_its_version_is_dropped() {
+        use kaspa_consensus_core::tx::{TransactionInput, TransactionOutpoint};
+
+        let header = finalized(1);
+        let hfc = header.hash;
+        let input = TransactionInput::new_with_compute_budget(TransactionOutpoint::new(Hash::from_bytes([3u8; 32]), 0), vec![], 0, 1);
+        let cb = Transaction::new(0, vec![input], vec![], 0, SUBNETWORK_ID_COINBASE, 0, AuxPow::embed_commitment(&[], hfc, &[]));
+        let aux = AuxPow { parent_header: finalized(9), parent_coinbase: cb, coinbase_merkle_branch: vec![] };
+
+        let mut pb: protowire::BlockHeader = (HeaderFormat::Compressed, &header).into();
+        pb.aux_pow = borsh::to_vec(&aux).unwrap();
+        let back: Header = Versioned(HeaderFormat::Compressed, pb).try_into().expect("the header survives");
+        assert_eq!(back.hash, hfc, "H_fc is untouched");
+        assert!(back.aux_pow.is_none(), "the witness the header store cannot serialize is not attached");
+    }
+
     /// A witness over the size cap is DROPPED, and the block survives on its native proof-of-work.
     ///
     /// This is the shape that matters. `check_pow_gated` tries native PoW first and returns before it

@@ -1606,8 +1606,19 @@ pub mod build {
         // Value is conserved by the binding signature at verification time regardless.
         // Checking it up front means a caller that mis-sums is told which side is short,
         // instead of being handed a bundle that silently fails to verify later.
-        let total_in: u64 = spends.iter().map(|s| s.note.value().inner()).sum();
-        let total_out: u64 = outputs.iter().map(|o| o.value).sum();
+        //
+        // Checked sums, not `.sum()`: every value here is a counterparty's claim (a spend offer's
+        // note value, a requested output), and with `overflow-checks` on, an overflowing `u64` sum
+        // PANICS -- which the daemon embedding this (`kaspad --wallet-api`) turns into
+        // `process::exit(1)`.
+        let total_in = spends
+            .iter()
+            .try_fold(0u64, |acc, s| acc.checked_add(s.note.value().inner()))
+            .ok_or_else(|| BuildError::Builder("spend values overflow u64".into()))?;
+        let total_out = outputs
+            .iter()
+            .try_fold(0u64, |acc, o| acc.checked_add(o.value))
+            .ok_or_else(|| BuildError::Builder("output values overflow u64".into()))?;
         let owed = total_out.checked_add(fee).ok_or_else(|| BuildError::Builder("outputs + fee overflow".into()))?;
         if total_in != owed {
             return Err(BuildError::Builder(format!(
@@ -2441,6 +2452,38 @@ pub mod build {
             match err {
                 BuildError::Builder(m) => assert!(m.contains("value not conserved"), "message explains: {m}"),
                 other => panic!("expected a value error, got {other:?}"),
+            }
+        }
+
+        /// Totals that overflow `u64` are an ERROR, never a panic. Every value summed here is a
+        /// counterparty's claim -- a spend offer's note value, a requested output -- and with
+        /// `overflow-checks` on an overflowing `.sum()` panics, which `kaspad --wallet-api`
+        /// turns into `process::exit(1)`.
+        #[test]
+        fn overflowing_totals_are_refused_not_panicked() {
+            use orchard::value::NoteValue;
+
+            let a = ShieldedKeys::from_seed([43u8; 32]).expect("valid seed");
+            let half = u64::MAX / 2 + 1;
+            let rho = Option::<Rho>::from(Rho::from_bytes(&canon(19))).unwrap();
+            let rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes(canon(20), &rho)).unwrap();
+            let note = Option::<Note>::from(Note::from_parts(a.address(), NoteValue::from_raw(half), rho, rseed, orchard::note::NoteVersion::V2)).unwrap();
+            let solo: [MerkleHashOrchard; 32] =
+                core::array::from_fn(|i| <MerkleHashOrchard as Hashable>::empty_root(Level::from(i as u8)));
+            let spend = || MultiSpend { fvk: a.fvk.clone(), note, path: MerklePath::from_parts(0, solo) };
+            let output = |value: u64| MultiOutput { ovk: None, recipient: a.address().to_raw_address_bytes(), value, memo: [0u8; 512] };
+
+            // Two spends of the same note share one anchor, so the sum is what is reached first.
+            let spends_overflow = prepare_multiparty(vec![spend(), spend()], vec![output(1)], 0, &[0x7cu8; 32], b"zkas-overflow-in");
+            // Two outputs whose total does not fit.
+            let outputs_overflow = prepare_multiparty(vec![spend()], vec![output(half), output(half)], 0, &[0x7cu8; 32], b"zkas-overflow-out");
+
+            for (what, res) in [("spends", spends_overflow), ("outputs", outputs_overflow)] {
+                match res {
+                    Err(BuildError::Builder(m)) => assert!(m.contains("overflow"), "{what}: message names the overflow: {m}"),
+                    Err(other) => panic!("{what}: expected an overflow error, got {other:?}"),
+                    Ok(_) => panic!("{what}: an overflowing total must be refused"),
+                }
             }
         }
 

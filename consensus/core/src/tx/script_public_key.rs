@@ -240,40 +240,29 @@ impl<'de> Deserialize<'de> for ScriptPublicKey {
                     #[serde(borrow)]
                     String(Cow<'a, str>),
                 }
-                impl From<Value<'_>> for u16 {
-                    fn from(value: Value<'_>) -> Self {
-                        let Value::U16(v) = value else { panic!("unexpected conversion: {value:?}") };
-                        v
-                    }
-                }
-
-                impl TryFrom<Value<'_>> for Vec<u8> {
-                    type Error = faster_hex::Error;
-
-                    fn try_from(value: Value) -> Result<Self, Self::Error> {
-                        match value {
-                            Value::U16(_) => {
-                                panic!("unexpected conversion: {value:?}")
-                            }
-                            Value::String(script) => {
-                                let mut script_bytes = vec![0u8; script.len() / 2];
-                                faster_hex::hex_decode(script.as_bytes(), script_bytes.as_mut_slice())?;
-
-                                Ok(script_bytes)
-                            }
-                        }
-                    }
-                }
 
                 let mut version: Option<u16> = None;
                 let mut script: Option<Vec<u8>> = None;
 
+                // `Value` is untagged, so EITHER shape arrives under EITHER key: which one a field
+                // holds is the sender's choice, and a mismatch is a malformed request, not a bug.
+                // These used to `panic!` on it, and this visitor serves wRPC JSON
+                // (`{"version": "00", ...}` in a submitted transaction's output), where the panic
+                // hook turns a panic into `process::exit(1)`.
                 while let Some((key, value)) = access.next_entry::<Field, Value>()? {
-                    match key {
-                        Field::Version => {
-                            version = Some(value.into());
+                    match (key, value) {
+                        (Field::Version, Value::U16(v)) => version = Some(v),
+                        (Field::Version, Value::String(_)) => {
+                            return Err(Error::custom("ScriptPublicKey `version` must be a number, not a string"));
                         }
-                        Field::Script => script = Some(value.try_into().map_err(Error::custom)?),
+                        (Field::Script, Value::String(hex)) => {
+                            let mut script_bytes = vec![0u8; hex.len() / 2];
+                            faster_hex::hex_decode(hex.as_bytes(), script_bytes.as_mut_slice()).map_err(Error::custom)?;
+                            script = Some(script_bytes);
+                        }
+                        (Field::Script, Value::U16(_)) => {
+                            return Err(Error::custom("ScriptPublicKey `script` must be a hex string, not a number"));
+                        }
                     }
                     if version.is_some() && script.is_some() {
                         break;
@@ -424,6 +413,23 @@ mod tests {
         let result = "0000".parse::<ScriptPublicKey>();
         let _empty = ScriptPublicKey { version: 0, script: ScriptVec::new() };
         assert!(matches!(result, Ok(_empty)));
+    }
+
+    /// The object form takes `version` as a number and `script` as a hex string. Either field in the
+    /// other shape is an ERROR, never a panic: this visitor decodes wRPC JSON from anyone who can
+    /// reach the port, and the panic hook exits the process on any panic.
+    #[test]
+    fn spk_object_with_mistyped_fields_is_an_error() {
+        for json in [
+            r#"{"version":"0001","script":"0102"}"#,
+            r#"{"version":1,"script":7}"#,
+            r#"{"script":7,"version":1}"#,
+            r#"{"version":"x","script":"y"}"#,
+        ] {
+            assert!(serde_json::from_str::<ScriptPublicKey>(json).is_err(), "{json} must be refused, not panic");
+        }
+        let spk = serde_json::from_str::<ScriptPublicKey>(r#"{"version":1,"script":"0102"}"#).expect("the honest object form decodes");
+        assert_eq!(spk, ScriptPublicKey::from_vec(1, vec![1, 2]));
     }
 
     #[test]
