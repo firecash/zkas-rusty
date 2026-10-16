@@ -11,7 +11,7 @@ use kaspa_p2p_lib::{
 };
 use log::debug;
 
-use crate::{flow_context::FlowContext, flow_trait::Flow};
+use crate::{flow_context::FlowContext, flow_trait::Flow, ibd::REQUEST_HEADERS_MAX_BLOCKS};
 
 pub struct RequestHeadersFlow {
     ctx: FlowContext,
@@ -37,9 +37,9 @@ impl RequestHeadersFlow {
     }
 
     async fn start_impl(&mut self) -> Result<(), ProtocolError> {
-        const MAX_BLOCKS: usize = 1 << 10;
-        // Internal consensus logic requires that `max_blocks > mergeset_size_limit`
-        let max_blocks = max(MAX_BLOCKS, self.ctx.config.mergeset_size_limit() as usize + 1);
+        // Internal consensus logic requires that `max_blocks > mergeset_size_limit`. Requesters size their
+        // ceiling on a chunk from the same constant (`max_headers_per_message`).
+        let max_blocks = max(REQUEST_HEADERS_MAX_BLOCKS, self.ctx.config.mergeset_size_limit() as usize + 1);
         let header_format = self.header_format;
 
         loop {

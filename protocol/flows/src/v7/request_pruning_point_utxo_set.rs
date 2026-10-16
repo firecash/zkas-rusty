@@ -1,4 +1,8 @@
-use crate::{flow_context::FlowContext, flow_trait::Flow, ibd::IBD_BATCH_SIZE};
+use crate::{
+    flow_context::FlowContext,
+    flow_trait::Flow,
+    ibd::{IBD_BATCH_SIZE, PRUNING_POINT_UTXO_CHUNK_SIZE as CHUNK_SIZE},
+};
 use itertools::Itertools;
 use kaspa_consensus_core::errors::consensus::ConsensusError;
 use kaspa_core::debug;
@@ -43,7 +47,6 @@ impl RequestPruningPointUtxoSetFlow {
     }
 
     async fn handle_request(&mut self, expected_pp: Hash) -> Result<(), ProtocolError> {
-        const CHUNK_SIZE: usize = 1000;
         let mut from_outpoint = None;
         let mut chunks_sent = 0;
 
