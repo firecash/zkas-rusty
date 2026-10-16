@@ -505,6 +505,17 @@ impl Consensus {
                 );
             }
         }
+        // An interrupted chain walk leaves the global nullifier set at some chain block other than the
+        // sink, and records which. Move it to the sink before any processor reads it. Only on stable
+        // state: mid-IBD the virtual state is not a sink the set was ever walked to.
+        if self.config.params.shielded_coinbase {
+            let meta = self.pruning_meta_stores.read();
+            let stable = meta.pruning_shielded_stable_flag() && meta.pruning_utxoset_stable_flag();
+            drop(meta);
+            if stable {
+                self.virtual_processor.reconcile_nullifier_set_at_startup();
+            }
+        }
         // Spawn the asynchronous processors.
         let header_processor = self.header_processor.clone();
         let body_processor = self.body_processor.clone();

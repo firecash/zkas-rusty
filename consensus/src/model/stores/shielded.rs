@@ -158,6 +158,17 @@ impl DbNullifierDiffStore {
     pub fn delete_batch(&self, batch: &mut WriteBatch, block: Hash) -> StoreResult<()> {
         self.access.delete(BatchDbWriter::new(batch), block)
     }
+
+    /// Every stored per-block diff, straight from RocksDB (no cache). Used only to rebuild the global
+    /// set when the startup self-check finds it diverged.
+    pub fn iter_all(&self) -> impl Iterator<Item = StoreResult<(Hash, Vec<[u8; 32]>)>> + '_ {
+        self.access.iterator().map(|res| match res {
+            Ok((key, nullifiers)) => Hash::try_from_slice(&key)
+                .map(|block| (block, nullifiers))
+                .map_err(|_| StoreError::DataInconsistency(format!("nullifier-diff key of {} bytes", key.len()))),
+            Err(e) => Err(StoreError::DataInconsistency(format!("nullifier-diff iteration failed: {e}"))),
+        })
+    }
 }
 
 impl NullifierDiffStoreReader for DbNullifierDiffStore {
@@ -167,6 +178,62 @@ impl NullifierDiffStoreReader for DbNullifierDiffStore {
             Err(StoreError::KeyNotFound(_)) => Ok(Vec::new()),
             Err(e) => Err(e),
         }
+    }
+}
+
+// ------------------------- Nullifier-set cursor --------------------------
+
+/// The single key of [`DbNullifierCursorStore`].
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct NullifierCursorKey;
+
+impl AsRef<[u8]> for NullifierCursorKey {
+    fn as_ref(&self) -> &[u8] {
+        &[0u8]
+    }
+}
+
+impl fmt::Display for NullifierCursorKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("nullifier-set cursor")
+    }
+}
+
+/// Which chain block the global nullifier set reflects: the set equals the union of the per-block
+/// diffs along that block's selected chain.
+///
+/// The global set is moved block by block as the virtual chain is walked, in several batches, while
+/// the virtual state that names the sink is committed once at the end. Each batch is atomic, so after
+/// a crash the set always reflects SOME chain block, but before this record existed nothing said
+/// which, and the node resumed as if it were the sink. Every write that changes the set now writes
+/// this record in the same batch, so the set is self-describing and a restart can walk it to the sink
+/// from the diffs. Absent on a database from an older build until its first chain commit.
+#[derive(Clone)]
+pub struct DbNullifierCursorStore {
+    access: CachedDbAccess<NullifierCursorKey, Hash>,
+}
+
+impl DbNullifierCursorStore {
+    pub fn new(db: Arc<DB>, cache_policy: CachePolicy) -> Self {
+        Self { access: CachedDbAccess::new(db, cache_policy, DatabaseStorePrefixes::ShieldedNullifierCursor.into()) }
+    }
+
+    /// `None` when this database has never recorded one (written by an older build).
+    pub fn get(&self) -> StoreResult<Option<Hash>> {
+        match self.access.read(NullifierCursorKey) {
+            Ok(block) => Ok(Some(block)),
+            Err(StoreError::KeyNotFound(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub fn set_batch(&self, batch: &mut WriteBatch, block: Hash) -> StoreResult<()> {
+        self.access.write(BatchDbWriter::new(batch), NullifierCursorKey, block)
+    }
+
+    #[cfg(test)]
+    pub fn delete_batch(&self, batch: &mut WriteBatch) -> StoreResult<()> {
+        self.access.delete(BatchDbWriter::new(batch), NullifierCursorKey)
     }
 }
 

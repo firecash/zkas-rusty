@@ -162,6 +162,10 @@ pub enum DatabaseStorePrefixes {
     /// `Hash` of the lowest block this node indexed itself, recorded when a shielded-history backfill
     /// first writes below it. Everything under it is peer-supplied.
     ShieldedHistoryOwnBase = 98,
+    /// `Hash` of the chain block whose selected chain the global nullifier set currently reflects.
+    /// Written in the same batch as every change to that set, so after a crash the set says where it
+    /// stands and startup can move it to the virtual sink from the per-block diffs.
+    ShieldedNullifierCursor = 99,
 
     // ---- Separator ----
     /// Reserved as a separator
