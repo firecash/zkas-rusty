@@ -941,10 +941,23 @@ impl VirtualStateProcessor {
     /// (`rebuild_nullifier_set`); if it cannot be rebuilt the node refuses templates and wallet reads
     /// and says so loudly. Holds the virtual upgradable lock so blocks are not committed mid-scan.
     pub fn check_nullifier_set_consistency(&self) {
-        // Only a node whose shielded state is marked stable is judged: one restarted mid-import (or
-        // a staging consensus during IBD) is legitimately not at its sink yet, and a false alarm
-        // here would refuse templates until restart.
-        if !self.shielded_coinbase || !self.pruning_meta_stores.read().pruning_shielded_stable_flag() {
+        // Only a node whose shielded state AND UTXO set are marked stable is judged: one restarted
+        // mid-import (or a staging consensus during IBD) is legitimately not at its sink yet, and a
+        // false alarm here latches `SHIELDED_STATE_DIVERGED` -- which refuses templates, wallet reads
+        // and shielded submissions -- until the next restart, long after IBD has finished.
+        //
+        // The shielded flag alone is not enough. A pruning catch-up imports the shielded state first
+        // (set at the NEW pruning point, flag raised) and the UTXO set after; until that second import
+        // resets the virtual state the sink is still the OLD one. A restart in that window (the UTXO
+        // download takes minutes) compared the new set against the old sink's snapshot, could not
+        // rebuild across the gap, and latched. `intrusive_pruning_point_update` lowers the UTXO flag in
+        // the same batch as the shielded one and only the finished UTXO import raises it, so it marks
+        // exactly that window. Same gate as `reconcile_nullifier_set_at_startup`.
+        let stable = {
+            let meta = self.pruning_meta_stores.read();
+            meta.pruning_shielded_stable_flag() && meta.pruning_utxoset_stable_flag()
+        };
+        if !self.shielded_coinbase || !stable {
             return;
         }
         // Before the virtual lock, for the lock order explained in `reconcile_nullifier_set_at_startup`.
