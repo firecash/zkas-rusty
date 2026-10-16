@@ -61,6 +61,18 @@ impl PruningProofManager {
             .map(|level| BlockHashSet::from_iter(proof[level as usize].iter().map(|header| header.hash)))
             .collect_vec();
 
+        // Every score below is taken from a header the sender chose, and is then stored as if this
+        // node had computed it: proof headers and trusted blocks get their ghostdag row's blue score
+        // from the header, and the DAA score is stored with the header. Later arithmetic adds to
+        // those values (a child's blue score is the selected parent's plus its blues, its DAA score
+        // likewise, the chain-segment walk adds the finality depth), and with overflow checks on in
+        // release a value near u64::MAX panicked there, which the panic hook turns into an exit.
+        // A trusted block's header is PoW-checked only against its own declared bits, so the value
+        // costs nothing to forge. Refuse it here, before anything is written.
+        for header in proof.iter().flatten().chain(trusted_set.iter().map(|tb| &tb.block.header)).chain(header_only_chain_segment) {
+            check_imported_scores(header)?;
+        }
+
         let mut expanded_proof = proof;
         let mut trusted_gd_map: BlockHashMap<GhostdagData> = BlockHashMap::new();
         let mut trusted_header_map: BlockHashMap<Arc<Header>> = BlockHashMap::new();
@@ -382,6 +394,20 @@ impl PruningProofManager {
     }
 }
 
+/// Ceiling on the blue and DAA score of any header imported through a pruning proof or trusted
+/// data. 2^62 is ~1.46 billion years of blocks at 100 BPS, so no honest header comes near it, and
+/// it leaves 3 * 2^62 of headroom for every addition made to a stored score afterwards (each is a
+/// mergeset size or a depth parameter). Node-local import policy, not a block validity rule: a
+/// header refused here is one no honest chain can contain.
+pub(crate) const MAX_IMPORTED_SCORE: u64 = 1 << 62;
+
+fn check_imported_scores(header: &Header) -> PruningImportResult<()> {
+    if header.blue_score > MAX_IMPORTED_SCORE || header.daa_score > MAX_IMPORTED_SCORE {
+        return Err(PruningImportError::ImplausibleImportedScores(header.hash, header.blue_score, header.daa_score, MAX_IMPORTED_SCORE));
+    }
+    Ok(())
+}
+
 impl PruningProofManager {
     /// Structural checks that every honest trusted ghostdag row passes. Deliberately NOT
     /// "selected_parent == mergeset_blues[0]": an honest pruned server rewrites the selected
@@ -422,6 +448,22 @@ impl PruningProofManager {
 mod trusted_ghostdag_tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn imported_scores_above_the_ceiling_are_refused() {
+        let header = |blue_score: u64, daa_score: u64| {
+            let mut header = Header::from_precomputed_hash(h(7), vec![h(1)]);
+            header.blue_score = blue_score;
+            header.daa_score = daa_score;
+            header
+        };
+        check_imported_scores(&header(0, 0)).unwrap();
+        check_imported_scores(&header(7_000_000, 7_000_000)).unwrap();
+        check_imported_scores(&header(MAX_IMPORTED_SCORE, MAX_IMPORTED_SCORE)).unwrap();
+        assert!(check_imported_scores(&header(u64::MAX, 0)).is_err(), "blue score at u64::MAX");
+        assert!(check_imported_scores(&header(0, u64::MAX)).is_err(), "DAA score at u64::MAX");
+        assert!(check_imported_scores(&header(MAX_IMPORTED_SCORE + 1, 0)).is_err());
+    }
 
     fn h(n: u8) -> Hash {
         Hash::from_bytes([n; 32])
