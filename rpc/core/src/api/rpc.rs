@@ -15,6 +15,15 @@ use std::sync::Arc;
 
 pub const MAX_SAFE_WINDOW_SIZE: u32 = 10_000;
 
+/// Most DAA scores one `GetDaaScoreTimestampEstimate` may ask about unless the node runs with
+/// `--unsaferpc`. The list was bounded only by the request size: ~16.7M one-byte varints fit in a
+/// 16 MiB gRPC request (64M+ in a 128 MiB wRPC JSON one), and the handler copies, sorts and
+/// hash-maps all of them while holding a consensus session -- tens of bytes of memory per byte of wire.
+/// Every caller in this tree asks for one score per call (the wallet, per transaction); the CLI
+/// passes what the operator types. 10,000 matches `MAX_SAFE_WINDOW_SIZE`, the other safe-mode
+/// ceiling on a client-chosen count.
+pub const MAX_SAFE_DAA_SCORE_ESTIMATES: usize = 10_000;
+
 /// Client RPC Api
 ///
 /// The [`RpcApi`] trait defines RPC calls taking a request message as unique parameter.
