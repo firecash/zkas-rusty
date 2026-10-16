@@ -105,8 +105,15 @@ const MAX_HISTORY_CHUNK_RECORDS: usize = 8_000;
 /// record dominate memory.
 const MAX_HISTORY_RECORD_BYTES: usize = 32 * 1024 * 1024;
 
-/// One history chunk's serialized records in total, checked before any is decoded.
-const MAX_HISTORY_CHUNK_BYTES: usize = 256 * 1024 * 1024;
+/// One history chunk's serialized records in total, checked before any is decoded. Kept under the
+/// p2p transport cap (`P2P_MAX_MESSAGE_SIZE`, 256 MB) with room for protobuf framing, so an
+/// oversized chunk fails with this protocol error rather than as an opaque transport decode error.
+const MAX_HISTORY_CHUNK_BYTES: usize = 192 * 1024 * 1024;
+
+/// A chunk that is not the last may be short in RECORDS if it is long in BYTES: a server that
+/// stopped on its own byte budget is doing the right thing, and refusing it as a drip feed would
+/// make a shielded-heavy range unsyncable. One of the two floors has to be met.
+const MIN_HISTORY_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 
 /// A chunk that is not the last must carry at least this many records. An honest server fills every
 /// chunk but the last (`max_blocks + 1` records); without a floor a peer could drip one record per
@@ -1100,9 +1107,9 @@ impl IbdFlow {
                     "peer sent {chunk_bytes} bytes of shielded history in one chunk, above the {MAX_HISTORY_CHUNK_BYTES} ceiling"
                 )));
             }
-            if !msg.done && msg.entries.len() < MIN_HISTORY_CHUNK_RECORDS {
+            if !msg.done && msg.entries.len() < MIN_HISTORY_CHUNK_RECORDS && chunk_bytes < MIN_HISTORY_CHUNK_BYTES {
                 return Err(ProtocolError::OtherOwned(format!(
-                    "peer sent a short shielded history chunk ({} records) that is not the last; refusing a drip feed",
+                    "peer sent a short shielded history chunk ({} records, {chunk_bytes} bytes) that is not the last; refusing a drip feed",
                     msg.entries.len()
                 )));
             }

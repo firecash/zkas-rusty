@@ -1630,16 +1630,45 @@ impl ConsensusApi for Consensus {
             // Not on this node's selected chain (or reorged away): the requester must re-anchor.
             return Ok((Vec::new(), false, 0));
         };
+        // A chunk has to be bounded in BYTES, not only in blocks. One record carries its chain
+        // block's whole mergeset of accepted actions in compact form (148 B each), and a mergeset
+        // is up to `mergeset_size_limit` blocks whose shielded capacity is itself bounded only by
+        // block mass -- so a single record can reach megabytes, and `max_blocks` of them can reach
+        // gigabytes. Nothing bounded that: the vector is built here in full, then serialized into
+        // one p2p message, so one cheap request could make this node allocate a chunk far larger
+        // than the transport will carry -- and every retry would fail the same way.
+        //
+        // `HISTORY_CHUNK_SOFT_BYTES` is the normal stop, taken only once the chunk holds enough
+        // records to satisfy a requester's anti-drip floor; `HISTORY_CHUNK_MAX_BYTES` is the
+        // backstop that holds even if single records are huge. Stopping early is not an error:
+        // `index > 0` keeps `done` false and the requester re-anchors at the lowest record it got.
+        const HISTORY_CHUNK_SOFT_BYTES: usize = 16 * 1024 * 1024;
+        const HISTORY_CHUNK_MAX_BYTES: usize = 128 * 1024 * 1024;
+        const HISTORY_CHUNK_MIN_RECORDS: usize = 1_000;
+        let record_bytes = |d: &kaspa_consensus_core::api::ShieldedChainBlockData| -> usize {
+            d.accepted_actions.iter().map(|a| a.len().saturating_add(8)).sum::<usize>()
+                + d.coinbase_outputs.iter().map(|(script, _)| script.len().saturating_add(16)).sum::<usize>()
+                + d.coinbase_commitments.len() * 32
+                + d.accepted_txids.len() * 32
+                + 96
+        };
+        let mut bytes = 0usize;
+
         let mut out = Vec::with_capacity(max_blocks.min(anchor_index as usize) + 1);
         // The anchor block ITSELF first. The requester needs one block it can already locate to
         // learn how its own index maps onto this node's genesis-based numbering; without it the
         // very first chunk has no overlap, the shift is unknowable, and nothing can be written.
         // Costs one record per chunk and makes the walk self-anchoring.
         if let Ok(data) = self.virtual_processor.shielded_chain_block_data(anchor) {
+            bytes = bytes.saturating_add(record_bytes(&data));
             out.push((anchor_index, data));
         }
         let mut index = anchor_index;
-        while out.len() <= max_blocks && index > 0 {
+        while out.len() <= max_blocks
+            && index > 0
+            && !(bytes >= HISTORY_CHUNK_SOFT_BYTES && out.len() >= HISTORY_CHUNK_MIN_RECORDS)
+            && bytes < HISTORY_CHUNK_MAX_BYTES
+        {
             index -= 1;
             let Some(hash) = sc_read.get_by_index(index).optional().unwrap() else { break };
             // A block with no shielded effects has no record; skip it rather than abort — the
@@ -1649,6 +1678,7 @@ impl ConsensusApi for Consensus {
             // with no shielded effects, and the requester rebuilds the tree from the `cmx`
             // leaves it receives, so empty records are harmless and keep the walk contiguous.
             if let Ok(data) = self.virtual_processor.shielded_chain_block_data(hash) {
+                bytes = bytes.saturating_add(record_bytes(&data));
                 out.push((index, data));
             }
         }
