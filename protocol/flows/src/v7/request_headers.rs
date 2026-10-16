@@ -74,9 +74,8 @@ impl RequestHeadersFlow {
                 debug!("Got {} header hashes above {}", block_headers.len(), low);
                 low = last;
                 // A requester can send `RequestNextHeaders` without reading a single chunk, so each
-                // chunk is paced -- and the session is released first, since that wait (and the
-                // dequeue after it) lasts as long as the peer chooses.
-                drop(session);
+                // chunk is paced. No session is held across that wait or the dequeue after it, both of
+                // which last as long as the peer chooses: `spawn_blocking` consumed it above.
                 self.router
                     .enqueue_paced(make_response!(Payload::BlockHeaders, BlockHeadersMessage { block_headers }, request_id))
                     .await?;
