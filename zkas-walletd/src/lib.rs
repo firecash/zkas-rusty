@@ -3102,7 +3102,9 @@ impl WalletEntry {
                     // node for the chain block at this DAA (locator: last block strictly
                     // below daa+1). A node without the locator answers its finality point,
                     // whose DAA will not match — skipped.
-                    let req = kaspa_rpc_core::GetShieldedTreeStateRequest { block_hash: None, below_daa_score: Some(daa + 1) };
+                    // Saturating: a corrupt row's DAA must not overflow under release overflow checks
+                    // (fatal when walletd is embedded in the node); the answer then simply won't match.
+                    let req = kaspa_rpc_core::GetShieldedTreeStateRequest { block_hash: None, below_daa_score: Some(daa.saturating_add(1)) };
                     match tokio::time::timeout(SYNC_RPC_TIMEOUT, client.get_shielded_tree_state_call(None, req)).await {
                         Ok(Ok(ts)) if ts.daa_score == daa => Some(ts.block_hash),
                         _ => None,
@@ -8274,7 +8276,9 @@ async fn proof_verify(
 
 /// The chain block at exactly `daa`, via the node's DAA locator.
 async fn chain_block_at_daa(client: &GrpcClient, daa: u64) -> Option<RpcHash> {
-    let req = kaspa_rpc_core::GetShieldedTreeStateRequest { block_hash: None, below_daa_score: Some(daa + 1) };
+    // `daa` is client-supplied (`/api/proof/verify`, `/api/wallet/scan-receipt`); `u64::MAX + 1`
+    // overflowed under release overflow checks, which kills the whole node when walletd is embedded.
+    let req = kaspa_rpc_core::GetShieldedTreeStateRequest { block_hash: None, below_daa_score: Some(daa.checked_add(1)?) };
     match tokio::time::timeout(SYNC_RPC_TIMEOUT, client.get_shielded_tree_state_call(None, req)).await {
         Ok(Ok(ts)) if ts.daa_score == daa => Some(ts.block_hash),
         _ => None,

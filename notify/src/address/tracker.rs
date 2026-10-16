@@ -1,7 +1,7 @@
 use crate::address::error::{Error, Result};
 use indexmap::{IndexMap, map::Entry};
 use itertools::Itertools;
-use kaspa_addresses::{Address, Prefix};
+use kaspa_addresses::{Address, Prefix, Version};
 use kaspa_consensus_core::tx::ScriptPublicKey;
 use kaspa_core::{debug, trace};
 use kaspa_txscript::{extract_script_pub_key_address, pay_to_address_script};
@@ -207,6 +207,23 @@ impl Indexer for IndexSet {
 }
 
 #[derive(Debug)]
+/// The address a tracked script was built from.
+///
+/// Every script in the tracker is `pay_to_address_script(address)` of a subscribed address
+/// ([`Tracker::register`] is the only insert path), so this is an exact inverse, not a guess. The
+/// generic `extract_script_pub_key_address` is not one: a shielded (Orchard) address's "script" is
+/// its raw 43-byte payload, which classifies as NonStandard and has no transparent inverse. The
+/// tracker used to `expect` that conversion, and every subscription is converted back on unsubscribe
+/// and on disconnect -- so subscribing to one shielded address and hanging up exited the node. The
+/// shielded case is rebuilt from the payload and confirmed by re-encoding.
+fn address_of_tracked_spk(spk: &ScriptPublicKey, prefix: Prefix) -> Option<Address> {
+    if let Ok(address) = extract_script_pub_key_address(spk, prefix) {
+        return Some(address);
+    }
+    let address = Address::try_new(prefix, Version::ShieldedOrchard, spk.script()).ok()?;
+    (pay_to_address_script(&address) == *spk).then_some(address)
+}
+
 struct Inner {
     /// Index-based map of [`ScriptPublicKey`] to its reference count
     ///
@@ -299,7 +316,7 @@ impl Inner {
     fn get_index_address(&self, index: Index, prefix: Prefix) -> Option<Address> {
         self.script_pub_keys
             .get_index(index as usize)
-            .map(|(spk, _)| extract_script_pub_key_address(spk, prefix).expect("is retro-convertible"))
+            .map(|(spk, _)| address_of_tracked_spk(spk, prefix).expect("every tracked script was built from an address"))
     }
 
     fn get_or_insert(&mut self, spk: ScriptPublicKey) -> Result<Index> {
@@ -311,7 +328,7 @@ impl Inner {
                     trace!(
                         "AddressTracker insert #{} {}",
                         index,
-                        extract_script_pub_key_address(entry.key(), Prefix::Mainnet).unwrap()
+                        address_of_tracked_spk(entry.key(), Prefix::Mainnet).map(|a| a.to_string()).unwrap_or_default()
                     );
                     let _ = *entry.insert(0);
 
@@ -687,6 +704,22 @@ mod tests {
             CAPACITY,
             "the tracker capacity should not have been affected by the transient insert/swap_remove"
         );
+    }
+
+    /// Every script the tracker holds converts back to the address it was built from, shielded ones
+    /// included. The shielded case had no inverse and `expect`ed one, which ran on every unsubscribe and
+    /// disconnect: one subscription to a shielded address plus a hang-up exited the node.
+    #[test]
+    fn tracked_scripts_convert_back_exactly_including_shielded() {
+        let shielded = Address::new(Prefix::Mainnet, Version::ShieldedOrchard, &[7u8; 43]);
+        let transparent = create_addresses(1, 1).pop().unwrap();
+        let tracker = Tracker::with_addresses(&[shielded.clone(), transparent.clone()]);
+        let inner = tracker.inner.read();
+        assert_eq!(inner.get_index_address(0, Prefix::Mainnet), Some(shielded));
+        assert_eq!(inner.get_index_address(1, Prefix::Mainnet), Some(transparent));
+        // A 43-byte script that is not the shielded encoding of anything is not passed off as one.
+        let foreign = ScriptPublicKey::new(1, kaspa_consensus_core::tx::ScriptVec::from_slice(&[7u8; 43]));
+        assert_eq!(address_of_tracked_spk(&foreign, Prefix::Mainnet), None);
     }
 
     #[test]

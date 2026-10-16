@@ -317,7 +317,10 @@ impl AddressManager {
         const MAX_BANNED_TIME: u64 = 24 * 60 * 60 * 1000;
         match self.banned_address_store.get(ip.into()).optional().unwrap() {
             Some(timestamp) => {
-                if unix_now() - timestamp.0 > MAX_BANNED_TIME {
+                // Saturating: a ban stamped before a backward clock step is in the "future", and a
+                // plain `-` underflowed (release builds check overflow) on the next connection from
+                // that IP, which this runs on since bans are consulted at connection time.
+                if unix_now().saturating_sub(timestamp.0) > MAX_BANNED_TIME {
                     self.unban(ip);
                     false
                 } else {

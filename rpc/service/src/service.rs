@@ -725,20 +725,27 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
     ) -> RpcResult<GetMempoolEntriesByAddressesResponse> {
         let query = self.extract_tx_query(request.filter_transaction_pool, request.include_orphan_pool)?;
         let session = self.consensus_manager.consensus().unguarded_session();
-        let script_public_keys = request.addresses.iter().map(pay_to_address_script).collect();
+        // Each owner is answered under the address it was REQUESTED as. Converting its script back
+        // with `extract_script_pub_key_address(..).expect(..)` was not total: a shielded `zkas:`
+        // address is a valid request whose "script" is its raw 43-byte payload, which classifies as
+        // NonStandard and has no transparent inverse, so one anonymous call naming any shielded
+        // address hit the `expect` and the panic hook exited the node. `fill_owner_set_transactions`
+        // answers exactly the requested scripts, so every owner is found here.
+        let requested: std::collections::HashMap<RpcScriptPublicKey, kaspa_addresses::Address> =
+            request.addresses.into_iter().map(|address| (pay_to_address_script(&address), address)).collect();
+        let script_public_keys = requested.keys().cloned().collect();
         let grouped_txs = self.mining_manager.clone().get_transactions_by_addresses(script_public_keys, query).await;
         let mempool_entries = grouped_txs
             .owners
             .iter()
-            .map(|(script_public_key, owner_transactions)| {
-                let address = extract_script_pub_key_address(script_public_key, self.config.prefix())
-                    .expect("script public key is convertible into an address");
-                self.consensus_converter.get_mempool_entries_by_address(
+            .filter_map(|(script_public_key, owner_transactions)| {
+                let address = requested.get(script_public_key)?.clone();
+                Some(self.consensus_converter.get_mempool_entries_by_address(
                     &session,
                     address,
                     owner_transactions,
                     &grouped_txs.transactions,
-                )
+                ))
             })
             .collect();
         Ok(GetMempoolEntriesByAddressesResponse::new(mempool_entries))

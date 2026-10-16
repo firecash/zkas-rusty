@@ -904,8 +904,14 @@ impl FlowContext {
 
         // Perform the handshake
         let peer_version_message = handshake.handshake(self_version_message.into()).await?;
-        // Get time_offset as accurate as possible by computing right after the handshake
-        let time_offset = unix_now() as i64 - peer_version_message.timestamp;
+        // Get time_offset as accurate as possible by computing right after the handshake.
+        //
+        // `timestamp` is the peer's raw protobuf int64, unchecked at this point, and release builds
+        // run with `overflow-checks = true`: a plain `-` let any TCP client of the p2p port send
+        // `i64::MIN` and overflow here, and the panic hook turned that into `process::exit(1)` before
+        // the network name, version or anything else about the peer had been looked at. The offset
+        // is informational (peer info), so saturate rather than refuse.
+        let time_offset = (unix_now() as i64).saturating_sub(peer_version_message.timestamp);
 
         let peer_version: Version = peer_version_message.try_into()?;
         router.set_identity(peer_version.id);
