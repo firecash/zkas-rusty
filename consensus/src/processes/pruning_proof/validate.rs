@@ -34,8 +34,8 @@ use crate::{
         },
     },
     processes::{
-        ghostdag::protocol::GhostdagManager, pruning_proof::GhostdagReaderExt, reachability::inquirer as reachability,
-        relations::RelationsStoreExtensions,
+        difficulty::level_work, ghostdag::protocol::GhostdagManager, pruning_proof::GhostdagReaderExt,
+        reachability::inquirer as reachability, relations::RelationsStoreExtensions,
     },
 };
 
@@ -336,6 +336,54 @@ impl ProofContext {
             selected_tip: self.selected_tip_by_level[level as usize],
         }
     }
+
+    /// The proof-of-work this proof demonstrates through its block levels, in expected hashes (the
+    /// unit of `blue_work`). Nothing declared is read: the count at each level is the locally
+    /// computed blue score of that level's selected tip, and every header counted there was checked
+    /// above to compute a level of at least that level from its own hash. See
+    /// [`level_attested_work`] for why that is work the sender cannot have skipped.
+    ///
+    /// The best estimate wins: the lowest level whose segment reaches genesis counts essentially
+    /// the whole chain, lower levels count only their recent segment (an underestimate), and higher
+    /// levels count the same chain with fewer, noisier samples. A level with fewer than
+    /// [`MIN_ATTESTING_HEADERS`] headers is ignored, so a single lucky high-level header cannot
+    /// stand in for a chain's worth of work.
+    fn level_attested_work(&self, max_block_level: BlockLevel) -> BlueWorkType {
+        (1..=max_block_level)
+            .filter_map(|level| {
+                // The level's root (a child of ORIGIN) has blue score 0 and each blue adds one, so
+                // the tip's blue score counts every blue header of the level but one. When the root
+                // is genesis -- free, its maximal level is a convention -- that one is genesis.
+                let headers = self.level(level).blue_score();
+                (headers >= MIN_ATTESTING_HEADERS).then(|| level_attested_work(headers, level, max_block_level))
+            })
+            .max()
+            .unwrap_or(BlueWorkType::ZERO)
+    }
+}
+
+/// Fewest headers at one level whose count is taken as evidence of work. A level-`L` header is a
+/// `2^-(256 - max_block_level + L)` event per hash, so one of them proves little about how many
+/// hashes were spent (the next one could take ten times as long); sixteen bound the estimate to
+/// within a small factor. Every honest proof clears it with room to spare: the lowest level whose
+/// segment reaches genesis holds about `pruning_proof_m` headers, because the level below it did not
+/// reach genesis in `2 * pruning_proof_m`.
+const MIN_ATTESTING_HEADERS: u64 = 16;
+
+/// Expected hashes behind `headers` proof headers whose computed level is at least `level` (`>= 1`).
+///
+/// A block's level is `max_block_level - bits(pow)` (`kaspa_pow::calc_level_from_pow`): it depends
+/// only on the hash value, not on the header's declared `bits`, so a level-`L` header needs
+/// `pow < 2^(max_block_level - L)`, which a hash meets with probability `2^-(256 - max_block_level +
+/// L)`. That per-header amount is [`level_work`], the same lower bound the level ghostdag above
+/// already applies to every block of a level. Level 0 is excluded (its level work is zero): every
+/// header has it, so its count proves only the declared `bits`, which is exactly what a fabricated
+/// proof chooses. One solution can back at most two headers (a header, and the block it serves as
+/// aux parent for, `kaspa_pow::auxpow::check_pow_gated`), so the estimate overstates a forger's real
+/// work by at most a factor of two.
+fn level_attested_work(headers: u64, level: BlockLevel, max_block_level: BlockLevel) -> BlueWorkType {
+    let (work, overflow) = level_work(level, max_block_level).overflowing_mul_u64(headers);
+    if overflow { BlueWorkType::MAX } else { work }
 }
 
 impl PruningProofManager {
@@ -391,6 +439,23 @@ impl PruningProofManager {
         defender_relay_blue_work: BlueWorkType,
         challenger_relay_blue_work: BlueWorkType,
     ) -> Result<(), ProofWeakness> {
+        // A node whose pruning point is still genesis has no proof of its own to weigh a challenger
+        // against, and the challenger's headers are checked only against their own declared bits:
+        // a chain mined at trivial difficulty from the real genesis wins every comparison below.
+        // Where the network sets a floor, require the challenger to attest real work first, by its
+        // block levels (see `ProofContext::level_attested_work`). Half the floor, because the
+        // estimate is sampled and the floor is read off the real chain: an honest proof attests
+        // about the floor or more, a forger has to spend at least a quarter of it (half, less the
+        // factor-two aux allowance). This is node-local adoption policy, never a validity rule.
+        if defender.pp_header.hash == self.genesis_hash
+            && let Some(floor) = self.fresh_sync_proof_work_floor
+        {
+            let attested = challenger.level_attested_work(self.max_block_level);
+            if attested < floor >> 1 {
+                return Err(ProofWeakness::BelowFreshSyncWorkFloor(attested, floor));
+            }
+        }
+
         // The accumulated blue work of the defender's proof from the pruning point onward
         let defender_pruning_period_work = defender_relay_blue_work.saturating_sub(defender.pp_header.blue_work);
 
@@ -443,11 +508,12 @@ impl PruningProofManager {
         // in the loop below, where a genesis-only defender cannot have a 2M level. What no
         // longer passes is a proof that has neither: a structurally empty one.
         //
-        // This raises the price of the attack from two headers to a structurally complete
-        // proof; it does NOT make the proof's work real, because the headers are still checked
-        // only against their own declared bits. Closing that needs an absolute work floor or a
-        // checkpoint for the fresh-node case -- a consensus-policy decision, and one upstream
-        // has not taken either (the waiver is still in rusty-kaspa master).
+        // On its own this raises the price of the attack from two headers to a structurally
+        // complete proof, but does not make the proof's work real: the headers are checked only
+        // against their own declared bits. The fresh-sync work floor at the top of this function
+        // closes that for a chain forged from genesis, on networks that set one. It does not
+        // close a proof that reuses the real chain's headers up to some point and forges only
+        // the part after it; see the floor's documentation in `Params`.
 
         // If we got here it means there's no level with shared blocks
         // between the challenger and the defender. In this case we
@@ -486,5 +552,169 @@ impl PruningProofManager {
             defender_relay_blue_work,
             challenger_relay_blue_work,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::level_attested_work;
+    use crate::consensus::test_consensus::TestConsensus;
+    use kaspa_consensus_core::{
+        BlockLevel, BlueWorkType,
+        api::ConsensusApi,
+        config::{Config, ConfigBuilder, params::MAINNET_PARAMS},
+        errors::pruning::{ProofWeakness, PruningImportError},
+        pruning::{PruningPointProof, PruningProofMetadata},
+    };
+    use kaspa_hashes::Hash;
+    use std::{
+        sync::Arc,
+        time::{Duration, Instant},
+    };
+
+    #[test]
+    fn level_attested_work_counts_hashes_not_declared_bits() {
+        // Mainnet: a level-1 header needs pow < 2^224, i.e. 2^32 hashes in expectation.
+        assert_eq!(level_attested_work(1, 1, 225), BlueWorkType::from_u64(1 << 32));
+        assert_eq!(level_attested_work(3, 2, 225), BlueWorkType::from_u64(3 << 33));
+        assert_eq!(level_attested_work(0, 7, 225), BlueWorkType::ZERO);
+        // Level 0 attests nothing: every header has it, whatever bits it declares.
+        assert_eq!(level_attested_work(1_000_000, 0, 225), BlueWorkType::ZERO);
+        // Above `MAX_WORK_LEVEL` the per-header work stops growing (`level_work`): an undercount,
+        // never an overcount.
+        assert_eq!(level_attested_work(1, 120, 225), BlueWorkType::from_u64(1) << 128);
+    }
+
+    // The scenario below is a test-scale model of mainnet's fresh-node sync, on a network whose
+    // block levels populate without real mining: proof-of-work checks are skipped, but a block's
+    // level is still `max_block_level - bits(kHeavyHash(header))`, and with `max_block_level = 254`
+    // a hash reaches level `L >= 1` with probability `2^-(L + 2)`, so each block is worth one hash
+    // and a level-1 header is worth 8 (`level_work(1, 254)`).
+    const TEST_MAX_BLOCK_LEVEL: BlockLevel = 254;
+    const PROOF_M: u64 = 16;
+
+    fn config(floor: Option<u64>) -> Config {
+        ConfigBuilder::new(MAINNET_PARAMS)
+            .skip_proof_of_work()
+            .edit_consensus_params(|p| {
+                // The pruning parameters of the integration `pruning_test`, which advance the
+                // pruning point after ~100 blocks of a single chain.
+                p.finality_depth = 2;
+                p.mergeset_size_limit = 2;
+                p.ghostdag_k = 2;
+                p.merge_depth = 3;
+                p.pruning_depth = 100;
+                p.pruning_proof_m = PROOF_M;
+                p.max_block_level = TEST_MAX_BLOCK_LEVEL;
+                // Empty-script coinbases (transparent), as in the virtual processor tests.
+                p.shielded_coinbase = false;
+                p.fresh_sync_proof_work_floor = floor.map(BlueWorkType::from_u64);
+            })
+            .build()
+    }
+
+    /// Mine a single chain on a node of its own until its pruning point has at least
+    /// `min_pruning_point_blue_score`, and return that node's proof with the metadata a relay
+    /// from it would carry.
+    async fn mine_chain(hash_base: u64, min_pruning_point_blue_score: u64) -> (Arc<PruningPointProof>, PruningProofMetadata) {
+        let config = config(None);
+        let tc = TestConsensus::new(&config);
+        let wait_handles = tc.init();
+        let mut tip = config.genesis.hash;
+        let blocks = min_pruning_point_blue_score + config.pruning_depth() + 20;
+        for i in 1..=blocks {
+            let hash: Hash = (hash_base + i).into();
+            tc.add_empty_utxo_valid_block_with_parents(hash, vec![tip]).await.unwrap();
+            tip = hash;
+        }
+        // The pruning point is advanced by the pruning processor, asynchronously.
+        let start = Instant::now();
+        loop {
+            let pp = tc.pruning_point();
+            if pp != config.genesis.hash && tc.get_header(pp).unwrap().blue_score >= min_pruning_point_blue_score {
+                break;
+            }
+            assert!(start.elapsed() < Duration::from_secs(30), "timed out waiting for the pruning point to advance");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let proof = tc.get_pruning_point_proof();
+        let metadata = PruningProofMetadata::new(tc.get_header(tc.get_headers_selected_tip()).unwrap().blue_work);
+        tc.shutdown(wait_handles);
+        (proof, metadata)
+    }
+
+    /// The proof that used to be adopted for free: genesis, then one block carrying whatever blue
+    /// work its author declared, at level 0 so the proof is otherwise well formed.
+    fn two_header_proof(fresh: &TestConsensus) -> PruningPointProof {
+        let genesis_hash = fresh.params().genesis.hash;
+        let genesis = fresh.get_header(genesis_hash).unwrap();
+        let mut forged = fresh.build_header_with_parents(Hash::from_u64_word(0xF4F4_F4F4), vec![genesis_hash]);
+        forged.blue_work = BlueWorkType::from_u64(u64::MAX);
+        while kaspa_pow::calc_block_level(&forged, TEST_MAX_BLOCK_LEVEL, true) != 0 {
+            forged.nonce += 1;
+        }
+        let forged = Arc::new(forged);
+        (0..=TEST_MAX_BLOCK_LEVEL)
+            .map(|level| if level == 0 { vec![genesis.clone(), forged.clone()] } else { vec![genesis.clone()] })
+            .collect()
+    }
+
+    fn is_weakness(result: &Result<(), PruningImportError>, check: impl Fn(&ProofWeakness) -> bool) -> bool {
+        matches!(result, Err(PruningImportError::ProofWeaknessError(weakness)) if check(weakness))
+    }
+
+    /// `compare_proofs_inner` with a genesis defender: the case of every node's first sync.
+    ///
+    /// An honest proof from a real (test) node is adopted with or without the floor. A proof of
+    /// two headers is refused either way (the waiver removed in 6b565e4 stays removed). A cheap but
+    /// structurally complete chain forged from genesis -- the part 6b565e4 could not close -- is
+    /// adopted by a node without a floor and refused by a node with one.
+    #[tokio::test]
+    async fn fresh_node_proof_adoption_needs_attested_work() {
+        // Honest chain: pruning point at blue score >= 400, so its proof attests ~400 hashes (at
+        // level 1 alone: 2M = 32 headers or more, worth 8 each, i.e. at least 256).
+        let (honest, honest_md) = mine_chain(1_000_000, 400).await;
+        // Forged chain from the same genesis: long enough to be complete (2M = 32 at level 0),
+        // too short to hold MIN_ATTESTING_HEADERS headers at any level >= 1 in expectation.
+        let (forged_chain, forged_md) = mine_chain(2_000_000, 40).await;
+
+        // The floor a real network would read off its chain (the honest pruning point's blue score,
+        // in this model's units); half of it, 200, must be attested. The honest proof clears that on
+        // its level-1 segment alone (at least 2M = 32 headers worth 8, or all ~52 of them). The
+        // forged chain's pruning point is at most ~60 blocks deep, so it would need 25 of those to
+        // be level 1 (expected ~7), or MIN_ATTESTING_HEADERS of them to be level 2 (expected ~4).
+        let floor = 400;
+
+        let open = TestConsensus::new(&config(None));
+        let guarded = TestConsensus::new(&config(Some(floor)));
+        let open_handles = open.init();
+        let guarded_handles = guarded.init();
+
+        let adopted = open.validate_pruning_proof(&honest, &honest_md);
+        assert!(adopted.is_ok(), "honest proof refused by an open node: {adopted:?}");
+        let adopted = guarded.validate_pruning_proof(&honest, &honest_md);
+        assert!(adopted.is_ok(), "honest proof refused by a guarded node: {adopted:?}");
+
+        let two = two_header_proof(&open);
+        let md = PruningProofMetadata::new(BlueWorkType::from_u64(u64::MAX));
+        let refused = open.validate_pruning_proof(&two, &md);
+        assert!(is_weakness(&refused, |w| matches!(w, ProofWeakness::NotEnoughHeaders)), "two-header proof adopted: {refused:?}");
+        let refused = guarded.validate_pruning_proof(&two, &md);
+        assert!(
+            is_weakness(&refused, |w| matches!(w, ProofWeakness::BelowFreshSyncWorkFloor(..))),
+            "two-header proof not refused by the floor: {refused:?}"
+        );
+
+        // The residual 6b565e4 left open, pinned so the floor is seen to be what closes it.
+        let adopted = open.validate_pruning_proof(&forged_chain, &forged_md);
+        assert!(adopted.is_ok(), "without a floor a complete low-work chain from genesis is adopted (the gap): {adopted:?}");
+        let refused = guarded.validate_pruning_proof(&forged_chain, &forged_md);
+        assert!(
+            is_weakness(&refused, |w| matches!(w, ProofWeakness::BelowFreshSyncWorkFloor(..))),
+            "low-work chain from genesis not refused by the floor: {refused:?}"
+        );
+
+        open.shutdown(open_handles);
+        guarded.shutdown(guarded_handles);
     }
 }

@@ -4,7 +4,7 @@ pub use super::{
     genesis::{DEVNET_GENESIS, GENESIS, GenesisBlock, SIMNET_GENESIS, TESTNET_GENESIS},
 };
 use crate::{
-    BlockLevel, KType,
+    BlockLevel, BlueWorkType, KType,
     constants::{BLOCK_VERSION, STORAGE_MASS_PARAMETER, TOCCATA_BLOCK_VERSION},
     mass::{BlockLaneLimits, BlockMassLimits, MassCofactors},
     network::{NetworkId, NetworkType},
@@ -559,6 +559,29 @@ pub struct Params {
     /// `None` disables the dev fee regardless of `dev_fee_permille`. Only meaningful on a
     /// `shielded_coinbase` network (the recipient is a shielded address).
     pub dev_fee_recipient: Option<[u8; 43]>,
+
+    /// Node-local IBD policy, not a consensus rule: the least proof-of-work a pruning proof must
+    /// attest before a node whose pruning point is still genesis adopts it.
+    ///
+    /// A fresh node has nothing to compare a proof against, and every proof header is checked only
+    /// against its own declared `bits`, so without this a chain mined at trivial difficulty from the
+    /// real genesis is adopted from whoever the node first syncs from. The work is not read from
+    /// any declared field: it is attested by the proof's block LEVELS, which are absolute (a level
+    /// is `max_block_level - bits(pow)`, independent of the header's `bits`), so a level-`L` header
+    /// costs `2^(256 - max_block_level + L)` hashes in expectation no matter what it declares.
+    ///
+    /// The value is a `blue_work` as a node reports it; a challenger must attest at least HALF of
+    /// it (the estimate is sampled, see `pruning_proof::validate`). Chain work only grows, so a
+    /// value taken from the live chain never starts rejecting honest proofs as it ages; it only
+    /// stops bounding an attacker who outspends it. `None` disables the check. Not reachable from
+    /// `--override-params`: mainnet refuses overrides, and the other networks carry `None`.
+    ///
+    /// What it closes: a chain forged from genesis, which must now carry real work of the order of
+    /// the real chain's. What it does not: a proof that reuses the real chain's own headers up to
+    /// some recent point (they carry the real work) and forges only the part after it. Refusing that
+    /// needs a judgement about RECENT work (hash rate), which a fixed number cannot make without
+    /// also refusing the honest chain the day its hash rate falls; it is left to peer diversity.
+    pub fresh_sync_proof_work_floor: Option<BlueWorkType>,
 }
 
 impl Params {
@@ -858,6 +881,9 @@ impl Params {
             // Consensus-critical dev fee; not exposed as a CLI override.
             dev_fee_permille: self.dev_fee_permille,
             dev_fee_recipient: self.dev_fee_recipient,
+
+            // Node-local IBD policy tied to this network's real chain; not exposed as a CLI override.
+            fresh_sync_proof_work_floor: self.fresh_sync_proof_work_floor,
         }
     }
 }
@@ -939,6 +965,17 @@ pub const ZKAS_SECURITY_FORK_DAA: u64 = 6_983_500;
 ///   (here possibly the final-note block). Sync new nodes from peers we run until the pruning point
 ///   passes F.
 pub const ZKAS_DEV_FEE_END_DAA: u64 = ZKAS_SECURITY_FORK_DAA;
+
+/// Mainnet [`Params::fresh_sync_proof_work_floor`]. Unset (`None`), the check is off and a fresh
+/// node behaves exactly as before it existed.
+///
+/// The operator fills it from a live, synced mainnet node: `getBlockDagInfo` gives the
+/// `pruningPointHash`; `getBlock` on that hash gives its header's `blueWork` (hex). Write that value
+/// here as `Some(kaspa_math::Uint192([low, mid, high]))`: the hex number split into 64-bit words,
+/// least significant word first. Use a pruning point, not the tip: it is final, so the number is one
+/// every honest proof keeps exceeding. Do not round it up and do not add a margin: the check already
+/// accepts half of it.
+pub const MAINNET_FRESH_SYNC_PROOF_WORK_FLOOR: Option<BlueWorkType> = None;
 
 pub const MAINNET_PARAMS: Params = Params {
     // ZKas is a distinct network with its own genesis; it MUST NOT advertise or
@@ -1074,6 +1111,7 @@ pub const MAINNET_PARAMS: Params = Params {
     // into the shielded pool like any miner reward.
     dev_fee_permille: ZKAS_DEV_FEE_PERMILLE,
     dev_fee_recipient: Some(ZKAS_DEV_FEE_RECIPIENT),
+    fresh_sync_proof_work_floor: MAINNET_FRESH_SYNC_PROOF_WORK_FLOOR,
 };
 
 pub const TESTNET_PARAMS: Params = Params {
@@ -1157,6 +1195,7 @@ pub const TESTNET_PARAMS: Params = Params {
     // Dev fee mirrors mainnet so the coinbase (miner note + dev note) is identical to production.
     dev_fee_permille: ZKAS_DEV_FEE_PERMILLE,
     dev_fee_recipient: Some(ZKAS_DEV_FEE_RECIPIENT),
+    fresh_sync_proof_work_floor: None,
 };
 
 pub const SIMNET_PARAMS: Params = Params {
@@ -1223,6 +1262,7 @@ pub const SIMNET_PARAMS: Params = Params {
     // No dev fee on this network.
     dev_fee_permille: 0,
     dev_fee_recipient: None,
+    fresh_sync_proof_work_floor: None,
 };
 
 pub const DEVNET_PARAMS: Params = Params {
@@ -1307,6 +1347,7 @@ pub const DEVNET_PARAMS: Params = Params {
     // each (the pre-fork shape), blocks above it accrue and pay one note per 20 DAA.
     dev_fee_permille: ZKAS_DEV_FEE_PERMILLE,
     dev_fee_recipient: Some(ZKAS_DEV_FEE_RECIPIENT),
+    fresh_sync_proof_work_floor: None,
 };
 
 #[cfg(test)]

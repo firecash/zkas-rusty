@@ -1,4 +1,4 @@
-use crate::BlockLevel;
+use crate::{BlockLevel, BlueWorkType};
 
 use super::{block::RuleError, tx::TxRuleError};
 use kaspa_hashes::Hash;
@@ -122,6 +122,9 @@ pub enum ProofWeakness {
 
     #[error("no shared blocks with the known level DAGs, and not enough headers from levels higher than the existing block levels.")]
     NotEnoughHeaders,
+
+    #[error("the proof attests {0} work by its block levels, below this network's fresh-sync floor (half of {1})")]
+    BelowFreshSyncWorkFloor(BlueWorkType, BlueWorkType),
 }
 
 pub type PruningImportResult<T> = std::result::Result<T, PruningImportError>;

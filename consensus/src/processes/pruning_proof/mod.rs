@@ -15,7 +15,7 @@ use parking_lot::{Mutex, RwLock};
 use rocksdb::WriteBatch;
 
 use kaspa_consensus_core::{
-    BlockHashMap, BlockHashSet, BlockLevel, HashMapCustomHasher, KType,
+    BlockHashMap, BlockHashSet, BlockLevel, BlueWorkType, HashMapCustomHasher, KType,
     blockhash::{self, BlockHashExtensions},
     config::params::ForkActivation,
     errors::{
@@ -121,6 +121,8 @@ pub struct PruningProofManager {
     toccata_activation: ForkActivation,
     merged_mining_activation: ForkActivation,
     security_fork_activation: ForkActivation,
+    /// See [`kaspa_consensus_core::config::params::Params::fresh_sync_proof_work_floor`].
+    fresh_sync_proof_work_floor: Option<BlueWorkType>,
 
     is_consensus_exiting: Arc<AtomicBool>,
 }
@@ -145,6 +147,7 @@ impl PruningProofManager {
         toccata_activation: ForkActivation,
         merged_mining_activation: ForkActivation,
         security_fork_activation: ForkActivation,
+        fresh_sync_proof_work_floor: Option<BlueWorkType>,
         is_consensus_exiting: Arc<AtomicBool>,
     ) -> Self {
         Self {
@@ -183,6 +186,7 @@ impl PruningProofManager {
             toccata_activation,
             merged_mining_activation,
             security_fork_activation,
+            fresh_sync_proof_work_floor,
 
             is_consensus_exiting,
         }
