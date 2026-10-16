@@ -212,6 +212,72 @@ mod tests {
         assert_eq!(Address::try_from(format!("firecash:{}", &forge(Prefix::Mainnet, &short)[5..]).as_str()).is_err(), true);
     }
 
+    /// TOTALITY. The two tests above pin the classes that were known to panic; this one
+    /// pins the property, which is what a regression oracle has to do: for a checksum-valid
+    /// string, `try_from` RETURNS -- `Ok` or `Err`, never a panic -- for every version byte
+    /// and every payload length, and anything it accepts satisfies the length invariant.
+    ///
+    /// A panic here is not a failed parse, it is a dead node: the process-wide hook turns any
+    /// panic into `exit(1)`, and this decoder sits behind unauthenticated input on the public
+    /// gRPC node, walletd and the explorer. The sweep is exhaustive rather than random
+    /// because the bug class was a length, and lengths are enumerable: 256 version bytes x
+    /// 65 payload lengths is the whole space that mattered.
+    ///
+    /// The shape of the generator is adapted from the Phase-II closure harness in the
+    /// third-party audit's POC collection (`regression/f2_bech32_closure.rs`), which ran the
+    /// same oracle over 200,000 cases; the encoder here is the crate's own, so the inputs are
+    /// exactly what the real encode path would produce.
+    #[test]
+    fn every_version_byte_and_payload_length_returns_rather_than_panics() {
+        let mut decoded = 0usize;
+        for version_byte in 0u8..=255 {
+            for len in 0usize..=64 {
+                let payload: Vec<u8> = (0..len).map(|i| (i as u8).wrapping_mul(37).wrapping_add(1)).collect();
+                let u5 = conv8to5(&[vec![version_byte], payload].concat());
+                let encoded = forge(Prefix::Mainnet, &u5);
+                // The assertion is that this call RETURNS at all.
+                if let Ok(address) = Address::try_from(encoded.as_str()) {
+                    assert_eq!(
+                        address.payload.len(),
+                        address.version.public_key_len(),
+                        "accepted an address whose payload contradicts its version: {encoded}"
+                    );
+                    decoded += 1;
+                }
+            }
+        }
+        // Sanity: the sweep really does reach the accepting path, so a decoder that rejected
+        // everything could not pass this test by refusing to work.
+        assert!(decoded >= 4, "the sweep should decode one address per known version, got {decoded}");
+    }
+
+    /// The same oracle over strings nobody generated on purpose: arbitrary charset noise, with
+    /// and without a valid checksum, at every length around the 8-character checksum boundary
+    /// where the first panic lived. Deterministic xorshift, so a failure is reproducible.
+    #[test]
+    fn arbitrary_strings_return_rather_than_panic() {
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..20_000u32 {
+            let len = (next() % 70) as usize;
+            let body: Vec<u8> = (0..len).map(|_| CHARSET[(next() % 32) as usize]).collect();
+            let body = String::from_utf8(body).expect("charset is ascii");
+            // Raw noise: most of these fail the checksum, which is the point -- the early
+            // paths (length, charset, checksum split) are where the indexing lived.
+            let _ = Address::try_from(format!("zkas:{body}").as_str());
+            let _ = Address::try_from(format!("zkastest:{body}").as_str());
+            // And the same payload made checksum-VALID, which is how an attacker reaches the
+            // code that assumes well-formedness.
+            let u5: Vec<u8> = body.as_bytes().iter().map(|b| REV_CHARSET[*b as usize]).collect();
+            let _ = Address::try_from(forge(Prefix::Mainnet, &u5).as_str());
+        }
+    }
+
     /// Every well-formed version still round-trips, so the length check cannot
     /// have been tightened past the real addresses.
     #[test]
