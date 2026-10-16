@@ -44,6 +44,16 @@ pub enum ConnectionError {
 }
 
 /// Maximum P2P decoded gRPC message size to send and receive
+/// Decode cap for one p2p message.
+///
+/// ZKas's largest honest message is the pruning-point proof, and it is far heavier than upstream's:
+/// nearly every header carries a merged-mining witness (a Kaspa parent header, coinbase and Merkle
+/// branch). Measured 2026-10-16 against a mainnet node: 220,930,010 bytes (210.7 MiB, 82% of this
+/// cap) for 78,450 header entries over 226 levels, 2,816 B per entry of which 1,970 B is witness.
+/// It grows by about one full level (~5.9 MB) per doubling of total chain work, so the remaining
+/// ~45 MB is roughly 7-8 doublings. Re-measure before lowering this, and before any change that
+/// makes headers or witnesses larger: a proof over the cap cannot be decoded, and every fresh or
+/// fallen-behind node would fail headers-proof IBD from every peer.
 const P2P_MAX_MESSAGE_SIZE: usize = 256 * 1024 * 1024; // 256MB
 
 const MAX_PENDING_INBOUND_HANDSHAKES: usize = 32;
