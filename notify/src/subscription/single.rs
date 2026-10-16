@@ -1082,4 +1082,66 @@ mod tests {
         ]);
         tests.run(&context)
     }
+
+    /// A shielded address goes through a whole subscription cycle. Subscribing to one and hanging up
+    /// used to exit the node: the blanket Stop a disconnect issues converts every tracked script back
+    /// to its address, and a shielded script had no inverse (1da1e6a). Covered here for the explicit
+    /// Stop, the blanket Stop under both mutation policies, and a mixed set.
+    #[test]
+    fn test_utxos_changed_cycle_with_a_shielded_address() {
+        let context = SubscriptionContext::new();
+        let shielded = Address::new(Prefix::Mainnet, kaspa_addresses::Version::ShieldedOrchard, &[7u8; 43]);
+        let transparent = get_3_addresses(true).remove(0);
+
+        let s = |active: bool, addresses: &[&Address]| {
+            Arc::new(UtxosChangedSubscription::with_addresses(
+                active,
+                addresses.iter().map(|a| (*a).clone()).collect(),
+                MutationTests::LISTENER_ID,
+                &context,
+            )) as DynSubscription
+        };
+        let m = |command: Command, addresses: &[&Address]| -> Mutation {
+            Mutation { command, scope: Scope::UtxosChanged(UtxosChangedScope::new(addresses.iter().map(|a| (*a).clone()).collect())) }
+        };
+
+        let tests = MutationTests::new(vec![
+            MutationTest {
+                name: "UtxosChangedSubscription None to Selected shielded (add set)",
+                state: s(false, &[]),
+                mutation: m(Command::Start, &[&shielded]),
+                new_state: s(true, &[&shielded]),
+                outcome: MutationOutcome::with_mutated(s(true, &[&shielded]), vec![m(Command::Start, &[&shielded])]),
+            },
+            MutationTest {
+                name: "UtxosChangedSubscription Selected shielded to None (stop all, as on disconnect)",
+                state: s(true, &[&shielded]),
+                mutation: m(Command::Stop, &[]),
+                new_state: s(false, &[]),
+                outcome: MutationOutcome::with_mutated(s(false, &[]), vec![m(Command::Stop, &[&shielded])]),
+            },
+            MutationTest {
+                name: "UtxosChangedSubscription Selected shielded to None (stop the shielded address)",
+                state: s(true, &[&shielded]),
+                mutation: m(Command::Stop, &[&shielded]),
+                new_state: s(false, &[]),
+                outcome: MutationOutcome::with_mutated(s(false, &[]), vec![m(Command::Stop, &[&shielded])]),
+            },
+            MutationTest {
+                name: "UtxosChangedSubscription Selected shielded+transparent to transparent (stop the shielded address)",
+                state: s(true, &[&shielded, &transparent]),
+                mutation: m(Command::Stop, &[&shielded]),
+                new_state: s(true, &[&transparent]),
+                outcome: MutationOutcome::with_mutations(vec![m(Command::Stop, &[&shielded])]),
+            },
+        ]);
+        tests.run(&context);
+
+        // The blanket Stop under the wildcard policy takes the same conversion path.
+        let mut state = s(true, &[&shielded]);
+        let policies = MutationPolicies::new(UtxosChangedMutationPolicy::Wildcard);
+        let outcome = state.mutate(m(Command::Stop, &[]), policies, &context).unwrap();
+        assert!(!state.active(), "the subscription is stopped");
+        assert_eq!(outcome.mutations, vec![m(Command::Stop, &[])]);
+    }
 }

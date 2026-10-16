@@ -1,4 +1,4 @@
-use std::{cmp::max, sync::Arc};
+use std::sync::Arc;
 
 use kaspa_consensus_core::api::ConsensusApi;
 use kaspa_hashes::Hash;
@@ -11,7 +11,7 @@ use kaspa_p2p_lib::{
 };
 use log::debug;
 
-use crate::{flow_context::FlowContext, flow_trait::Flow, ibd::REQUEST_HEADERS_MAX_BLOCKS};
+use crate::{flow_context::FlowContext, flow_trait::Flow, ibd::request_headers_max_blocks};
 
 pub struct RequestHeadersFlow {
     ctx: FlowContext,
@@ -39,7 +39,7 @@ impl RequestHeadersFlow {
     async fn start_impl(&mut self) -> Result<(), ProtocolError> {
         // Internal consensus logic requires that `max_blocks > mergeset_size_limit`. Requesters size their
         // ceiling on a chunk from the same constant (`max_headers_per_message`).
-        let max_blocks = max(REQUEST_HEADERS_MAX_BLOCKS, self.ctx.config.mergeset_size_limit() as usize + 1);
+        let max_blocks = request_headers_max_blocks(self.ctx.config.mergeset_size_limit());
         let header_format = self.header_format;
 
         loop {

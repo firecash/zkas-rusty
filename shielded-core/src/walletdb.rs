@@ -3995,11 +3995,34 @@ mod tests {
         // The tree prefix on its own parses, so a `None` below comes from the count.
         assert!(read_tree(&mut Cursor { buf: &tree_bytes, pos: 0 }).is_some());
 
-        for declared in [u64::from(TREE_DEPTH) + 1, 1 << 40, u64::MAX] {
+        for declared in [1 << 40, u64::MAX] {
             let mut buf = tree_bytes.clone();
             buf.extend_from_slice(&declared.to_le_bytes());
             assert!(read_witness(&mut Cursor { buf: &buf, pos: 0 }).is_none(), "declared {declared}");
         }
+
+        // One past the limit, with every byte present: a one-leaf tree (so `from_parts` has a
+        // position to witness), `count` valid ommer hashes and an empty cursor. A short read cannot
+        // be what refuses it, so only the count check can. The same body at the limit parses.
+        let mut tree = CommitmentTree::<MerkleHashOrchard, TREE_DEPTH>::empty();
+        tree.append(MerkleHashOrchard::empty_leaf()).unwrap();
+        let witness_bytes = |count: u64| {
+            let mut buf = Vec::new();
+            write_tree(&mut buf, &tree);
+            buf.extend_from_slice(&count.to_le_bytes());
+            for level in 0..count {
+                buf.extend_from_slice(&MerkleHashOrchard::empty_root(Level::from((level % 32) as u8)).to_bytes());
+            }
+            buf.push(0);
+            buf
+        };
+        let at_limit = witness_bytes(u64::from(TREE_DEPTH));
+        let mut r = Cursor { buf: &at_limit, pos: 0 };
+        let parsed = read_witness(&mut r).expect("one filled ommer per level is accepted");
+        assert_eq!(parsed.filled().len(), usize::from(TREE_DEPTH));
+        assert_eq!(r.pos, at_limit.len(), "the body at the limit is consumed exactly");
+        let over = witness_bytes(u64::from(TREE_DEPTH) + 1);
+        assert!(read_witness(&mut Cursor { buf: &over, pos: 0 }).is_none(), "one ommer more than the tree has levels");
     }
 
     /// The checkpoint leaf count only sizes a capacity hint, and the hint is clamped to what

@@ -574,7 +574,16 @@ impl Args {
         I: IntoIterator<Item = T>,
         T: Into<OsString> + Clone,
     {
-        let m: clap::ArgMatches = cli().try_get_matches_from(itr)?;
+        Self::parse_with(cli(), itr)
+    }
+
+    /// [`Args::parse`] against a given command (tests pass one with the environment fallbacks removed).
+    fn parse_with<I, T>(cmd: Command, itr: I) -> Result<Args, clap::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<OsString> + Clone,
+    {
+        let m: clap::ArgMatches = cmd.try_get_matches_from(itr)?;
         let mut defaults: Args = Default::default();
 
         if let Some(config_file) = m.get_one::<String>("configfile") {
@@ -685,7 +694,18 @@ fn validate_ua_rules(rules: &[String]) -> Result<(), clap::Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::Args;
+    use super::{Args, ContextualNetAddress, cli};
+    use std::ffi::OsString;
+
+    /// [`Args::parse`] with every `KASPAD_*` / `ZKAS_*` environment fallback removed, so a variable set
+    /// in the environment running the tests cannot stand in for (or mask) the value under test.
+    fn parse_without_env<I, T>(itr: I) -> Result<Args, clap::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<OsString> + Clone,
+    {
+        Args::parse_with(cli().mut_args(|arg| arg.env(None::<&'static str>)), itr)
+    }
 
     #[test]
     fn parses_ua_rules() {
@@ -699,27 +719,30 @@ mod tests {
         let path = std::env::temp_dir().join(format!("kaspad-args-test-{}.toml", std::process::id()));
         std::fs::write(
             &path,
-            "verify-shielded-history = true\nshielded-history = false\nconsensus-diag = \"/tmp/diag\"\nenablebanning = true\n",
+            "verify-shielded-history = true\nshielded-history = false\nconsensus-diag = \"/tmp/diag\"\nenablebanning = true\n\
+             externalip = \"203.0.113.7:16111\"\noverride-params-file = \"/tmp/params.json\"\n",
         )
         .unwrap();
-        let args = Args::parse(["kaspad".to_string(), format!("--configfile={}", path.display())]);
+        let args = parse_without_env(["kaspad".to_string(), format!("--configfile={}", path.display())]);
         let _ = std::fs::remove_file(&path);
         let args = args.unwrap();
         assert!(args.verify_shielded_history);
         assert_eq!(args.shielded_history, Some(false));
         assert_eq!(args.consensus_diag.as_deref(), Some("/tmp/diag"));
         assert!(args.enable_banning);
+        assert_eq!(args.externalip, Some("203.0.113.7:16111".parse::<ContextualNetAddress>().unwrap()));
+        assert_eq!(args.override_params_file.as_deref(), Some("/tmp/params.json"));
     }
 
     #[test]
     fn banning_is_opt_in() {
-        let args = Args::parse(["kaspad"]).unwrap();
+        let args = parse_without_env(["kaspad"]).unwrap();
         assert!(!args.enable_banning);
         let mut config = kaspa_consensus_core::config::Config::new(kaspa_consensus_core::config::params::MAINNET_PARAMS);
         args.apply_to_config(&mut config);
         assert!(!config.enable_banning);
 
-        let args = Args::parse(["kaspad", "--enablebanning"]).unwrap();
+        let args = parse_without_env(["kaspad", "--enablebanning"]).unwrap();
         assert!(args.enable_banning);
         args.apply_to_config(&mut config);
         assert!(config.enable_banning);

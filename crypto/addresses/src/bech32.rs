@@ -169,7 +169,13 @@ mod tests {
     /// Build an address string with a VALID checksum over an arbitrary 5-bit
     /// payload — everything an attacker needs is the public charset.
     fn forge(prefix: Prefix, payload_u5: &[u8]) -> String {
-        let fivebit_prefix = prefix.as_str().as_bytes().iter().copied().map(|c| c & 0x1fu8);
+        forge_hrp(prefix.as_str(), payload_u5)
+    }
+
+    /// [`forge`] under a literal HRP, so a legacy `firecash:` string carries a checksum valid for
+    /// `firecash` (the checksum covers the HRP as written, not the canonical spelling).
+    fn forge_hrp(hrp: &str, payload_u5: &[u8]) -> String {
+        let fivebit_prefix = hrp.as_bytes().iter().copied().map(|c| c & 0x1fu8);
         let cs = checksum(payload_u5, fivebit_prefix);
         let body: Vec<u8> = payload_u5
             .iter()
@@ -177,7 +183,7 @@ mod tests {
             .chain(conv8to5(&cs.to_be_bytes()[3..]))
             .map(|c| CHARSET[c as usize])
             .collect();
-        format!("{}:{}", prefix.as_str(), String::from_utf8(body).unwrap())
+        format!("{}:{}", hrp, String::from_utf8(body).unwrap())
     }
 
     /// A checksum-valid string whose payload does not match its version byte is
@@ -208,8 +214,19 @@ mod tests {
         let bad_version = conv8to5(&[vec![7u8], vec![0u8; 32]].concat());
         assert_eq!(Address::try_from(forge(Prefix::Mainnet, &bad_version).as_str()), Err(AddressError::InvalidVersion(7)));
 
-        // The legacy HRP is no shortcut around the same checks.
-        assert_eq!(Address::try_from(format!("firecash:{}", &forge(Prefix::Mainnet, &short)[5..]).as_str()).is_err(), true);
+        // The legacy HRP is no shortcut around the same checks. The forged checksum is valid for
+        // `firecash` (a well-formed payload forged the same way decodes), so the refusal can only be
+        // the length check, not the checksum.
+        let well_formed = conv8to5(&[vec![Version::PubKey as u8], vec![0u8; 32]].concat());
+        assert_eq!(
+            Address::try_from(forge_hrp("firecash", &well_formed).as_str()),
+            Ok(Address::new(Prefix::Mainnet, Version::PubKey, &[0u8; 32])),
+            "the legacy forge carries a valid checksum"
+        );
+        assert!(
+            matches!(Address::try_from(forge_hrp("firecash", &short).as_str()), Err(AddressError::InvalidPayloadLength { .. })),
+            "a legacy-HRP payload of the wrong length is refused by the length check"
+        );
     }
 
     /// TOTALITY. The two tests above pin the classes that were known to panic; this one

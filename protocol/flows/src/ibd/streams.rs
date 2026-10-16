@@ -42,26 +42,42 @@ pub fn check_requested_blocks(kind: &'static str, count: usize) -> Result<(), Pr
     Ok(())
 }
 
-/// The `max_blocks` floor the `RequestHeaders` server walks per chunk (it uses
-/// `max(REQUEST_HEADERS_MAX_BLOCKS, mergeset_size_limit + 1)`).
+/// The `max_blocks` floor the `RequestHeaders` server walks per chunk (see [`request_headers_max_blocks`]).
 pub const REQUEST_HEADERS_MAX_BLOCKS: usize = 1 << 10;
+
+/// The `max_blocks` the `RequestHeaders` server walks per chunk: [`REQUEST_HEADERS_MAX_BLOCKS`], raised
+/// to `mergeset_size_limit + 1` where that is larger (consensus requires `max_blocks > mergeset_size_limit`).
+pub fn request_headers_max_blocks(mergeset_size_limit: u64) -> usize {
+    REQUEST_HEADERS_MAX_BLOCKS.max(mergeset_size_limit as usize + 1)
+}
+
+/// The `RequestAntipast` server bounds its traversal to this many mergesets (see [`antipast_traversal_limit`]).
+pub const ANTIPAST_TRAVERSAL_MERGESETS: u64 = 4;
+
+/// The traversal limit the `RequestAntipast` server passes to `get_antipast_from_pov`.
+pub fn antipast_traversal_limit(mergeset_size_limit: u64) -> u64 {
+    mergeset_size_limit * ANTIPAST_TRAVERSAL_MERGESETS
+}
 
 /// Most headers one `BlockHeaders` message may carry, for a network with `mergeset_size_limit`.
 ///
 /// A syncer's header chunk was bounded only by the 256 MB transport cap (~1M headers), and each
 /// header in it becomes a concurrent validation job before the first one is judged. The honest
 /// senders are bounded by construction:
-/// * a `RequestHeaders` chunk holds at most `max(REQUEST_HEADERS_MAX_BLOCKS, mergeset + 1) + 1`
+/// * a `RequestHeaders` chunk holds at most [`request_headers_max_blocks`]` + 1`
 ///   headers (`antipast_hashes_between` stops before a chain block's mergeset would pass
 ///   `max_blocks`, then appends the highest chain block reached);
-/// * a `RequestAntipast` reply holds at most `4 * mergeset` (its traversal limit, and the output
-///   is a subset of what it traverses).
+/// * a `RequestAntipast` reply holds at most [`antipast_traversal_limit`] = `4 * mergeset` (the
+///   output is a subset of what it traverses).
 ///
 /// `REQUEST_HEADERS_MAX_BLOCKS + 4 * mergeset + 2` is above both, and the factor 2 is headroom.
 /// Mainnet (`mergeset_size_limit` 180): 2 * (1024 + 720 + 2) = 3,492.
 pub fn max_headers_per_message(mergeset_size_limit: u64) -> usize {
     let mergeset = usize::try_from(mergeset_size_limit).unwrap_or(usize::MAX);
-    REQUEST_HEADERS_MAX_BLOCKS.saturating_add(mergeset.saturating_mul(4)).saturating_add(2).saturating_mul(2)
+    REQUEST_HEADERS_MAX_BLOCKS
+        .saturating_add(mergeset.saturating_mul(ANTIPAST_TRAVERSAL_MERGESETS as usize))
+        .saturating_add(2)
+        .saturating_mul(2)
 }
 
 /// UTXOs the pruning-point UTXO set server puts in one chunk.
@@ -551,15 +567,17 @@ mod tests {
 
     #[test]
     fn header_ceiling_covers_every_honest_sender() {
+        use kaspa_consensus_core::config::{bps::Bps, params};
         // Mainnet is 1 BPS (mergeset 180); `Bps::mergeset_size_limit` clamps every rate to [180, 512].
         assert_eq!(max_headers_per_message(180), 3_492);
-        for mergeset in [180u64, 300, 512] {
-            let m = mergeset as usize;
+        let networks = [params::MAINNET_PARAMS, params::TESTNET_PARAMS, params::SIMNET_PARAMS, params::DEVNET_PARAMS];
+        let rates = [Bps::<1>::mergeset_size_limit(), Bps::<10>::mergeset_size_limit(), Bps::<32>::mergeset_size_limit()];
+        for mergeset in networks.iter().map(|p| p.mergeset_size_limit()).chain(rates).chain([180u64, 300, 512]) {
             let ceiling = max_headers_per_message(mergeset);
-            // `RequestHeaders`: `max(REQUEST_HEADERS_MAX_BLOCKS, m + 1)` plus the appended chain block.
-            assert!(ceiling >= REQUEST_HEADERS_MAX_BLOCKS.max(m + 1) + 1);
-            // `RequestAntipast`: at most its traversal limit.
-            assert!(ceiling >= 4 * m);
+            // `RequestHeaders`: the limits the server itself walks with, plus the appended chain block.
+            assert!(ceiling >= request_headers_max_blocks(mergeset) + 1, "mergeset {mergeset}");
+            // `RequestAntipast`: at most the traversal limit the server itself passes.
+            assert!(ceiling as u64 >= antipast_traversal_limit(mergeset), "mergeset {mergeset}");
         }
         // An absurd configured value saturates instead of wrapping.
         assert_eq!(max_headers_per_message(u64::MAX), usize::MAX);
