@@ -634,7 +634,11 @@ mod tests {
             if pp != config.genesis.hash && tc.get_header(pp).unwrap().blue_score >= min_pruning_point_blue_score {
                 break;
             }
-            assert!(start.elapsed() < Duration::from_secs(30), "timed out waiting for the pruning point to advance");
+            // Generous on purpose: every pruning-point move first builds the proof, and with this
+            // config's 255 levels one build took 29 s on a loaded build box (measured 2026-10-17;
+            // later moves ~1 s). The 30 s this used to allow failed the test on load alone, and its
+            // panic, raised with the consensus still open, aborted the whole test binary.
+            assert!(start.elapsed() < Duration::from_secs(600), "timed out waiting for the pruning point to advance");
             std::thread::sleep(Duration::from_millis(100));
         }
         let proof = tc.get_pruning_point_proof();
