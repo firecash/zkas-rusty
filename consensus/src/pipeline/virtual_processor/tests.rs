@@ -1027,7 +1027,10 @@ async fn reorg_crash_window_recovers(window: CrashWindow) {
     let config = ConfigBuilder::new(params)
         .edit_consensus_params(|p| {
             p.genesis.bits = 0x207fffff;
-            p.blockrate.finality_depth = 5;
+            // Not 5 like the tests around it: before B3 arrives the virtual merges B1, X and B2 on top
+            // of A3 (blue score 14), so depth 5 puts the finality point at A2 and B3 is refused as a
+            // finality violation -- correctly, but then nothing reorgs. 10 keeps it below the split.
+            p.blockrate.finality_depth = 10;
             p.blockrate.shielded_anchor_depth = 3;
         })
         .build();
@@ -1104,6 +1107,15 @@ async fn reorg_crash_window_recovers(window: CrashWindow) {
     let b3_hash = b3.header.hash;
     let bw = |h: Hash| ctx.consensus.ghostdag_store().get_blue_work(h).unwrap();
     assert!(bw(b2_hash) < bw(a3_hash), "B2 cannot take the chain");
+    // The reorg must be one finality allows, or B3 is filtered out before any walk starts.
+    let finality_point = {
+        let vp = ctx.consensus.virtual_processor();
+        vp.virtual_finality_point(&vp.lkg_virtual_state.load().ghostdag_data, ctx.consensus.pruning_point())
+    };
+    assert!(
+        ctx.consensus.reachability_service().is_chain_ancestor_of(finality_point, split),
+        "the virtual finality point is at or below the split, so B3 may reorg"
+    );
 
     // Arm the crash image only now: nothing is built from here on, so the only walk that can reach a
     // failpoint is `resolve_virtual` moving the sink from A3 to B3.
