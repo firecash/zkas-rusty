@@ -38,14 +38,25 @@ impl RequestPruningPointProofFlow {
         loop {
             let (_, request_id) = dequeue_with_request_id!(self.incoming_route, Payload::RequestPruningPointProof)?;
             debug!("Got pruning point proof request");
-            let proof = self.ctx.consensus().unguarded_session().async_get_pruning_point_proof().await;
+            // Nothing of ours may still be queued for this peer before a proof is built for it.
+            self.router.pace_outgoing().await?;
+            // `ctx` is cloned so the permit does not borrow `self` across the sends below.
+            let ctx = self.ctx.clone();
+            let Some(_permit) = ctx.proof_serve_gate.admit().await else {
+                return Err(ProtocolError::Other("this node has served its share of pruning point proofs for now; ask another peer"));
+            };
+            let proof = ctx.consensus().unguarded_session().async_get_pruning_point_proof().await;
             self.router
-                .enqueue_paced(make_response!(
+                .enqueue(make_response!(
                     Payload::PruningPointProof,
                     PruningPointProofMessage { headers: proof.iter().map(|headers| (self.header_format, headers).into()).collect() },
                     request_id
                 ))
                 .await?;
+            drop(proof);
+            // Hold the build slot until the transport has taken the message off the route, so at
+            // most one converted proof exists outside the send buffers at any time.
+            self.router.pace_outgoing().await?;
             debug!("Sent pruning point proof");
         }
     }

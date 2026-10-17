@@ -1,4 +1,5 @@
 use crate::ban_policy::{AutoBanBudget, auto_ban_may_target, is_fork_reject_reason};
+use crate::serve_policy::ProofServeGate;
 use crate::flowcontext::{
     orphans::{OrphanBlocksPool, OrphanOutput},
     process_queue::ProcessQueue,
@@ -293,6 +294,9 @@ pub struct FlowContextInner {
     /// Rate limit on `--enablebanning`, see `ban_if_protocol_violation`.
     auto_ban_budget: Mutex<AutoBanBudget>,
 
+    /// Global limit on pruning-point proof serves, see `serve_policy`.
+    pub(crate) proof_serve_gate: ProofServeGate,
+
     bps: usize,
 
     // Orphan parameters
@@ -403,6 +407,7 @@ impl FlowContext {
                 block_event_logger: Some(BlockEventLogger::new(bps, CountdownActivation::toccata(config.toccata_activation))),
                 relay_credit: Default::default(),
                 auto_ban_budget: Default::default(),
+                proof_serve_gate: Default::default(),
                 bps,
                 orphan_resolution_range,
                 max_orphans,
@@ -494,6 +499,16 @@ impl FlowContext {
         let Some(connection_manager) = self.connection_manager() else {
             return;
         };
+        if fork_reject {
+            let user_agent = &router.properties().user_agent;
+            if crate::user_agent_rule::advertises_newer_release(user_agent, kaspa_core::kaspad_env::name(), kaspa_core::kaspad_env::version()) {
+                info!(
+                    "P2P, not auto-banning peer {} ({}): it runs a newer release ({}), so this node may be the one behind",
+                    router, reason, user_agent
+                );
+                return;
+            }
+        }
         let ctx = self.clone();
         let peer = router.to_string();
         tokio::spawn(async move {

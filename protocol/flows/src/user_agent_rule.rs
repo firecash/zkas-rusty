@@ -166,6 +166,16 @@ fn normalize_version(version: &Version) -> Version {
     Version::new(version.major, version.minor, version.patch)
 }
 
+/// Whether `user_agent` names a `name` release newer than `ours` (release numbers only).
+///
+/// Used to keep the fork-reject auto-ban off peers that may be ahead of this node: when a LATER
+/// release tightens a rule, an upgraded peer rejects this node's blocks with the same reason a
+/// pre-fork node does, and the outdated side must not answer by banning the network it is behind.
+pub(crate) fn advertises_newer_release(user_agent: &str, name: &str, ours: &str) -> bool {
+    let Ok(ours) = parse_normalized_version(ours) else { return false };
+    user_agent_versions(user_agent, name).any(|theirs| theirs > ours)
+}
+
 fn user_agent_versions<'a>(user_agent: &'a str, expected_name: &'a str) -> impl Iterator<Item = Version> + 'a {
     user_agent.split('/').filter_map(move |segment| {
         let (name, version) = segment.split_once(':')?;
@@ -180,7 +190,18 @@ fn user_agent_versions<'a>(user_agent: &'a str, expected_name: &'a str) -> impl 
 
 #[cfg(test)]
 mod tests {
-    use super::{UserAgentRule, UserAgentRuleRejectReason, UserAgentRuleSet};
+    use super::{UserAgentRule, UserAgentRuleRejectReason, UserAgentRuleSet, advertises_newer_release};
+
+    #[test]
+    fn only_a_strictly_newer_release_is_newer() {
+        assert!(advertises_newer_release("/kaspad:2.0.2/", "kaspad", "2.0.1"));
+        assert!(advertises_newer_release("/kaspad:2.1.0(x; y)/", "kaspad", "2.0.1"));
+        assert!(!advertises_newer_release("/kaspad:2.0.1/", "kaspad", "2.0.1"), "same release: still eligible");
+        assert!(!advertises_newer_release("/kaspad:2.0.0/", "kaspad", "2.0.1"));
+        assert!(!advertises_newer_release("/kaspad:2.0.2-rc.1/", "kaspad", "2.0.2"), "suffixes compare as the release");
+        assert!(!advertises_newer_release("", "kaspad", "2.0.1"), "no user agent (a reject during the handshake)");
+        assert!(!advertises_newer_release("/other:9.9.9/", "kaspad", "2.0.1"));
+    }
 
     fn rules(rules: &[&str]) -> UserAgentRuleSet {
         let mut rule_set = UserAgentRuleSet::empty();
