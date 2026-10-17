@@ -116,7 +116,9 @@ impl Manager {
         // On a forwarded node the bound that matters lives in the forwarder: keep its child limit
         // below `--rpcmaxclients` (e.g. `socat ... max-children=480` with `--rpcmaxclients=512`), and
         // the difference is reserved for local services by construction.
-        if !ip.is_loopback() && from_ip() >= self.max_per_ip {
+        // Canonical first: on a dual-stack listener an IPv4 forwarder arrives as `::ffff:127.0.0.1`,
+        // which is not `is_loopback()` until it is.
+        if !ip.to_canonical().is_loopback() && from_ip() >= self.max_per_ip {
             return Err(RegistrationError::PerIpCapacityReached(ip, self.max_per_ip));
         }
         Ok(())
