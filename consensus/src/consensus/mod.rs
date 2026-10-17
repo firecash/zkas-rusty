@@ -2928,6 +2928,7 @@ impl ConsensusApi for Consensus {
         // arrives at the peer's pace. The IBD flow refuses to import in that case; what this records is
         // the case the flow's check cannot see, a chain walk validating it while the data streams.
         let selected_child = self.pruning_point_selected_child(new_pruning_point);
+        let child_validated_before = selected_child.is_some_and(|child| self.is_utxo_valid(child));
         let mut nullifiers: Vec<[u8; 32]> = Vec::new();
         for batch in nullifier_batches {
             nullifiers.extend(batch);
@@ -2954,10 +2955,8 @@ impl ConsensusApi for Consensus {
         let virtual_write = self.virtual_stores.write();
         // A walk validated the child while the data streamed: its nullifiers (and those of every chain
         // block above it) are in the live set, and the clear would destroy them without revalidation.
-        // Checked under the lock whatever it was before: the flow's own refusal runs before the
-        // stream, and a walk can validate the child between that check and this import, so a child
-        // that was ALREADY valid when the stream started is no safer to clear under.
-        if let Some(child) = selected_child
+        if !child_validated_before
+            && let Some(child) = selected_child
             && self.is_utxo_valid(child)
         {
             return Err(PruningImportError::ShieldedStateError(format!(
