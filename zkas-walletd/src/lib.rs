@@ -6062,6 +6062,16 @@ impl AppState {
         };
         let t_meta = t_load0.elapsed();
         let genesis = self.genesis;
+        // A load that stopped between setting its own checkpoint aside for a twin and putting it
+        // back (see the twin adoption below) left it at `.scan.own`. With no `.scan` in its place,
+        // that file is this wallet's own last checkpoint: take it back.
+        {
+            let own_scan = scan_path(&self.wallet_dir, token);
+            let own_aside = format!("{own_scan}.own");
+            if !std::path::Path::new(&own_scan).exists() && std::fs::rename(&own_aside, &own_scan).is_ok() {
+                log::warn!("wallet {token}: restored its own checkpoint set aside by an interrupted twin adoption");
+            }
+        }
         // Resume from a persisted checkpoint when one is present and version/genesis
         // valid; otherwise fast-sync (birthday-gated: a fast-synced wallet is blind
         // to notes older than its base) or the pruning-point full scan.
@@ -6263,7 +6273,24 @@ impl AppState {
             // `mine` is this wallet's own checkpoint when a twin was merely PREFERRED (it is
             // already loaded and verified), else `None`.
             mine => match key.fvk_bytes() {
-                Some(fvk) => match self.adopt_twin(token, &fvk, birthday, recoverable_history).await {
+                Some(fvk) => {
+                // When a twin is only PREFERRED, this wallet's own verified checkpoint is on disk,
+                // and adoption puts the donor's file at the same name. Set the own file aside
+                // first, so a donor that fails verification below costs nothing: the own file is
+                // put back and `mine` kept, instead of the donor's copy being deleted and the
+                // wallet sent to a rescan from its birthday with its verified state in hand.
+                let own_scan = scan_path(&self.wallet_dir, token);
+                let own_aside = format!("{own_scan}.own");
+                let set_aside = mine.is_some() && std::fs::rename(&own_scan, &own_aside).is_ok();
+                let put_back = || {
+                    if set_aside {
+                        // Over whatever the adoption left at the name (a rejected copy, or nothing).
+                        if let Err(e) = std::fs::rename(&own_aside, &own_scan) {
+                            log::warn!("wallet {token}: could not restore its own checkpoint after a declined twin ({e})");
+                        }
+                    }
+                };
+                let outcome = match self.adopt_twin(token, &fvk, birthday, recoverable_history).await {
                     Some((donor, keep_birthday)) => {
                         // The copied file carries the DONOR's cursor. Verify it against the
                         // node's frontier at THAT block — not `tip`, fetched above for this
@@ -6276,6 +6303,7 @@ impl AppState {
                             Ok(t) => t,
                             Err(e) => {
                                 log::warn!("wallet {token}: cannot verify the adopted twin checkpoint ({e}); retrying later");
+                                put_back();
                                 return None;
                             }
                         };
@@ -6284,6 +6312,9 @@ impl AppState {
                                 log::info!(
                                     "wallet {token}: adopted checkpoint from twin token {donor} (birthday {keep_birthday}) instead of rescanning from {birthday}"
                                 );
+                                if set_aside {
+                                    let _ = std::fs::remove_file(&own_aside);
+                                }
                                 Some(restored)
                             }
                             None => {
@@ -6308,10 +6339,14 @@ impl AppState {
                                 let scan = scan_path(&self.wallet_dir, token);
                                 if std::fs::remove_file(&scan).is_ok() {
                                     log::warn!(
-                                        "wallet {token}: twin {donor}'s checkpoint was rejected too (same cursor); discarded it and scanning clean"
+                                        "wallet {token}: twin {donor}'s checkpoint was rejected too (same cursor); discarded it{}",
+                                        if set_aside { " and kept its own" } else { " and scanning clean" }
                                     );
                                 }
-                                None
+                                // Its own checkpoint, if it had one, was verified above and is
+                                // still the best this wallet has.
+                                put_back();
+                                mine
                             }
                         }
                     }
@@ -6322,8 +6357,13 @@ impl AppState {
                     // from its birthday merely because a twin had LOOKED further ahead. Keep it.
                     // (Its file may be gone if a copy failed midway; the next checkpoint save
                     // writes it back from this in-memory state.)
-                    None => mine,
-                },
+                    None => {
+                        put_back();
+                        mine
+                    }
+                };
+                outcome
+                }
                 None => mine,
             },
         };
