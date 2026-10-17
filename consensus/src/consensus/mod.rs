@@ -1269,25 +1269,55 @@ impl ConsensusApi for Consensus {
             let meta = self.pruning_meta_stores.read();
             (!meta.shielded_history_backfilled()).then(|| sc.get_by_index(0).optional().unwrap()).flatten()
         };
-        if shift > 0 {
-            // Rebase highest-first so a shift never lands on an entry not yet moved.
-            // A hole is skipped. An unreadable entry was skipped too, so it stayed where the shift
-            // then overwrote it and the index was numbered two ways at once; refuse the chunk
-            // instead (nothing is written, and the caller purges and retries).
+        // Every read that can refuse the chunk happens here, before anything is staged. The stores
+        // cache a write when it is STAGED, not when the batch lands, so a refusal after the first
+        // staged write would drop the batch but leave the caches holding a rebased index, a moved
+        // highest index and records the disk never got -- and the next virtual commit would append
+        // at the cached highest index.
+        let rebase = if shift > 0 {
+            // An unreadable entry used to be skipped, so it stayed where the shift then overwrote it
+            // and the index was numbered two ways at once; refuse the chunk instead.
+            let mut entries = Vec::new();
             for i in (0..=local_tip).rev() {
                 if let Some(h) = sc
                     .get_by_index(i)
                     .optional()
                     .map_err(|e| ConsensusError::GeneralOwned(format!("backfill chunk refused: cannot read index entry {i}: {e}")))?
                 {
-                    sc.rebase_entry(&mut batch, i, h, i + shift).unwrap();
+                    entries.push((i, h));
                 }
+            }
+            entries
+        } else {
+            Vec::new()
+        };
+        // Only a MISSING record is written. `unwrap_or(None)` read an unreadable one as missing and
+        // overwrote this node's own record with the peer's.
+        let mut record_missing = Vec::with_capacity(records.len());
+        for (index, r) in records.iter() {
+            let missing = *index <= ours_from
+                && self
+                    .virtual_processor
+                    .shielded_state_manager_ref()
+                    .scan_block(r.hash)
+                    .map_err(|e| {
+                        ConsensusError::GeneralOwned(format!("backfill chunk refused: cannot read the record of {}: {e}", r.hash))
+                    })?
+                    .is_none();
+            record_missing.push(missing);
+        }
+
+        if shift > 0 {
+            // Rebase highest-first (the order read above) so a shift never lands on an entry not yet
+            // moved. A hole is skipped.
+            for (i, h) in rebase {
+                sc.rebase_entry(&mut batch, i, h, i + shift).unwrap();
             }
             sc.set_highest_index(&mut batch, local_tip + shift).unwrap();
         }
 
         let (mut idx_written, mut rec_written) = (0u64, 0u64);
-        for (index, r) in records.iter() {
+        for ((index, r), missing) in records.iter().zip(record_missing) {
             if *index > ours_from {
                 continue; // above the anchor is our own validated range; ours is authoritative
             }
@@ -1302,17 +1332,7 @@ impl ConsensusApi for Consensus {
                 sc.write_entry(&mut batch, *index, r.hash).unwrap();
                 idx_written += 1;
             }
-            // Only a MISSING record is written. `unwrap_or(None)` read an unreadable one as missing
-            // and overwrote this node's own record with the peer's.
-            if self
-                .virtual_processor
-                .shielded_state_manager_ref()
-                .scan_block(r.hash)
-                .map_err(|e| {
-                    ConsensusError::GeneralOwned(format!("backfill chunk refused: cannot read the record of {}: {e}", r.hash))
-                })?
-                .is_none()
-            {
+            if missing {
                 let accepted = r
                     .accepted_actions
                     .iter()
@@ -2908,7 +2928,6 @@ impl ConsensusApi for Consensus {
         // arrives at the peer's pace. The IBD flow refuses to import in that case; what this records is
         // the case the flow's check cannot see, a chain walk validating it while the data streams.
         let selected_child = self.pruning_point_selected_child(new_pruning_point);
-        let child_validated_before = selected_child.is_some_and(|child| self.is_utxo_valid(child));
         let mut nullifiers: Vec<[u8; 32]> = Vec::new();
         for batch in nullifier_batches {
             nullifiers.extend(batch);
@@ -2935,8 +2954,10 @@ impl ConsensusApi for Consensus {
         let virtual_write = self.virtual_stores.write();
         // A walk validated the child while the data streamed: its nullifiers (and those of every chain
         // block above it) are in the live set, and the clear would destroy them without revalidation.
-        if !child_validated_before
-            && let Some(child) = selected_child
+        // Checked under the lock whatever it was before: the flow's own refusal runs before the
+        // stream, and a walk can validate the child between that check and this import, so a child
+        // that was ALREADY valid when the stream started is no safer to clear under.
+        if let Some(child) = selected_child
             && self.is_utxo_valid(child)
         {
             return Err(PruningImportError::ShieldedStateError(format!(

@@ -1012,6 +1012,20 @@ impl VirtualStateProcessor {
         // raise a false "diverged" that refuses templates until restart. Holding the upgradable lock
         // pauses virtual resolution for the walk; header and body processing continue.
         let _guard = self.virtual_stores.upgradable_read();
+        // Again under the lock: the flags were read before it, and a pruning catch-up's import
+        // (which takes the virtual write lock) may have lowered them since. Judging the set then is
+        // the false alarm the gate exists to prevent.
+        let still_stable = {
+            let meta = self.pruning_meta_stores.read();
+            meta.pruning_shielded_stable_flag() && meta.pruning_utxoset_stable_flag()
+        };
+        // (Only the meta flags: the pruning-point store comes BEFORE the virtual lock in the lock
+        // order. The flags suffice, as `intrusive_pruning_point_update` lowers them in the batch that
+        // moves the pruning point.)
+        if !still_stable {
+            info!("shielded self-check: a pruning-point import started meanwhile; not judging the set mid-import");
+            return;
+        }
         let sink = self.lkg_virtual_state.load().ghostdag_data.selected_parent;
         let started = std::time::Instant::now();
         match self.shielded_state_manager.global_set_matches_snapshot(sink) {
@@ -1744,7 +1758,7 @@ impl VirtualStateProcessor {
         match self.move_nullifier_set_to(from, finality_point) {
             Ok(Some(was)) => warn!("shielded: the nullifier set reflected {was}, not the walk's start {from}; moved it there first"),
             Ok(None) => {}
-            Err(e) => debug!("shielded: nullifier set not moved to {from} before walking: {e}"),
+            Err(e) => warn!("shielded: nullifier set not moved to {from} before walking: {e}"),
         }
 
         let mut split_point: Option<Hash> = None;
