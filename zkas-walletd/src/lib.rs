@@ -5013,6 +5013,14 @@ struct AppState {
     /// A failed load releases the lock and caches nothing, so the next request retries;
     /// the token is never poisoned (see the `spawn_load` warning above).
     loading: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Loads admitted under the hard resident rules (task 03) that have not landed in
+    /// `wallets` yet, with their estimated bytes. Every later admission and every sweep
+    /// counts them, so a queue of admitted loads waiting on `load_gate` cannot overshoot the
+    /// budget together. A plain std mutex: it is only held for a copy, an insert or a remove.
+    admitted: std::sync::Mutex<HashMap<String, u64>>,
+    /// Serialises admissions' check-then-reserve, so two loads cannot both be admitted
+    /// against the same room. Never held while an admission sleeps.
+    admission: tokio::sync::Mutex<()>,
     /// Payment preparation is deliberately serialized: witness reconstruction and Halo2
     /// proving are CPU-heavy synchronous work, and overlapping copies exhaust every
     /// runtime worker and take the whole wallet API offline.
@@ -6333,6 +6341,21 @@ impl AppState {
                 return Some(w.clone());
             }
         }
+        // Memory admission (task 03): make room BEFORE restoring another checkpoint, and
+        // refuse (the caller keeps answering "opening") rather than exceed the budget.
+        //
+        // It runs here, after this token's load lock and BEFORE the load-gate permit: making
+        // room evicts (and flushes) other wallets and may wait up to ADMISSION_WAIT, and doing
+        // that while holding one of the few load permits would stall every other wallet's
+        // load behind it. Only a token whose wallet file exists may evict anything; an unknown
+        // token skips admission and takes the slow miss below without touching the resident
+        // set. The reservation is released when this function returns, by which time a
+        // successful load is already in `wallets` and counted there.
+        let _admitted = if std::path::Path::new(&wallet_path(&self.wallet_dir, token)).exists() {
+            Some(admit_load(self, token).await?)
+        } else {
+            None
+        };
         // Gate concurrent loads of DIFFERENT wallets so a reconnect storm can't pin
         // every worker with tree rebuilds. Re-check once more after the permit.
         let _permit = self.load_gate.acquire().await.ok()?;
@@ -6374,11 +6397,6 @@ impl AppState {
             return None;
         };
         let t_meta = t_load0.elapsed();
-        // Memory admission (task 03): make room BEFORE restoring another checkpoint, and
-        // refuse (the caller keeps answering "opening") rather than exceed the budget.
-        if !admit_load(self, token).await {
-            return None;
-        }
         let genesis = self.genesis;
         // A load that stopped between setting its own checkpoint aside for a twin and putting it
         // back (see the twin adoption below) left it at `.scan.own`. With no `.scan` in its place,
@@ -7485,6 +7503,15 @@ async fn enforce_resident_budget(state: &Arc<AppState>, incoming: Option<u64>) -
     if let Some(i) = WalletDb::default_nullifier_interner() {
         infos.push(ResidentInfo { token: String::new(), bytes: i.approx_heap_bytes() as u64, busy: true, protected: true, last_touch: None });
     }
+    // Loads already admitted but not yet resident are wallets about to arrive: they count
+    // against both caps and can never be victims. One that has just landed is counted once,
+    // as the resident wallet above.
+    let admitted: Vec<(String, u64)> = state.admitted.lock().map(|m| m.iter().map(|(t, b)| (t.clone(), *b)).collect()).unwrap_or_default();
+    for (t, b) in admitted {
+        if !resident.iter().any(|(r, _)| *r == t) {
+            infos.push(ResidentInfo { token: format!("admitted:{t}"), bytes: b, busy: true, protected: true, last_touch: None });
+        }
+    }
     // Count only wallets against the count cap: the two shared structures are not wallets.
     let shared = infos.iter().filter(|r| r.token.is_empty() || r.token == CHAIN_TREE_TOKEN).count();
     let hard_eff = if hard == 0 { 0 } else { hard + shared };
@@ -7510,22 +7537,44 @@ async fn enforce_resident_budget(state: &Arc<AppState>, incoming: Option<u64>) -
 /// How long a load waits for room under the hard resident rules before it is deferred.
 const ADMISSION_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
 
+/// A load admitted by [`admit_load`]: its estimated bytes stay reserved in
+/// `AppState::admitted` until this is dropped.
+struct Admission {
+    state: Arc<AppState>,
+    token: String,
+}
+
+impl Drop for Admission {
+    fn drop(&mut self) {
+        if let Ok(mut m) = self.state.admitted.lock() {
+            m.remove(&self.token);
+        }
+    }
+}
+
 /// Admit a wallet load under the hard resident rules (task 03): evict to make room first,
-/// wait up to [`ADMISSION_WAIT`] if every candidate is busy, then refuse. A refused load is
-/// retried by the client's next request; the status path keeps answering "opening".
-async fn admit_load(state: &Arc<AppState>, token: &str) -> bool {
+/// wait up to [`ADMISSION_WAIT`] if every candidate is busy, then refuse (`None`). A
+/// refused load is retried by the client's next request; the status path keeps answering
+/// "opening". An admitted load holds a reservation until the returned guard drops.
+async fn admit_load(state: &Arc<AppState>, token: &str) -> Option<Admission> {
     // A restored wallet holds about its checkpoint's leaf and note sections; the file also
     // carries the nullifier section, which with the shared interner is not resident, so
     // this over-estimates — the conservative direction for an admission check.
     let est = std::fs::metadata(scan_path(&state.wallet_dir, token)).map(|m| m.len()).unwrap_or(64 << 20).max(16 << 20);
     let deadline = std::time::Instant::now() + ADMISSION_WAIT;
     loop {
-        if enforce_resident_budget(state, Some(est)).await {
-            return true;
+        {
+            let _serial = state.admission.lock().await;
+            if enforce_resident_budget(state, Some(est)).await {
+                if let Ok(mut m) = state.admitted.lock() {
+                    m.insert(token.to_string(), est);
+                }
+                return Some(Admission { state: state.clone(), token: token.to_string() });
+            }
         }
         if std::time::Instant::now() >= deadline {
             log::warn!("wallet {token}: load deferred: the resident budget is full and every resident wallet is busy");
-            return false;
+            return None;
         }
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
@@ -12563,6 +12612,8 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
         persisted_snaps: Mutex::new(snap_seed),
         load_gate: tokio::sync::Semaphore::new(resources.load_wallets.max(1)),
         loading: Mutex::new(HashMap::new()),
+        admitted: std::sync::Mutex::new(HashMap::new()),
+        admission: tokio::sync::Mutex::new(()),
         // Concurrent preparations are capped by config (`--max-concurrent-proves`):
         // proving is CPU-heavy, and unbounded overlap is a CPU DoS on a hosted daemon.
         prepare_gate: tokio::sync::Semaphore::new(cfg.max_concurrent_proves.max(1)),
