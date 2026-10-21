@@ -94,6 +94,26 @@ const ORCHARD_SCRIPT_LEN: usize = 43;
 /// Anchor maturity depth (blocks) — must match consensus `shielded_anchor_depth`
 /// (600 * BPS = 600 at 1 BPS, ~10 min). A note is spendable once this deep.
 const DEFAULT_ANCHOR_DEPTH: u64 = 600;
+/// Consensus `max_shielded_anchor_age` for the active network, recorded at startup.
+///
+/// It is `pruning_depth / 4`, which differs per network and per BPS, so it is READ from the
+/// same params consensus signs against instead of being written here as a number. A wrong
+/// constant would either refuse good sends or keep letting doomed ones through.
+static MAX_ANCHOR_AGE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+/// Record the anchor-age bound for this network. Called once at startup.
+fn set_max_anchor_age(v: u64) {
+    let _ = MAX_ANCHOR_AGE.set(v);
+}
+
+/// The anchor-age bound, or `u64::MAX` when startup has not set it.
+///
+/// Defaulting to "no bound known" means any path that somehow runs before startup behaves
+/// exactly as it did before this guard existed, rather than refusing good sends on a value
+/// nobody supplied.
+fn max_anchor_age() -> u64 {
+    MAX_ANCHOR_AGE.get().copied().unwrap_or(u64::MAX)
+}
 /// Max `GetShieldedBlocks` pages a wallet advances per sync chunk. Kept small so
 /// the per-wallet lock is released frequently (status stays responsive); speed
 /// comes from looping back immediately instead of pausing between chunks.
@@ -446,6 +466,42 @@ pub struct ResourceLimits {
     /// remote node) raises it so the loop stops fetching pages one-at-a-time
     /// with the cores idle between round-trips. See `deep_prefetch`.
     pub prefetch_depth: usize,
+    /// Seconds before a wallet that has advanced is checkpointed on the TIME rule.
+    ///
+    /// The built-in 60 was chosen for a phone: the comment on `CHECKPOINT_INTERVAL` is about
+    /// "a phone against a public node" being force-stopped by Android with no shutdown, which
+    /// threw away everything since the last save. A hosted daemon is the opposite case — it
+    /// shuts down gracefully (flushing checkpoints and preserving tens of thousands of blocks
+    /// of progress) and a supervisor restarts it — so the window this protects is one it
+    /// rarely has to use.
+    ///
+    /// It is the dominant write source. A far-behind wallet checkpoints on this rule ALONE
+    /// (see `bursting`), and until it catches up each write is the whole growing leaf stream —
+    /// ~150-300 MB. Measured on the hosted daemon: 30 resident wallets, 95.3 GB written in 12
+    /// minutes, ~132 MB/s, against 26.3 GB read, on a box sitting at 69% iowait with 23
+    /// threads blocked on I/O and 0 runnable. Raising this divides that volume directly.
+    ///
+    /// The cost of raising it is bounded and known: a hard kill loses at most this many
+    /// seconds of scan progress per wallet, which is re-scanned, never lost money.
+    pub checkpoint_interval_secs: u64,
+    /// Seconds before a FAR-BEHIND wallet is checkpointed on the time rule. 0 = use
+    /// `checkpoint_interval_secs` for everyone, which is the old behaviour.
+    ///
+    /// These are the writes that matter. A wallet that is catching up "retains every leaf
+    /// since its birthday until it is caught up (base compaction runs only then)", and
+    /// `checkpoint_bytes` "copies every retained leaf (32 B each — tens to hundreds of MB
+    /// mid-restore)". It also checkpoints on the TIME rule alone (see `bursting`), so each
+    /// interval it re-serialises its whole growing blob: ~700 MB observed on this deployment,
+    /// every interval, per restoring wallet. Measured at interval 120: ~150 MB/s of writes
+    /// with 65% iowait, and `find -mmin -5 -size +20M` showing 83 files / 23 GB rewritten in
+    /// five minutes.
+    ///
+    /// Separating it from the normal interval is what makes it safe. A longer wait costs a
+    /// far-behind wallet only RE-SCAN time after an ungraceful exit, and it is rescanning
+    /// anyway; it does not hold more memory for waiting, because those leaves are retained
+    /// until compaction regardless of when they are written. A caught-up wallet keeps the
+    /// short interval, so ordinary balances are still persisted promptly.
+    pub catchup_checkpoint_interval_secs: u64,
 }
 
 impl Default for ResourceLimits {
@@ -471,6 +527,8 @@ impl Default for ResourceLimits {
             warm_budget_pct: 60,
             subtree_free_floor_mb: 1_200,
             prefetch_depth: 1,
+            checkpoint_interval_secs: 60,
+            catchup_checkpoint_interval_secs: 0,
         }
     }
 }
@@ -1923,6 +1981,90 @@ async fn node_reaches(client: &GrpcClient, cursor_daa: u64, timeout: std::time::
     Ok(())
 }
 
+/// Delete this wallet's older retired-checkpoint copies, keeping the newest of each
+/// kind.
+///
+/// Every rejected load copies the whole checkpoint aside as `.scan.divergent-<ts>`,
+/// every `/rescan` renames one aside as `.scan.bak`, a second retirement rotates that
+/// to `.scan.bak.<stamp>`, and a pruned cursor leaves `.scan.stale-<ts>`. Nothing ever
+/// deleted any of them. That is not a tidiness problem: on a synced wallet ONE copy is
+/// about 670 MB. This daemon's wallet directory is carrying 5.9 GB of `.divergent-*`
+/// across 35 files and 17 GB of `.bak*` across 109, none of which any code path will
+/// ever read again, and a phone running the same engine in-process reported 9 GB of
+/// storage for a single wallet.
+///
+/// The copies exist for real reasons and the mechanism stays: a user lost 18,354 ZKAS
+/// to a rescan that amputated notes below a pruning point, and the retired copy is what
+/// `--graft` rebuilds from. What is removed is only the ACCUMULATION — for recovery you
+/// want the most recent artifact of each kind, and the older ones of the same wallet are
+/// strictly less complete than the one that replaced them.
+fn prune_retired_copies(dir: &str, token: &str) {
+    let prefix = format!("{token}.scan.");
+    // (kind, mtime, name) for every retired copy of THIS wallet.
+    let mut found: Vec<(&'static str, std::time::SystemTime, String)> = Vec::new();
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for entry in rd.flatten() {
+        let Ok(name) = entry.file_name().into_string() else { continue };
+        let Some(rest) = name.strip_prefix(&prefix) else { continue };
+        let kind = if rest.starts_with("bak") {
+            "bak"
+        } else if rest.starts_with("divergent-") {
+            "divergent"
+        } else if rest.starts_with("stale-") {
+            "stale"
+        } else if rest.ends_with(".tmp") {
+            // An ORPHANED partial write. `save_checkpoint` writes `<token>.scan.<seq>.tmp`
+            // and renames it into place, so a `.tmp` still sitting here was interrupted —
+            // the process was killed mid-write — and nothing will ever finish or read it.
+            // Each one is a partial copy of a checkpoint that reaches ~670 MB on a synced
+            // wallet, the sequence number makes every one a NEW file, and nothing deleted
+            // them: this daemon is holding 17 of them totalling 628 MB, the oldest two
+            // weeks old. On a phone, where the way out of a stuck wallet has been to
+            // force-stop the app, that is the single biggest source of the 9 GB a user
+            // reported.
+            //
+            // Only ones that are demonstrably not in flight: this wallet is not loaded at
+            // the moment we prune it, and the age check means a concurrent writer is never
+            // raced even if that ever changes.
+            let fresh = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .map(|t| t.elapsed().map(|e| e.as_secs() < 600).unwrap_or(false))
+                .unwrap_or(false);
+            if fresh {
+                continue;
+            }
+            "tmp"
+        } else {
+            continue; // anything else is not ours to remove
+        };
+        let mtime = entry.metadata().and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
+        found.push((kind, mtime, name));
+    }
+    // Orphaned partial writes are worth nothing at all, so none is kept.
+    for (kind, _, name) in found.iter().filter(|(k, _, _)| *k == "tmp") {
+        let _ = kind;
+        let path = format!("{dir}/{name}");
+        let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        if std::fs::remove_file(&path).is_ok() {
+            log::info!("wallet '{token}': removed orphaned partial checkpoint {name} ({bytes} bytes)");
+        }
+    }
+    for kind in ["bak", "divergent", "stale"] {
+        let mut of_kind: Vec<&(&str, std::time::SystemTime, String)> =
+            found.iter().filter(|(k, _, _)| *k == kind).collect();
+        // Newest first; everything after the first is superseded.
+        of_kind.sort_by(|a, b| b.1.cmp(&a.1));
+        for (_, _, name) in of_kind.into_iter().skip(1) {
+            let path = format!("{dir}/{name}");
+            let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            if std::fs::remove_file(&path).is_ok() {
+                log::info!("wallet '{token}': removed superseded checkpoint copy {name} ({bytes} bytes)");
+            }
+        }
+    }
+}
+
 /// Take `token`'s `.scan.stale-<ts>` quarantine copies out of `restore_quarantined`'s
 /// reach by renaming them `.rescanned` (kept for forensics, never auto-restored). Called
 /// by `/rescan`, whose whole point is to rebuild rather than resume.
@@ -2359,6 +2501,13 @@ pub fn graft_wallet(dir: &str, token: &str, older_scan: &str, secret: Option<&st
 // same cursor returns more blocks as the chain grows).
 // ---------------------------------------------------------------------------
 
+/// How long a FINAL (limit-bound, therefore immutable) page stays reusable.
+///
+/// Not unbounded: `cap` already bounds the cache, so this only decides whether a page is
+/// thrown away before `cap` needs the slot. An hour comfortably covers the deep scans this
+/// cache exists for without keeping anything alive that the cap would not have kept anyway.
+const FINAL_PAGE_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
+
 /// One chain block, fetched once and **decoded once** for the whole wallet cohort.
 /// The two costs that are identical for every wallet — parsing each accepted
 /// bundle, and computing each coinbase note's Sinsemilla leaf commitment — are paid
@@ -2606,7 +2755,17 @@ fn decode_compact_actions(bytes: &[u8]) -> Option<Vec<CompactActionRecord>> {
 }
 
 struct PageCache {
-    map: HashMap<(RpcHash, u64), (std::time::Instant, Arc<DecodedPage>)>,
+    /// Keyed page -> (fetched at, how long THIS page stays reusable, decoded page).
+    ///
+    /// The TTL is per entry because the reason it is short applies to exactly one kind of
+    /// page. A cursor near the tip returns MORE blocks as the chain grows, so a cached
+    /// answer there goes stale and the short TTL is what keeps it fresh. A page that came
+    /// back FULL was limited by `limit`, not by the tip: the same request can never return
+    /// more, so it is immutable and expiring it only buys a refetch. During the deep scans
+    /// that dominate this cache (332 pages, ~138 s, fetch 92% of the wall time) almost
+    /// every page is of the second kind, and the uniform TTL was expiring them inside a
+    /// single wallet's own scan.
+    map: HashMap<(RpcHash, u64), (std::time::Instant, std::time::Duration, Arc<DecodedPage>)>,
     order: VecDeque<(RpcHash, u64)>,
     /// Pages being fetched right now, so simultaneous askers wait for one answer
     /// instead of each fetching and decoding the same page. See `fetch_shielded_page`.
@@ -2638,6 +2797,10 @@ struct PageCache {
     hits: u64,
     dedup_hits: u64,
     misses: u64,
+    /// Fetches that found the page already cached but EXPIRED — pure waste, and
+    /// indistinguishable from a first fetch in `misses` alone. Without this nobody can say
+    /// how much of the miss rate is the cache giving up on pages it still had.
+    expired_refetch: u64,
 }
 
 impl PageCache {
@@ -2658,6 +2821,7 @@ impl PageCache {
             hits: 0,
             dedup_hits: 0,
             misses: 0,
+            expired_refetch: 0,
         }
     }
 }
@@ -2757,12 +2921,14 @@ async fn fetch_shielded_page(
     let key = (low, limit);
     {
         let mut c = cache.lock().await;
-        if let Some((at, resp)) = c.map.get(&key) {
-            if at.elapsed() < c.ttl {
+        if let Some((at, ttl, resp)) = c.map.get(&key) {
+            if at.elapsed() < *ttl {
                 let resp = resp.clone();
                 c.hits += 1;
                 return Ok(resp);
             }
+            // Still held, but past its TTL: this fetch is one the cache could have served.
+            c.expired_refetch += 1;
         }
     }
     // Miss. Everyone who misses the SAME page queues behind one fetch rather than
@@ -2790,19 +2956,19 @@ async fn fetch_shielded_page(
     // The leader may have filled the cache while we waited, which is the whole point.
     {
         let mut c = cache.lock().await;
-        if let Some((at, resp)) = c.map.get(&key) {
-            if at.elapsed() < c.ttl {
+        if let Some((at, ttl, resp)) = c.map.get(&key) {
+            if at.elapsed() < *ttl {
                 let resp = resp.clone();
                 c.dedup_hits += 1;
                 return Ok(resp);
             }
         }
         c.misses += 1;
-        let (h, d, m) = (c.hits, c.dedup_hits, c.misses);
+        let (h, d, m, x) = (c.hits, c.dedup_hits, c.misses, c.expired_refetch);
         // Every 256th real fetch, not every call: this is the hot path.
         if m % 256 == 0 {
             log::info!(
-                "page cache: {h} hit / {d} rode-a-peer / {m} fetched -> {}% served without touching the node",
+                "page cache: {h} hit / {d} rode-a-peer / {m} fetched ({x} of them a page we still held but had expired) -> {}% served without touching the node",
                 (h + d) * 100 / (h + d + m).max(1),
             );
         }
@@ -2870,7 +3036,12 @@ async fn fetch_shielded_page(
         }
         c.next.insert(low, last.hash);
     }
-    if c.map.insert(key, (std::time::Instant::now(), decoded.clone())).is_some() {
+    // A full page is FINAL: the node gave back every block `limit` allowed, so this cursor
+    // was bounded by the limit and not by the tip, and the same request can never return
+    // more. A short page is at the frontier and keeps the configured TTL, which is the only
+    // place the freshness argument holds.
+    let page_ttl = if decoded.blocks.len() as u64 >= limit { FINAL_PAGE_TTL } else { c.ttl };
+    if c.map.insert(key, (std::time::Instant::now(), page_ttl, decoded.clone())).is_some() {
         if let Some(pos) = c.order.iter().position(|k| *k == key) {
             c.order.remove(pos);
         }
@@ -2883,7 +3054,7 @@ async fn fetch_shielded_page(
     // `order` is insertion-ordered (a re-insert moves to the back), so the sweep stops
     // at the first live entry and costs only what it evicts.
     while let Some(old) = c.order.front().copied() {
-        if c.map.get(&old).is_some_and(|(at, _)| at.elapsed() < c.ttl) {
+        if c.map.get(&old).is_some_and(|(at, ttl, _)| at.elapsed() < *ttl) {
             break;
         }
         c.order.pop_front();
@@ -4202,8 +4373,35 @@ impl WalletEntry {
     /// The newest chain-block boundary at least `anchor_depth + slack` blue units below
     /// the sink: the matured, canonical anchor a spend roots at.
     fn matured_leaves(&self) -> Option<u64> {
+        self.matured_boundary().map(|(_, leaves)| leaves)
+    }
+
+    /// [`Self::matured_leaves`] keeping the boundary's blue score, so callers can judge how
+    /// OLD the anchor is and not merely that one exists.
+    fn matured_boundary(&self) -> Option<(u64, u64)> {
         let cutoff_blue = self.sink_blue.saturating_sub(DEFAULT_ANCHOR_DEPTH + ANCHOR_SLACK);
-        self.boundaries.iter().rev().find(|(bs, _)| *bs <= cutoff_blue).map(|&(_, leaves)| leaves)
+        self.boundaries.iter().rev().find(|(bs, _)| *bs <= cutoff_blue).copied()
+    }
+
+    /// How far below the sink the anchor a spend would root at sits, in blue units.
+    ///
+    /// `boundaries` is a [`MATURED_RING`]-entry ring pushed once per block THIS WALLET
+    /// ingests, while `sink_blue` comes from the node. So a wallet whose scan lags the sink
+    /// by more than the ring anchors at its own scan head, and this age is then the sync gap
+    /// itself rather than the intended ~`DEFAULT_ANCHOR_DEPTH`.
+    fn anchor_age(&self) -> Option<u64> {
+        self.matured_boundary().map(|(bs, _)| self.sink_blue.saturating_sub(bs))
+    }
+
+    /// Whether a spend rooted at the current anchor could still be mined.
+    ///
+    /// Past `max_shielded_anchor_age` consensus rejects the spend on EVERY node, so without
+    /// this the wallet builds an ~9 s Halo2 proof for a payment that cannot land and the user
+    /// is shown a consensus string that names none of the three things it could mean.
+    /// Measured live 2026-10-02: a wallet anchored 106,117 leaves (~12 h) behind the
+    /// wallets that were caught up, and every send from it failed.
+    fn anchor_in_window(&self) -> bool {
+        self.anchor_age().is_some_and(|age| age <= max_anchor_age())
     }
 
     /// The anchor block a spend rooted at `matured` leaves must name, or `None` before the security
@@ -5029,6 +5227,10 @@ fn snap_from_entry(address: String, e: &WalletEntry, daa_score: u64) -> StatusSn
         spend_ready: tip > 0
             && e.reorged_strikes == 0
             && e.matured_leaves().is_some()
+            // An anchor that exists but is out of the consensus window is not spendable:
+            // every send rooted at it is rejected. Reporting ready there is the same fault
+            // as the stale-tip case above, one step further along.
+            && e.anchor_in_window()
             && (e.db.tree_is_valid() || e.db.is_borrowing()),
         blocks_behind: tip.saturating_sub(e.scanned as u64),
         caught_up: e.caught_up,
@@ -6289,6 +6491,12 @@ impl AppState {
             }
             None => None,
         };
+        // Clean up on LOAD, not only when a new copy is made. Otherwise a wallet that
+        // already accumulated copies keeps carrying them until it happens to produce
+        // another one — which, once the checkpoint-rejection fix stops producing them,
+        // is never. A phone reported 9 GB for a single wallet; this is what gives it
+        // back on the next open.
+        prune_retired_copies(&self.wallet_dir, token);
         let t_verify = t_load0.elapsed();
         // A checkpoint the node could not VERIFY must not be treated as one the node
         // CONTRADICTED. On the unverifiable shape, return without opening the wallet at
@@ -6332,6 +6540,7 @@ impl AppState {
             let quarantine = format!("{scan}.divergent-{}", now_unix());
             if std::fs::copy(&scan, &quarantine).is_ok() {
                 log::warn!("preserved rejected checkpoint as {quarantine}");
+                prune_retired_copies(&self.wallet_dir, token);
             }
         }
         // A quarantined copy of this token's own checkpoint that the node serves again
@@ -7046,7 +7255,22 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
     // witness state (v5) is persisted immediately — a restart seconds later must not throw
     // it away and re-do the ~30–90 s warm.
     let force = e.force_checkpoint;
-    let overdue = advanced > 0 && e.last_checkpoint_at.elapsed() >= CHECKPOINT_INTERVAL;
+    // Configurable: see `checkpoint_interval_secs`. The constant remains the default and the
+    // phone/desktop story; a hosted daemon on a disk-bound box raises it.
+    let checkpoint_interval = if state.resources.checkpoint_interval_secs == 0 {
+        CHECKPOINT_INTERVAL
+    } else {
+        std::time::Duration::from_secs(state.resources.checkpoint_interval_secs)
+    };
+    let bursting_now = chain_len.saturating_sub(e.scanned as u64) >= CATCHUP_BURST_MIN_BEHIND;
+    // A far-behind wallet writes its whole retained leaf set each time; give it its own,
+    // longer interval when one is configured. See `catchup_checkpoint_interval_secs`.
+    let effective_interval = match state.resources.catchup_checkpoint_interval_secs {
+        0 => checkpoint_interval,
+        secs if bursting_now => std::time::Duration::from_secs(secs.max(state.resources.checkpoint_interval_secs)),
+        _ => checkpoint_interval,
+    };
+    let overdue = advanced > 0 && e.last_checkpoint_at.elapsed() >= effective_interval;
     // A wallet far enough behind to burst (see `CATCHUP_BURST_MIN_BEHIND`) ingests
     // several thousand blocks per pass, so the block rule alone would rewrite the
     // checkpoint on EVERY pass — and a restoring wallet retains every leaf since its
@@ -8877,6 +9101,7 @@ async fn wallet_rescan(
     let _ = std::fs::rename(&scan, format!("{scan}.bak"));
     // A deliberate rescan must not be undone by `restore_quarantined` on the next load.
     retire_quarantine_copies(&state.wallet_dir, &token);
+    prune_retired_copies(&state.wallet_dir, &token);
     log::info!("wallet '{token}': rescan requested — checkpoint retired, will reload from birthday");
     // Return NOW. Reloading a wallet means a fast-sync anchor fetch and a scan
     // from birthday; doing that inline would hold the request open for minutes and
@@ -12911,6 +13136,109 @@ mod sdk_api_tests {
     /// viewing key another token already scanned must clone that checkpoint, and
     /// the clone must parse under EITHER key form (the desktop imported the seed;
     /// the phone registers only the FVK — same wallet, same checkpoint).
+    /// A node that cannot verify a checkpoint must not be allowed to condemn it.
+    ///
+    /// The live daemon logged 2,975 checkpoint rejections and 0 of them were the
+    /// case this guard exists for (same leaf count, different root). Every one was a
+    /// SIZE mismatch, and re-querying three of those cursors days later returned
+    /// exactly the size the wallet had claimed — the wallets were right and the node
+    /// had been behind. Each rejection threw away the whole scan and rebuilt from the
+    /// birthday; on a phone, with no twin checkpoint to adopt, that is a user watching
+    /// a half-finished sync restart at 0%.
+    #[test]
+    fn a_node_that_cannot_verify_a_checkpoint_must_not_condemn_it() {
+        use kaspa_shielded_core::tree::FrontierState;
+        let tmp = std::env::temp_dir().join(format!("zkas-verify-test-{}", std::process::id()));
+        let dir = tmp.to_string_lossy().to_string();
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let genesis = RpcHash::from_bytes([7u8; 32]);
+        let seed = [0x5au8; 32];
+        let db = WalletDb::from_seed(seed).expect("valid seed");
+        let boundaries: VecDeque<(u64, u64)> = VecDeque::from([(100, 0)]);
+        save_checkpoint(&dir, "w", &genesis, &RpcHash::from_bytes([9u8; 32]), 777, &db, &boundaries, 100, 0).unwrap();
+        let buf = std::fs::read(scan_path(&dir, "w")).unwrap();
+
+        // The node agrees about the leaf count: the checkpoint loads.
+        let agreeing = FrontierState { size: db.size(), leaf: None, ommers: vec![] };
+        let mut why = CheckpointReject::Malformed;
+        assert!(
+            parse_scan_bytes_why(&buf, WalletKey::Seed(seed), Some(&agreeing), &mut why).is_some(),
+            "a frontier that matches the wallet's own tree must restore"
+        );
+
+        // The node reports a DIFFERENT leaf count — because it is behind, or because
+        // it holds no shielded state for that block and reports an empty tree. Neither
+        // says anything about this wallet, so neither may destroy its scan.
+        for size in [1u64, 5, 9_401_145] {
+            let unusable = FrontierState { size, leaf: Some([1u8; 32]), ommers: vec![] };
+            let mut why = CheckpointReject::Malformed;
+            let out = parse_scan_bytes_why(&buf, WalletKey::Seed(seed), Some(&unusable), &mut why);
+            assert!(out.is_none(), "an unverifiable checkpoint is not installed");
+            assert_eq!(
+                why,
+                CheckpointReject::Unverifiable,
+                "a leaf-count mismatch (node says {size}, wallet says {}) must be reported as UNVERIFIABLE, never as divergence — \
+                 the caller deletes the scan on divergence",
+                db.size()
+            );
+        }
+
+        // And the file is still there: nothing destroyed it.
+        assert!(std::fs::metadata(scan_path(&dir, "w")).is_ok(), "the checkpoint file must survive an unverifiable load");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Retired checkpoint copies must stop accumulating.
+    ///
+    /// One copy of a synced wallet's checkpoint is ~670 MB. The live daemon had
+    /// reached 5.9 GB of `.divergent-*` (35 files) and 17 GB of `.bak*` (109 files)
+    /// that nothing would ever read, and a phone running the same engine reported
+    /// 9 GB of storage for one wallet. Keep the newest of each kind — recovery needs
+    /// the most recent artifact, not every one ever made — and drop the rest.
+    #[test]
+    fn retired_checkpoint_copies_do_not_pile_up() {
+        let tmp = std::env::temp_dir().join(format!("zkas-prune-test-{}", std::process::id()));
+        let dir = tmp.to_string_lossy().to_string();
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let live = format!("{dir}/tok.scan");
+        std::fs::write(&live, b"live").unwrap();
+        // Three of each kind, plus a second wallet that must not be touched.
+        let made = [
+            "tok.scan.divergent-1000", "tok.scan.divergent-2000", "tok.scan.divergent-3000",
+            "tok.scan.bak", "tok.scan.bak.1000", "tok.scan.bak.2000",
+            "tok.scan.stale-1000", "tok.scan.stale-2000",
+            "other.scan", "other.scan.divergent-1000",
+        ];
+        for (i, n) in made.iter().enumerate() {
+            std::fs::write(format!("{dir}/{n}"), b"x").unwrap();
+            // Distinct mtimes so "newest" is well defined.
+            let t = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000 + i as u64 * 60);
+            let f = std::fs::File::options().write(true).open(format!("{dir}/{n}")).unwrap();
+            f.set_modified(t).unwrap();
+        }
+        prune_retired_copies(&dir, "tok");
+
+        let left: std::collections::BTreeSet<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().into_string().unwrap())
+            .collect();
+        assert!(left.contains("tok.scan"), "the LIVE checkpoint must never be removed");
+        assert!(left.contains("tok.scan.divergent-3000"), "keeps the newest divergent copy");
+        assert!(left.contains("tok.scan.bak.2000"), "keeps the newest bak copy");
+        assert!(left.contains("tok.scan.stale-2000"), "keeps the newest stale copy");
+        assert!(!left.contains("tok.scan.divergent-1000"), "older divergent copies go");
+        assert!(!left.contains("tok.scan.divergent-2000"), "older divergent copies go");
+        assert!(!left.contains("tok.scan.bak"), "older bak copies go");
+        assert!(!left.contains("tok.scan.bak.1000"), "older bak copies go");
+        assert!(!left.contains("tok.scan.stale-1000"), "older stale copies go");
+        assert!(left.contains("other.scan"), "another wallet's live checkpoint is untouched");
+        assert!(left.contains("other.scan.divergent-1000"), "another wallet's copies are untouched");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn twin_checkpoint_adoption_clones_and_verifies() {
         let tmp = std::env::temp_dir().join(format!("zkas-adopt-test-{}", std::process::id()));

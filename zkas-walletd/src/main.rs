@@ -181,6 +181,41 @@ struct Cli {
     /// Defer optional subtree-index builds below this MemAvailable value.
     #[arg(long, value_name = "MIB")]
     subtree_free_floor_mb: Option<u64>,
+    /// Full `GetShieldedBlocks` pages to fetch CONCURRENTLY ahead of the ingest cursor
+    /// during a deep scan. 1 = fetch one page at a time (the old built-in default).
+    ///
+    /// Worth tuning because page fetch is 80-93% of sync wall time, and the default of 1
+    /// assumed the hosted daemon's node is local and therefore cheap. Measured on this
+    /// deployment it is 415 ms/page against 127.0.0.1 — `GetShieldedBlocks` on an archival
+    /// node is disk-bound, not network-bound — so the loop waits on I/O with the cores
+    /// idle, exactly the shape the flag's own docs describe for a phone on a remote node.
+    ///
+    /// Raising it is NOT free: the extra fetches land on the same disk, so past the point
+    /// where the node's I/O saturates it buys queueing instead of throughput. A flag rather
+    /// than a new baked-in number, so the trade can be measured on the box it runs on.
+    #[arg(long, value_name = "N")]
+    prefetch_depth: Option<usize>,
+    /// Seconds before a wallet that has advanced is checkpointed on the time rule (default 60).
+    ///
+    /// Checkpoint writes are the dominant disk I/O on a hosted daemon: a far-behind wallet
+    /// saves on this rule alone and each save is the whole growing leaf stream (~150-300 MB
+    /// until it catches up). Measured on the 8,400-wallet deployment: 95.3 GB written in 12
+    /// minutes at 69% iowait. The built-in 60 is tuned for a PHONE, which can be force-stopped
+    /// without a shutdown; a supervised server flushes on SIGTERM, so it can afford a longer
+    /// interval. A hard kill then costs at most this many seconds of re-scanning per wallet.
+    #[arg(long, value_name = "SECONDS")]
+    checkpoint_interval: Option<u64>,
+    /// Seconds before a FAR-BEHIND wallet is checkpointed on the time rule (default: same as
+    /// --checkpoint-interval).
+    ///
+    /// Catching-up wallets are where the write volume is: one retains every leaf since its
+    /// birthday until it is caught up, and each checkpoint re-serialises that whole growing
+    /// blob — ~700 MB per write on the 8,400-wallet deployment, every interval. Raising this
+    /// alone leaves caught-up wallets persisting promptly while cutting the writes that
+    /// actually saturate the disk. The cost is re-scan time after an ungraceful exit, for a
+    /// wallet that is already re-scanning.
+    #[arg(long, value_name = "SECONDS")]
+    catchup_checkpoint_interval: Option<u64>,
 }
 
 // Oversubscribe worker threads (2x cores). The background sync loop does CPU-bound
@@ -263,6 +298,15 @@ async fn run(cli: Cli) {
     }
     if let Some(v) = cli.subtree_free_floor_mb {
         resources.subtree_free_floor_mb = v;
+    }
+    if let Some(v) = cli.prefetch_depth.filter(|v| *v > 0) {
+        resources.prefetch_depth = v;
+    }
+    if let Some(v) = cli.checkpoint_interval.filter(|v| *v > 0) {
+        resources.checkpoint_interval_secs = v;
+    }
+    if let Some(v) = cli.catchup_checkpoint_interval.filter(|v| *v > 0) {
+        resources.catchup_checkpoint_interval_secs = v;
     }
 
     // Offline admin modes: operate on the wallet files directly and exit.
