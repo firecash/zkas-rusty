@@ -321,18 +321,20 @@ pub struct WalletDb {
     /// Multiplied across a hosted daemon's resident wallets this is the dominant
     /// term in its RSS (measured: 6.8 GB across 39 wallets). Keeping ONE keyless copy
     /// for everyone is what [`Self::set_leaves_only`] exists for.
-    leaves: Vec<[u8; 32]>,
-    /// The leaf stream decoded to curve points, built on first use.
     ///
-    /// A `MerkleHashOrchard` is a Pallas point, so turning a stored leaf back into one
-    /// is a point *decompression* — ~0.68 ms each, ~136 s for a 200K-leaf chain. Doing
-    /// that eagerly on restore was over half of the multi-minute window in which a
-    /// restarted daemon showed every user an empty wallet. Nothing about a balance, a
-    /// note, or the tip anchor needs curve points; only rebuilding a spend witness
-    /// does. So the stream is *stored* as bytes (restoring it is a memcpy) and decoded
-    /// lazily, once, when a witness actually needs it — and `warm_leaves` lets the
-    /// daemon do that off the request path so a send never waits on it either.
-    decoded: OnceCell<Vec<MerkleHashOrchard>>,
+    /// **Held ONCE (walletd-scale task 03, 2026-10-21).** It used to be stored twice: as
+    /// canonical bytes here and again as `decoded: OnceCell<Vec<MerkleHashOrchard>>`, built
+    /// on first witness use and then kept for the life of the wallet. Measured on the hosted
+    /// daemon at 11:23 UTC: 118 equal-sized paired mappings, 23.6 GiB, i.e. the same 15 M
+    /// leaves twice in up to ~120 resident wallets. The decoded form was justified as "a
+    /// point decompression, ~0.68 ms each", but a `MerkleHashOrchard` is a Pallas BASE FIELD
+    /// element and `from_bytes` is `pallas::Base::from_repr`: one Montgomery multiply and a
+    /// range check, tens of ns. So the stream is kept only in the form every consumer reads
+    /// (witness replay, subtree fold, compaction), and converted at the edges: `to_bytes`
+    /// when a checkpoint is written, `from_bytes` when one is restored. The checkpoint bytes
+    /// are unchanged (`to_bytes(from_bytes(b)) == b` for every canonical `b`, and only
+    /// canonical leaves are ever stored: `append_leaf` takes them from `from_cmx`).
+    leaves: Vec<MerkleHashOrchard>,
     /// Owned, unspent notes (absolute position + note only; witnesses are built lazily).
     notes: Vec<OwnedNote>,
     /// Number of leaves ingested so far, absolute (`base_size + leaves.len()`) — the
@@ -811,7 +813,6 @@ impl WalletDb {
             base_frontier: Frontier::empty(),
             base_size: 0,
             leaves: Vec::new(),
-            decoded: OnceCell::new(),
             notes: Vec::new(),
             size: 0,
             witnesses: Vec::new(),
@@ -864,7 +865,6 @@ impl WalletDb {
             base_frontier: Frontier::empty(),
             base_size: 0,
             leaves: Vec::new(),
-            decoded: OnceCell::new(),
             notes: Vec::new(),
             size: 0,
             witnesses: Vec::new(),
@@ -1870,12 +1870,8 @@ impl WalletDb {
         }
         self.base_frontier = tree.to_frontier();
         self.base_size = step_target;
-        // Drop the now-summarised prefix from both the raw stream and its decoded cache,
-        // keeping the two exactly in step (see `append_leaf`).
+        // Drop the now-summarised prefix (the stream is held once; see `leaves`).
         self.leaves.drain(..rel);
-        if let Some(d) = self.decoded.get_mut() {
-            d.drain(..rel);
-        }
         // CRUCIAL: the live witnesses are self-contained (their own inner tree + filled +
         // cursor, at absolute positions ≥ the earliest note ≥ the new base), so compacting
         // the base BELOW them does not invalidate them — keep them. Wiping them here (the
@@ -1928,8 +1924,6 @@ impl WalletDb {
         // The stream's prefix and base both moved: the cache was seeded from the frontier
         // this graft just replaced, so retire it and let it be rebuilt.
         self.subtree = SubtreeCache::default();
-        // The decoded cache mirrors `leaves` index-for-index — rebuild it lazily.
-        self.decoded = OnceCell::new();
         Ok(gap as u64)
     }
 
@@ -2050,16 +2044,8 @@ impl WalletDb {
     /// wrote ourselves, and failing closed makes a witness build return `None` (a clean
     /// send error) rather than silently root to a wrong tree.
     fn decoded_leaves(&self) -> &[MerkleHashOrchard] {
-        self.decoded.get_or_init(|| {
-            // Each leaf decodes independently; a multi-million-leaf stream is seconds of
-            // one core, so spread it.
-            use rayon::prelude::*;
-            self.leaves
-                .par_iter()
-                .map(|b| Option::<MerkleHashOrchard>::from(MerkleHashOrchard::from_bytes(b)))
-                .collect::<Option<Vec<_>>>()
-                .unwrap_or_default()
-        })
+        // The stream is held decoded (see `leaves`); nothing to build.
+        &self.leaves
     }
 
     /// Decode the leaf stream now, so a later spend doesn't pay for it. The daemon calls
@@ -2076,12 +2062,7 @@ impl WalletDb {
         let t_leaf = std::time::Instant::now();
         self.scan_cost.leaves += 1;
         let leaf = MerkleHashOrchard::from_cmx(&cmx);
-        self.leaves.push(leaf.to_bytes());
-        // Keep an already-materialised cache in step rather than invalidating it — a
-        // synced wallet appends a few leaves a second and must not re-decode the chain.
-        if let Some(d) = self.decoded.get_mut() {
-            d.push(leaf);
-        }
+        self.leaves.push(leaf);
         // The mirror tree is the expensive half of a scan and it is PUBLIC — the shared
         // tree is building the identical thing. A borrowing wallet skips it and adopts
         // that frontier instead (see `adopt_tip_frontier`), which is sound because the
@@ -2539,9 +2520,9 @@ impl WalletDb {
     /// biggest thing on the device. Returns the number of decoded leaves dropped so a
     /// caller can log what it actually reclaimed.
     pub fn release_reclaimable(&mut self) -> usize {
-        let n = self.decoded.get().map(|d| d.len()).unwrap_or(0);
-        self.decoded = OnceCell::new();
-        n
+        // Nothing left to give back: the decoded cache this used to drop no longer exists
+        // (the stream is held once, decoded; see `leaves`). Kept for API stability.
+        0
     }
 
     /// Where this wallet's scan CPU has gone so far — see [`ScanCost`].
@@ -3218,7 +3199,8 @@ impl WalletDb {
         out.extend_from_slice(&self.size.to_le_bytes());
         out.extend_from_slice(&(self.leaves.len() as u64).to_le_bytes());
         for leaf in &self.leaves {
-            out.extend_from_slice(leaf);
+            // Canonical bytes, exactly what was written before the stream was held decoded.
+            out.extend_from_slice(&leaf.to_bytes());
         }
         out.extend_from_slice(&(self.notes.len() as u64).to_le_bytes());
         for n in &self.notes {
@@ -3425,9 +3407,11 @@ impl WalletDb {
         // instead of failing this one restore on its first short read below.
         db.leaves.reserve(n_leaves.min(r.remaining() / 32));
         for _ in 0..n_leaves {
-            // Stored verbatim — no point decompression here; that is what makes a restore
-            // a memcpy instead of minutes of curve arithmetic.
-            db.leaves.push(r.arr::<32>()?);
+            // A field-element range check (`pallas::Base::from_repr`), tens of ns per leaf --
+            // not a point decompression. A non-canonical leaf cannot have been written by
+            // `to_checkpoint` (it stores `to_bytes()` of an element), so it means a corrupt
+            // file and fails this restore like any other malformed field.
+            db.leaves.push(Option::<MerkleHashOrchard>::from(MerkleHashOrchard::from_bytes(&r.arr::<32>()?))?);
         }
         let n_notes = r.u64()? as usize;
         for _ in 0..n_notes {
@@ -5469,6 +5453,42 @@ mod tests {
     /// requirement — a content hash, a checksum-based backup, a byte-equality assert —
     /// this test still passes, so read the comment in `to_checkpoint` before assuming
     /// a canonical encoding is available.
+    /// The leaf stream is held ONCE, decoded (task 03). The checkpoint must not notice:
+    /// encode -> restore -> encode is byte-identical, the restored stream and root equal the
+    /// original, every stored leaf is its canonical encoding, and a non-canonical leaf in a
+    /// blob fails the restore rather than being kept.
+    #[test]
+    fn leaf_stream_held_once_keeps_checkpoint_bytes_identical() {
+        let mine = [5u8; 32];
+        let mut db = WalletDb::from_seed(mine).unwrap();
+        for i in 0u64..1000 {
+            let mut b = [0u8; 32];
+            b[..8].copy_from_slice(&i.wrapping_mul(0x9e37_79b9_7f4a_7c15).to_le_bytes());
+            b[8..16].copy_from_slice(&(!i).to_le_bytes());
+            b[31] = 0; // below the Pallas base modulus: canonical
+            let cmx = Option::<ExtractedNoteCommitment>::from(ExtractedNoteCommitment::from_bytes(&b)).expect("canonical");
+            db.append_leaf(cmx, None);
+        }
+        let bytes = db.to_checkpoint();
+        let r = WalletDb::from_checkpoint(mine, &bytes).expect("restore");
+        assert_eq!(r.to_checkpoint(), bytes, "restore then encode is byte-identical");
+        assert_eq!(r.leaves, db.leaves);
+        assert_eq!(r.leaf_count(), 1000);
+        assert_eq!(r.anchor(), db.anchor());
+        let l0 = db.leaves[0].to_bytes();
+        assert_eq!(Option::<MerkleHashOrchard>::from(MerkleHashOrchard::from_bytes(&l0)), Some(db.leaves[0]));
+        let pos = bytes.windows(32).position(|w| w == l0).expect("leaf 0 is stored as its canonical bytes");
+        let mut bad = bytes.clone();
+        bad[pos..pos + 32].copy_from_slice(&[0xff; 32]);
+        assert!(WalletDb::from_checkpoint(mine, &bad).is_none(), "a non-canonical leaf must fail the restore");
+        // The witness path still reads the same stream: a replayed root equals the tip root.
+        let mut tree = CommitmentTree::<MerkleHashOrchard, TREE_DEPTH>::from_frontier(&r.base_frontier);
+        for l in r.decoded_leaves() {
+            tree.append(*l).unwrap();
+        }
+        assert_eq!(tree.root().to_bytes(), r.anchor());
+    }
+
     #[test]
     fn spent_nullifiers_roundtrip_as_a_set_regardless_of_insertion_order() {
         let mine = [5u8; 32];
