@@ -4390,7 +4390,7 @@ impl WalletEntry {
     /// Measured live 2026-10-02: a wallet anchored 106,117 leaves (~12 h) behind the
     /// wallets that were caught up, and every send from it failed.
     fn anchor_in_window(&self) -> bool {
-        self.anchor_age().is_some_and(|age| age <= max_anchor_age())
+        self.anchor_age().is_some_and(|age| age >= DEFAULT_ANCHOR_DEPTH && age <= max_anchor_age())
     }
 
     /// The anchor block a spend rooted at `matured` leaves must name, or `None` before the security
@@ -11975,6 +11975,57 @@ async fn warm_sweep_loop(state: Arc<AppState>) {
 #[cfg(test)]
 mod warm_overlap_tests {
     use super::{warm_overlap_allowed, WARM_OVERLAP_MAX_BEHIND};
+
+    /// The anchor window has TWO ends, and this daemon only ever checked one.
+    ///
+    /// Consensus requires `age >= shielded_anchor_depth && age <= max_shielded_anchor_age`
+    /// (`judge_anchor_source`). `anchor_in_window` tested only the ceiling, so an anchor that
+    /// was too YOUNG passed, was proved — a full Halo 2 build — and was then refused by the
+    /// node as "anchor not final (out of the maturity window)", the SAME opaque string an
+    /// over-aged anchor produces, with nothing on this side having objected first.
+    ///
+    /// The asymmetry this pins is what makes it fragile: `max_anchor_age()` is READ from the
+    /// consensus params at startup, while the floor is the hardcoded `DEFAULT_ANCHOR_DEPTH`.
+    /// Consensus derives the floor as `600 * BPS`, so 600 is correct ONLY because mainnet is
+    /// a 1-BPS network. On a 10-BPS network the real floor is 6,000 and the hardcoded one
+    /// would be wrong by ten times, refusing every send as immature.
+    #[test]
+    fn the_anchor_floor_matches_consensus_for_this_network() {
+        let p = kaspa_consensus_core::config::params::Params::from(crate::state_prefix_network("mainnet"));
+        assert_eq!(
+            crate::DEFAULT_ANCHOR_DEPTH,
+            p.shielded_anchor_depth(),
+            "the hardcoded anchor floor has drifted from the consensus params for this network"
+        );
+        assert!(p.shielded_anchor_depth() < p.max_shielded_anchor_age(), "a window needs a floor below its ceiling");
+    }
+
+    /// Canonical hex is what makes the prepare marker's insert and remove agree, so it must
+    /// be case-stable and whitespace-free for every input `unhex` accepts.
+    ///
+    /// The production fix is already here (`guard_key = hex(&fvk_bytes)`); this pins it. Keyed
+    /// on the TEXT instead, "AABB…", "aabb…" and " aabb… " were one viewing key under three
+    /// keys: two concurrent prepares for one wallet both passed the guard, both selected the
+    /// same notes, and one transaction was rejected for reusing a nullifier after paying full
+    /// proving cost — and an entry inserted under a non-canonical key was never removed, so
+    /// that wallet was refused "still being prepared" until the daemon restarted.
+    #[test]
+    fn canonical_hex_is_what_both_sides_key_on() {
+        let raw = [0xabu8, 0xCD, 0x01, 0xff];
+        let canonical = crate::hex(&raw);
+        assert_eq!(canonical, "abcd01ff", "crate::hex() must emit lowercase");
+        let forms = ["ABCD01FF", "abcd01ff", " abcd01ff ", "AbCd01Ff"];
+        for sent in forms {
+            let parsed = crate::unhex(sent).expect("unhex accepts every one of these");
+            assert_eq!(crate::hex(&parsed), canonical, "{sent:?} must canonicalise to the same key");
+        }
+        // Non-vacuity: some accepted forms must DIFFER from the canonical string, because that
+        // difference is exactly what made insert and remove disagree.
+        assert!(
+            forms.iter().any(|f| *f != canonical),
+            "no tested form differs from the canonical key, so this test proves nothing"
+        );
+    }
 
     /// The case the overlap exists for: an app reopened on a wallet at ~99.4%, ~30k
     /// blocks from the tip. It must warm while it finishes, or the user pays the scan
