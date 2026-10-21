@@ -75,3 +75,10 @@ rcgen = "0.13"
 qrcode = { version = "0.14", default-features = false }
 sha2.workspace = true
 hex.workspace = true
+
+[dev-dependencies]
+# Only for the task-03 differential test (`day_diff_tests`): the reference two-NoteCommit
+# coinbase derivation and planted notes. Same versions the workspace already links.
+orchard = { package = "zakura-orchard", version = "=2.2.0", default-features = false, features = ["std", "weighted-merkle"] }
+zcash_note_encryption = "=0.4.2"
+blake2b_simd = { workspace = true }

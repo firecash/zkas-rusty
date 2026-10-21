@@ -13971,3 +13971,564 @@ async fn bundle_submit(
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// Task 03 (2026-10-21): old vs new decode/scan over a REAL day of mainnet blocks
+// ---------------------------------------------------------------------------
+
+/// Differential test for the three no-fork scan changes (coinbase NoteCommit once,
+/// cohort-epk reuse on the CPU path, asm field backend), over a real day of chain blocks
+/// served by a node, with FRESH THROWAWAY keys only (derived here, never used anywhere).
+///
+/// Two wallet sets follow the same blocks in lockstep:
+/// - OLD: coinbase leaves from the pre-change two-step derivation (`from_parts`, then
+///   `note.commitment()`, re-implemented below verbatim), trial decryption through
+///   orchard's batch API (`predecrypt_page_cached(.., None)`: no cohort epks, so the
+///   reuse branch is never taken — exactly the code that ran before).
+/// - NEW: the daemon's own `decode_block` and the page-shared epks, i.e. the patched paths.
+///
+/// Asserted: every coinbase leaf equal (OLD == NEW == the node's own commitment), every
+/// action leaf equal, the tree root after EVERY block equal per wallet, leaf counts equal,
+/// found notes / balance / history equal, and (unplanted mode) the final root equal to the
+/// node's own tree state at the last block. Planted mode (`DAYDIFF_PLANT=1`) additionally
+/// inserts notes to the throwaway keys, coinbase rewards to them, spends of those notes and
+/// hostile encodings into the real pages, so "found notes equal" is not vacuous; there the
+/// node-root check is skipped (the stream was altered on purpose).
+///
+/// The asm backend is compiled in or not, so it is compared ACROSS two runs: every run
+/// writes one line with a digest over all of the above to `DAYDIFF_OUT`; the
+/// `--features pasta-asm` run and the portable run must print the same digest.
+///
+/// Env: `DAYDIFF_RPC` (host:port, required), `DAYDIFF_START` (block hash hex; else chosen
+/// `DAYDIFF_SPAN`+3600 DAA below the tip and written to `DAYDIFF_OUT.start`),
+/// `DAYDIFF_SPAN` (DAA, default 86400 = one day at 1 BPS), `DAYDIFF_WALLETS` (default 2),
+/// `DAYDIFF_PLANT`, `DAYDIFF_OUT`. Ignored by default: it needs a node.
+#[cfg(test)]
+mod day_diff_tests {
+    use super::*;
+    use kaspa_shielded_core::ExtractedNoteCommitment;
+    use kaspa_shielded_core::wallet::{decompress_epk, ivk_agreement_scalar, scan_compact_auto_cached};
+    use orchard::Address as OAddr;
+    use orchard::keys::{FullViewingKey, Scope, SpendingKey};
+    use orchard::note::{Note as ONote, NoteVersion, RandomSeed, Rho};
+    use orchard::note_encryption::{OrchardDomain, OrchardNoteEncryption};
+    use orchard::value::NoteValue as OValue;
+    use rayon::prelude::*;
+    use sha2::{Digest, Sha256};
+    use std::time::{Duration, Instant};
+    use zcash_note_encryption::Domain;
+
+    fn env_u64(k: &str, d: u64) -> u64 {
+        std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+    }
+
+    fn h32(parts: &[&[u8]]) -> [u8; 32] {
+        let mut st = blake2b_simd::Params::new().hash_length(32).personal(b"zkas-daydiff-t03").to_state();
+        for p in parts {
+            st.update(p);
+        }
+        let mut o = [0u8; 32];
+        o.copy_from_slice(st.finalize().as_bytes());
+        o
+    }
+
+    /// Deterministic stream (splitmix64), so the asm and portable runs plant identically.
+    struct Det(u64);
+    impl Det {
+        fn from(parts: &[&[u8]]) -> Self {
+            let b = h32(parts);
+            Det(u64::from_le_bytes(b[..8].try_into().unwrap()))
+        }
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9e3779b97f4a7c15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+            z ^ (z >> 31)
+        }
+        fn b32(&mut self) -> [u8; 32] {
+            let mut o = [0u8; 32];
+            for c in o.chunks_mut(8) {
+                c.copy_from_slice(&self.next().to_le_bytes());
+            }
+            o
+        }
+    }
+
+    /// The coinbase leaf exactly as it was derived before the change: two NoteCommits.
+    fn old_coinbase_cmx(desc: &CoinbaseNoteDesc, value: u64) -> Option<ExtractedNoteCommitment> {
+        let recipient: OAddr = Option::from(OAddr::from_raw_address_bytes(&desc.recipient))?;
+        let rho: Rho = Option::from(Rho::from_bytes(&desc.rho))?;
+        let rseed: RandomSeed = Option::from(RandomSeed::from_bytes(desc.rseed, &rho))?;
+        let note: ONote = Option::from(ONote::from_parts(recipient, OValue::from_raw(value), rho, rseed, NoteVersion::V2))?;
+        Some(ExtractedNoteCommitment::from(note.commitment()))
+    }
+
+    /// The pre-change `decode_block` coinbase half, on the old derivation.
+    fn old_coinbase(b: &RpcShieldedChainBlock) -> Vec<(CoinbaseNoteDesc, u64, ExtractedNoteCommitment)> {
+        b.coinbase_outputs
+            .iter()
+            .enumerate()
+            .map(|(i, out)| {
+                assert!(out.script_public_key.len() >= ORCHARD_SCRIPT_LEN, "short coinbase script in {}", b.hash);
+                let mut recipient = [0u8; ORCHARD_SCRIPT_LEN];
+                recipient.copy_from_slice(&out.script_public_key[..ORCHARD_SCRIPT_LEN]);
+                let desc = derive_coinbase_note_desc(recipient, &coinbase_note_seed(&b.hash, b.daa_score, &b.coinbase_txid, i));
+                let cmx = old_coinbase_cmx(&desc, out.value).expect("a consensus coinbase output derives");
+                (desc, out.value, cmx)
+            })
+            .collect()
+    }
+
+    /// A compact record carrying a real note to `addr` (nf doubles as the note's rho, as
+    /// `for_compact_action` reads it). `None` on the rare non-canonical draw.
+    fn plant(addr: OAddr, value: u64, rng: &mut Det) -> Option<CompactActionRecord> {
+        let mut nf = rng.b32();
+        nf[31] &= 0x3f;
+        let rho: Rho = Option::from(Rho::from_bytes(&nf))?;
+        let rseed: RandomSeed = Option::from(RandomSeed::from_bytes(rng.b32(), &rho))?;
+        let note: ONote = Option::from(ONote::from_parts(addr, OValue::from_raw(value), rho, rseed, NoteVersion::V2))?;
+        let enc = OrchardNoteEncryption::new(None, note, [0u8; 512]);
+        let epk = OrchardDomain::epk_bytes(enc.epk()).0;
+        let ct = enc.encrypt_note_plaintext();
+        let mut c52 = [0u8; 52];
+        c52.copy_from_slice(&ct[..52]);
+        Some(CompactActionRecord {
+            nullifier: nf,
+            cmx: ExtractedNoteCommitment::from(note.commitment()).to_bytes(),
+            ephemeral_key: epk,
+            enc_ciphertext: c52,
+        })
+    }
+
+    fn plant_retry(addr: OAddr, value: u64, rng: &mut Det) -> CompactActionRecord {
+        (0..64).find_map(|_| plant(addr, value, rng)).expect("a canonical draw within 64 tries")
+    }
+
+    fn seed_wallet(tag: &[u8], i: u64) -> (WalletDb, [u8; 32]) {
+        let mut k = 0u64;
+        loop {
+            let s = h32(&[b"throwaway-key", tag, &i.to_le_bytes(), &k.to_le_bytes()]);
+            if let Some(db) = WalletDb::from_seed(s) {
+                return (db, s);
+            }
+            k += 1;
+        }
+    }
+
+    async fn connect(rpc: &str) -> GrpcClient {
+        GrpcClient::connect_with_args(
+            NotificationMode::Direct,
+            format!("grpc://{rpc}"),
+            None,
+            true,
+            None,
+            false,
+            Some(500_000),
+            Default::default(),
+        )
+        .await
+        .expect("connect to DAYDIFF_RPC")
+    }
+
+    fn frontier(ts: &kaspa_rpc_core::GetShieldedTreeStateResponse) -> FrontierState {
+        FrontierState { size: ts.size, leaf: (ts.size > 0).then(|| ts.leaf.as_bytes()), ommers: ts.ommers.iter().map(|h| h.as_bytes()).collect() }
+    }
+
+    fn hex32(b: &[u8; 32]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    fn parse_hash(s: &str) -> RpcHash {
+        let v = hex::decode(s.trim()).expect("hex block hash");
+        RpcHash::from_bytes(v.try_into().expect("32 bytes"))
+    }
+
+    /// Start block for the run: explicit, or saved by an earlier run, or chosen now.
+    async fn start_block(client: &GrpcClient, out: &str, span: u64) -> kaspa_rpc_core::GetShieldedTreeStateResponse {
+        let saved = std::env::var("DAYDIFF_START").ok().or_else(|| std::fs::read_to_string(format!("{out}.start")).ok());
+        if let Some(h) = saved {
+            let h = parse_hash(&h);
+            let ts = client.get_shielded_tree_state(Some(h)).await.expect("tree state at start");
+            assert_eq!(ts.block_hash, h, "node returned the tree state of another block");
+            return ts;
+        }
+        let dag = client.get_block_dag_info().await.expect("dag info");
+        let below = dag.virtual_daa_score.saturating_sub(span + 3600);
+        let req = kaspa_rpc_core::GetShieldedTreeStateRequest { block_hash: None, below_daa_score: Some(below) };
+        let ts = client.get_shielded_tree_state_call(None, req).await.expect("tree state below daa");
+        std::fs::write(format!("{out}.start"), hex32(&ts.block_hash.as_bytes())).expect("save start");
+        ts
+    }
+
+    #[derive(Default)]
+    struct Clock {
+        decode_old: Duration,
+        decode_new: Duration,
+        epk_new: Duration,
+        decrypt_old: Duration,
+        decrypt_new: Duration,
+        ingest_old: Duration,
+        ingest_new: Duration,
+    }
+
+    fn fold_wallet(h: &mut Sha256, db: &WalletDb) {
+        let mut notes: Vec<(u64, u64, [u8; 32], [u8; 32])> = db
+            .notes()
+            .iter()
+            .map(|n| (n.position, n.value(), n.nullifier(), ExtractedNoteCommitment::from(n.note.commitment()).to_bytes()))
+            .collect();
+        notes.sort();
+        for (p, v, nf, cm) in &notes {
+            h.update(p.to_le_bytes());
+            h.update(v.to_le_bytes());
+            h.update(nf);
+            h.update(cm);
+        }
+        h.update(db.balance().to_le_bytes());
+        for e in db.history() {
+            h.update(format!("{:?}", e.kind).as_bytes());
+            h.update(e.txid);
+            h.update(e.daa_score.to_le_bytes());
+            h.update(e.amount.to_le_bytes());
+            h.update(e.fee.to_le_bytes());
+        }
+        h.update(db.size().to_le_bytes());
+        h.update(db.anchor());
+    }
+
+    #[test]
+    #[ignore = "needs a node: DAYDIFF_RPC=127.0.0.1:16810"]
+    fn real_day_old_vs_new_identical() {
+        let rpc = std::env::var("DAYDIFF_RPC").expect("DAYDIFF_RPC");
+        let out = std::env::var("DAYDIFF_OUT").unwrap_or_else(|_| "/tmp/daydiff".into());
+        let span = env_u64("DAYDIFF_SPAN", 86_400);
+        let k_wallets = env_u64("DAYDIFF_WALLETS", 2) as usize;
+        let plant_mode = env_u64("DAYDIFF_PLANT", 0) == 1;
+        // Mainnet, as `serve` sets it.
+        COINBASE_SEED_ACTIVATION_DAA.store(
+            kaspa_consensus_core::config::params::MAINNET_PARAMS.shielded_coinbase_seed_activation.daa_score(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        rt.block_on(async move {
+            let client = connect(&rpc).await;
+            let ts0 = start_block(&client, &out, span).await;
+            let end_daa = ts0.daa_score + span;
+            let fs0 = frontier(&ts0);
+            let tag = ts0.block_hash.as_bytes();
+            let mut old: Vec<WalletDb> = Vec::new();
+            let mut new: Vec<WalletDb> = Vec::new();
+            let mut addrs: Vec<Vec<[u8; 43]>> = Vec::new();
+            for i in 0..k_wallets {
+                let (mut a, _) = seed_wallet(&tag, i as u64);
+                let (mut b, _) = seed_wallet(&tag, i as u64);
+                a.apply_frontier(&fs0).expect("frontier");
+                b.apply_frontier(&fs0).expect("frontier");
+                addrs.push((0..300u32).map(|j| a.address_bytes_at(j)).collect());
+                old.push(a);
+                new.push(b);
+            }
+            let stranger = OAddr::from_raw_address_bytes(&seed_wallet(b"stranger", 0).0.address_bytes_at(7)).unwrap();
+            let mut planted_spends: HashSet<[u8; 32]> = HashSet::new();
+            let (mut h_old, mut h_new) = (Sha256::new(), Sha256::new());
+            let mut clk = Clock::default();
+            let (mut n_blocks, mut n_cb, mut n_act, mut n_node_cmx, mut n_node_mismatch, mut n_planted, mut n_pages) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+            let mut low = ts0.block_hash;
+            let mut last = ts0.block_hash;
+            let t_all = Instant::now();
+            'pages: loop {
+                let resp = client.get_shielded_blocks(low, SHIELDED_PAGE).await.expect("get_shielded_blocks");
+                assert!(!resp.reorged, "start block reorged off the chain");
+                let mut blocks: Vec<RpcShieldedChainBlock> = resp.blocks.into_iter().take_while(|b| b.daa_score < end_daa).collect();
+                if blocks.is_empty() {
+                    break 'pages;
+                }
+                let page_done = blocks.len() < SHIELDED_PAGE as usize;
+                n_pages += 1;
+                if plant_mode {
+                    // Spends of notes OLD already holds (each at most once), then receipts, coinbase
+                    // rewards and hostile encodings. Identical for both sets, deterministic per block.
+                    let mut held: Vec<[u8; 32]> = old.iter().flat_map(|w| w.notes().iter().map(|n| n.nullifier())).collect();
+                    held.retain(|nf| !planted_spends.contains(nf));
+                    for b in blocks.iter_mut() {
+                        let mut r = Det::from(&[b"plant", &tag, &b.hash.as_bytes()]);
+                        let mut txs: Vec<Vec<CompactActionRecord>> = Vec::new();
+                        if !held.is_empty() && r.next() % 30 == 0 {
+                            let nf = held.swap_remove((r.next() % held.len() as u64) as usize);
+                            planted_spends.insert(nf);
+                            let mut rec = plant_retry(stranger, 5, &mut r);
+                            rec.nullifier = nf;
+                            txs.push(vec![rec]);
+                        }
+                        if r.next() % 40 == 0 {
+                            let w = (r.next() % k_wallets as u64) as usize;
+                            let j = (r.next() % 300) as usize;
+                            let to = OAddr::from_raw_address_bytes(&addrs[w][j]).unwrap();
+                            let mut tx = vec![plant_retry(stranger, 1 + r.next() % 1_000_000, &mut r), plant_retry(to, 1 + r.next() % 1_000_000_000, &mut r)];
+                            if r.next() % 4 == 0 {
+                                let mut bad = plant_retry(stranger, 9, &mut r);
+                                match r.next() % 3 {
+                                    0 => bad.ephemeral_key = [0u8; 32],
+                                    1 => bad.ephemeral_key = [0xff; 32],
+                                    _ => bad.cmx = [0xff; 32],
+                                }
+                                tx.push(bad);
+                            }
+                            if r.next() % 2 == 0 {
+                                tx.reverse();
+                            }
+                            txs.push(tx);
+                        }
+                        if r.next() % 60 == 0 {
+                            let w = (r.next() % k_wallets as u64) as usize;
+                            let j = (r.next() % 256) as usize;
+                            let i = b.coinbase_outputs.len();
+                            let value = 1 + r.next() % 50_000_000_000;
+                            let desc = derive_coinbase_note_desc(addrs[w][j], &coinbase_note_seed(&b.hash, b.daa_score, &b.coinbase_txid, i));
+                            let cm = old_coinbase_cmx(&desc, value).expect("planted coinbase derives");
+                            b.coinbase_outputs.push(kaspa_rpc_core::RpcShieldedCoinbaseOutput {
+                                script_public_key: addrs[w][j].to_vec(),
+                                value,
+                                commitment: Some(cm.to_bytes()),
+                            });
+                            n_planted += 1;
+                        }
+                        for tx in txs {
+                            n_planted += 1;
+                            let pos = (r.next() % (b.accepted_actions.len() as u64 + 1)) as usize;
+                            let bytes: Vec<u8> = tx.iter().flat_map(|a| a.to_bytes()).collect();
+                            b.accepted_actions.insert(pos, bytes);
+                            if !b.accepted_txids.is_empty() {
+                                b.accepted_txids.insert(pos, RpcHash::from_bytes(r.b32()));
+                            }
+                        }
+                    }
+                }
+                // NEW: the daemon's shared page decode.
+                let t = Instant::now();
+                let decoded: Vec<DecodedBlock> = blocks.par_iter().map(decode_block).collect::<Result<_, _>>().expect("decode_block");
+                clk.decode_new += t.elapsed();
+                let flat: Vec<CompactActionRecord> = decoded.iter().flat_map(|b| b.compact.iter().flatten().copied()).collect();
+                let t = Instant::now();
+                let epks: Vec<_> = flat.par_iter().map(|r| decompress_epk(&r.ephemeral_key)).collect();
+                clk.epk_new += t.elapsed();
+                // OLD: the two-NoteCommit derivation.
+                let t = Instant::now();
+                let old_cb: Vec<_> = blocks.par_iter().map(old_coinbase).collect();
+                clk.decode_old += t.elapsed();
+                for (i, b) in blocks.iter().enumerate() {
+                    assert_eq!(old_cb[i].len(), decoded[i].coinbase.len());
+                    for (k, ((_, v_old, c_old), (_, v_new, c_new))) in old_cb[i].iter().zip(decoded[i].coinbase.iter()).enumerate() {
+                        assert_eq!(v_old, v_new);
+                        assert_eq!(c_old.to_bytes(), c_new.to_bytes(), "coinbase leaf {k} of block {}", b.hash);
+                        if let Some(node) = b.coinbase_outputs[k].commitment {
+                            n_node_cmx += 1;
+                            if node != c_new.to_bytes() {
+                                n_node_mismatch += 1;
+                            }
+                        }
+                        h_old.update(c_old.to_bytes());
+                        h_new.update(c_new.to_bytes());
+                    }
+                    for rec in decoded[i].compact.iter().flatten() {
+                        h_old.update(rec.cmx);
+                        h_new.update(rec.cmx);
+                    }
+                    n_cb += old_cb[i].len() as u64;
+                    n_act += decoded[i].compact.iter().map(|t| t.len() as u64).sum::<u64>();
+                }
+                for w in 0..k_wallets {
+                    if !flat.is_empty() {
+                        let t = Instant::now();
+                        old[w].predecrypt_page_cached(&flat, None);
+                        clk.decrypt_old += t.elapsed();
+                        let t = Instant::now();
+                        new[w].predecrypt_page_cached(&flat, Some(epks.as_slice()));
+                        clk.decrypt_new += t.elapsed();
+                    }
+                    for (i, b) in decoded.iter().enumerate() {
+                        let meta = (b.timestamp > 0 && b.txids.len() == b.compact.len()).then(|| BlockMeta {
+                            coinbase_txid: b.coinbase_txid,
+                            txids: b.txids.clone(),
+                            timestamp_ms: b.timestamp,
+                            daa_score: b.daa_score,
+                        });
+                        let t = Instant::now();
+                        old[w].ingest_block_compact_precomputed_with_meta(&old_cb[i], &b.compact, meta.as_ref());
+                        clk.ingest_old += t.elapsed();
+                        let t = Instant::now();
+                        new[w].ingest_block_compact_precomputed_with_meta(&b.coinbase, &b.compact, meta.as_ref());
+                        clk.ingest_new += t.elapsed();
+                        assert!(!old[w].poisoned() && !new[w].poisoned(), "poisoned at {}", b.hash);
+                        assert_eq!(old[w].size(), new[w].size(), "tree size after block {}", b.hash);
+                        assert_eq!(old[w].anchor(), new[w].anchor(), "tree root (anchor) after block {} wallet {w}", b.hash);
+                        h_old.update(old[w].anchor());
+                        h_new.update(new[w].anchor());
+                    }
+                    old[w].end_page();
+                    new[w].end_page();
+                }
+                n_blocks += blocks.len() as u64;
+                last = blocks.last().unwrap().hash;
+                low = last;
+                if page_done {
+                    break 'pages;
+                }
+            }
+            let wall = t_all.elapsed();
+            let mut found = 0usize;
+            for w in 0..k_wallets {
+                let mut a = Sha256::new();
+                let mut b = Sha256::new();
+                fold_wallet(&mut a, &old[w]);
+                fold_wallet(&mut b, &new[w]);
+                assert_eq!(a.finalize(), b.finalize(), "wallet {w}: notes / balance / history / root differ");
+                fold_wallet(&mut h_old, &old[w]);
+                fold_wallet(&mut h_new, &new[w]);
+                found += new[w].notes().len();
+            }
+            let (d_old, d_new) = (h_old.finalize(), h_new.finalize());
+            let d_new_b: [u8; 32] = d_new.as_slice().try_into().expect("sha256 is 32 bytes");
+            assert_eq!(d_old, d_new, "run digest");
+            assert_eq!(n_node_mismatch, 0, "a derived coinbase leaf disagreed with the node");
+            let root_check = if plant_mode {
+                "skipped (planted)".to_string()
+            } else {
+                let ts1 = client.get_shielded_tree_state(Some(last)).await.expect("tree state at end");
+                assert_eq!(ts1.block_hash, last);
+                let node_root = GlobalTree::from_state(&frontier(&ts1)).expect("node frontier").anchor().to_bytes();
+                for w in 0..k_wallets {
+                    assert_eq!(new[w].size(), ts1.size, "leaf count vs node at {last}");
+                    assert_eq!(new[w].anchor(), node_root, "root vs node at {last}");
+                    assert_eq!(old[w].anchor(), node_root);
+                }
+                format!("node root {} at size {} == both", hex32(&node_root), ts1.size)
+            };
+            if plant_mode {
+                assert!(found > 0, "planted mode found no notes: the comparison would be vacuous");
+            }
+            let line = format!(
+                "label={} digest={} start={} end={} span_daa={} pages={} blocks={} coinbase_leaves={} actions={} node_cmx_checked={} wallets={} planted={} found_unspent={} root_check=[{}] \
+                 wall_s={:.1} decode_old_s={:.2} decode_new_s={:.2} epk_shared_s={:.2} decrypt_old_s={:.2} decrypt_new_s={:.2} ingest_old_s={:.2} ingest_new_s={:.2} rayon_threads={}",
+                if cfg!(feature = "pasta-asm") { "asm" } else { "portable" },
+                hex32(&d_new_b),
+                hex32(&ts0.block_hash.as_bytes()),
+                hex32(&last.as_bytes()),
+                span,
+                n_pages,
+                n_blocks,
+                n_cb,
+                n_act,
+                n_node_cmx,
+                k_wallets,
+                n_planted,
+                found,
+                root_check,
+                wall.as_secs_f64(),
+                clk.decode_old.as_secs_f64(),
+                clk.decode_new.as_secs_f64(),
+                clk.epk_new.as_secs_f64(),
+                clk.decrypt_old.as_secs_f64(),
+                clk.decrypt_new.as_secs_f64(),
+                clk.ingest_old.as_secs_f64(),
+                clk.ingest_new.as_secs_f64(),
+                rayon::current_num_threads(),
+            );
+            println!("DAYDIFF {line}");
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&out).expect("DAYDIFF_OUT");
+            writeln!(f, "{line}").unwrap();
+        });
+    }
+
+    /// Old vs new trial decryption for N throwaway viewing keys over real pages
+    /// (`DAYDIFF_BENCH_PAGES`, default 2) from the saved start block, N from
+    /// `DAYDIFF_IVKS` (comma list, default "1,1000"). Two of the N get a planted note so
+    /// the hit sets compared are not empty. Prints us per (action, key).
+    #[test]
+    #[ignore = "needs a node: DAYDIFF_RPC=127.0.0.1:16810"]
+    fn ivk_scaling_old_vs_new() {
+        let rpc = std::env::var("DAYDIFF_RPC").expect("DAYDIFF_RPC");
+        let out = std::env::var("DAYDIFF_OUT").unwrap_or_else(|_| "/tmp/daydiff".into());
+        let pages = env_u64("DAYDIFF_BENCH_PAGES", 2);
+        let ns: Vec<usize> = std::env::var("DAYDIFF_IVKS").unwrap_or_else(|_| "1,1000".into()).split(',').filter_map(|s| s.trim().parse().ok()).collect();
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let (mut actions, tag) = rt.block_on(async {
+            let client = connect(&rpc).await;
+            let ts0 = start_block(&client, &out, env_u64("DAYDIFF_SPAN", 86_400)).await;
+            let mut low = ts0.block_hash;
+            let mut acts: Vec<CompactActionRecord> = Vec::new();
+            for _ in 0..pages {
+                let resp = client.get_shielded_blocks(low, SHIELDED_PAGE).await.expect("page");
+                let Some(l) = resp.blocks.last() else { break };
+                low = l.hash;
+                for b in &resp.blocks {
+                    for bytes in &b.accepted_actions {
+                        acts.extend(decode_compact_actions(bytes).expect("whole records"));
+                    }
+                }
+            }
+            (acts, ts0.block_hash.as_bytes())
+        });
+        let nmax = ns.iter().copied().max().unwrap_or(1);
+        let keys: Vec<(FullViewingKey, _, _)> = (0..nmax as u64)
+            .into_par_iter()
+            .map(|i| {
+                let mut k = 0u64;
+                loop {
+                    let s = h32(&[b"bench-key", &tag, &i.to_le_bytes(), &k.to_le_bytes()]);
+                    if let Some(sk) = Option::<SpendingKey>::from(SpendingKey::from_bytes(s)) {
+                        let fvk = FullViewingKey::from(&sk);
+                        let ivk = fvk.to_ivk(Scope::External);
+                        let sc = ivk_agreement_scalar(&ivk).expect("scalar");
+                        return (fvk, ivk.prepare(), sc);
+                    }
+                    k += 1;
+                }
+            })
+            .collect();
+        let mut r = Det::from(&[b"bench-plant", &tag]);
+        for who in [0usize, nmax - 1] {
+            let to = keys[who].0.address_at((r.next() % 1000) as u32, Scope::External);
+            let rec = plant_retry(to, 4242 + who as u64, &mut r);
+            let pos = (r.next() % (actions.len() as u64 + 1)) as usize;
+            actions.insert(pos, rec);
+        }
+        let t = Instant::now();
+        let epks: Vec<_> = actions.par_iter().map(|a| decompress_epk(&a.ephemeral_key)).collect();
+        let t_epk = t.elapsed();
+        let key = |v: &[kaspa_shielded_core::wallet::ReceivedNote]| -> Vec<(usize, u64)> { v.iter().map(|n| (n.action_index, n.note.value().inner())).collect() };
+        let mut lines = Vec::new();
+        for &n in &ns {
+            let t = Instant::now();
+            let old: Vec<_> = keys[..n].iter().map(|(_, p, sc)| key(scan_compact_auto_cached(p, Some(sc), &actions, None).as_slice())).collect();
+            let t_old = t.elapsed();
+            let t = Instant::now();
+            let new: Vec<_> = keys[..n].iter().map(|(_, p, sc)| key(scan_compact_auto_cached(p, Some(sc), &actions, Some(epks.as_slice())).as_slice())).collect();
+            let t_new = t.elapsed() + t_epk;
+            assert_eq!(old, new, "hit sets differ at N={n}");
+            let hits: usize = new.iter().map(|v| v.len()).sum();
+            assert!(hits >= 1, "planted notes not found");
+            let per = |d: Duration| d.as_secs_f64() * 1e6 / (actions.len() * n) as f64;
+            let line = format!(
+                "label={} N={n} actions={} hits={hits} old_s={:.2} new_s={:.2} (incl. one shared epk pass {:.3}s) old_us_per_action_key={:.2} new_us_per_action_key={:.2} rayon_threads={}",
+                if cfg!(feature = "pasta-asm") { "asm" } else { "portable" },
+                actions.len(),
+                t_old.as_secs_f64(),
+                t_new.as_secs_f64(),
+                t_epk.as_secs_f64(),
+                per(t_old),
+                per(t_new),
+                rayon::current_num_threads(),
+            );
+            println!("IVKBENCH {line}");
+            lines.push(line);
+        }
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(format!("{out}.ivk")).expect("out");
+        for l in lines {
+            writeln!(f, "{l}").unwrap();
+        }
+    }
+}
