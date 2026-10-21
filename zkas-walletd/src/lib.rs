@@ -94,25 +94,13 @@ const ORCHARD_SCRIPT_LEN: usize = 43;
 /// Anchor maturity depth (blocks) — must match consensus `shielded_anchor_depth`
 /// (600 * BPS = 600 at 1 BPS, ~10 min). A note is spendable once this deep.
 const DEFAULT_ANCHOR_DEPTH: u64 = 600;
-/// Consensus `max_shielded_anchor_age` for the active network, recorded at startup.
-///
-/// It is `pruning_depth / 4`, which differs per network and per BPS, so it is READ from the
-/// same params consensus signs against instead of being written here as a number. A wrong
-/// constant would either refuse good sends or keep letting doomed ones through.
-static MAX_ANCHOR_AGE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-
-/// Record the anchor-age bound for this network. Called once at startup.
-fn set_max_anchor_age(v: u64) {
-    let _ = MAX_ANCHOR_AGE.set(v);
-}
-
-/// The anchor-age bound, or `u64::MAX` when startup has not set it.
+/// The anchor-age bound, read from the single startup-initialised store below.
 ///
 /// Defaulting to "no bound known" means any path that somehow runs before startup behaves
 /// exactly as it did before this guard existed, rather than refusing good sends on a value
 /// nobody supplied.
 fn max_anchor_age() -> u64 {
-    MAX_ANCHOR_AGE.get().copied().unwrap_or(u64::MAX)
+    MAX_ANCHOR_AGE.load(std::sync::atomic::Ordering::Relaxed)
 }
 /// Max `GetShieldedBlocks` pages a wallet advances per sync chunk. Kept small so
 /// the per-wallet lock is released frequently (status stays responsive); speed
@@ -2110,6 +2098,7 @@ fn scan_is_receipt_derived(dir: &str, token: &str) -> bool {
 /// statements about the WALLET and one is a statement about the NODE, and conflating them
 /// deleted thousands of correct scans — including a phone's half-finished one, which went
 /// back to 0% because a local engine has no twin checkpoint to be rescued by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CheckpointReject {
     /// Absent, truncated, wrong magic/version, or a different genesis.
     Malformed,
@@ -6231,7 +6220,36 @@ impl AppState {
         Some(rest)
     }
 
+    /// Load `token`'s wallet, and do not let the REQUESTER'S departure cancel the load.
+    ///
+    /// The load used to run inside the request future. axum drops that future the moment the
+    /// client disconnects, so the work was abandoned part-way and nothing was kept. The
+    /// client aborts a request after 10 s (`req()` in api.ts) and a cold load of a
+    /// 15M-leaf wallet measures 10-61 s, so for those wallets the sequence was: poll,
+    /// load for 10 s, abort, discard, poll, load for 10 s, abort — forever. The wallet
+    /// could never become resident, and a wallet that is not resident is not synced by
+    /// `sync_loop` either, so it never advanced again.
+    ///
+    /// Measured on the live fleet while this was true: of 3,322 checkpoints only 8 were
+    /// within 100 blocks of the tip and 3,024 were more than 50,000 behind, most not
+    /// checkpointed in a quarter of an hour. It showed up as "Android sits at 99.9% and
+    /// never moves" while the web app was fine — the web page had loaded its wallet back
+    /// when loads were quick and kept it resident by polling inside the idle-evict window.
+    ///
+    /// So the load runs in its own task. A caller that goes away loses its answer, the load
+    /// finishes anyway, the wallet lands in `self.wallets`, and the client's NEXT poll
+    /// takes the resident fast path. The per-token `loading` lock still coalesces, so the
+    /// retry does not start a second load of the same wallet.
     async fn get_wallet(self: &Arc<Self>, token: &str) -> Option<Wallet> {
+        let state = self.clone();
+        let token = token.to_string();
+        // A JoinHandle dropped without being awaited DETACHES the task rather than
+        // aborting it, which is the whole point: cancelling this await cannot cancel the
+        // load. Only a panic inside the task yields Err, and that is not a loaded wallet.
+        tokio::spawn(async move { state.get_wallet_inner(&token).await }).await.ok().flatten()
+    }
+
+    async fn get_wallet_inner(self: &Arc<Self>, token: &str) -> Option<Wallet> {
         // Mark the wallet active so the sync loop keeps it current; idle wallets are
         // parked (see `sync_loop`).
         self.touch(token).await;
@@ -13156,7 +13174,7 @@ mod sdk_api_tests {
         let seed = [0x5au8; 32];
         let db = WalletDb::from_seed(seed).expect("valid seed");
         let boundaries: VecDeque<(u64, u64)> = VecDeque::from([(100, 0)]);
-        save_checkpoint(&dir, "w", &genesis, &RpcHash::from_bytes([9u8; 32]), 777, &db, &boundaries, 100, 0).unwrap();
+        save_checkpoint(&dir, "w", &genesis, &RpcHash::from_bytes([9u8; 32]), 777, &db, &boundaries, &HashMap::new(), 100, 0).unwrap();
         let buf = std::fs::read(scan_path(&dir, "w")).unwrap();
 
         // The node agrees about the leaf count: the checkpoint loads.
