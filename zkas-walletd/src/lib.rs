@@ -14790,3 +14790,61 @@ mod resident_budget_tests {
         assert_eq!(peak, 12);
     }
 }
+
+/// Task 03 memory measurement: resident bytes per loaded wallet, old vs new code.
+///
+/// Loads `MEMTEST_N` (default 2) independent copies of a COPY of the keyless shared chain
+/// tree checkpoint (`MEMTEST_DIR/__chain.tree__.scan`: public chain data, fixed public seed,
+/// no user wallet involved) exactly as the daemon loads a wallet (`load_checkpoint`), warms
+/// each as the daemon does before a spend (`warm_leaves`), and prints the VmRSS growth per
+/// wallet. The same test text runs on the base tree (where `warm_leaves` materialises the
+/// second, decoded copy) and on the candidate (one copy; shared nullifier interner
+/// installed as `serve()` does). Ignored by default: it needs the file and ~1.5 GB per copy.
+#[cfg(test)]
+mod memtest_t03 {
+    use super::*;
+
+    fn rss_kb() -> u64 {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|s| s.lines().find_map(|l| l.strip_prefix("VmRSS:")).and_then(|v| v.split_whitespace().next()).and_then(|v| v.parse().ok()))
+            .unwrap_or(0)
+    }
+
+    #[test]
+    #[ignore = "needs MEMTEST_DIR with a copy of __chain.tree__.scan"]
+    fn resident_bytes_per_loaded_wallet() {
+        let dir = std::env::var("MEMTEST_DIR").expect("MEMTEST_DIR");
+        let n: usize = std::env::var("MEMTEST_N").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
+        let genesis = RpcHash::from_bytes(kaspa_consensus_core::config::params::MAINNET_PARAMS.genesis.hash.as_bytes());
+        let _ = WalletDb::set_default_nullifier_interner(kaspa_shielded_core::walletdb::NullifierInterner::new());
+        let r0 = rss_kb();
+        let mut held = Vec::new();
+        let mut lines = Vec::new();
+        for i in 0..n {
+            let t = std::time::Instant::now();
+            let (db, _low, scanned, _b, _s, _bb) =
+                load_checkpoint(&dir, CHAIN_TREE_TOKEN, WalletKey::Seed(CHAIN_TREE_SEED), &genesis, None).expect("load copy");
+            let t_load = t.elapsed();
+            let r_loaded = rss_kb();
+            db.warm_leaves();
+            let r_warm = rss_kb();
+            lines.push(format!(
+                "copy {i}: leaves {} size {} scanned {scanned} load {:.1}s rss after load +{} MiB, after warm +{} MiB (cumulative from start {} MiB)",
+                db.leaf_count(),
+                db.size(),
+                t_load.as_secs_f64(),
+                r_loaded.saturating_sub(r0) / 1024,
+                r_warm.saturating_sub(r_loaded) / 1024,
+                r_warm.saturating_sub(r0) / 1024,
+            ));
+            held.push(db);
+        }
+        let per = rss_kb().saturating_sub(r0) / 1024 / n as u64;
+        for l in &lines {
+            println!("MEMTEST {l}");
+        }
+        println!("MEMTEST label={} copies={n} rss_growth_per_wallet_mib={per}", std::env::var("MEMTEST_LABEL").unwrap_or_else(|_| "?".into()));
+        drop(held);
+    }
+}
