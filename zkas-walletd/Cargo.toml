@@ -14,7 +14,22 @@ path = "src/main.rs"
 [lints]
 workspace = true
 
+[features]
+# Pasta field arithmetic through the x86-64 MULX/ADCX/ADOX inline-asm backend that
+# zakura-pasta-curves 2.2.0 ships behind `x86_64-asm` (spec 11 R1: about -16% on trial
+# decryption, measured on this host). Needs BMI2 + ADX at RUN time (Broadwell / Zen or
+# newer): there is no runtime dispatch, so a binary built with this on dies with SIGILL
+# on an older CPU. OPT-IN, not default: kaspad links this crate behind its
+# `wallet-api` feature and must not inherit an asm field backend into its consensus
+# build by accident. The hosted daemon is built with `--features pasta-asm`. Cargo
+# feature unification turns it on for every crate in that binary that links pasta
+# (Halo 2 proving included); the verify.rs proof/VK tests must pass in the same
+# invocation (`cargo test -p kaspa-shielded-core -p zkas-walletd --features pasta-asm`).
+pasta-asm = ["pasta_curves/x86_64-asm"]
+
 [dependencies]
+# Only so `pasta-asm` can name the feature; the code uses kaspa_shielded_core::pasta_curves.
+pasta_curves = { package = "zakura-pasta-curves", version = "=2.2.0" }
 # Address parse/format for the wallet's own shielded address + the recipient.
 kaspa-addresses.workspace = true
 # The version-2 shielded transaction shape + tx id.

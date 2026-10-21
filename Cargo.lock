@@ -10081,6 +10081,7 @@ dependencies = [
  "sha2",
  "tokio",
  "tower-http",
+ "zakura-pasta-curves",
  "zkas-gpu",
  "zkas-sdk",
  "zkas-wallet-engine",
