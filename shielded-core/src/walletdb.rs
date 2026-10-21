@@ -2389,6 +2389,11 @@ impl WalletDb {
         DEFAULT_NF_INTERNER.set(i).is_ok()
     }
 
+    /// The interner installed by [`Self::set_default_nullifier_interner`], if any.
+    pub fn default_nullifier_interner() -> Option<std::sync::Arc<NullifierInterner>> {
+        DEFAULT_NF_INTERNER.get().cloned()
+    }
+
     /// Move an existing private set onto `interner` (same members) and free the private table.
     pub fn share_nullifiers(&mut self, interner: &std::sync::Arc<NullifierInterner>) {
         if let Some(sh) = &self.nf_shared {

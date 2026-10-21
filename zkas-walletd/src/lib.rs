@@ -434,6 +434,18 @@ pub struct ResourceLimits {
     pub active_sync_secs: u64,
     pub idle_evict_secs: u64,
     pub max_resident_wallets: usize,
+    /// HARD cap on resident wallets (task 03, 2026-10-21). `max_resident_wallets` is soft by
+    /// design: its overflow rule only evicts wallets idle for `active_sync_secs`, so every
+    /// polled token stayed resident and ~120 wallets (58 GB) were held against a "cap" of 6
+    /// until the cgroup killed the daemon. Past THIS number a load first evicts the least
+    /// recently used wallet whatever its age (pins last, never one whose lock is held), and
+    /// waits or is deferred if that is impossible. 0 = no count cap.
+    pub hard_max_resident_wallets: usize,
+    /// Byte budget for resident wallets, from their own estimate
+    /// ([`WalletDb::approx_heap_bytes`], plus the shared chain tree and nullifier table).
+    /// Same enforcement as `hard_max_resident_wallets`. `Some(0)` = auto: 70% of this
+    /// process's cgroup `memory.high` (or `memory.max`) when finite, else off. `None` = off.
+    pub resident_budget_mb: Option<u64>,
     /// Keep the N most recently active wallets resident and fully prepared, exempt from
     /// BOTH eviction rules. 0 = off (the old behaviour exactly).
     ///
@@ -511,6 +523,8 @@ impl Default for ResourceLimits {
             active_sync_secs: 90,
             idle_evict_secs: 30 * 60,
             max_resident_wallets,
+            hard_max_resident_wallets: 0,
+            resident_budget_mb: Some(0),
             warm_always: 0,
             warm_budget_pct: 60,
             subtree_free_floor_mb: 1_200,
@@ -6360,6 +6374,11 @@ impl AppState {
             return None;
         };
         let t_meta = t_load0.elapsed();
+        // Memory admission (task 03): make room BEFORE restoring another checkpoint, and
+        // refuse (the caller keeps answering "opening") rather than exceed the budget.
+        if !admit_load(self, token).await {
+            return None;
+        }
         let genesis = self.genesis;
         // A load that stopped between setting its own checkpoint aside for a twin and putting it
         // back (see the twin adoption below) left it at `.scan.own`. With no `.scan` in its place,
@@ -7370,6 +7389,148 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
     if behind { SyncOutcome::Behind } else { SyncOutcome::Idle }
 }
 
+/// One resident wallet as the hard resident rules see it (task 03).
+#[derive(Clone, Debug)]
+struct ResidentInfo {
+    token: String,
+    /// Estimated heap bytes ([`WalletDb::approx_heap_bytes`]; the `.scan` size when busy).
+    bytes: u64,
+    /// Its lock is held (a load, a scan step, a prepare): never chosen.
+    busy: bool,
+    /// One of the `--warm-always` pins: chosen last.
+    protected: bool,
+    last_touch: Option<std::time::Instant>,
+}
+
+/// The victims needed so that, after evicting them and admitting `incoming` (estimated
+/// bytes of a wallet about to load, if any), the resident set holds at most `hard_max`
+/// wallets (0 = no count cap) whose bytes total at most `budget` (None = no byte cap).
+/// Least recently touched first (never-touched before touched), pins after every unpinned
+/// wallet, busy wallets never. Unlike the soft `max_resident_wallets` rule there is NO
+/// active-window exemption: that exemption is what let ~120 polled wallets stay resident.
+/// Returns the victims and whether the limits are met once they are gone; an empty
+/// resident set always admits (one wallet must always be loadable, however large).
+fn hard_victims(res: &[ResidentInfo], hard_max: usize, budget: Option<u64>, incoming: Option<u64>) -> (Vec<String>, bool) {
+    let extra_n = incoming.is_some() as usize;
+    let extra_b = incoming.unwrap_or(0);
+    let mut n = res.len();
+    let mut b: u64 = res.iter().map(|r| r.bytes).sum();
+    let over = |n: usize, b: u64| (hard_max > 0 && n + extra_n > hard_max) || budget.is_some_and(|cap| b.saturating_add(extra_b) > cap);
+    let mut cands: Vec<&ResidentInfo> = res.iter().filter(|r| !r.busy).collect();
+    cands.sort_by_key(|r| (r.protected, r.last_touch));
+    let mut victims = Vec::new();
+    for r in cands {
+        if !over(n, b) {
+            break;
+        }
+        victims.push(r.token.clone());
+        n -= 1;
+        b = b.saturating_sub(r.bytes);
+    }
+    let fits = !over(n, b) || n == 0;
+    (victims, fits)
+}
+
+/// This process's cgroup v2 memory limit: min(`memory.high`, `memory.max`) when finite.
+fn cgroup_memory_limit_bytes() -> Option<u64> {
+    let cg = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let path = cg.lines().find_map(|l| l.strip_prefix("0::"))?.trim().to_string();
+    let read = |f: &str| std::fs::read_to_string(format!("/sys/fs/cgroup{path}/{f}")).ok().and_then(|v| v.trim().parse::<u64>().ok());
+    match (read("memory.high"), read("memory.max")) {
+        (Some(h), Some(m)) => Some(h.min(m)),
+        (h, m) => h.or(m),
+    }
+}
+
+/// The resident byte budget in force (see [`ResourceLimits::resident_budget_mb`]).
+fn resident_budget_bytes(limits: &ResourceLimits) -> Option<u64> {
+    match limits.resident_budget_mb {
+        None => None,
+        Some(0) => cgroup_memory_limit_bytes().map(|b| b / 10 * 7),
+        Some(mb) => Some(mb.saturating_mul(1024 * 1024)),
+    }
+}
+
+/// The `--warm-always` pins: the N most recently touched tokens.
+fn warm_pins(touches: &HashMap<String, std::time::Instant>, n: usize) -> HashSet<String> {
+    if n == 0 {
+        return HashSet::new();
+    }
+    let mut by_recent: Vec<(&String, &std::time::Instant)> = touches.iter().collect();
+    by_recent.sort_by_key(|(_, at)| std::cmp::Reverse(**at));
+    by_recent.into_iter().take(n).map(|(t, _)| t.clone()).collect()
+}
+
+/// Apply the hard resident rules now, evicting as needed, optionally reserving room for a
+/// wallet about to load. Returns whether the limits are met (with that wallet admitted).
+async fn enforce_resident_budget(state: &Arc<AppState>, incoming: Option<u64>) -> bool {
+    let hard = state.resources.hard_max_resident_wallets;
+    let budget = resident_budget_bytes(&state.resources);
+    if hard == 0 && budget.is_none() {
+        return true;
+    }
+    let touches: HashMap<String, std::time::Instant> = state.last_touch.lock().await.clone();
+    let pins = warm_pins(&touches, state.resources.warm_always);
+    let resident: Vec<(String, Wallet)> = state.wallets.lock().await.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    let mut infos: Vec<ResidentInfo> = Vec::with_capacity(resident.len() + 1);
+    for (t, w) in &resident {
+        let (bytes, busy) = match w.try_lock() {
+            Ok(e) => (e.db.approx_heap_bytes() as u64, false),
+            Err(_) => (std::fs::metadata(scan_path(&state.wallet_dir, t)).map(|m| m.len()).unwrap_or(0), true),
+        };
+        // The chain tree is shared by everyone and never a victim, but its bytes count.
+        let never = t.as_str() == CHAIN_TREE_TOKEN;
+        infos.push(ResidentInfo { token: t.clone(), bytes, busy: busy || never, protected: pins.contains(t), last_touch: touches.get(t).copied() });
+    }
+    if let Some(i) = WalletDb::default_nullifier_interner() {
+        infos.push(ResidentInfo { token: String::new(), bytes: i.approx_heap_bytes() as u64, busy: true, protected: true, last_touch: None });
+    }
+    // Count only wallets against the count cap: the two shared structures are not wallets.
+    let shared = infos.iter().filter(|r| r.token.is_empty() || r.token == CHAIN_TREE_TOKEN).count();
+    let hard_eff = if hard == 0 { 0 } else { hard + shared };
+    let (victims, fits) = hard_victims(&infos, hard_eff, budget, incoming);
+    if !victims.is_empty() {
+        let total: u64 = infos.iter().map(|r| r.bytes).sum();
+        log::warn!(
+            "resident budget: {} resident (~{} MiB est.){}, cap {} wallets / {} MiB: evicting {} least recently used",
+            resident.len(),
+            total >> 20,
+            incoming.map(|b| format!(" + one loading (~{} MiB)", b >> 20)).unwrap_or_default(),
+            if hard == 0 { "-".to_string() } else { hard.to_string() },
+            budget.map(|b| (b >> 20).to_string()).unwrap_or_else(|| "-".into()),
+            victims.len()
+        );
+    }
+    for t in &victims {
+        evict_wallet(state, t, "over-budget").await;
+    }
+    fits
+}
+
+/// How long a load waits for room under the hard resident rules before it is deferred.
+const ADMISSION_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Admit a wallet load under the hard resident rules (task 03): evict to make room first,
+/// wait up to [`ADMISSION_WAIT`] if every candidate is busy, then refuse. A refused load is
+/// retried by the client's next request; the status path keeps answering "opening".
+async fn admit_load(state: &Arc<AppState>, token: &str) -> bool {
+    // A restored wallet holds about its checkpoint's leaf and note sections; the file also
+    // carries the nullifier section, which with the shared interner is not resident, so
+    // this over-estimates — the conservative direction for an admission check.
+    let est = std::fs::metadata(scan_path(&state.wallet_dir, token)).map(|m| m.len()).unwrap_or(64 << 20).max(16 << 20);
+    let deadline = std::time::Instant::now() + ADMISSION_WAIT;
+    loop {
+        if enforce_resident_budget(state, Some(est)).await {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            log::warn!("wallet {token}: load deferred: the resident budget is full and every resident wallet is busy");
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+}
+
 /// Evict wallets past [`ResourceLimits::idle_evict_secs`] (plus LRU overflow past
 /// [`ResourceLimits::max_resident_wallets`]). Memory is a cache of the on-disk checkpoint — a hosted
 /// daemon serving hundreds of browsers must not hold every wallet it has ever loaded.
@@ -7459,41 +7620,51 @@ async fn evict_idle_wallets(state: &Arc<AppState>) {
         }
     }
     for token in victims {
-        let Some(w) = state.wallets.lock().await.get(&token).cloned() else { continue };
-        {
-            let mut e = w.lock().await;
-            // Flush a dirty victim so eviction is free of rescan cost. A wallet in an
-            // error state is evicted as-is — its checkpoint already lagged and the
-            // reload path re-derives whatever it can.
-            if e.error.is_none() && e.saved_scanned != e.scanned {
-                if save_checkpoint(
-                    &state.wallet_dir,
-                    &token,
-                    &e.genesis,
-                    &e.low,
-                    e.scanned as u64,
-                    &e.db,
-                    &e.boundaries,
-                    &e.boundary_blocks,
-                    e.sink_blue,
-                    e.blind_below,
-                )
-                .is_ok()
-                {
-                    e.saved_scanned = e.scanned;
-            e.last_checkpoint_at = std::time::Instant::now();
-                    e.force_checkpoint = false;
-                }
+        evict_wallet(state, &token, "idle").await;
+    }
+    // The hard rules (task 03) run after the idle/soft rules, on what is left.
+    enforce_resident_budget(state, None).await;
+}
+
+/// Flush (if dirty) and drop one resident wallet. Removal is by Arc identity, so a wallet
+/// retired or reloaded meanwhile is left alone. Returns whether it was removed.
+async fn evict_wallet(state: &Arc<AppState>, token: &str, why: &str) -> bool {
+    let Some(w) = state.wallets.lock().await.get(token).cloned() else { return false };
+    {
+        let mut e = w.lock().await;
+        // Flush a dirty victim so eviction is free of rescan cost. A wallet in an
+        // error state is evicted as-is — its checkpoint already lagged and the
+        // reload path re-derives whatever it can.
+        if e.error.is_none() && e.saved_scanned != e.scanned {
+            if save_checkpoint(
+                &state.wallet_dir,
+                token,
+                &e.genesis,
+                &e.low,
+                e.scanned as u64,
+                &e.db,
+                &e.boundaries,
+                &e.boundary_blocks,
+                e.sink_blue,
+                e.blind_below,
+            )
+            .is_ok()
+            {
+                e.saved_scanned = e.scanned;
+                e.last_checkpoint_at = std::time::Instant::now();
+                e.force_checkpoint = false;
             }
         }
-        // Remove only if the map still holds THIS instance (a retire/reload racing the
-        // sweep must not be eaten).
-        let mut map = state.wallets.lock().await;
-        if map.get(&token).map(|cur| Arc::ptr_eq(cur, &w)).unwrap_or(false) {
-            map.remove(&token);
-            log::info!("evicted idle wallet '{token}' (checkpoint on disk; it reloads on its next request)");
-        }
     }
+    // Remove only if the map still holds THIS instance (a retire/reload racing the
+    // sweep must not be eaten).
+    let mut map = state.wallets.lock().await;
+    if map.get(token).map(|cur| Arc::ptr_eq(cur, &w)).unwrap_or(false) {
+        map.remove(token);
+        log::info!("evicted {why} wallet '{token}' (checkpoint on disk; it reloads on its next request)");
+        return true;
+    }
+    false
 }
 
 /// Memory policing must not share the sync loop. A cohort of large checkpoints can
@@ -14538,5 +14709,84 @@ mod day_diff_tests {
         for l in lines {
             writeln!(f, "{l}").unwrap();
         }
+    }
+}
+
+/// Task 03: the hard resident rules are a real bound, unlike the soft count cap.
+#[cfg(test)]
+mod resident_budget_tests {
+    use super::{ResidentInfo, hard_victims};
+    use std::time::{Duration, Instant};
+
+    fn w(t: &str, mb: u64, age_s: u64, busy: bool, protected: bool, now: Instant) -> ResidentInfo {
+        ResidentInfo { token: t.into(), bytes: mb << 20, busy, protected, last_touch: Some(now - Duration::from_secs(age_s)) }
+    }
+
+    #[test]
+    fn count_cap_evicts_lru_even_inside_the_active_window() {
+        let now = Instant::now() + Duration::from_secs(10_000);
+        // Ten wallets all touched within the last 60 s: the soft rule would evict none.
+        let res: Vec<_> = (0..10).map(|i| w(&format!("t{i}"), 100, 60 - i, false, false, now)).collect();
+        let (v, fits) = hard_victims(&res, 6, None, Some(100 << 20));
+        assert!(fits);
+        assert_eq!(v, vec!["t0", "t1", "t2", "t3", "t4"], "oldest first, to 5 + the incoming one");
+        let (v, fits) = hard_victims(&res, 6, None, None);
+        assert!(fits);
+        assert_eq!(v.len(), 4);
+    }
+
+    #[test]
+    fn pins_go_last_and_busy_wallets_never() {
+        let now = Instant::now() + Duration::from_secs(10_000);
+        let res = vec![
+            w("pinned-old", 100, 900, false, true, now),
+            w("busy-old", 100, 800, true, false, now),
+            w("new", 100, 10, false, false, now),
+            w("mid", 100, 100, false, false, now),
+        ];
+        let (v, fits) = hard_victims(&res, 2, None, None);
+        assert!(fits);
+        assert_eq!(v, vec!["mid", "new"], "unpinned before pinned, busy skipped");
+        let (v, fits) = hard_victims(&res, 1, None, Some(1));
+        assert_eq!(v, vec!["mid", "new", "pinned-old"]);
+        assert!(!fits, "only the busy wallet is left, and the cap is 1 with one loading: defer");
+    }
+
+    #[test]
+    fn byte_budget_is_enforced_and_one_wallet_always_loads() {
+        let now = Instant::now() + Duration::from_secs(10_000);
+        let res: Vec<_> = (0..8).map(|i| w(&format!("t{i}"), 500, 100 - i, false, false, now)).collect();
+        // 4,000 MiB resident, budget 2,000 MiB, a 700 MiB wallet loading: keep 2 (1,000) + 700.
+        let (v, fits) = hard_victims(&res, 0, Some(2_000 << 20), Some(700 << 20));
+        assert!(fits);
+        assert_eq!(v.len(), 6);
+        // A wallet larger than the whole budget still loads into an empty daemon.
+        let (v, fits) = hard_victims(&[], 0, Some(1 << 20), Some(5_000 << 20));
+        assert!(v.is_empty() && fits);
+        // Off: nothing happens.
+        let (v, fits) = hard_victims(&res, 0, None, Some(1 << 40));
+        assert!(v.is_empty() && fits);
+    }
+
+    #[test]
+    fn a_polling_cohort_cannot_grow_the_resident_set_past_the_cap() {
+        // Simulate 1,000 distinct tokens, each polled once a second, arriving one by one.
+        let mut now = Instant::now() + Duration::from_secs(100_000);
+        let mut resident: Vec<ResidentInfo> = Vec::new();
+        let mut peak = 0usize;
+        for i in 0..1_000u32 {
+            now += Duration::from_millis(50);
+            for r in resident.iter_mut() {
+                r.last_touch = Some(now);
+            }
+            let (victims, fits) = hard_victims(&resident, 12, Some(6_000 << 20), Some(480 << 20));
+            assert!(fits);
+            resident.retain(|r| !victims.contains(&r.token));
+            resident.push(ResidentInfo { token: format!("t{i}"), bytes: 480 << 20, busy: false, protected: false, last_touch: Some(now) });
+            peak = peak.max(resident.len());
+            let bytes: u64 = resident.iter().map(|r| r.bytes).sum();
+            assert!(resident.len() <= 12 && bytes <= 6_000 << 20, "bounded at step {i}");
+        }
+        assert_eq!(peak, 12);
     }
 }

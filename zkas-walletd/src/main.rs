@@ -175,9 +175,21 @@ struct Cli {
     /// Evict a checkpoint from RAM after this many idle seconds.
     #[arg(long, value_name = "SECONDS")]
     idle_evict: Option<u64>,
-    /// Hard cap on wallet checkpoints resident in RAM.
+    /// SOFT cap on wallet checkpoints resident in RAM: its overflow rule never evicts a
+    /// wallet touched within --active-sync-window. See --hard-max-resident-wallets.
     #[arg(long, value_name = "N")]
     max_resident_wallets: Option<usize>,
+    /// HARD cap on resident wallets: a load first evicts the least recently used wallet
+    /// whatever its age (pins last, never a busy one), else it is deferred. 0 = none.
+    #[arg(long, value_name = "N")]
+    hard_max_resident_wallets: Option<usize>,
+    /// Resident-wallet byte budget in MiB (estimated heap). 0 (default) = 70% of this
+    /// process's cgroup memory.high/memory.max when finite; see --no-resident-budget.
+    #[arg(long, value_name = "MIB")]
+    resident_budget_mb: Option<u64>,
+    /// Disable the resident byte budget entirely.
+    #[arg(long)]
+    no_resident_budget: bool,
     /// Defer optional subtree-index builds below this MemAvailable value.
     #[arg(long, value_name = "MIB")]
     subtree_free_floor_mb: Option<u64>,
@@ -295,6 +307,15 @@ async fn run(cli: Cli) {
     }
     if let Some(v) = cli.max_resident_wallets.filter(|v| *v > 0) {
         resources.max_resident_wallets = v;
+    }
+    if let Some(v) = cli.hard_max_resident_wallets {
+        resources.hard_max_resident_wallets = v;
+    }
+    if let Some(v) = cli.resident_budget_mb {
+        resources.resident_budget_mb = Some(v);
+    }
+    if cli.no_resident_budget {
+        resources.resident_budget_mb = None;
     }
     if let Some(v) = cli.subtree_free_floor_mb {
         resources.subtree_free_floor_mb = v;
