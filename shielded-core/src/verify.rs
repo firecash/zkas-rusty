@@ -405,6 +405,15 @@ mod e2e {
         crate::verify::check_verifying_key().expect("verifying key matches the chain's");
     }
 
+    /// The startup banner reports the key this build constructed, not the pin; on a build that
+    /// passes the check the two must read the same, so a banner that differs from the pin is a
+    /// build that would have refused to start.
+    #[test]
+    fn startup_banner_reports_the_built_verifying_key() {
+        let pinned: String = crate::verify::VERIFYING_KEY_FINGERPRINT.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(crate::verify::built_verifying_key_fingerprint().as_deref(), Some(pinned.as_str()));
+    }
+
     #[test]
     fn real_bundle_verifies_and_rejects_tampering() {
         let mut rng = rand::rng();
@@ -609,6 +618,20 @@ pub fn check_verifying_key() -> Result<(), String> {
             VERIFYING_KEY_FINGERPRINT.iter().map(|b| format!("{b:02x}")).collect::<String>(),
             circuit_identity()
         ))
+    }
+}
+
+/// Hex of the verifying key THIS build constructs — the measured value, not the pin — for the
+/// startup banner. Reads the same cached key `check_verifying_key` compares, so it costs nothing
+/// extra once either has run. `None` without the circuit feature, so a caller needs no `cfg`.
+pub fn built_verifying_key_fingerprint() -> Option<String> {
+    #[cfg(feature = "circuit")]
+    {
+        Some(verifying_key().fingerprint().iter().map(|b| format!("{b:02x}")).collect())
+    }
+    #[cfg(not(feature = "circuit"))]
+    {
+        None
     }
 }
 
