@@ -42,7 +42,6 @@ use orchard::{
     tree::{MerkleHashOrchard, MerklePath},
     value::NoteValue,
 };
-use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use zcash_note_encryption::try_output_recovery_with_ovk;
@@ -263,6 +262,108 @@ impl ScanCost {
     }
 }
 
+/// One process-wide table of every nullifier any wallet in this process has seen, each
+/// given a small dense id (walletd-scale task 03, 2026-10-21).
+///
+/// Every `WalletDb` keeps the set of nullifiers its stream has applied (the consensus drop
+/// rule, the repeat-nullifier poison check, and the "spent before it appeared" note rule all
+/// read it). On a hosted daemon those sets are the SAME public chain data in every wallet:
+/// measured 2026-10-21 11:23 UTC, 47 power-of-two `HashSet<[u8;32]>` tables holding 18.7 GiB
+/// across ~120 resident wallets (`01-live-profile.md` §1.3). With an interner installed
+/// ([`WalletDb::set_default_nullifier_interner`]) a wallet keeps only a BITSET over the dense
+/// ids: ~1.2 MB per wallet at 9.3 M chain nullifiers, plus one shared table of ~0.6 GB.
+///
+/// Semantics are exactly the private set's: a wallet's bitset holds precisely the ids of the
+/// nullifiers IT inserted, so a nullifier another wallet has seen (ahead of this one, or one
+/// this wallet never ingested) is not "seen" by this wallet. Ids are process-local and never
+/// persisted; checkpoints still store the 32-byte nullifiers, so the file format is unchanged.
+/// Entries are never removed (bounded by the nullifiers the node ever served).
+#[derive(Default)]
+pub struct NullifierInterner {
+    ids: std::sync::RwLock<HashMap<[u8; 32], u32>>,
+}
+
+impl NullifierInterner {
+    pub fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self::default())
+    }
+
+    fn get(&self, nf: &[u8; 32]) -> Option<u32> {
+        self.ids.read().unwrap_or_else(|e| e.into_inner()).get(nf).copied()
+    }
+
+    fn intern(&self, nf: &[u8; 32]) -> u32 {
+        if let Some(id) = self.get(nf) {
+            return id;
+        }
+        let mut w = self.ids.write().unwrap_or_else(|e| e.into_inner());
+        let next = u32::try_from(w.len()).expect("fewer than 2^32 distinct nullifiers");
+        *w.entry(*nf).or_insert(next)
+    }
+
+    /// Distinct nullifiers interned so far.
+    pub fn len(&self) -> usize {
+        self.ids.read().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Approximate heap bytes of the shared table (hashbrown: 36 B per slot + 1 control byte,
+    /// slots = capacity).
+    pub fn approx_heap_bytes(&self) -> usize {
+        self.ids.read().unwrap_or_else(|e| e.into_inner()).capacity() * 37
+    }
+}
+
+static DEFAULT_NF_INTERNER: std::sync::OnceLock<std::sync::Arc<NullifierInterner>> = std::sync::OnceLock::new();
+
+/// A wallet's applied-nullifier set as a bitset over a shared [`NullifierInterner`].
+#[derive(Clone)]
+struct SharedNfSet {
+    interner: std::sync::Arc<NullifierInterner>,
+    bits: Vec<u64>,
+    count: usize,
+}
+
+impl SharedNfSet {
+    fn contains(&self, nf: &[u8; 32]) -> bool {
+        match self.interner.get(nf) {
+            Some(id) => self.bits.get((id / 64) as usize).is_some_and(|w| w & (1u64 << (id % 64)) != 0),
+            None => false,
+        }
+    }
+
+    fn insert(&mut self, nf: &[u8; 32]) {
+        let id = self.interner.intern(nf);
+        let (word, bit) = ((id / 64) as usize, 1u64 << (id % 64));
+        if self.bits.len() <= word {
+            // Grow geometrically so a scan that interns new ids block by block does not
+            // reallocate per block.
+            let want = (word + 1).max(self.bits.len() * 5 / 4 + 16);
+            self.bits.resize(want, 0);
+        }
+        if self.bits[word] & bit == 0 {
+            self.bits[word] |= bit;
+            self.count += 1;
+        }
+    }
+
+    /// Every member, as nullifier bytes (order unspecified, like the private `HashSet`).
+    fn to_vec(&self) -> Vec<[u8; 32]> {
+        let ids = self.interner.ids.read().unwrap_or_else(|e| e.into_inner());
+        let mut out = Vec::with_capacity(self.count);
+        for (nf, &id) in ids.iter() {
+            if self.bits.get((id / 64) as usize).is_some_and(|w| w & (1u64 << (id % 64)) != 0) {
+                out.push(*nf);
+            }
+        }
+        debug_assert_eq!(out.len(), self.count);
+        out
+    }
+}
+
 /// A wallet's running view of the global note-commitment tree: it walks the
 /// canonical commitment stream, recognises its own notes, and keeps a spendable
 /// witness for each.
@@ -367,6 +468,10 @@ pub struct WalletDb {
     /// parallel DAG blocks both carried the same tx) double-counts its outputs
     /// and shifts every later leaf position off the consensus tree.
     spent_nullifiers: HashSet<[u8; 32]>,
+    /// When set, the applied-nullifier set lives HERE as a bitset over a shared interner and
+    /// `spent_nullifiers` stays empty (see [`NullifierInterner`]). Read and written only
+    /// through `nf_contains` / `nf_insert` / `nf_len` / `nf_all`.
+    nf_shared: Option<SharedNfSet>,
     /// Outgoing viewing key (external scope) — recovers the recipient/amount/memo
     /// of our own past sends *if* they were built with it (`recoverable history`).
     /// Derived from the FVK, so a watch-only wallet has it too.
@@ -578,6 +683,11 @@ struct SubtreeCache {
 }
 
 impl SubtreeCache {
+    /// Approximate heap bytes (capacity of the stored levels and bookkeeping).
+    fn approx_heap_bytes(&self) -> usize {
+        self.levels.iter().map(|l| l.capacity() * 32).sum::<usize>() + self.first.capacity() * 8 + self.peaks.capacity() * 48
+    }
+
     /// Record a complete subtree root, keeping each level densely indexed. Returns
     /// `false` if that would leave a gap — the caller then abandons the cache rather
     /// than serve from a structure it cannot index soundly.
@@ -820,6 +930,7 @@ impl WalletDb {
             lag_tree: CommitmentTree::empty(),
             witnessed_upto: 0,
             spent_nullifiers: HashSet::new(),
+            nf_shared: DEFAULT_NF_INTERNER.get().map(|i| SharedNfSet { interner: i.clone(), bits: Vec::new(), count: 0 }),
             ovk,
             history: Vec::new(),
             history_enabled: true,
@@ -872,6 +983,7 @@ impl WalletDb {
             lag_tree: CommitmentTree::empty(),
             witnessed_upto: 0,
             spent_nullifiers: HashSet::new(),
+            nf_shared: DEFAULT_NF_INTERNER.get().map(|i| SharedNfSet { interner: i.clone(), bits: Vec::new(), count: 0 }),
             ovk,
             history: Vec::new(),
             history_enabled: true,
@@ -1103,7 +1215,7 @@ impl WalletDb {
     /// ingest paths above.
     fn ingest_bundles(&mut self, txs: &[&ShieldedBundle], meta: Option<&BlockMeta>) {
         for (bi, bundle) in txs.iter().enumerate() {
-            if bundle.actions.iter().any(|a| self.spent_nullifiers.contains(&a.nullifier)) {
+            if bundle.actions.iter().any(|a| self.nf_contains(&a.nullifier)) {
                 self.poisoned = true;
                 continue;
             }
@@ -1123,7 +1235,7 @@ impl WalletDb {
                 self.notes.retain(|n| n.nullifier != action.nullifier);
                 self.pending_spends.retain(|p| p.note.nullifier != action.nullifier);
                 self.prune_pending_change();
-                self.spent_nullifiers.insert(action.nullifier);
+                self.nf_insert(&action.nullifier);
 
                 let Some(cmx) = Option::<ExtractedNoteCommitment>::from(ExtractedNoteCommitment::from_bytes(&action.cmx)) else {
                     continue;
@@ -1205,7 +1317,7 @@ impl WalletDb {
     /// tree-append order, over compact action records.
     fn ingest_bundles_compact(&mut self, txs: &[Vec<CompactActionRecord>], meta: Option<&BlockMeta>) {
         for (bi, records) in txs.iter().enumerate() {
-            if records.iter().any(|a| self.spent_nullifiers.contains(&a.nullifier)) {
+            if records.iter().any(|a| self.nf_contains(&a.nullifier)) {
                 self.poisoned = true;
                 continue;
             }
@@ -1242,7 +1354,7 @@ impl WalletDb {
                 self.notes.retain(|n| n.nullifier != rec.nullifier);
                 self.pending_spends.retain(|p| p.note.nullifier != rec.nullifier);
                 self.prune_pending_change();
-                self.spent_nullifiers.insert(rec.nullifier);
+                self.nf_insert(&rec.nullifier);
 
                 let Some(cmx) = Option::<ExtractedNoteCommitment>::from(ExtractedNoteCommitment::from_bytes(&rec.cmx)) else {
                     continue;
@@ -1637,7 +1749,7 @@ impl WalletDb {
         for bundle in txs {
             // Same drop rule as ingest: a bundle re-spending an already-spent nullifier
             // appends nothing, so it must not be previewed either.
-            if bundle.actions.iter().any(|a| self.spent_nullifiers.contains(&a.nullifier)) {
+            if bundle.actions.iter().any(|a| self.nf_contains(&a.nullifier)) {
                 continue;
             }
             // Our own parked spend with its change already reported: nothing to add.
@@ -1680,7 +1792,7 @@ impl WalletDb {
             }
         }
         for records in txs {
-            if records.iter().any(|a| self.spent_nullifiers.contains(&a.nullifier)) {
+            if records.iter().any(|a| self.nf_contains(&a.nullifier)) {
                 continue;
             }
             if self.accounted_pending_spend(records.iter().map(|a| a.nullifier)) {
@@ -2091,7 +2203,7 @@ impl WalletDb {
             // each nullifier, so a record can move a spend earlier than the note it spends. The
             // nullifier set is the truth either way: keep the leaf (the tree must not change) and
             // never offer the note as spendable.
-            if !self.spent_nullifiers.contains(&nullifier) {
+            if !self.nf_contains(&nullifier) {
                 self.notes.push(OwnedNote { note, position: self.size, nullifier });
             }
         }
@@ -2245,6 +2357,73 @@ impl WalletDb {
     ///
     /// Such a wallet can never own a note, so `notes` stays empty and no balance,
     /// history or spend path is meaningful on it.
+    fn nf_contains(&self, nf: &[u8; 32]) -> bool {
+        match &self.nf_shared {
+            None => self.spent_nullifiers.contains(nf),
+            Some(sh) => sh.contains(nf),
+        }
+    }
+
+    fn nf_insert(&mut self, nf: &[u8; 32]) {
+        match &mut self.nf_shared {
+            None => {
+                self.spent_nullifiers.insert(*nf);
+            }
+            Some(sh) => sh.insert(nf),
+        }
+    }
+
+    /// Number of applied nullifiers this wallet's stream holds (either representation).
+    pub fn nf_len(&self) -> usize {
+        match &self.nf_shared {
+            None => self.spent_nullifiers.len(),
+            Some(sh) => sh.count,
+        }
+    }
+
+    /// Install a process-wide [`NullifierInterner`]: every `WalletDb` constructed AFTER this
+    /// call (fresh, fast-synced or restored from a checkpoint) keeps its applied-nullifier
+    /// set as a bitset over it. First call wins; a multi-wallet daemon calls it once at start.
+    /// A single-wallet engine should not: one wallet gains nothing from sharing.
+    pub fn set_default_nullifier_interner(i: std::sync::Arc<NullifierInterner>) -> bool {
+        DEFAULT_NF_INTERNER.set(i).is_ok()
+    }
+
+    /// Move an existing private set onto `interner` (same members) and free the private table.
+    pub fn share_nullifiers(&mut self, interner: &std::sync::Arc<NullifierInterner>) {
+        if let Some(sh) = &self.nf_shared {
+            if std::sync::Arc::ptr_eq(&sh.interner, interner) {
+                return;
+            }
+        }
+        let members: Vec<[u8; 32]> = match &self.nf_shared {
+            None => std::mem::take(&mut self.spent_nullifiers).into_iter().collect(),
+            Some(sh) => sh.to_vec(),
+        };
+        let mut sh = SharedNfSet { interner: interner.clone(), bits: Vec::new(), count: 0 };
+        for nf in &members {
+            sh.insert(nf);
+        }
+        self.spent_nullifiers = HashSet::new();
+        self.nf_shared = Some(sh);
+    }
+
+    /// Approximate heap bytes held by this wallet's largest public-data structures: the leaf
+    /// stream, the applied-nullifier set (private table or shared bitset; the shared table
+    /// itself is counted once by its owner) and the subtree cache. Used by the daemon's
+    /// resident-memory budget; deliberately an estimate (capacity-based, no allocator
+    /// overhead), not an accounting.
+    pub fn approx_heap_bytes(&self) -> usize {
+        let leaves = self.leaves.capacity() * std::mem::size_of::<MerkleHashOrchard>();
+        let nfs = match &self.nf_shared {
+            None => self.spent_nullifiers.capacity() * 33,
+            Some(sh) => sh.bits.capacity() * 8,
+        };
+        let subtree = self.subtree.approx_heap_bytes();
+        let notes = self.notes.len() * 256 + self.history.len() * 128 + self.witnesses.len() * 2048;
+        leaves + nfs + subtree + notes
+    }
+
     /// Whether ingest has seen data that consensus could never have applied (see `poisoned`).
     pub fn poisoned(&self) -> bool {
         self.poisoned
@@ -3234,9 +3413,18 @@ impl WalletDb {
         // rsync-by-checksum), do NOT restore the sort: keep `spent_nullifiers` as an
         // insertion-ordered Vec beside its HashSet index and write that. Chain order is
         // already canonical and costs nothing.
-        out.extend_from_slice(&(self.spent_nullifiers.len() as u64).to_le_bytes());
-        for nf in &self.spent_nullifiers {
-            out.extend_from_slice(nf);
+        out.extend_from_slice(&(self.nf_len() as u64).to_le_bytes());
+        match &self.nf_shared {
+            None => {
+                for nf in &self.spent_nullifiers {
+                    out.extend_from_slice(nf);
+                }
+            }
+            Some(sh) => {
+                for nf in sh.to_vec() {
+                    out.extend_from_slice(&nf);
+                }
+            }
         }
         // v4: the **tip** frontier — the mirror tree summarised in O(1). Without it a
         // restore has to replay every leaf back through Sinsemilla to rebuild `tree`,
@@ -3427,7 +3615,8 @@ impl WalletDb {
         }
         let n_nfs = r.u64()? as usize;
         for _ in 0..n_nfs {
-            db.spent_nullifiers.insert(r.arr::<32>()?);
+            let nf = r.arr::<32>()?;
+            db.nf_insert(&nf);
         }
         // The tip mirror tree. v4 carries it as a frontier, so restoring it is O(1) —
         // no hashing at all. A v3 blob has no such field, so fall back to replaying the
@@ -5487,6 +5676,76 @@ mod tests {
             tree.append(*l).unwrap();
         }
         assert_eq!(tree.root().to_bytes(), r.anchor());
+    }
+
+    fn nf_rec(i: u64, nf: [u8; 32]) -> CompactActionRecord {
+        let mut cmx = [0u8; 32];
+        cmx[..8].copy_from_slice(&i.wrapping_mul(0x9e37_79b9_7f4a_7c15).to_le_bytes());
+        CompactActionRecord { nullifier: nf, cmx, ephemeral_key: [0u8; 32], enc_ciphertext: [0u8; 52] }
+    }
+
+    /// The shared-interner nullifier set (task 03) behaves exactly like the private
+    /// `HashSet`: same members, same drop/poison verdicts, same checkpoint content, and a
+    /// nullifier seen only by ANOTHER wallet on the same interner is not seen by this one.
+    #[test]
+    fn shared_nullifier_set_is_exactly_the_private_set() {
+        let mine = [5u8; 32];
+        let interner = NullifierInterner::new();
+        let mut private = WalletDb::from_seed(mine).unwrap();
+        let mut shared = WalletDb::from_seed(mine).unwrap();
+        shared.share_nullifiers(&interner);
+        let mut other = WalletDb::from_seed([6u8; 32]).unwrap();
+        other.share_nullifiers(&interner);
+        let nf = |i: u64| -> [u8; 32] {
+            let mut b = [0u8; 32];
+            b[..8].copy_from_slice(&i.to_le_bytes());
+            b[8] = 0xa5;
+            b
+        };
+        // `other` runs AHEAD and sees nullifiers 0..400; ours see 0..300 only.
+        for i in 0..400u64 {
+            other.ingest_block_compact_with_meta(&[], &[vec![nf_rec(i, nf(i))]], None);
+        }
+        for i in 0..300u64 {
+            private.ingest_block_compact_with_meta(&[], &[vec![nf_rec(i, nf(i))]], None);
+            shared.ingest_block_compact_with_meta(&[], &[vec![nf_rec(i, nf(i))]], None);
+        }
+        assert!(!private.poisoned() && !shared.poisoned() && !other.poisoned());
+        assert_eq!(private.nf_len(), 300);
+        assert_eq!(shared.nf_len(), 300);
+        assert!(shared.spent_nullifiers.is_empty(), "the private table is not kept in shared mode");
+        for i in 0..400u64 {
+            assert_eq!(private.nf_contains(&nf(i)), shared.nf_contains(&nf(i)), "membership of {i}");
+        }
+        assert!(!shared.nf_contains(&nf(350)), "seen by another wallet only: not seen here");
+        // Ours now reaches 300..400, which `other` already interned: no false repeat.
+        for i in 300..400u64 {
+            shared.ingest_block_compact_with_meta(&[], &[vec![nf_rec(i, nf(i))]], None);
+            private.ingest_block_compact_with_meta(&[], &[vec![nf_rec(i, nf(i))]], None);
+        }
+        assert!(!shared.poisoned() && !private.poisoned());
+        assert_eq!(shared.anchor(), private.anchor());
+        assert_eq!(shared.size(), private.size());
+        // A genuine repeat poisons both, and the bundle appends nothing in both.
+        private.ingest_block_compact_with_meta(&[], &[vec![nf_rec(9_999, nf(7))]], None);
+        shared.ingest_block_compact_with_meta(&[], &[vec![nf_rec(9_999, nf(7))]], None);
+        assert!(private.poisoned() && shared.poisoned());
+        assert_eq!(shared.size(), private.size());
+        // Same checkpoint content (as a set): restore both privately and compare.
+        let rp = WalletDb::from_checkpoint(mine, &private.to_checkpoint()).unwrap();
+        let rs = WalletDb::from_checkpoint(mine, &shared.to_checkpoint()).unwrap();
+        assert_eq!(rp.spent_nullifiers, rs.spent_nullifiers);
+        assert_eq!(rs.spent_nullifiers.len(), 400);
+        assert_eq!(private.to_checkpoint().len(), shared.to_checkpoint().len(), "same blob size: format unchanged");
+        // Moving a private wallet onto the interner keeps its members.
+        let mut moved = WalletDb::from_checkpoint(mine, &private.to_checkpoint()).unwrap();
+        moved.share_nullifiers(&interner);
+        assert_eq!(moved.nf_len(), 400);
+        for i in 0..410u64 {
+            assert_eq!(moved.nf_contains(&nf(i)), i < 400);
+        }
+        assert!(interner.len() >= 400);
+        assert!(moved.approx_heap_bytes() < rp.approx_heap_bytes(), "the bitset is smaller than the table");
     }
 
     #[test]

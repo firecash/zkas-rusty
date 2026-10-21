@@ -12335,6 +12335,14 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
         kaspa_consensus_core::config::params::Params::from(state_prefix_network(&cfg.network)).genesis.hash.as_bytes(),
     );
     log::info!("network genesis (shielded sighash domain): {genesis}");
+    // One process-wide nullifier table, each wallet a bitset over it (task 03): the per-wallet
+    // applied-nullifier HashSets were 18.7 GiB of identical public data on the hosted daemon.
+    // Exact same semantics (see `NullifierInterner`); the checkpoint format is unchanged.
+    // Only where many wallets share the process; `ZKAS_WALLETD_SHARED_NULLIFIERS=0` opts out.
+    if cfg.build_shared_tree && std::env::var("ZKAS_WALLETD_SHARED_NULLIFIERS").as_deref() != Ok("0") {
+        let installed = WalletDb::set_default_nullifier_interner(kaspa_shielded_core::walletdb::NullifierInterner::new());
+        log::info!("shared nullifier interner: {}", if installed { "installed (wallets keep a bitset)" } else { "already installed" });
+    }
     // `ZKAS_SECURITY_FORK_DAA` overrides the activation for a test network started with an
     // override-params file (refused on mainnet, as the node refuses overrides there).
     let fork = match std::env::var("ZKAS_SECURITY_FORK_DAA").ok().and_then(|v| v.parse::<u64>().ok()) {
