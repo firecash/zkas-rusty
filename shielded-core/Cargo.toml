@@ -39,7 +39,7 @@ serde = { workspace = true, features = ["derive"] }
 # Curve point handling for the encoding consensus rules (non-identity epk).
 # Versions are pinned to match what Orchard 0.14 links.
 group = "0.14"
-pasta_curves = { package = "zakura-pasta-curves", version = "=2.2.0" }
+pasta_curves = { package = "zakura-pasta-curves", version = "=2.2.0", features = ["glv"] }
 # Shielded-transaction sighash.
 blake2b_simd = { workspace = true }
 chacha20 = "0.9"

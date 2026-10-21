@@ -329,6 +329,48 @@ pub mod scan {
         // above exists to prevent. `action_index` is restored to be page-relative so
         // callers cannot tell the batch was split.
         const PAR_MIN_BATCH: usize = 512;
+
+        // The cohort already decompressed every ephemeral key once (the page decode
+        // does it for all wallets riding the page), but orchard's batch API takes key
+        // BYTES and decompresses again, per wallet: the square root alone is ~5.5 us of
+        // the ~41 us a foreign action costs one viewing key (spec 10 B4, spec 11 §2).
+        // With the cohort's points in hand, do the key agreement here on those points
+        // (the same batched GLV ladder orchard uses) and let `scan_compact_gpu_inner`
+        // run its KDF + ChaCha20 + lead-byte FILTER, handing the ~1/256 survivors to
+        // orchard's own decryption, which decides. Superset argument as for the device
+        // path: the filter's condition is implied by orchard's, so nothing orchard
+        // would find can be dropped. `ZKAS_WALLETD_CPU_EPK_REUSE=0` restores the old
+        // path without a rebuild.
+        if let (Some(sc), Some(e)) = (agree_scalar, epks) {
+            if e.len() == actions.len() && cpu_epk_reuse_enabled() {
+                if actions.len() >= PAR_MIN_BATCH {
+                    use rayon::prelude::*;
+                    let chunk = (actions.len() / rayon::current_num_threads().max(1)).max(128);
+                    let parts: Option<Vec<Vec<ReceivedNote>>> = actions
+                        .par_chunks(chunk)
+                        .zip(e.par_chunks(chunk))
+                        .enumerate()
+                        .map(|(ci, (part, epart))| {
+                            let base = ci * chunk;
+                            scan_compact_gpu_inner(prepared, part, Some(epart), |p| Some(cpu_agree_points(sc, p))).map(|v| {
+                                v.into_iter()
+                                    .map(|mut n| {
+                                        n.action_index += base;
+                                        n
+                                    })
+                                    .collect()
+                            })
+                        })
+                        .collect();
+                    if let Some(parts) = parts {
+                        return parts.into_iter().flatten().collect();
+                    }
+                } else if let Some(found) = scan_compact_gpu_inner(prepared, actions, Some(e), |p| Some(cpu_agree_points(sc, p))) {
+                    return found;
+                }
+            }
+        }
+
         if actions.len() >= PAR_MIN_BATCH {
             use rayon::prelude::*;
             let chunk = (actions.len() / rayon::current_num_threads().max(1)).max(128);
@@ -345,6 +387,50 @@ pub mod scan {
                 .collect();
         }
         scan_compact_cpu(prepared, actions)
+    }
+
+    /// Whether the CPU path may reuse the cohort's decompressed ephemeral keys (see
+    /// [`scan_compact_auto_cached`]). On unless `ZKAS_WALLETD_CPU_EPK_REUSE=0`; read once.
+    pub fn cpu_epk_reuse_enabled() -> bool {
+        static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *V.get_or_init(|| std::env::var("ZKAS_WALLETD_CPU_EPK_REUSE").as_deref() != Ok("0"))
+    }
+
+    /// `ivk * P` for every already-decompressed ephemeral key, in affine form, on the
+    /// CPU — the "device" for [`scan_compact_gpu_inner`] when there is no device.
+    ///
+    /// This is exactly orchard's batched agreement (`PreparedEphemeralPublicKey::
+    /// batch_tabled` + `batch_agree` + `SharedSecret::batch_to_affine`): one GLV window
+    /// per point with one shared normalisation, one decomposition of the scalar, one
+    /// synchronised ladder over the batch, one batch normalisation of the products.
+    /// The identity is mapped to `None`, as orchard refuses it as an ephemeral key
+    /// (`NonIdentityPallasPoint`), so it can never yield a note there either.
+    pub fn cpu_agree_points(scalar: &pallas::Scalar, epks: &[Option<pallas::Point>]) -> Vec<Option<pallas::Affine>> {
+        use group::{Curve, Group};
+        use pasta_curves::glv::{Decomposed, Table};
+        let live: Vec<usize> = epks
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| match e {
+                Some(p) if !bool::from(p.is_identity()) => Some(i),
+                _ => None,
+            })
+            .collect();
+        let mut out: Vec<Option<pallas::Affine>> = vec![None; epks.len()];
+        if live.is_empty() {
+            return out;
+        }
+        let points: Vec<pallas::Point> = live.iter().map(|&i| epks[i].expect("live")).collect();
+        let tables = Table::<pallas::Point>::batch(&points);
+        let refs: Vec<&Table<pallas::Point>> = tables.iter().collect();
+        let decomposed = Decomposed::<pallas::Point>::new(scalar);
+        let products = Table::mul_decomposed_batch(&refs, &decomposed);
+        let mut affine = vec![pallas::Affine::default(); products.len()];
+        pallas::Point::batch_normalize(&products, &mut affine);
+        for (k, &i) in live.iter().enumerate() {
+            out[i] = Some(affine[k]);
+        }
+        out
     }
 
     /// The CPU path: orchard's batch API, unchanged. Also what the GPU filter uses to
@@ -816,6 +902,7 @@ pub use scan::{
     decompress_epk, scan_bundle, scan_bundle_prepared, scan_compact, scan_compact_auto, scan_compact_auto_cached, scan_compact_cpu, scan_compact_gpu, scan_compact_gpu_cached,
     scan_compact_prepared, trim_memo,
     PreparedEpks, gpu_filter_enabled, install_gpu_filter, prepare_epks, scan_compact_auto_prepared, scan_compact_gpu_filter,
+    cpu_agree_points, cpu_epk_reuse_enabled,
 };
 
 #[cfg(feature = "circuit")]
@@ -2586,3 +2673,107 @@ pub use build::{
     BuildError, PreparedPayment, ShieldedKeys, build_output_only_bundle, build_payment_bundle, build_spend_bundle, finalize_payment,
     prepare_payment, sign_spend_auth, to_wire,
 };
+
+/// The CPU path that reuses the cohort's decompressed ephemeral keys must find exactly
+/// what orchard's own batch API finds, action for action. Built without a proof (only
+/// note encryption is needed for a compact record), so it runs in the plain test build.
+#[cfg(test)]
+mod epk_reuse_tests {
+    use super::scan::*;
+    use orchard::{
+        Address,
+        keys::{FullViewingKey, Scope, SpendingKey},
+        note::{ExtractedNoteCommitment, Note, NoteVersion, RandomSeed, Rho},
+        note_encryption::{OrchardDomain, OrchardNoteEncryption},
+        value::NoteValue,
+    };
+    use zcash_note_encryption::Domain;
+
+    fn h(tag: &[u8], i: u32) -> [u8; 32] {
+        let d = blake2b_simd::Params::new().hash_length(32).to_state().update(tag).update(&i.to_le_bytes()).finalize();
+        let mut b = [0u8; 32];
+        b.copy_from_slice(d.as_bytes());
+        b
+    }
+
+    fn fvk(seed: u8) -> FullViewingKey {
+        let sk = Option::<SpendingKey>::from(SpendingKey::from_bytes([seed; 32])).expect("valid sk");
+        FullViewingKey::from(&sk)
+    }
+
+    /// A compact record carrying a real note to `addr`, exactly as a node would distil
+    /// it from an action (nf = the note's rho, the way `for_compact_action` reads it).
+    fn plant(addr: Address, value: u64, i: u32) -> Option<CompactActionRecord> {
+        let mut nf = h(b"nf", i);
+        nf[31] &= 0x3f;
+        let rho: Rho = Option::from(Rho::from_bytes(&nf))?;
+        let rseed: RandomSeed = Option::from(RandomSeed::from_bytes(h(b"rseed", i), &rho))?;
+        let note: Note = Option::from(Note::from_parts(addr, NoteValue::from_raw(value), rho, rseed, NoteVersion::V2))?;
+        let enc = OrchardNoteEncryption::new(None, note, [0u8; 512]);
+        let epk = OrchardDomain::epk_bytes(enc.epk()).0;
+        let ct = enc.encrypt_note_plaintext();
+        let mut c52 = [0u8; 52];
+        c52.copy_from_slice(&ct[..52]);
+        Some(CompactActionRecord { nullifier: nf, cmx: ExtractedNoteCommitment::from(note.commitment()).to_bytes(), ephemeral_key: epk, enc_ciphertext: c52 })
+    }
+
+    fn page(n_foreign: usize, mine: &[(usize, u64)], me: Address) -> Vec<CompactActionRecord> {
+        let stranger = fvk(77).address_at(3u32, Scope::External);
+        let uniq: Vec<CompactActionRecord> = (0..64u32).filter_map(|i| plant(stranger, 1000 + i as u64, 10_000 + i)).collect();
+        let mut v: Vec<CompactActionRecord> = (0..n_foreign).map(|i| uniq[i % uniq.len()]).collect();
+        // Hostile and degenerate encodings orchard must refuse, and so must we.
+        if v.len() > 8 {
+            v[1].ephemeral_key = [0u8; 32]; // the identity
+            v[2].ephemeral_key = [0xff; 32]; // not a point
+            v[3].nullifier = [0xff; 32]; // non-canonical nullifier
+            v[4].cmx = [0xff; 32]; // non-canonical commitment
+        }
+        for (k, &(pos, value)) in mine.iter().enumerate() {
+            let rec = plant(me, value, 20_000 + k as u32).expect("plant");
+            v.insert(pos.min(v.len()), rec);
+        }
+        v
+    }
+
+    fn compare(actions: &[CompactActionRecord], ivk_seed: u8, expect: usize) {
+        let fvk = fvk(ivk_seed);
+        let ivk = fvk.to_ivk(Scope::External);
+        let prepared = ivk.prepare();
+        let sc = ivk_agreement_scalar(&ivk).expect("scalar");
+        let epks: Vec<Option<pasta_curves::pallas::Point>> = actions.iter().map(|r| decompress_epk(&r.ephemeral_key)).collect();
+        let old = scan_compact_cpu(&prepared, actions);
+        let new = scan_compact_auto_cached(&prepared, Some(&sc), actions, Some(&epks));
+        let key = |v: &[ReceivedNote]| -> Vec<(usize, u64, [u8; 32], [u8; 43])> {
+            v.iter()
+                .map(|n| {
+                    (n.action_index, n.note.value().inner(), ExtractedNoteCommitment::from(n.note.commitment()).to_bytes(), n.note.recipient().to_raw_address_bytes())
+                })
+                .collect()
+        };
+        assert_eq!(key(&old), key(&new), "reuse path must find exactly what orchard finds");
+        assert_eq!(old.len(), expect, "and that is the planted set");
+        // The agreement itself is orchard's: same products as a plain scalar multiply.
+        let agreed = cpu_agree_points(&sc, &epks);
+        for (i, (e, a)) in epks.iter().zip(agreed.iter()).enumerate().take(80) {
+            use group::{Curve, Group};
+            let want = e.and_then(|p| (!bool::from(p.is_identity())).then(|| (p * sc).to_affine()));
+            assert_eq!(*a, want, "agreement at {i}");
+        }
+    }
+
+    #[test]
+    fn epk_reuse_matches_orchard_small_and_large_pages() {
+        let me = fvk(5).address_at(0u32, Scope::External);
+        let me_far = fvk(5).address_at(9_000u32, Scope::External);
+        // Below the parallel threshold: the single-call path.
+        compare(&page(300, &[(0, 7), (150, 8), (300, 9)], me), 5, 3);
+        // Above it: the chunked path, notes on and around chunk boundaries.
+        let mut big = page(4000, &[(0, 1), (127, 2), (128, 3), (1000, 4), (3999, 5)], me);
+        big.insert(2048, plant(me_far, 6, 30_000).unwrap());
+        compare(&big, 5, 6);
+        // A stranger's key finds nothing on either path.
+        compare(&big, 99, 0);
+        // An empty page and a page with nothing decodable.
+        compare(&[], 5, 0);
+    }
+}
