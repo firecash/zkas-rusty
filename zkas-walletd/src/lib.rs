@@ -1942,6 +1942,33 @@ fn retire_quarantine_copies(dir: &str, token: &str) {
 /// corruption / version or genesis mismatch — the caller then rescans, so a stale
 /// checkpoint can never yield a wrong tree.
 #[allow(clippy::type_complexity)]
+/// Why a checkpoint was refused. The distinction is the whole point: two of these are
+/// statements about the WALLET and one is a statement about the NODE, and conflating them
+/// deleted thousands of correct scans — including a phone's half-finished one, which went
+/// back to 0% because a local engine has no twin checkpoint to be rescued by.
+enum CheckpointReject {
+    /// Absent, truncated, wrong magic/version, or a different genesis.
+    Malformed,
+    /// Same leaf count as the node, DIFFERENT root. The wallet's tree genuinely disagrees
+    /// with consensus at its own cursor — the only shape that proves it.
+    Divergent,
+    /// The node's frontier at this cursor cannot verify anything: it is empty (the node
+    /// holds no shielded state for that block and `frontier_at` reports an empty tree
+    /// rather than an error) or smaller than the wallet's own tree (the node is behind).
+    /// Both say something about the NODE. Verified by re-querying three rejected cursors
+    /// days later: the node then returned exactly the size the wallet had been destroyed
+    /// for claiming.
+    Unverifiable,
+}
+
+/// Consecutive times a token's checkpoint could not be VERIFIED (not contradicted). After
+/// this many the old behaviour resumes: rebuild honestly. The file is copied aside either way.
+fn unverified_strikes() -> &'static std::sync::Mutex<std::collections::HashMap<String, u8>> {
+    static S: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, u8>>> = std::sync::OnceLock::new();
+    S.get_or_init(Default::default)
+}
+const UNVERIFIED_STRIKES_MAX: u8 = 3;
+
 fn load_checkpoint(
     dir: &str,
     token: &str,
@@ -1949,12 +1976,25 @@ fn load_checkpoint(
     current_genesis: &RpcHash,
     tip: Option<&kaspa_shielded_core::tree::FrontierState>,
 ) -> Option<(WalletDb, RpcHash, usize, VecDeque<(u64, u64)>, u64, u64)> {
-    let buf = std::fs::read(scan_path(dir, token)).ok()?;
-    let (saved_genesis, rest) = parse_scan_bytes(&buf, key, tip)?;
+    load_checkpoint_why(dir, token, key, current_genesis, tip).ok()
+}
+
+/// [`load_checkpoint`] keeping the reason, so a caller can tell "the node could not verify
+/// this" from "the node contradicted this" and decline to destroy the file for the former.
+fn load_checkpoint_why(
+    dir: &str,
+    token: &str,
+    key: WalletKey,
+    current_genesis: &RpcHash,
+    tip: Option<&kaspa_shielded_core::tree::FrontierState>,
+) -> Result<(WalletDb, RpcHash, usize, VecDeque<(u64, u64)>, u64, u64), CheckpointReject> {
+    let buf = std::fs::read(scan_path(dir, token)).map_err(|_| CheckpointReject::Malformed)?;
+    let mut why = CheckpointReject::Malformed;
+    let (saved_genesis, rest) = parse_scan_bytes_why(&buf, key, tip, &mut why).ok_or(why)?;
     if saved_genesis != *current_genesis {
-        return None; // chain relaunched → rescan
+        return Err(CheckpointReject::Malformed); // chain relaunched → rescan
     }
-    Some(rest)
+    Ok(rest)
 }
 
 /// Parse one scan-file blob into `(genesis, (db, low, scanned, boundaries,
@@ -1966,6 +2006,17 @@ fn parse_scan_bytes(
     buf: &[u8],
     key: WalletKey,
     tip: Option<&kaspa_shielded_core::tree::FrontierState>,
+) -> Option<(RpcHash, (WalletDb, RpcHash, usize, VecDeque<(u64, u64)>, u64, u64))> {
+    let mut why = CheckpointReject::Malformed;
+    parse_scan_bytes_why(buf, key, tip, &mut why)
+}
+
+#[allow(clippy::type_complexity)]
+fn parse_scan_bytes_why(
+    buf: &[u8],
+    key: WalletKey,
+    tip: Option<&kaspa_shielded_core::tree::FrontierState>,
+    why: &mut CheckpointReject,
 ) -> Option<(RpcHash, (WalletDb, RpcHash, usize, VecDeque<(u64, u64)>, u64, u64))> {
     if buf.len() < SCAN_HEADER_LEN || &buf[0..4] != SCAN_MAGIC || !matches!(buf[4], SCAN_VERSION | SCAN_VERSION_PREV) {
         return None;
@@ -2005,8 +2056,36 @@ fn parse_scan_bytes(
         if !db.tree_is_valid() {
             db.adopt_tip_frontier(fs);
         }
+        // A size mismatch is NOT evidence that this wallet is wrong, and treating it as
+        // such destroyed thousands of correct scans. The node answers from its own
+        // per-block shielded state, which can be behind the wallet, or absent for that
+        // block entirely — and `frontier_at` reports an ABSENT entry as an empty tree
+        // (size 0) rather than an error, so "I have no idea" is indistinguishable from
+        // "the tree is empty here" unless the shape is examined.
+        //
+        // Three cursors rejected this way were re-queried days later and the node then
+        // returned EXACTLY the size the wallet had claimed: the wallets were right and the
+        // node was behind. Those scans were deleted for nothing. This is also why a local
+        // engine pointed at SOMEONE ELSE'S node lost a part-finished scan on every
+        // restart, while hosted wallets mostly survived it.
+        //
+        // So only a same-size/different-root mismatch is a verdict on the wallet. That is
+        // the real guard, it still fails closed, and it had fired 0 times in 2,975
+        // rejections. Size first: there is no reason to build a tree out of a frontier
+        // already decided against.
+        if db.size() != fs.size {
+            *why = CheckpointReject::Unverifiable;
+            log::warn!(
+                "cannot verify wallet checkpoint at cursor {low} against the node yet: wallet {} leaves, node {} leaves{} — keeping the checkpoint and retrying",
+                db.size(),
+                fs.size,
+                if fs.size == 0 { " (node holds no shielded state for this block)" } else { "" },
+            );
+            return None;
+        }
         let expected = GlobalTree::from_state(fs).ok()?.anchor().to_bytes();
-        if db.size() != fs.size || db.anchor() != expected {
+        if db.anchor() != expected {
+            *why = CheckpointReject::Divergent;
             log::warn!(
                 "rejecting divergent wallet checkpoint at cursor {low}: wallet size/root {}/{}, node size/root {}/{}",
                 db.size(),
@@ -6140,8 +6219,41 @@ impl AppState {
             None => None,
         };
         let t_verify = t_load0.elapsed();
-        let restored =
-            (!abandoned_checkpoint).then(|| load_checkpoint(&self.wallet_dir, token, key, &genesis, tip.as_ref())).flatten();
+        // A checkpoint the node could not VERIFY must not be treated as one the node
+        // CONTRADICTED. On the unverifiable shape, return without opening the wallet at
+        // all: that leaves the file untouched for the next request, where the node may
+        // well answer properly. Opening and rescanning would overwrite the only copy —
+        // which is how "I was at 8% and the update reset it" happens.
+        let restored = if abandoned_checkpoint {
+            None
+        } else {
+            match load_checkpoint_why(&self.wallet_dir, token, key, &genesis, tip.as_ref()) {
+                Ok(r) => {
+                    unverified_strikes().lock().unwrap_or_else(|p| p.into_inner()).remove(token);
+                    Some(r)
+                }
+                Err(CheckpointReject::Unverifiable) => {
+                    let strikes = {
+                        let mut m = unverified_strikes().lock().unwrap_or_else(|p| p.into_inner());
+                        let n = m.entry(token.to_string()).or_insert(0);
+                        *n = n.saturating_add(1);
+                        *n
+                    };
+                    if strikes < UNVERIFIED_STRIKES_MAX {
+                        log::info!(
+                            "wallet '{token}': node cannot verify the checkpoint yet (attempt {strikes}/{UNVERIFIED_STRIKES_MAX}); keeping it and retrying on the next request"
+                        );
+                        return None;
+                    }
+                    log::warn!(
+                        "wallet '{token}': node has failed to verify the checkpoint {strikes} times; rebuilding from the birthday"
+                    );
+                    unverified_strikes().lock().unwrap_or_else(|p| p.into_inner()).remove(token);
+                    None
+                }
+                Err(_) => None,
+            }
+        };
         // Preserve a rejected checkpoint for forensic recovery/grafting. Never let
         // the subsequent clean scan overwrite the only copy of older owned notes.
         if restored.is_none() && tip.is_some() && checkpoint_cursor(&self.wallet_dir, token, &genesis).is_some() {
