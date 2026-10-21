@@ -1,0 +1,36 @@
+Copyright (c) The Zakura Contributors
+
+Copyrights in the "zakura-orchard" library are retained by their contributors. No
+copyright assignment is required to contribute to the "zakura-orchard"
+library.
+
+The "zakura-orchard" library is licensed under either of
+
+ * Apache License, Version 2.0, (see ./LICENSE-APACHE or http://www.apache.org/licenses/LICENSE-2.0)
+ * MIT license (see ./LICENSE-MIT or http://opensource.org/licenses/MIT)
+
+at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally
+submitted for inclusion in the work by you, as defined in the Apache-2.0
+license, shall be dual licensed as above, without any additional terms or
+conditions.
+
+==============================================================================
+
+This library began as a fork of the "orchard" crate. The original copyright
+notices are preserved below:
+
+  Copyright (c) 2020-2025 The Electric Coin Company
+  Copyright (c) 2026 Zcash Open Development Lab
+
+==============================================================================
+
+Note on the upstream license change: the licensing of the upstream "orchard"
+crate changed from the Bootstrap Open Source License to the "MIT OR
+Apache-2.0" dual license in its 0.7.0 release. The license exception that
+applied to the Zcash and Zebra projects, other projects designed to integrate
+with Zcash, and certain forks of Zcash, is no longer necessary. For clarity,
+this was intended to be a strict relaxation of the previous licensing, i.e. it
+permits all usage that was previously possible with or without use of the
+license exception.

@@ -119,9 +119,13 @@ pub fn coinbase_note_commitment(desc: &CoinbaseNoteDesc, value: u64) -> Result<E
     let recipient: Address = Option::from(Address::from_raw_address_bytes(&desc.recipient)).ok_or(CoinbaseNoteError::BadRecipient)?;
     let rho: Rho = Option::from(Rho::from_bytes(&desc.rho)).ok_or(CoinbaseNoteError::BadRho)?;
     let rseed: RandomSeed = Option::from(RandomSeed::from_bytes(desc.rseed, &rho)).ok_or(CoinbaseNoteError::BadRseed)?;
-    let note: Note =
-        Option::from(Note::from_parts(recipient, NoteValue::from_raw(value), rho, rseed, orchard::note::NoteVersion::V2)).ok_or(CoinbaseNoteError::BadNote)?;
-    Ok(ExtractedNoteCommitment::from(note.commitment()))
+    // One NoteCommit, not two: `from_parts` must derive the commitment to validate the
+    // note, and `from_parts_with_commitment` hands that same value back instead of
+    // discarding it and recomputing it via `note.commitment()`. Same `None` cases.
+    let (_note, cm) =
+        Note::from_parts_with_commitment(recipient, NoteValue::from_raw(value), rho, rseed, orchard::note::NoteVersion::V2)
+            .ok_or(CoinbaseNoteError::BadNote)?;
+    Ok(ExtractedNoteCommitment::from(cm))
 }
 
 /// Build a single [`CoinbaseNote`] (value + commitment) from its public
@@ -212,6 +216,40 @@ mod tests {
     fn rejects_bad_recipient() {
         let desc = CoinbaseNoteDesc { recipient: [0xff; 43], rho: canon32(1), rseed: canon32(2) };
         assert!(matches!(coinbase_note_commitment(&desc, 100), Err(CoinbaseNoteError::BadRecipient)));
+    }
+
+    /// `coinbase_note_commitment` now takes the commitment `from_parts` computed while
+    /// validating (one NoteCommit) instead of computing it a second time. Pin that this is
+    /// value-identical to the old two-step derivation (`from_parts`, then
+    /// `note.commitment()`) over many real-shaped descriptions, and that both refuse the
+    /// same inputs. A leaf that differed here would fork every wallet's tree.
+    #[test]
+    fn commitment_once_equals_from_parts_then_commitment() {
+        let recipient = test_recipient().to_raw_address_bytes();
+        let mut checked = 0;
+        for i in 0u32..512 {
+            let mut seed = b"coinbase-txid-for-the-differential||".to_vec();
+            seed.extend_from_slice(&i.to_le_bytes());
+            let desc = derive_coinbase_note_desc(recipient, &seed);
+            let value = 1u64 + (i as u64) * 7_919_000_003;
+            let old: Option<ExtractedNoteCommitment> = (|| {
+                let addr: Address = Option::from(Address::from_raw_address_bytes(&desc.recipient))?;
+                let rho: Rho = Option::from(Rho::from_bytes(&desc.rho))?;
+                let rseed: RandomSeed = Option::from(RandomSeed::from_bytes(desc.rseed, &rho))?;
+                let note: Note =
+                    Option::from(Note::from_parts(addr, NoteValue::from_raw(value), rho, rseed, orchard::note::NoteVersion::V2))?;
+                Some(ExtractedNoteCommitment::from(note.commitment()))
+            })();
+            let new = coinbase_note_commitment(&desc, value).ok();
+            assert_eq!(old.map(|c| c.to_bytes()), new.map(|c| c.to_bytes()), "seed {i}");
+            if new.is_some() {
+                checked += 1;
+            }
+        }
+        assert!(checked > 500, "the sweep must exercise the success path, not only refusals ({checked})");
+        // A recipient that is not an address is refused before any commitment.
+        let bad = CoinbaseNoteDesc { recipient: [0xff; 43], rho: canon32(1), rseed: canon32(2) };
+        assert!(coinbase_note_commitment(&bad, 1).is_err());
     }
 
     /// A coinbase note feeds the state transition as a mint of exactly its public

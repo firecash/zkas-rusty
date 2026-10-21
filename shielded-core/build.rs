@@ -38,6 +38,17 @@ fn main() {
                     checksum = c.trim_end_matches('"').to_string();
                 }
             }
+            // A `[patch]`ed path crate has no registry checksum. It must then carry a
+            // ZKAS-PATCH marker naming the registry checksum it was derived from and
+            // the patch, so the identity stays honest instead of reading "unknown".
+            if checksum == "unknown" {
+                let marker = Path::new(&manifest_dir).join("..").join("patches").join(format!("{name}-{version}")).join("ZKAS-PATCH");
+                println!("cargo:rerun-if-changed={}", marker.display());
+                if let Ok(m) = fs::read_to_string(&marker) {
+                    let field = |k: &str| m.lines().find_map(|l| l.strip_prefix(k)).unwrap_or("unknown").to_string();
+                    checksum = format!("{}+zkas-patch:{}", field("base_checksum="), field("tag="));
+                }
+            }
             ident = Some(format!("{name} {version} {checksum}"));
             break;
         }

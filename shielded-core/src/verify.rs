@@ -390,7 +390,9 @@ mod e2e {
         // fingerprint below is unchanged.
         assert_eq!(
             crate::verify::ORCHARD_CRATE,
-            "zakura-orchard 2.2.0 b460a562603ba2e9820cb988b5f873ef470bd007c6c2f86e50abaa91b45e241e"
+            // walletd-scale 2026-10-21: the registry crate (checksum unchanged) plus the one
+            // additive function `orchard_patch_is_one_additive_function` below proves.
+            "zakura-orchard 2.2.0 b460a562603ba2e9820cb988b5f873ef470bd007c6c2f86e50abaa91b45e241e+zkas-patch:from_parts_with_commitment"
         );
         assert_eq!(
             crate::verify::HALO2_GADGETS_CRATE,
@@ -403,6 +405,63 @@ mod e2e {
     #[test]
     fn verifying_key_fingerprint_is_pinned() {
         crate::verify::check_verifying_key().expect("verifying key matches the chain's");
+    }
+
+    /// The `[patch]`ed zakura-orchard is the registry 2.2.0 source with exactly one
+    /// additive function and nothing else: every other source file hashes to the
+    /// registry crate's manifest (pinned below, computed from
+    /// ~/.cargo/registry/src/*/zakura-orchard-2.2.0 on 2026-10-21), `note.rs.orig` is the
+    /// registry `note.rs`, and the patched `note.rs` is that file plus ONE contiguous
+    /// insertion that defines `from_parts_with_commitment` and no other item. The circuit,
+    /// and so the verifying key, cannot have moved.
+    #[test]
+    fn orchard_patch_is_one_additive_function() {
+        use sha2::{Digest, Sha256};
+        fn hexd(b: &[u8]) -> String {
+            b.iter().map(|x| format!("{x:02x}")).collect()
+        }
+        fn walk(dir: &std::path::Path, root: &std::path::Path, out: &mut Vec<String>) {
+            for e in std::fs::read_dir(dir).expect("read_dir") {
+                let p = e.expect("entry").path();
+                if p.is_dir() {
+                    walk(&p, root, out);
+                } else {
+                    out.push(p.strip_prefix(root).unwrap().to_string_lossy().into_owned());
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../patches/zakura-orchard-2.2.0");
+        let mut files = Vec::new();
+        walk(&root.join("src"), &root, &mut files);
+        files.retain(|f| f != "src/note.rs");
+        files.sort();
+        let mut manifest = String::new();
+        for f in &files {
+            manifest.push_str(f);
+            manifest.push('\n');
+            manifest.push_str(&hexd(&Sha256::digest(std::fs::read(root.join(f)).unwrap())));
+            manifest.push('\n');
+        }
+        assert_eq!(
+            hexd(&Sha256::digest(manifest.as_bytes())),
+            "244dd7b1da5c60d68cbbd0864f0ef495f8a2988051198efc2b2160efe1b4a55f",
+            "a source file other than note.rs differs from registry zakura-orchard 2.2.0"
+        );
+        let orig = std::fs::read_to_string(root.join("note.rs.orig")).unwrap();
+        assert_eq!(
+            hexd(&Sha256::digest(orig.as_bytes())),
+            "a8233a2fb5b9ed2045ef9e6b62454cca93bc453e37850b0b426a33342cc65781",
+            "note.rs.orig is not the registry note.rs"
+        );
+        let patched = std::fs::read_to_string(root.join("src/note.rs")).unwrap();
+        let (o, p) = (orig.as_bytes(), patched.as_bytes());
+        let pre = o.iter().zip(p.iter()).take_while(|(a, b)| a == b).count();
+        let suf = o.iter().rev().zip(p.iter().rev()).take_while(|(a, b)| a == b).count().min(o.len() - pre);
+        assert_eq!(pre + suf, o.len(), "the patch must only INSERT (nothing of the original removed or changed)");
+        let inserted = &patched[pre..p.len() - suf];
+        assert_eq!(inserted.matches("fn ").count(), 1, "exactly one function inserted");
+        assert!(inserted.contains("pub fn from_parts_with_commitment("), "and it is the documented one");
+        assert!(!inserted.contains("unsafe"), "no unsafe code");
     }
 
     #[test]

@@ -1,0 +1,143 @@
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use orchard::{
+    keys::{FullViewingKey, PreparedIncomingViewingKey, Scope, SpendingKey},
+    note_encryption::{CompactAction, IronwoodDomain},
+};
+use zcash_note_encryption::{batch, try_compact_note_decryption, try_note_decryption};
+
+#[cfg(unix)]
+use pprof::criterion::{Output, PProfProfiler};
+
+mod support;
+
+use support::payment_fixture_with_index;
+
+const PAYMENT_ACTIONS: usize = 2;
+const BATCH_ACTIONS: usize = 100;
+
+fn bench_note_decryption(c: &mut Criterion) {
+    let fixtures = (0..BATCH_ACTIONS / PAYMENT_ACTIONS)
+        .map(|fixture_index| {
+            payment_fixture_with_index(
+                PAYMENT_ACTIONS,
+                u64::try_from(fixture_index).expect("fixture index fits into u64"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let valid_ivk = PreparedIncomingViewingKey::new(fixtures[0].recipient_ivk());
+
+    // Compact actions don't have the full AEAD ciphertext, so ZIP 307 trial-decryption
+    // relies on an invalid ivk resulting in random noise for which the note commitment
+    // is invalid. However, in practice we still get early rejection:
+    // - The version byte will be invalid in 255/256 instances.
+    // - If the version byte is valid, one of either the note commitment check or the esk
+    //   check will be invalid, saving us at least one scalar mul.
+    //
+    // Our fixed (action, invalid ivk) tuple will always fall into a specific rejection
+    // case. In order to reflect the real behaviour in the benchmarks, we trial-decrypt
+    // with 10240 invalid ivks (each of which will result in a different uniformly-random
+    // plaintext); this is equivalent to trial-decrypting 10240 different actions with the
+    // same ivk, but is faster to set up.
+    let invalid_ivks: Vec<_> = (0u32..10240)
+        .map(|i| {
+            let mut sk = [0; 32];
+            sk[..4].copy_from_slice(&i.to_le_bytes());
+            let fvk = FullViewingKey::from(&SpendingKey::from_bytes(sk).unwrap());
+            PreparedIncomingViewingKey::new(&fvk.to_ivk(Scope::External))
+        })
+        .collect();
+
+    let action = fixtures[0].bundle().actions().first();
+
+    let domain = IronwoodDomain::for_action(action);
+
+    let compact = {
+        let mut group = c.benchmark_group("ironwood-note-decryption");
+        group.throughput(Throughput::Elements(1));
+
+        group.bench_function("valid", |b| {
+            b.iter(|| try_note_decryption(&domain, &valid_ivk, action).unwrap())
+        });
+
+        // Non-compact actions will always early-reject at the same point: AEAD decryption.
+        group.bench_function("invalid", |b| {
+            b.iter(|| try_note_decryption(&domain, &invalid_ivks[0], action))
+        });
+
+        let compact = CompactAction::from(action);
+
+        group.bench_function("compact-valid", |b| {
+            b.iter(|| try_compact_note_decryption(&domain, &valid_ivk, &compact).unwrap())
+        });
+
+        compact
+    };
+
+    {
+        let mut group = c.benchmark_group("ironwood-compact-note-decryption");
+        group.throughput(Throughput::Elements(invalid_ivks.len() as u64));
+        group.bench_function("invalid", |b| {
+            b.iter(|| {
+                for ivk in &invalid_ivks {
+                    try_compact_note_decryption(&domain, ivk, &compact);
+                }
+            })
+        });
+    }
+
+    {
+        // Benchmark a wallet-sized search with two distinct IVKs. The first
+        // owns every payment output; the second exercises the other-key path.
+        let ivks = 2;
+        let valid_ivks = vec![valid_ivk, invalid_ivks[0].clone()];
+        let actions: Vec<_> = fixtures
+            .iter()
+            .flat_map(|fixture| fixture.bundle().actions())
+            .map(|action| (IronwoodDomain::for_action(action), action.clone()))
+            .collect();
+        assert_eq!(actions.len(), BATCH_ACTIONS);
+        let compact: Vec<_> = actions
+            .iter()
+            .map(|(_, action)| {
+                (
+                    IronwoodDomain::for_action(action),
+                    CompactAction::from(action),
+                )
+            })
+            .collect();
+
+        let mut group = c.benchmark_group("ironwood-batch-note-decryption");
+
+        for size in [10, 50, 100] {
+            group.throughput(Throughput::Elements((ivks * size) as u64));
+
+            group.bench_function(BenchmarkId::new("valid", size), |b| {
+                b.iter(|| batch::try_note_decryption(&valid_ivks, &actions[..size]))
+            });
+
+            group.bench_function(BenchmarkId::new("invalid", size), |b| {
+                b.iter(|| batch::try_note_decryption(&invalid_ivks[..ivks], &actions[..size]))
+            });
+
+            group.bench_function(BenchmarkId::new("compact-valid", size), |b| {
+                b.iter(|| batch::try_compact_note_decryption(&valid_ivks, &compact[..size]))
+            });
+
+            group.bench_function(BenchmarkId::new("compact-invalid", size), |b| {
+                b.iter(|| {
+                    batch::try_compact_note_decryption(&invalid_ivks[..ivks], &compact[..size])
+                })
+            });
+        }
+    }
+}
+
+#[cfg(unix)]
+criterion_group! {
+    name = benches;
+    config = Criterion::default().with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
+    targets = bench_note_decryption
+}
+#[cfg(not(unix))]
+criterion_group!(benches, bench_note_decryption);
+criterion_main!(benches);

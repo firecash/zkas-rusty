@@ -1,0 +1,5 @@
+base_checksum=b460a562603ba2e9820cb988b5f873ef470bd007c6c2f86e50abaa91b45e241e
+tag=from_parts_with_commitment
+# Registry zakura-orchard 2.2.0 plus ONE additive fn in src/note.rs
+# (Note::from_parts_with_commitment). note.rs.orig is the registry file; the test
+# kaspa-shielded-core verify::tests::orchard_patch_is_one_additive_function proves it.

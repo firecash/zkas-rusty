@@ -508,3 +508,10 @@ opt-level = 2
 [workspace.lints.clippy]
 empty_docs = "allow"
 uninlined_format_args = "allow"
+
+# ZKAS LOCAL PATCH (walletd-scale 2026-10-21): zakura-orchard 2.2.0 plus ONE additive
+# function, `Note::from_parts_with_commitment`, so the coinbase commitment is derived
+# once instead of twice (spec 10 B1a). Every other line is the registry source; diff
+# against ~/.cargo/registry/src/*/zakura-orchard-2.2.0 to verify.
+[patch.crates-io]
+zakura-orchard = { path = "patches/zakura-orchard-2.2.0" }
