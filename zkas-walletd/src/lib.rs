@@ -7449,15 +7449,36 @@ fn hard_victims(res: &[ResidentInfo], hard_max: usize, budget: Option<u64>, inco
     (victims, fits)
 }
 
-/// This process's cgroup v2 memory limit: min(`memory.high`, `memory.max`) when finite.
-fn cgroup_memory_limit_bytes() -> Option<u64> {
-    let cg = std::fs::read_to_string("/proc/self/cgroup").ok()?;
-    let path = cg.lines().find_map(|l| l.strip_prefix("0::"))?.trim().to_string();
-    let read = |f: &str| std::fs::read_to_string(format!("/sys/fs/cgroup{path}/{f}")).ok().and_then(|v| v.trim().parse::<u64>().ok());
-    match (read("memory.high"), read("memory.max")) {
+/// This process's cgroup v2 directory: "0::/<path>" in /proc/self/cgroup, with the knobs
+/// under /sys/fs/cgroup/<path>/. `None` outside a v2 cgroup.
+fn own_cgroup_dir() -> Option<std::path::PathBuf> {
+    let rel = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let rel = rel.lines().find_map(|l| l.strip_prefix("0::"))?.trim().to_string();
+    Some(std::path::PathBuf::from(format!("/sys/fs/cgroup{rel}")))
+}
+
+/// One cgroup v2 memory knob in bytes. "max" (unlimited) and an unreadable knob are `None`,
+/// never zero. Same parsing as the audit fix's `cgroup_headroom_mb_at`
+/// (zkas-ckpt-wip/rk-perf), so the two cannot disagree once that is ported.
+fn cgroup_knob_bytes(base: &std::path::Path, name: &str) -> Option<u64> {
+    let raw = std::fs::read_to_string(base.join(name)).ok()?;
+    let raw = raw.trim();
+    if raw == "max" { None } else { raw.parse::<u64>().ok() }
+}
+
+/// The binding memory ceiling of the cgroup at `base`: the LOWER of `memory.high` and
+/// `memory.max`, because `high` throttles the process into reclaim (the wedge this daemon
+/// keeps hitting) before `max` kills it. `None` when both are unlimited or unreadable.
+fn cgroup_ceiling_bytes_at(base: &std::path::Path) -> Option<u64> {
+    match (cgroup_knob_bytes(base, "memory.high"), cgroup_knob_bytes(base, "memory.max")) {
         (Some(h), Some(m)) => Some(h.min(m)),
         (h, m) => h.or(m),
     }
+}
+
+/// This process's cgroup v2 memory limit: min(`memory.high`, `memory.max`) when finite.
+fn cgroup_memory_limit_bytes() -> Option<u64> {
+    cgroup_ceiling_bytes_at(&own_cgroup_dir()?)
 }
 
 /// The resident byte budget in force (see [`ResourceLimits::resident_budget_mb`]).
@@ -14766,7 +14787,30 @@ mod day_diff_tests {
 /// Task 03: the hard resident rules are a real bound, unlike the soft count cap.
 #[cfg(test)]
 mod resident_budget_tests {
-    use super::{ResidentInfo, hard_victims};
+    use super::{ResidentInfo, cgroup_ceiling_bytes_at, hard_victims};
+
+    /// The auto budget is 70% of the ceiling, so the ceiling must be the LOWER knob, "max"
+    /// must read as unlimited (not zero, which would evict everything), and an unreadable
+    /// cgroup must be no limit at all. Cases adapted from the audit fix's
+    /// `cgroup_headroom_reads_the_lower_ceiling_and_cannot_underflow`.
+    #[test]
+    fn cgroup_ceiling_reads_the_lower_knob_and_treats_max_as_unlimited() {
+        let dir = std::env::temp_dir().join(format!("zkas-cg-ceiling-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let put = |name: &str, v: &str| std::fs::write(dir.join(name), v).unwrap();
+        let gb = 1024u64 * 1024 * 1024;
+        put("memory.high", &format!("{}\n", 50 * gb));
+        put("memory.max", &(57 * gb).to_string());
+        assert_eq!(cgroup_ceiling_bytes_at(&dir), Some(50 * gb), "high binds first");
+        put("memory.high", &(60 * gb).to_string());
+        assert_eq!(cgroup_ceiling_bytes_at(&dir), Some(57 * gb), "the lower knob wins either way");
+        put("memory.high", "max");
+        assert_eq!(cgroup_ceiling_bytes_at(&dir), Some(57 * gb), "\"max\" falls back to the other knob");
+        put("memory.max", "max\n");
+        assert_eq!(cgroup_ceiling_bytes_at(&dir), None, "both unlimited: no budget");
+        assert_eq!(cgroup_ceiling_bytes_at(std::path::Path::new("/nonexistent-cgroup")), None, "unreadable is not zero");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     use std::time::{Duration, Instant};
 
     fn w(t: &str, mb: u64, age_s: u64, busy: bool, protected: bool, now: Instant) -> ResidentInfo {
