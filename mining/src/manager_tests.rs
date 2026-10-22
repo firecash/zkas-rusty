@@ -209,6 +209,76 @@ mod tests {
         }
     }
 
+    /// A relayed batch stops being verified at the first chunk that carries a failed shielded proof
+    /// (MI-2): the rest of the batch is refused unvalidated as `RejectBatchAbandoned`, instead of a
+    /// single peer making the node verify every junk bundle of a 131k-entry inv before the relay flow
+    /// sees the first failure and disconnects it. A clean batch of the same shape is fully accepted.
+    #[test]
+    fn test_batch_stops_verifying_after_an_invalid_shielded_proof() {
+        const TX_COUNT: usize = 30;
+        // A small block mass, so that a handful of these transactions fills one validation chunk.
+        const SMALL_BLOCK_MASS: u64 = 1_000;
+        let new_manager = || {
+            let config = Config::build_default(
+                TARGET_TIME_PER_BLOCK,
+                false,
+                BlockMassLimits::with_shared_limit(SMALL_BLOCK_MASS),
+                BLOCK_LANE_LIMITS,
+            );
+            MiningManager::with_config(config, ForkActivation::never(), None, Arc::new(MiningCounters::default()))
+        };
+        let is_bad_proof = |r: &MiningManagerResult<Arc<Transaction>>| {
+            matches!(r, Err(MiningManagerError::MempoolError(RuleError::RejectTxRule(TxRuleError::InvalidShieldedProof(_)))))
+        };
+        let is_abandoned = |r: &MiningManagerResult<Arc<Transaction>>| {
+            matches!(r, Err(MiningManagerError::MempoolError(RuleError::RejectBatchAbandoned(_))))
+        };
+
+        // Clean batch: spans several chunks, everything is validated and accepted.
+        let consensus = Arc::new(ConsensusMock::new());
+        let txs = create_and_add_funding_transactions(&consensus, TX_COUNT)
+            .iter()
+            .map(|funding| create_transaction(funding, DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE))
+            .collect_vec();
+        let batch_mass: u64 = txs.iter().map(transaction_estimated_serialized_size).sum();
+        assert!(batch_mass > 3 * SMALL_BLOCK_MASS, "the batch must span several validation chunks ({batch_mass})");
+        let mining_manager = new_manager();
+        let results = mining_manager.validate_and_insert_transaction_batch(
+            consensus.as_ref(),
+            txs,
+            Priority::Low,
+            Orphan::Allowed,
+            RbfPolicy::Allowed,
+        );
+        assert_eq!(results.len(), TX_COUNT);
+        assert!(results.iter().all(|r| r.is_ok()), "a clean batch is fully accepted: {results:?}");
+
+        // Junk batch: every transaction fails its proof. Only the first chunk is verified.
+        let consensus = Arc::new(ConsensusMock::new());
+        let txs = create_and_add_funding_transactions(&consensus, TX_COUNT)
+            .iter()
+            .map(|funding| create_transaction(funding, DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE))
+            .collect_vec();
+        for tx in txs.iter() {
+            consensus.set_status(tx.id(), Err(TxRuleError::InvalidShieldedProof("simulated garbage proof".to_string())));
+        }
+        let mining_manager = new_manager();
+        let results = mining_manager.validate_and_insert_transaction_batch(
+            consensus.as_ref(),
+            txs,
+            Priority::Low,
+            Orphan::Allowed,
+            RbfPolicy::Allowed,
+        );
+        assert_eq!(results.len(), TX_COUNT, "every transaction gets a result");
+        let bad = results.iter().filter(|r| is_bad_proof(r)).count();
+        let abandoned = results.iter().filter(|r| is_abandoned(r)).count();
+        assert!(bad >= 1, "the failed proof is reported, so the relay flow disconnects the peer");
+        assert!(abandoned > 0 && bad + abandoned == TX_COUNT, "verified {bad}, abandoned {abandoned} of {TX_COUNT}");
+        assert!(bad < TX_COUNT / 3, "only the first chunk may be verified, verified {bad} of {TX_COUNT}");
+        assert_eq!(mining_manager.get_all_transactions(TransactionQuery::TransactionsOnly).0.len(), 0);
+    }
+
     /// test_insert_double_transactions_to_mempool verifies that an attempt to insert a transaction
     /// more than once into the mempool will result in raising an appropriate error.
     #[test]

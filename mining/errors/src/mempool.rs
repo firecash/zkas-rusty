@@ -96,6 +96,11 @@ pub enum RuleError {
 
     #[error("Rejected tx {0} from mempool due to incomputable storage mass")]
     RejectStorageMassIncomputable(TransactionId),
+
+    /// Not validated: an earlier transaction of the same relayed batch carried an invalid shielded
+    /// proof, so the rest of that batch was dropped unverified (the sending peer is misbehaving).
+    #[error("transaction {0} was dropped unvalidated: its batch carried an invalid shielded proof")]
+    RejectBatchAbandoned(TransactionId),
 }
 
 impl From<NonStandardError> for RuleError {

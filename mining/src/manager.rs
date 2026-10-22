@@ -36,7 +36,10 @@ use kaspa_consensus_core::{
 };
 use kaspa_consensusmanager::{ConsensusProxy, spawn_blocking};
 use kaspa_core::{debug, error, info, time::Stopwatch, warn};
-use kaspa_mining_errors::{manager::MiningManagerError, mempool::RuleError};
+use kaspa_mining_errors::{
+    manager::MiningManagerError,
+    mempool::{RuleError, RuleResult},
+};
 use parking_lot::RwLock;
 use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
@@ -486,13 +489,22 @@ impl MiningManager {
         let virtual_daa_score = consensus.get_virtual_daa_score();
         while let Some(upper_bound) = self.next_transaction_chunk_upper_bound(&transactions, lower_bound, virtual_daa_score) {
             assert!(lower_bound < upper_bound, "the chunk is never empty");
-            validation_results.extend(validate_mempool_transactions_in_parallel(
-                consensus,
-                &mut transactions[lower_bound..upper_bound],
-                &args,
-            ));
+            let chunk_results =
+                validate_mempool_transactions_in_parallel(consensus, &mut transactions[lower_bound..upper_bound], &args);
+            let invalid_proof = chunk_results.iter().any(is_invalid_shielded_proof);
+            validation_results.extend(chunk_results);
             lower_bound = upper_bound;
+            // A failed Halo 2 proof is context-free: an honest sender verifies before relaying, so a
+            // batch carrying one comes from a misbehaving peer (the relay flow disconnects it on this
+            // result). Proofs are the expensive part and a garbage proof costs its author nothing, so
+            // stop verifying this batch here: without this a single peer could make us verify up to
+            // MAX_INV_PER_TX_INV_MSG junk bundles before the flow ever saw the first failure. The cost
+            // per batch is now bounded by one chunk (one block's mass), as for validating a block.
+            if invalid_proof {
+                break;
+            }
         }
+        validation_results.extend(transactions[lower_bound..].iter().map(|tx| Err(RuleError::RejectBatchAbandoned(tx.id()))));
         assert_eq!(transactions.len(), validation_results.len(), "every transaction should have a matching validation result");
 
         // write lock on mempool
@@ -1097,6 +1109,12 @@ fn feerate_stats(transactions: Vec<Transaction>, calculated_fees: Vec<u64>) -> O
     let median = feerates[feerates.len() / 2];
 
     Some(Stats { max, median, min })
+}
+
+/// Whether a mempool validation result is a failed shielded proof or signature (see
+/// [`TxRuleError::InvalidShieldedProof`]).
+fn is_invalid_shielded_proof(result: &RuleResult<()>) -> bool {
+    matches!(result, Err(RuleError::RejectTxRule(TxRuleError::InvalidShieldedProof(_))))
 }
 
 #[cfg(test)]
