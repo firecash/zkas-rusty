@@ -124,9 +124,21 @@ pub struct RpcCoreService {
     fee_estimate_cache: ExpiringCache<RpcFeeEstimate>,
     fee_estimate_verbose_cache: ExpiringCache<kaspa_mining::errors::MiningManagerResult<GetFeeEstimateExperimentalResponse>>,
     mining_rule_engine: Arc<MiningRuleEngine>,
+    /// Bounds how many shielded-proof pre-verifications RPC callers can run at once (see
+    /// `submit_transaction_call`).
+    shielded_preverify_permits: Arc<tokio::sync::Semaphore>,
 }
 
 const RPC_CORE: &str = "rpc-core";
+
+/// The most shielded-proof pre-verifications RPC submissions may run concurrently: half the cores,
+/// at least one. A proof check is CPU-bound for milliseconds and a junk bundle costs its sender
+/// nothing (an RPC caller, unlike a relay peer, is not disconnected for one), so without a bound a
+/// public RPC endpoint flooded with fresh junk bundles occupies every core with Halo 2 verification
+/// and starves block processing. Excess submissions wait their turn instead.
+fn shielded_preverify_concurrency() -> usize {
+    std::thread::available_parallelism().map_or(1, |n| (n.get() / 2).max(1))
+}
 
 /// Refuse to answer when the startup self-check found this node's live nullifier set and the
 /// snapshot its committed state root covers to disagree.
@@ -260,6 +272,7 @@ impl RpcCoreService {
             fee_estimate_cache: ExpiringCache::new(Duration::from_millis(500), Duration::from_millis(1000)),
             fee_estimate_verbose_cache: ExpiringCache::new(Duration::from_millis(500), Duration::from_millis(1000)),
             mining_rule_engine,
+            shielded_preverify_permits: Arc::new(tokio::sync::Semaphore::new(shielded_preverify_concurrency())),
         }
     }
 
@@ -778,11 +791,24 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         // fresh junk bundles that each cost a full Halo 2 verification while the virtual state lock was
         // held, delaying every chain update. A success is cached, so the mempool's check is a hit.
         if transaction.is_shielded() {
-            session.async_preverify_shielded_transaction(transaction.clone()).await.map_err(|err| {
-                let err = RpcError::RejectedTransaction(transaction_id, err.to_string());
-                debug!("{err}");
-                err
-            })?;
+            // The permit moves into the blocking task, so it is held for as long as the verification
+            // runs, even if this request is dropped meanwhile (a caller that disconnects must not free a
+            // slot while its proof check still occupies a core). The semaphore is never closed.
+            let permit =
+                self.shielded_preverify_permits.clone().acquire_owned().await.expect("the preverify semaphore is never closed");
+            let tx = transaction.clone();
+            session
+                .clone()
+                .spawn_blocking(move |c| {
+                    let _permit = permit;
+                    c.preverify_shielded_transaction(&tx)
+                })
+                .await
+                .map_err(|err| {
+                    let err = RpcError::RejectedTransaction(transaction_id, err.to_string());
+                    debug!("{err}");
+                    err
+                })?;
         }
         let orphan = match allow_orphan {
             true => Orphan::Allowed,
