@@ -6381,6 +6381,12 @@ impl AppState {
         // clone copies could otherwise lag the donor's actual state by ~17 minutes
         // of chain — the whole point here is that the second device starts where
         // the first one IS, not where it was at the last periodic save.
+        //
+        // Only a donor with unsaved progress, and throttled like any request-triggered
+        // write (`request_flush_due`). Unconditional, every registration of a known viewing
+        // key under a fresh made-up token rewrote the donor's whole checkpoint under its
+        // lock, and a viewing key is not secret from everyone (`/api/wallet/sign` prints
+        // it). A file at most that old leaves the clone a few blocks to rescan.
         {
             let map = self.wallets.lock().await;
             let resident: Vec<(String, Wallet)> =
@@ -6388,7 +6394,8 @@ impl AppState {
             drop(map);
             for (t, w) in resident {
                 let mut e = w.lock().await;
-                if e.error.is_none()
+                let dirty = e.error.is_none() && (e.saved_scanned != e.scanned || e.force_checkpoint);
+                if request_flush_due(dirty, e.last_checkpoint_at.elapsed())
                     && save_checkpoint(
                         &self.wallet_dir,
                         &t,
