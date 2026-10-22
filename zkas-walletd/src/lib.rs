@@ -2308,7 +2308,7 @@ fn prune_retired_copies(dir: &str, token: &str) {
         let path = format!("{dir}/{name}");
         let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         if std::fs::remove_file(&path).is_ok() {
-            log::info!("wallet '{token_p}': removed orphaned partial checkpoint {name} ({bytes} bytes)", token_p = log_pseudonym(&token));
+            log::info!("wallet '{token_p}': removed orphaned partial checkpoint {name_p} ({bytes} bytes)", token_p = log_pseudonym(&token), name_p = log_wallet_path(&name));
         }
     }
     for kind in ["bak", "divergent", "stale"] {
@@ -2320,7 +2320,7 @@ fn prune_retired_copies(dir: &str, token: &str) {
             let path = format!("{dir}/{name}");
             let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
             if std::fs::remove_file(&path).is_ok() {
-                log::info!("wallet '{token_p}': removed superseded checkpoint copy {name} ({bytes} bytes)", token_p = log_pseudonym(&token));
+                log::info!("wallet '{token_p}': removed superseded checkpoint copy {name_p} ({bytes} bytes)", token_p = log_pseudonym(&token), name_p = log_wallet_path(&name));
             }
         }
     }
@@ -6512,7 +6512,7 @@ impl AppState {
         let ts = match tokio::time::timeout(std::time::Duration::from_secs(8), c.get_shielded_tree_state(Some(cursor))).await {
             Ok(Ok(ts)) => ts,
             Ok(Err(e)) => {
-                log::info!("wallet {token_p}: quarantined checkpoint {path} (DAA {scanned}) is not resumable on this node ({e})", token_p = log_pseudonym(&token));
+                log::info!("wallet {token_p}: quarantined checkpoint {path_p} (DAA {scanned}) is not resumable on this node ({e})", token_p = log_pseudonym(&token), path_p = log_wallet_path(&path));
                 return None;
             }
             Err(_) => return None,
@@ -6535,7 +6535,7 @@ impl AppState {
         // to bind, and nothing another key could smuggle in — restore it. Only a copy whose
         // notes do NOT derive under this key is refused.
         if rest.0.notes_bound_to_key(8) == Some(false) {
-            log::warn!("wallet {token_p}: quarantined checkpoint {path} holds notes not derived under this wallet's key; not restoring", token_p = log_pseudonym(&token));
+            log::warn!("wallet {token_p}: quarantined checkpoint {path_p} holds notes not derived under this wallet's key; not restoring", token_p = log_pseudonym(&token), path_p = log_wallet_path(&path));
             return None;
         }
         // Keep the partial rebuild it replaces (its pending-spend bookkeeping, if any).
@@ -6551,7 +6551,7 @@ impl AppState {
         // takes a fresh copy of the live file anyway, so nothing is lost by retiring this one.
         let _ = std::fs::rename(&path, format!("{path}.restored"));
         log::warn!(
-            "wallet {token_p}: restored quarantined checkpoint {path} (cursor {cursor}, DAA {scanned}) — the node serves its cursor again; the rebuild had reached DAA {mine_scanned}", token_p = log_pseudonym(&token));
+            "wallet {token_p}: restored quarantined checkpoint {path_p} (cursor {cursor}, DAA {scanned}) — the node serves its cursor again; the rebuild had reached DAA {mine_scanned}", token_p = log_pseudonym(&token), path_p = log_wallet_path(&path));
         Some(rest)
     }
 
@@ -6775,9 +6775,8 @@ impl AppState {
                             if std::fs::copy(&scan, &quarantine).is_ok() {
                                 let _ = std::fs::remove_file(&scan);
                                 log::warn!(
-                                    "checkpoint cursor {cursor} (DAA {cursor_daa}) is not on the chain of a synced node that holds history there (served {} instead); quarantined as {quarantine} and rebuilding",
-                                    ts.block_hash
-                                );
+                                    "checkpoint cursor {cursor} (DAA {cursor_daa}) is not on the chain of a synced node that holds history there (served {} instead); quarantined as {quarantine_p} and rebuilding",
+                                    ts.block_hash, quarantine_p = log_wallet_path(&quarantine));
                                 abandoned_checkpoint = true;
                                 None
                             } else {
@@ -6840,8 +6839,7 @@ impl AppState {
                             if std::fs::copy(&scan, &quarantine).is_ok() {
                                 let _ = std::fs::remove_file(&scan);
                                 log::warn!(
-                                    "checkpoint cursor {cursor} (DAA {cursor_daa}) is not on the selected chain of a synced node that has passed it ({detail}); quarantined as {quarantine} and rebuilding"
-                                );
+                                    "checkpoint cursor {cursor} (DAA {cursor_daa}) is not on the selected chain of a synced node that has passed it ({detail}); quarantined as {quarantine_p} and rebuilding", quarantine_p = log_wallet_path(&quarantine));
                                 abandoned_checkpoint = true;
                                 None
                             } else {
@@ -6905,7 +6903,7 @@ impl AppState {
             let scan = scan_path(&self.wallet_dir, token);
             let quarantine = format!("{scan}.divergent-{}", now_unix());
             if std::fs::copy(&scan, &quarantine).is_ok() {
-                log::warn!("preserved rejected checkpoint as {quarantine}");
+                log::warn!("preserved rejected checkpoint as {quarantine_p}", quarantine_p = log_wallet_path(&quarantine));
                 prune_retired_copies(&self.wallet_dir, token);
             }
         }
@@ -7503,6 +7501,26 @@ impl ScanStats {
 fn scan_stats_limiter() -> &'static std::sync::Mutex<(std::time::Instant, u32)> {
     static L: std::sync::OnceLock<std::sync::Mutex<(std::time::Instant, u32)>> = std::sync::OnceLock::new();
     L.get_or_init(|| std::sync::Mutex::new((std::time::Instant::now(), 0)))
+}
+
+/// A wallet-directory path or file name for a log line, with the wallet token in its file
+/// name (`<token>.scan`, `<token>.scan.<n>.tmp`, `<token>.scan.divergent-<ts>`, …) replaced
+/// by [`log_pseudonym`]. A file name built from a token is the token: the first build that
+/// pseudonymised the `{token}` captures still printed it through `removed orphaned partial
+/// checkpoint {name}` (seen live 2026-10-22 20:52). The shared chain tree's own file has no
+/// token and is left as is.
+fn log_wallet_path(p: &str) -> String {
+    let (dir, file) = match p.rfind('/') {
+        Some(i) => (&p[..=i], &p[i + 1..]),
+        None => ("", p),
+    };
+    if file.starts_with(CHAIN_TREE_TOKEN) {
+        return p.to_string();
+    }
+    match file.find('.') {
+        Some(i) => format!("{dir}{}{}", log_pseudonym(&file[..i]), &file[i..]),
+        None => format!("{dir}{}", log_pseudonym(file)),
+    }
 }
 
 /// A stable 8-hex pseudonym for a wallet token in logs: SHA-256 under a fixed domain string,
@@ -14061,6 +14079,9 @@ mod sdk_api_tests {
             .chain(std::iter::once(format!("{}!(", "eprintln")))
             .collect();
         const NAMES: [&str; 7] = ["token", "who", "donor", "victim", "tok", "wallet_token", "access_token"];
+        // Wallet-directory paths and file names embed the token (`<token>.scan…`); they must go
+        // through `log_wallet_path`.
+        const PATHS: [&str; 8] = ["path", "name", "quarantine", "scan", "bak", "tmp", "live", "older"];
         let b = src.as_bytes();
         let mut hits = Vec::new();
         for mac in &macros {
@@ -14107,15 +14128,20 @@ mod sdk_api_tests {
                 }
                 let call = &src[start..j.min(src.len())];
                 let mut bad = false;
-                for n in NAMES {
+                for n in NAMES.iter().chain(PATHS.iter()) {
                     if fmt.contains(&format!("{{{n}}}")) || fmt.contains(&format!("{{{n}:")) {
                         bad = true;
                     }
                 }
                 for a in args.iter().skip(1) {
                     let a = a.trim().trim_start_matches('&');
-                    if a.contains("log_pseudonym") {
+                    if a.contains("log_pseudonym") || a.contains("log_wallet_path") {
                         continue;
+                    }
+                    for n in PATHS {
+                        if a == n || a.starts_with(&format!("{n}.")) {
+                            bad = true;
+                        }
                     }
                     // A slice of a token (`&t[..8]`, the old rotation line) is a credential
                     // prefix. Only slices of token-named variables count: a blanket "any `[..`"
@@ -14164,6 +14190,9 @@ mod sdk_api_tests {
             format!("{w}\"now {{}}\", &t[..8]);"),
             format!("{w}\"build for {{who}} in {{:?}}\", t);"),
             format!("{}!(\"write failed for {{token}}: {{err}}\");", "eprintln"),
+            format!("{w}\"removed orphaned partial checkpoint {{name}}\");"),
+            format!("{w}\"preserved rejected checkpoint as {{quarantine}}\");"),
+            format!("{w}\"quarantined {{}}\", path);"),
         ] {
             assert_eq!(raw_token_log_calls("x", &leak).len(), 1, "not caught: {leak}");
         }
@@ -14173,12 +14202,25 @@ mod sdk_api_tests {
             format!("{w}\"token {{}}\", if session_token.is_some() {{ \"yes\" }} else {{ \"no\" }});"),
             format!("{w}\"first {{:?}}\", &unserved[..unserved.len().min(6)]);"),
             format!("{w}\"x {{:?}}\", &list[..2]);"),
+            format!("{w}\"removed {{name_p}}\", name_p = log_wallet_path(&name));"),
         ] {
             assert!(raw_token_log_calls("x", &clean).is_empty(), "false positive: {clean}");
         }
         let mut hits = raw_token_log_calls("lib.rs", include_str!("lib.rs"));
         hits.extend(raw_token_log_calls("selfhost.rs", include_str!("selfhost.rs")));
         assert!(hits.is_empty(), "log calls that format a raw wallet token:\n{}", hits.join("\n"));
+    }
+
+    /// `log_wallet_path` replaces exactly the token stem of a wallet file name and nothing else.
+    #[test]
+    fn log_wallet_path_hides_the_token_in_file_names() {
+        let t = "0123456789abcdef0123456789abcdef";
+        let p = log_pseudonym(t);
+        assert_eq!(log_wallet_path(&format!("/w/{t}.scan.1787.tmp")), format!("/w/{p}.scan.1787.tmp"));
+        assert_eq!(log_wallet_path(&format!("{t}.scan.divergent-17")), format!("{p}.scan.divergent-17"));
+        assert_eq!(log_wallet_path(&format!("/w/{t}")), format!("/w/{p}"));
+        assert_eq!(log_wallet_path("/w/__chain.tree__.scan"), "/w/__chain.tree__.scan");
+        assert!(!log_wallet_path(&format!("/root/firecash/wallets/{t}.scan")).contains(t));
     }
 
     /// The v11 write gate's arithmetic: only the wallet's own range, only what the shared file
