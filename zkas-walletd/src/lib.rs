@@ -2690,6 +2690,27 @@ fn adopt_twin_checkpoint(
     Some((donor, if birthday == 0 { donor_birthday } else { donor_birthday.min(birthday) }))
 }
 
+/// Permission for a registration to rebuild the viewing-key index itself, which it needs only
+/// while the startup pass has not finished: `None` once that pass is merged (registrations keep
+/// the index current, so a key it lacks is new and there is no twin to find), or while another
+/// rebuild is running.
+///
+/// The rebuild is [`build_fvk_index`]: every wallet file read and parsed, Argon2 per encrypted
+/// seed, 231-343 s on the hosted daemon's ~3,700 wallets. It ran for every registration of a key
+/// the index lacked, which is every new key, so `/api/wallet/watch` with a made-up token and a
+/// freshly generated viewing key started a full pass on the blocking pool each time, and the
+/// timeout around it only stopped the caller waiting. A handful of such requests held every
+/// core for minutes.
+fn fvk_index_fallback_slot<'a>(
+    ready: &std::sync::atomic::AtomicBool,
+    slot: &'a tokio::sync::Semaphore,
+) -> Option<tokio::sync::SemaphorePermit<'a>> {
+    if ready.load(std::sync::atomic::Ordering::Acquire) {
+        return None;
+    }
+    slot.try_acquire().ok()
+}
+
 /// One pass over every wallet file in `dir` → viewing key → tokens map. Argon2 per
 /// encrypted seed file, so this belongs on a blocking thread (startup does ~50 ms ×
 /// wallet count there once; registrations keep the map current after that).
@@ -5409,6 +5430,9 @@ struct AppState {
     /// current by registrations; entries are re-verified against the wallet files
     /// before use, so staleness only ever costs the fast path, never correctness.
     fvk_index: Mutex<HashMap<[u8; 96], HashSet<String>>>,
+    /// Set once the startup [`build_fvk_index`] pass is merged into `fvk_index`. Every
+    /// registration indexes its own key from then on, so a key missing from the index is new.
+    fvk_index_ready: std::sync::atomic::AtomicBool,
     /// Note-count ceiling for background consolidation; see [`Config::auto_consolidate`].
     auto_consolidate: Option<usize>,
     /// See [`Config::build_shared_tree`].
@@ -6324,14 +6348,21 @@ impl AppState {
         // The index is built in the background at daemon startup. A second device
         // commonly registers while that scan is still running; do not silently miss
         // the reuse path just because the asynchronous warm-up has not finished.
-        // Build a one-shot fallback index off the async runtime and merge it back.
+        // Build a one-shot fallback index off the async runtime and merge it back -- only
+        // until the warm-up is merged, and one at a time (see `fvk_index_fallback_slot`).
         let mut candidates: Vec<String> =
             self.fvk_index.lock().await.get(fvk).map(|s| s.iter().cloned().collect()).unwrap_or_default();
-        if candidates.is_empty() {
+        static FVK_INDEX_FALLBACK: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+        let fallback = if candidates.is_empty() { fvk_index_fallback_slot(&self.fvk_index_ready, &FVK_INDEX_FALLBACK) } else { None };
+        if let Some(slot) = fallback {
             let (dir, secret) = (self.wallet_dir.clone(), self.wallet_secret.clone());
             if let Ok(Ok(map)) = tokio::time::timeout(
                 std::time::Duration::from_secs(30),
-                tokio::task::spawn_blocking(move || build_fvk_index(&dir, secret.as_deref())),
+                // The slot moves into the pass: the timeout stops the caller waiting, not the pass.
+                tokio::task::spawn_blocking(move || {
+                    let _slot = slot;
+                    build_fvk_index(&dir, secret.as_deref())
+                }),
             )
             .await
             {
@@ -13195,6 +13226,7 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
         addr_index: Mutex::new(HashMap::new()),
         in_pass: std::sync::Mutex::new(HashSet::new()),
         fvk_index: Mutex::new(HashMap::new()),
+        fvk_index_ready: std::sync::atomic::AtomicBool::new(false),
         auto_consolidate: cfg.auto_consolidate,
         build_shared_tree: cfg.build_shared_tree,
         allow_custodial: cfg.allow_custodial,
@@ -13255,6 +13287,7 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
                 for (k, tokens) in map {
                     idx.entry(k).or_default().extend(tokens);
                 }
+                state.fvk_index_ready.store(true, std::sync::atomic::Ordering::Release);
                 log::info!(
                     "viewing-key index ready: {} keys / {wallets} wallets in {:.1?} (twin-checkpoint adoption armed)",
                     idx.len(),
@@ -13638,6 +13671,27 @@ mod operator_route_tests {
         assert!(require_local_operator(at("160.187.211.153:5000")).is_err(), "the public proxy is not an operator");
         assert!(require_local_operator(at("[::ffff:160.187.211.153]:5000")).is_err());
         assert!(require_local_operator(None).is_err(), "no connection info is refused, not trusted");
+    }
+}
+
+#[cfg(test)]
+mod fvk_index_fallback_tests {
+    use super::fvk_index_fallback_slot;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// A registration of a key the index lacks may rebuild the index from disk only while the
+    /// startup pass is unfinished, and never two at once.
+    #[test]
+    fn a_registration_rebuilds_the_index_only_before_it_is_ready_and_one_at_a_time() {
+        let slot = tokio::sync::Semaphore::new(1);
+        let ready = AtomicBool::new(false);
+        let first = fvk_index_fallback_slot(&ready, &slot);
+        assert!(first.is_some(), "before the startup index is merged, a missing key may still have a twin on disk");
+        assert!(fvk_index_fallback_slot(&ready, &slot).is_none(), "a second rebuild never runs beside the first");
+        drop(first);
+        assert!(fvk_index_fallback_slot(&ready, &slot).is_some());
+        ready.store(true, Ordering::Release);
+        assert!(fvk_index_fallback_slot(&ready, &slot).is_none(), "once ready, a missing key is a new key: no directory pass");
     }
 }
 
