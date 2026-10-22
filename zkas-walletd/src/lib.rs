@@ -13581,7 +13581,23 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
 /// when `only` is None) to disk now. Returns (wallets saved, wallets considered,
 /// blocks of progress preserved). Skips wallets in error and wallets whose on-disk
 /// checkpoint already matches memory, so calling it often is cheap.
-async fn flush_checkpoints(state: &Arc<AppState>, only: Option<&str>) -> (usize, usize, usize) {
+/// Least time between two writes of one wallet's checkpoint that a REQUEST may cause.
+///
+/// A checkpoint carries the wallet's whole leaf stream (~570 MB on a synced wallet) and a
+/// wallet that is syncing has unsaved progress after every block, so a caller looping on
+/// `/api/checkpoint` with its own token had the daemon rewrite that file back to back -- the
+/// box's disk bandwidth driven by one client. The app asks as it goes to the background; a
+/// save at most this recent loses a few blocks, which the next open rescans in seconds.
+const REQUEST_FLUSH_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Whether a request may write a wallet's checkpoint now: there is progress to save and the
+/// last write is at least [`REQUEST_FLUSH_MIN_INTERVAL`] old.
+fn request_flush_due(dirty: bool, since_last_write: std::time::Duration) -> bool {
+    dirty && since_last_write >= REQUEST_FLUSH_MIN_INTERVAL
+}
+
+/// `throttle`: a request is asking (see [`request_flush_due`]); shutdown saves everything.
+async fn flush_checkpoints(state: &Arc<AppState>, only: Option<&str>, throttle: bool) -> (usize, usize, usize) {
     let resident: Vec<(String, Wallet)> = {
         state
             .wallets
@@ -13597,6 +13613,9 @@ async fn flush_checkpoints(state: &Arc<AppState>, only: Option<&str>) -> (usize,
     for (token, w) in resident {
         let mut e = w.lock().await;
         if e.error.is_some() || e.saved_scanned == e.scanned {
+            continue;
+        }
+        if throttle && !request_flush_due(true, e.last_checkpoint_at.elapsed()) {
             continue;
         }
         let advanced = e.scanned.saturating_sub(e.saved_scanned);
@@ -13640,7 +13659,7 @@ async fn checkpoint(
     // caller with a junk token rewrote every syncing wallet's checkpoint, each under that
     // wallet's lock, as often as it liked. The caller's own wallet is the only one in scope.
     let token = token_from(&headers, state.allow_default_token)?;
-    let (saved, total, blocks) = flush_checkpoints(&state, Some(&token)).await;
+    let (saved, total, blocks) = flush_checkpoints(&state, Some(&token), true).await;
     if blocks > 0 {
         log::info!("checkpoint on request: saved {saved}/{total} wallet(s), preserving {blocks} block(s) of scan progress");
     }
@@ -13650,7 +13669,7 @@ async fn checkpoint(
 /// Persist every resident wallet's scan progress on the way out.
 async fn flush_checkpoints_on_exit(state: &Arc<AppState>) {
     let started = std::time::Instant::now();
-    let (saved, total, blocks) = flush_checkpoints(state, None).await;
+    let (saved, total, blocks) = flush_checkpoints(state, None, false).await;
     log::info!(
         "shutdown: flushed {saved}/{total} wallet checkpoint(s) in {:.1?}, preserving {blocks} block(s) of scan progress that a restart would otherwise redo",
         started.elapsed()
@@ -13671,6 +13690,22 @@ mod operator_route_tests {
         assert!(require_local_operator(at("160.187.211.153:5000")).is_err(), "the public proxy is not an operator");
         assert!(require_local_operator(at("[::ffff:160.187.211.153]:5000")).is_err());
         assert!(require_local_operator(None).is_err(), "no connection info is refused, not trusted");
+    }
+}
+
+#[cfg(test)]
+mod request_flush_tests {
+    use super::{request_flush_due, REQUEST_FLUSH_MIN_INTERVAL};
+    use std::time::Duration;
+
+    /// A request writes a checkpoint only with progress to save, and not again right after the
+    /// last write however often it asks.
+    #[test]
+    fn a_requested_checkpoint_write_needs_progress_and_a_gap() {
+        assert!(!request_flush_due(false, Duration::from_secs(3_600)), "nothing to save");
+        assert!(!request_flush_due(true, Duration::ZERO), "a loop of requests cannot rewrite the file back to back");
+        assert!(!request_flush_due(true, REQUEST_FLUSH_MIN_INTERVAL - Duration::from_millis(1)));
+        assert!(request_flush_due(true, REQUEST_FLUSH_MIN_INTERVAL));
     }
 }
 
