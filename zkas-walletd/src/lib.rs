@@ -995,9 +995,19 @@ fn sanitize_token(raw: &str) -> Option<String> {
 /// absent), so an unauthenticated caller can't reach any wallet. When
 /// `allow_default` is set the daemon falls back to the "default" wallet for the
 /// trusted single-user localhost case.
+///
+/// A header that is PRESENT but not visible ASCII is invalid, never absent. `to_str()` refuses
+/// any byte >= 0x80, and it used to sit before the match, so `X-Wallet-Token: \xff` read as no
+/// header at all and, with `--allow-default-token`, named the "default" wallet. The hosted
+/// proxy refuses only an EMPTY header, so any internet caller reached that wallet that way:
+/// its status and history, and for a seed wallet `/reveal` and `/send`.
 fn token_from(headers: &HeaderMap, allow_default: bool) -> Result<String, (StatusCode, Json<serde_json::Value>)> {
-    match headers.get("x-wallet-token").and_then(|v| v.to_str().ok()) {
-        Some(raw) => sanitize_token(raw).ok_or_else(|| err(StatusCode::BAD_REQUEST, "invalid X-Wallet-Token")),
+    match headers.get("x-wallet-token") {
+        Some(raw) => raw
+            .to_str()
+            .ok()
+            .and_then(sanitize_token)
+            .ok_or_else(|| err(StatusCode::BAD_REQUEST, "invalid X-Wallet-Token")),
         None if allow_default => Ok("default".to_string()),
         None => Err(err(StatusCode::UNAUTHORIZED, "missing X-Wallet-Token")),
     }
@@ -13697,6 +13707,34 @@ mod operator_route_tests {
         assert!(require_local_operator(at("160.187.211.153:5000")).is_err(), "the public proxy is not an operator");
         assert!(require_local_operator(at("[::ffff:160.187.211.153]:5000")).is_err());
         assert!(require_local_operator(None).is_err(), "no connection info is refused, not trusted");
+    }
+}
+
+#[cfg(test)]
+mod token_header_tests {
+    use super::token_from;
+    use axum::http::{HeaderMap, HeaderValue, StatusCode};
+
+    fn with_token(v: HeaderValue) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("x-wallet-token", v);
+        h
+    }
+
+    /// Only a missing header may fall back to the default wallet. One carrying bytes that are
+    /// not visible ASCII is a malformed token, whatever `allow_default` says.
+    #[test]
+    fn a_non_ascii_token_header_is_refused_not_read_as_the_default_wallet() {
+        for raw in [&b"\xff"[..], b"abc\x80def", b"\xc3\xa9"] {
+            let h = with_token(HeaderValue::from_bytes(raw).expect("obs-text is a legal header value"));
+            for allow_default in [true, false] {
+                let got = token_from(&h, allow_default);
+                assert!(matches!(&got, Err((StatusCode::BAD_REQUEST, _))), "{raw:?} allow_default={allow_default}: {:?}", got.as_ref().ok());
+            }
+        }
+        assert_eq!(token_from(&HeaderMap::new(), true).ok().as_deref(), Some("default"), "an absent header still means default");
+        assert!(token_from(&HeaderMap::new(), false).is_err());
+        assert_eq!(token_from(&with_token(HeaderValue::from_static("abc-DEF_1")), true).ok().as_deref(), Some("abc-DEF_1"));
     }
 }
 
