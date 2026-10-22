@@ -190,6 +190,11 @@ struct Cli {
     /// Disable the resident byte budget entirely.
     #[arg(long)]
     no_resident_budget: bool,
+    /// Write checkpoints that reference the shared chain tree's leaf stream (format v11)
+    /// instead of embedding a per-wallet copy. Off by default: a build that predates v11
+    /// cannot read those checkpoints, so this is a one-way door for every wallet it rewrites.
+    #[arg(long)]
+    shared_leaf_store: bool,
     /// Defer optional subtree-index builds below this MemAvailable value.
     #[arg(long, value_name = "MIB")]
     subtree_free_floor_mb: Option<u64>,
@@ -317,6 +322,7 @@ async fn run(cli: Cli) {
     if cli.no_resident_budget {
         resources.resident_budget_mb = None;
     }
+    resources.shared_leaf_store = cli.shared_leaf_store;
     if let Some(v) = cli.subtree_free_floor_mb {
         resources.subtree_free_floor_mb = v;
     }

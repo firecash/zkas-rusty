@@ -3375,14 +3375,41 @@ impl WalletDb {
     }
 
     pub fn to_checkpoint(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(64 + self.leaves.len() * 32 + self.notes.len() * 123);
-        out.push(CHECKPOINT_VERSION);
+        self.encode_checkpoint(0)
+    }
+
+    /// [`Self::to_checkpoint`], referencing the leaves at absolute positions
+    /// `[base_size, shared_upto)` instead of carrying them — see [`CHECKPOINT_VERSION_V11`].
+    ///
+    /// Only for a caller that can guarantee a [`LeafSource`] serving that range will exist
+    /// when the blob is read back; the blob cannot be restored without one. If the range is
+    /// empty (`shared_upto <= base_size`) this writes exactly the v10 blob `to_checkpoint`
+    /// writes, so a wallet the shared stream cannot serve keeps the full form.
+    pub fn to_checkpoint_sharing_leaves(&self, shared_upto: u64) -> Vec<u8> {
+        self.encode_checkpoint(shared_upto)
+    }
+
+    /// Absolute leaf positions this wallet holds, `[base_size, base_size + leaves.len())`.
+    pub fn leaf_span(&self) -> (u64, u64) {
+        (self.base_size, self.base_size + self.leaves.len() as u64)
+    }
+
+    fn encode_checkpoint(&self, shared_upto: u64) -> Vec<u8> {
+        let n_shared = usize::try_from(shared_upto.saturating_sub(self.base_size)).unwrap_or(usize::MAX).min(self.leaves.len());
+        let inline = &self.leaves[n_shared..];
+        let mut out = Vec::with_capacity(64 + inline.len() * 32 + self.notes.len() * 123);
+        out.push(if n_shared > 0 { CHECKPOINT_VERSION_V11 } else { CHECKPOINT_VERSION });
         // Fast-sync base: absolute base size, then the base frontier (empty ⇒ tag 0).
         out.extend_from_slice(&self.base_size.to_le_bytes());
         write_frontier(&mut out, &self.base_frontier);
         out.extend_from_slice(&self.size.to_le_bytes());
         out.extend_from_slice(&(self.leaves.len() as u64).to_le_bytes());
-        for leaf in &self.leaves {
+        if n_shared > 0 {
+            // v11 only: how many of those leaves (from `base_size`) are referenced. The rest
+            // follow inline, exactly as in v10, and every later section is unchanged.
+            out.extend_from_slice(&(n_shared as u64).to_le_bytes());
+        }
+        for leaf in inline {
             // Canonical bytes, exactly what was written before the stream was held decoded.
             out.extend_from_slice(&leaf.to_bytes());
         }
@@ -3542,7 +3569,7 @@ impl WalletDb {
     /// mirror `tree` is reconstructed from the base frontier + `leaves` (O(N) hashing,
     /// no network and no trial-decryption — far cheaper than re-fetching the chain).
     pub fn from_checkpoint(seed: [u8; 32], bytes: &[u8]) -> Option<Self> {
-        Self::restore(Self::from_seed(seed)?, bytes, None)
+        Self::restore(Self::from_seed(seed)?, bytes, None, None)
     }
 
     /// [`Self::from_checkpoint`] with the tip tree supplied by the caller.
@@ -3558,11 +3585,11 @@ impl WalletDb {
     /// checkpoint claims; on any mismatch we fall back to rebuilding from the stream, so
     /// a wrong or stale frontier can never silently install a wrong tree.
     pub fn from_checkpoint_with_tip(seed: [u8; 32], bytes: &[u8], tip: &FrontierState) -> Option<Self> {
-        Self::restore(Self::from_seed(seed)?, bytes, Some(tip))
+        Self::restore(Self::from_seed(seed)?, bytes, Some(tip), None)
     }
 
     pub fn from_checkpoint_fvk_with_tip(fvk_bytes: &[u8; 96], bytes: &[u8], tip: &FrontierState) -> Option<Self> {
-        Self::restore(Self::from_fvk(fvk_bytes)?, bytes, Some(tip))
+        Self::restore(Self::from_fvk(fvk_bytes)?, bytes, Some(tip), None)
     }
 
     /// [`Self::from_checkpoint`] for a **watch-only** wallet: the checkpoint blob holds
@@ -3570,16 +3597,32 @@ impl WalletDb {
     /// viewing key. This is what lets a daemon resume syncing a non-custodial wallet
     /// across restarts without ever having seen the seed.
     pub fn from_checkpoint_fvk(fvk_bytes: &[u8; 96], bytes: &[u8]) -> Option<Self> {
-        Self::restore(Self::from_fvk(fvk_bytes)?, bytes, None)
+        Self::restore(Self::from_fvk(fvk_bytes)?, bytes, None, None)
     }
 
-    fn restore(mut db: Self, bytes: &[u8], tip: Option<&FrontierState>) -> Option<Self> {
+    /// [`Self::from_checkpoint`] / [`Self::from_checkpoint_with_tip`] that can also read a
+    /// v11 blob, whose referenced leaves `src` supplies. Older blobs ignore `src`.
+    pub fn from_checkpoint_shared(seed: [u8; 32], bytes: &[u8], tip: Option<&FrontierState>, src: LeafSource<'_>) -> Option<Self> {
+        Self::restore(Self::from_seed(seed)?, bytes, tip, Some(src))
+    }
+
+    /// The watch-only form of [`Self::from_checkpoint_shared`] — what the hosted daemon uses.
+    pub fn from_checkpoint_fvk_shared(
+        fvk_bytes: &[u8; 96],
+        bytes: &[u8],
+        tip: Option<&FrontierState>,
+        src: LeafSource<'_>,
+    ) -> Option<Self> {
+        Self::restore(Self::from_fvk(fvk_bytes)?, bytes, tip, Some(src))
+    }
+
+    fn restore(mut db: Self, bytes: &[u8], tip: Option<&FrontierState>, src: Option<LeafSource<'_>>) -> Option<Self> {
         let mut r = Cursor { buf: bytes, pos: 0 };
         // v3 blobs are still accepted so that shipping v4 does not force every live
         // wallet into a full rescan; they simply pay the old O(N) tree rebuild once and
         // are rewritten as v4 by the next checkpoint.
         let version = r.u8()?;
-        if !(CHECKPOINT_VERSION_V3..=CHECKPOINT_VERSION).contains(&version) {
+        if !(CHECKPOINT_VERSION_V3..=CHECKPOINT_VERSION_V11).contains(&version) {
             return None;
         }
         let has_tip_frontier = version >= CHECKPOINT_VERSION_V4;
@@ -3594,12 +3637,65 @@ impl WalletDb {
 
         let size = r.u64()?;
         let n_leaves = r.u64()? as usize;
-        // A hint only, clamped to what the rest of the blob can hold: the count is read from a
-        // `.scan` file, and a corrupt or truncated one used to ask for up to 2^64 leaves here --
-        // a capacity overflow panic or an allocation abort, which takes the whole daemon down
-        // instead of failing this one restore on its first short read below.
-        db.leaves.reserve(n_leaves.min(r.remaining() / 32));
-        for _ in 0..n_leaves {
+        // v11: the first `n_shared` leaves come from `src`, the rest inline as before.
+        let n_shared = if version >= CHECKPOINT_VERSION_V11 {
+            let n_shared = r.u64()? as usize;
+            // An encoder never writes v11 for an empty shared range, and never shares more
+            // leaves than it holds; either is a corrupt blob.
+            if n_shared == 0 || n_shared > n_leaves {
+                return None;
+            }
+            // No source ⇒ REFUSE. Restoring with a missing stream would leave notes this
+            // wallet cannot witness, which reads to its owner as lost funds.
+            let src = src?;
+            let inline = n_leaves - n_shared;
+            // The inline tail is bounded by the blob itself, before anything is allocated.
+            if inline > r.remaining() / 32 {
+                return None;
+            }
+            let mut got = 0usize;
+            let mut bad = false;
+            let mut sink = |chunk: &[u8]| -> Option<()> {
+                if chunk.len() % 32 != 0 || got + chunk.len() / 32 > n_shared {
+                    bad = true;
+                    return None;
+                }
+                if got == 0 {
+                    // Reserve exactly once, on the first chunk: by then the source has checked
+                    // `[base_size, base_size + n_shared)` against its own stream, so the count is
+                    // real, and the tail was bounded above. Exact, because a doubling `push`
+                    // leaves up to 2x the leaf stream in capacity (seen live as 918 MiB
+                    // mappings holding 455 MiB of leaves).
+                    db.leaves.reserve_exact(n_leaves);
+                }
+                for c in chunk.chunks_exact(32) {
+                    let mut a = [0u8; 32];
+                    a.copy_from_slice(c);
+                    // Canonical check, same as the inline path below: refuse rather than
+                    // install a leaf `to_checkpoint` could never have written.
+                    let Some(leaf) = Option::<MerkleHashOrchard>::from(MerkleHashOrchard::from_bytes(&a)) else {
+                        bad = true;
+                        return None;
+                    };
+                    db.leaves.push(leaf);
+                }
+                got += chunk.len() / 32;
+                Some(())
+            };
+            src(base_size, n_shared, &mut sink)?;
+            if bad || got != n_shared {
+                return None;
+            }
+            n_shared
+        } else {
+            // A hint only, clamped to what the rest of the blob can hold: the count is read from a
+            // `.scan` file, and a corrupt or truncated one used to ask for up to 2^64 leaves here --
+            // a capacity overflow panic or an allocation abort, which takes the whole daemon down
+            // instead of failing this one restore on its first short read below.
+            db.leaves.reserve(n_leaves.min(r.remaining() / 32));
+            0
+        };
+        for _ in n_shared..n_leaves {
             // A field-element range check (`pallas::Base::from_repr`), tens of ns per leaf --
             // not a point decompression. A non-canonical leaf cannot have been written by
             // `to_checkpoint` (it stores `to_bytes()` of an element), so it means a corrupt
@@ -4067,6 +4163,35 @@ const RECEIPT_VERSION: u8 = 1;
 const RECEIPT_MAX_NOTES: usize = 4096;
 
 const CHECKPOINT_VERSION: u8 = 10;
+/// v11 (follow-up F5, `--shared-leaf-store`, OFF by default): the blob REFERENCES a prefix
+/// of its leaf stream instead of carrying it.
+///
+/// Layout: identical to v10 except that the leaf count is followed by `n_shared: u64`, and
+/// only the leaves after the first `n_shared` follow inline. The referenced ones are absolute
+/// positions `[base_size, base_size + n_shared)`, which the reader must be given a
+/// [`LeafSource`] for — on the hosted daemon, the shared chain tree's own checkpoint file.
+/// Every later section is byte-identical to v10 and keeps its own `>= V5..V10` gate.
+///
+/// This is not the ckpt-wip draft of v11 (that one carried only the count and referenced the
+/// whole stream). The difference is the inline TAIL: the writer references only leaves the
+/// shared file held at write time minus a reorg margin, so a shared tree that later rolls
+/// back a little (a reorg) or has not yet re-persisted its newest leaves can never be asked
+/// for a position it does not hold, or hold differently. The tail costs a few MB per blob;
+/// the referenced prefix is the ~480 MB that made every hosted `.scan` a chain copy.
+///
+/// ONE-WAY per wallet: a build that predates v11 refuses the blob (the version gate above),
+/// so after a rollback to such a build every v11 wallet is rebuilt from its birthday. A v11
+/// blob read with no source, or a source that cannot serve the range, is REFUSED rather than
+/// restored with a hole in its stream.
+const CHECKPOINT_VERSION_V11: u8 = 11;
+
+/// Supplies the leaves a v11 checkpoint references (see [`CHECKPOINT_VERSION_V11`]).
+///
+/// Called once as `src(lo, n, sink)`: it hands `sink` the canonical 32-byte leaves at absolute
+/// positions `[lo, lo + n)`, in order, in chunks of whole leaves, and returns `None` if it
+/// cannot serve the whole range (or `sink` returned `None`). Chunked so a 15 M-leaf range is
+/// never held as raw bytes and decoded leaves at the same time (2 × 480 MB on 142).
+pub type LeafSource<'a> = &'a dyn Fn(u64, usize, &mut dyn FnMut(&[u8]) -> Option<()>) -> Option<()>;
 /// v10 adds each history row's per-output breakdown ([`Credit`]). Gate it on THIS
 /// constant, never on `CHECKPOINT_VERSION` — see the v8 note below for what that
 /// mistake costs. The credits are written *inside* each row, so a v9 reader cannot
@@ -4215,7 +4340,7 @@ mod tests {
             blob.extend_from_slice(&0u64.to_le_bytes()); // size
             blob.extend_from_slice(&declared.to_le_bytes()); // leaf count, backed by nothing
             blob.extend_from_slice(&[0u8; 64]); // two leaves' worth, not 2^40
-            assert!(WalletDb::restore(WalletDb::from_seed([3u8; 32]).unwrap(), &blob, None).is_none(), "declared {declared}");
+            assert!(WalletDb::restore(WalletDb::from_seed([3u8; 32]).unwrap(), &blob, None, None).is_none(), "declared {declared}");
         }
     }
 
@@ -4499,6 +4624,74 @@ mod tests {
     /// which is the one thing it exists to keep. Live, it did exactly that within
     /// minutes (`base_size == matured`), leaving it able to witness nothing for anyone
     /// and unable to ever install a subtree cache.
+    /// F5 / v11: a blob that references a prefix of its leaf stream restores to the SAME
+    /// wallet, writes v10 when nothing is shared, and is REFUSED whenever the referenced
+    /// leaves cannot be supplied exactly — never restored with a hole in its stream.
+    #[test]
+    fn v11_checkpoint_references_a_prefix_and_restores_identically() {
+        let seed = [7u8; 32];
+        let mut db = WalletDb::from_seed(seed).expect("fixed seed is valid");
+        // Content is irrelevant, only that both encodings agree; bytes <= 0x3f are canonical.
+        let raw: Vec<[u8; 32]> = (0..64u8).map(|i| [i; 32]).collect();
+        for b in &raw {
+            db.leaves.push(Option::<MerkleHashOrchard>::from(MerkleHashOrchard::from_bytes(b)).unwrap());
+        }
+        db.size = 64;
+        assert_eq!(db.leaf_span(), (0, 64));
+
+        let full = db.to_checkpoint();
+        assert_eq!(full[0], CHECKPOINT_VERSION, "the full form is still v10");
+        assert_eq!(db.to_checkpoint_sharing_leaves(0), full, "nothing shared: byte-identical v10");
+        let thin = db.to_checkpoint_sharing_leaves(40);
+        assert_eq!(thin[0], CHECKPOINT_VERSION_V11);
+        assert_eq!(full.len() - thin.len(), 40 * 32 - 8, "40 leaves left out, one u64 count added");
+
+        // A source over the same stream, delivering in odd-sized chunks.
+        let asked = std::cell::Cell::new((u64::MAX, 0usize));
+        let serve = |lo: u64, n: usize, sink: &mut dyn FnMut(&[u8]) -> Option<()>| -> Option<()> {
+            asked.set((lo, n));
+            let want = raw.get(lo as usize..lo as usize + n)?;
+            for chunk in want.chunks(7) {
+                let bytes: Vec<u8> = chunk.iter().flatten().copied().collect();
+                sink(&bytes)?;
+            }
+            Some(())
+        };
+        let from_full = WalletDb::from_checkpoint(seed, &full).expect("v10 restores");
+        let from_thin = WalletDb::from_checkpoint_shared(seed, &thin, None, &serve).expect("v11 restores");
+        assert_eq!(asked.get(), (0, 40), "the reader asks for exactly its referenced prefix");
+        assert_eq!(from_thin.to_checkpoint(), from_full.to_checkpoint(), "indistinguishable from a full restore");
+        assert_eq!(from_thin.leaves.capacity(), 64, "reserved exactly, not by doubling");
+        // A v10 blob ignores the source.
+        assert!(WalletDb::from_checkpoint_shared(seed, &full, None, &serve).is_some());
+        // Everything shared (inline tail empty) works too.
+        let all = db.to_checkpoint_sharing_leaves(1_000);
+        assert_eq!(full.len() - all.len(), 64 * 32 - 8);
+        assert_eq!(WalletDb::from_checkpoint_shared(seed, &all, None, &serve).unwrap().to_checkpoint(), full);
+
+        // Refusals.
+        assert!(WalletDb::from_checkpoint(seed, &thin).is_none(), "no source: refused");
+        let absent = |_: u64, _: usize, _: &mut dyn FnMut(&[u8]) -> Option<()>| -> Option<()> { None };
+        assert!(WalletDb::from_checkpoint_shared(seed, &thin, None, &absent).is_none(), "source cannot serve: refused");
+        let short = |lo: u64, n: usize, sink: &mut dyn FnMut(&[u8]) -> Option<()>| -> Option<()> {
+            let b: Vec<u8> = raw[lo as usize..lo as usize + n - 1].iter().flatten().copied().collect();
+            sink(&b)
+        };
+        assert!(WalletDb::from_checkpoint_shared(seed, &thin, None, &short).is_none(), "one leaf short: refused");
+        let torn = |_: u64, _: usize, sink: &mut dyn FnMut(&[u8]) -> Option<()>| -> Option<()> { sink(&[0u8; 33]) };
+        assert!(WalletDb::from_checkpoint_shared(seed, &thin, None, &torn).is_none(), "torn chunk: refused");
+        let noncanon = |_: u64, n: usize, sink: &mut dyn FnMut(&[u8]) -> Option<()>| -> Option<()> { sink(&vec![0xffu8; n * 32]) };
+        assert!(WalletDb::from_checkpoint_shared(seed, &thin, None, &noncanon).is_none(), "non-canonical leaf: refused");
+        // A corrupt n_shared (0, or above the leaf count) is refused before the source is asked.
+        let pos = 1 + 8 + 1 + 8 + 8; // version, base_size, empty base frontier, size, n_leaves
+        let mut zero = thin.clone();
+        zero[pos..pos + 8].copy_from_slice(&0u64.to_le_bytes());
+        assert!(WalletDb::from_checkpoint_shared(seed, &zero, None, &serve).is_none());
+        let mut over = thin.clone();
+        over[pos..pos + 8].copy_from_slice(&65u64.to_le_bytes());
+        assert!(WalletDb::from_checkpoint_shared(seed, &over, None, &serve).is_none());
+    }
+
     #[test]
     fn leaves_only_tree_never_compacts_the_stream_away() {
         let mut shared = WalletDb::from_seed([21u8; 32]).unwrap();

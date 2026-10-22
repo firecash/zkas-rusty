@@ -446,6 +446,11 @@ pub struct ResourceLimits {
     /// Same enforcement as `hard_max_resident_wallets`. `Some(0)` = auto: 70% of this
     /// process's cgroup `memory.high` (or `memory.max`) when finite, else off. `None` = off.
     pub resident_budget_mb: Option<u64>,
+    /// `--shared-leaf-store` (F5): write v11 checkpoints that reference the shared chain
+    /// tree's leaf stream instead of carrying a ~480 MB copy each. OFF by default: a v11
+    /// blob cannot be read by a build that predates it, so enabling it is a one-way door for
+    /// every wallet it rewrites. See `CHECKPOINT_VERSION_V11` and [`shared_leaf_upto`].
+    pub shared_leaf_store: bool,
     /// Keep the N most recently active wallets resident and fully prepared, exempt from
     /// BOTH eviction rules. 0 = off (the old behaviour exactly).
     ///
@@ -525,6 +530,7 @@ impl Default for ResourceLimits {
             max_resident_wallets,
             hard_max_resident_wallets: 0,
             resident_budget_mb: Some(0),
+            shared_leaf_store: false,
             warm_always: 0,
             warm_budget_pct: 60,
             subtree_free_floor_mb: 1_200,
@@ -813,6 +819,170 @@ const CHAIN_TREE_TOKEN: &str = "__chain.tree__";
 /// never spends. Fixed so a restart reloads the same checkpoint.
 const CHAIN_TREE_SEED: [u8; 32] = *b"zkas-shared-chain-tree-v1-notele";
 
+/// `--shared-leaf-store` (follow-up F5): write v11 checkpoints that reference the shared
+/// chain tree's leaf stream. OFF by default; a one-way door per wallet (see
+/// `CHECKPOINT_VERSION_V11` in walletdb.rs). Process-wide rather than threaded through
+/// `ResourceLimits`, because the writers include the offline `--graft` tool and the
+/// shutdown flush, which never see an `AppState`. Set once, by `serve`.
+static SHARED_LEAF_STORE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Leaves a v11 blob keeps INLINE below the end of what the shared file held when it was
+/// written: 262,144 leaves = 8 MiB per blob, ~1.9 days at the measured ~140 K leaves/day.
+///
+/// Wallets and the chain tree append only below `sink_blue - SYNC_TIP_MARGIN`, so a reorg
+/// rarely touches persisted leaves at all; this margin covers the rarer cases where the
+/// shared FILE is behind or briefly different from what a wallet holds — the chain tree
+/// rolling back for a reorg past the margin, or a crash before its next checkpoint — so a
+/// wallet can never reference a position the file does not hold, or holds differently.
+const SHARED_LEAF_TAIL_MARGIN: u64 = 1 << 18;
+
+/// Where the shared chain tree's leaf stream sits in its checkpoint file:
+/// `(base, n_leaves, file offset of leaf base)`. Reads only the head of the file (the scan
+/// header, then the db blob's version, base size, base frontier, size and leaf count), and
+/// checks every bound against the declared blob length and the real file length. `None` if
+/// the file is absent, malformed, or not a full-form (≤ v10) blob — the shared tree never
+/// writes v11, and a stream it does not carry cannot be served from it.
+fn shared_tree_extent(dir: &str) -> Option<(u64, u64, u64)> {
+    shared_tree_extent_of(&mut std::fs::File::open(scan_path(dir, CHAIN_TREE_TOKEN)).ok()?)
+}
+
+/// [`shared_tree_extent`] on an open handle, read from its start.
+fn shared_tree_extent_of(f: &mut std::fs::File) -> Option<(u64, u64, u64)> {
+    use std::io::{Read, Seek, SeekFrom};
+    f.seek(SeekFrom::Start(0)).ok()?;
+    let file_len = f.metadata().ok()?.len();
+    // Header 77 + db_len 8 + blob head: version 1, base 8, frontier ≤ 1+32+8+32·32, size 8,
+    // count 8. 2 KiB covers it with room to spare.
+    let mut head = Vec::with_capacity(2048);
+    f.by_ref().take(2048).read_to_end(&mut head).ok()?;
+    if head.len() < SCAN_HEADER_LEN + 8 || &head[0..4] != SCAN_MAGIC || !matches!(head[4], SCAN_VERSION | SCAN_VERSION_PREV) {
+        return None;
+    }
+    let u64_at = |p: usize| -> Option<u64> { Some(u64::from_le_bytes(head.get(p..p + 8)?.try_into().ok()?)) };
+    let db_len = u64_at(SCAN_HEADER_LEN)?;
+    let blob0 = SCAN_HEADER_LEN + 8;
+    let version = *head.get(blob0)?;
+    if !(3..=10).contains(&version) {
+        return None;
+    }
+    let mut p = blob0 + 1;
+    let base = u64_at(p)?;
+    p += 8;
+    match *head.get(p)? {
+        0 => p += 1,
+        1 => {
+            p += 1 + 32;
+            let ommers = u64_at(p)?;
+            if ommers > 32 {
+                return None;
+            }
+            p += 8 + ommers as usize * 32;
+        }
+        _ => return None,
+    }
+    p += 8; // size
+    let n_leaves = u64_at(p)?;
+    p += 8;
+    let data = p as u64;
+    let end = data.checked_add(n_leaves.checked_mul(32)?)?;
+    if end > (blob0 as u64).checked_add(db_len)? || end > file_len {
+        return None;
+    }
+    Some((base, n_leaves, data))
+}
+
+/// The [`kaspa_shielded_core::walletdb::LeafSource`] for a v11 blob on this daemon: leaves
+/// `[lo, lo + n)` read from the shared chain tree's checkpoint file and handed to `sink` in
+/// 2 MiB chunks.
+///
+/// Reads the FILE, never the in-memory tree: that tree is behind the mutex its own sync pass
+/// holds, and up to `--load-wallets` restores run at once. Seeks to the range rather than
+/// reading the file (~480 MB of leaves on 142) per load. The file is replaced only by an
+/// atomic rename, so the open handle sees one consistent version throughout.
+fn shared_tree_leaves(dir: &str, lo: u64, n: usize, sink: &mut dyn FnMut(&[u8]) -> Option<()>) -> Option<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    // One handle for both the extent and the read, so a rename in between cannot pair one
+    // file's offsets with another file's bytes.
+    let mut f = std::fs::File::open(scan_path(dir, CHAIN_TREE_TOKEN)).ok()?;
+    let (base, n_leaves, data) = shared_tree_extent_of(&mut f)?;
+    if lo < base || (lo - base).checked_add(n as u64)? > n_leaves {
+        return None;
+    }
+    f.seek(SeekFrom::Start(data + (lo - base) * 32)).ok()?;
+    const CHUNK_LEAVES: usize = 1 << 16;
+    let mut buf = vec![0u8; CHUNK_LEAVES.min(n.max(1)) * 32];
+    let mut left = n;
+    while left > 0 {
+        let k = left.min(CHUNK_LEAVES);
+        f.read_exact(&mut buf[..k * 32]).ok()?;
+        sink(&buf[..k * 32])?;
+        left -= k;
+    }
+    Some(())
+}
+
+/// The absolute position up to which a checkpoint of `db` (owned by `token`) may reference
+/// the shared leaf stream instead of carrying it, or 0 for "carry everything" (v10).
+///
+/// 0 unless `--shared-leaf-store` is on, never for the chain tree itself (it is the stream),
+/// and 0 when the shared file does not reach below the wallet's own base. Otherwise the
+/// wallet's range clipped to what the file held at this moment minus
+/// [`SHARED_LEAF_TAIL_MARGIN`].
+fn shared_leaf_upto(dir: &str, token: &str, db: &WalletDb) -> u64 {
+    if !SHARED_LEAF_STORE.load(std::sync::atomic::Ordering::Relaxed) || token == CHAIN_TREE_TOKEN {
+        return 0;
+    }
+    let Some((base, n_leaves, _)) = shared_tree_extent(dir) else { return 0 };
+    shared_leaf_upto_for(db.leaf_span(), base, n_leaves)
+}
+
+/// What a wallet's checkpoint will cost in RAM once loaded, estimated from its file: the
+/// file size, plus — for a v11 file — the referenced leaves it does not carry (32 B each,
+/// held decoded once loaded). Without the second term a v11 wallet of ~8 MB on disk would
+/// be admitted against the resident budget as 8 MB while bringing ~480 MB of leaves.
+fn scan_resident_estimate(dir: &str, token: &str) -> Option<u64> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(scan_path(dir, token)).ok()?;
+    let len = f.metadata().ok()?.len();
+    let mut head = [0u8; 2048];
+    let mut got = 0;
+    while got < head.len() {
+        match f.read(&mut head[got..]) {
+            Ok(0) => break,
+            Ok(k) => got += k,
+            Err(_) => return Some(len),
+        }
+    }
+    Some(len + v11_shared_leaves(&head[..got]).unwrap_or(0).saturating_mul(32))
+}
+
+/// `n_shared` of a scan file whose head is `head`, if its db blob is v11.
+fn v11_shared_leaves(head: &[u8]) -> Option<u64> {
+    let blob0 = SCAN_HEADER_LEN + 8;
+    if head.len() < blob0 + 1 || &head[0..4] != SCAN_MAGIC || *head.get(blob0)? != 11 {
+        return None;
+    }
+    let u64_at = |p: usize| -> Option<u64> { Some(u64::from_le_bytes(head.get(p..p + 8)?.try_into().ok()?)) };
+    let mut p = blob0 + 1 + 8; // version, base_size
+    match *head.get(p)? {
+        0 => p += 1,
+        1 => p += 1 + 32 + 8 + (u64_at(p + 1 + 32)?.min(32) as usize) * 32,
+        _ => return None,
+    }
+    p += 16; // size, leaf count
+    u64_at(p)
+}
+
+/// Pure arithmetic of [`shared_leaf_upto`], for tests.
+fn shared_leaf_upto_for((lo, hi): (u64, u64), shared_base: u64, shared_len: u64) -> u64 {
+    if lo < shared_base {
+        return 0;
+    }
+    let safe = shared_base.saturating_add(shared_len).saturating_sub(SHARED_LEAF_TAIL_MARGIN);
+    let upto = hi.min(safe);
+    if upto <= lo { 0 } else { upto }
+}
+
 fn sanitize_token(raw: &str) -> Option<String> {
     let t = raw.trim();
     if t.is_empty() || t.len() > 128 {
@@ -936,6 +1106,20 @@ impl WalletKey {
         match self {
             WalletKey::Seed(s) => WalletDb::from_checkpoint_with_tip(*s, bytes, tip),
             WalletKey::Fvk(f) => WalletDb::from_checkpoint_fvk_with_tip(f, bytes, tip),
+        }
+    }
+
+    /// As [`Self::db_from_checkpoint`] / [`Self::db_from_checkpoint_with_tip`], able to read
+    /// a v11 blob whose referenced leaves `src` supplies (see [`shared_tree_leaves`]).
+    fn db_from_checkpoint_src(
+        &self,
+        bytes: &[u8],
+        tip: Option<&kaspa_shielded_core::tree::FrontierState>,
+        src: kaspa_shielded_core::walletdb::LeafSource<'_>,
+    ) -> Option<WalletDb> {
+        match self {
+            WalletKey::Seed(s) => WalletDb::from_checkpoint_shared(*s, bytes, tip, src),
+            WalletKey::Fvk(f) => WalletDb::from_checkpoint_fvk_shared(f, bytes, tip, src),
         }
     }
 
@@ -1473,9 +1657,18 @@ const MEM_AVAILABLE_TTL: std::time::Duration = std::time::Duration::from_secs(15
 /// Cached `MemAvailable`, in MB, with the instant it was read.
 static MEM_AVAILABLE_MB: std::sync::Mutex<Option<(u64, std::time::Instant)>> = std::sync::Mutex::new(None);
 
-/// Free memory in MB as the kernel reports it (`MemAvailable`), cached for
-/// [`MEM_AVAILABLE_TTL`]. `None` on any platform or kernel that doesn't publish it —
-/// callers then skip the memory gate rather than refuse to work.
+/// Free memory in MB, cached for [`MEM_AVAILABLE_TTL`]: the host's `MemAvailable`,
+/// clamped by the headroom left in this process's own cgroup (see
+/// [`cgroup_headroom_bytes_at`]). `None` on any platform or kernel that doesn't publish
+/// `MemAvailable` — callers then skip the memory gate rather than refuse to work.
+///
+/// The clamp (follow-up F4, 2026-10-22). `/proc/meminfo` describes the BOX. The hosted
+/// daemon runs in a systemd-run scope that throttles it at `memory.high`, and every gate
+/// fed by this figure (subtree builds, the maintenance pull, proof and sync fan-out) was
+/// deciding against memory the process could not have. Measured on 142 at 17:04 UTC: host
+/// MemAvailable 33.6 GB against scope headroom 31.2 GB, and on 2026-10-19 29.8 GB against
+/// 20.2 GB. Outside a cgroup ceiling (desktop, phone, an unlimited scope) the host figure
+/// stands unchanged.
 fn mem_available_mb() -> Option<u64> {
     let mut slot = MEM_AVAILABLE_MB.lock().ok()?;
     if let Some((mb, at)) = *slot {
@@ -1489,9 +1682,71 @@ fn mem_available_mb() -> Option<u64> {
         .find_map(|l| l.strip_prefix("MemAvailable:"))
         .and_then(|v| v.split_whitespace().next())
         .and_then(|v| v.parse().ok())?;
-    let mb = kb / 1024;
+    let host_mb = kb / 1024;
+    let mb = match own_cgroup_dir().and_then(|d| cgroup_headroom_bytes_at(&d)) {
+        Some(cg) => host_mb.min(cg >> 20),
+        None => host_mb,
+    };
     *slot = Some((mb, std::time::Instant::now()));
     Some(mb)
+}
+
+/// Headroom left under the cgroup at `base`, in bytes: the binding ceiling
+/// ([`cgroup_ceiling_bytes_at`], the lower of `memory.high` and `memory.max`) minus the
+/// cgroup's WORKING SET, `memory.current - inactive_file`. `None` when there is no finite
+/// ceiling or `memory.current` cannot be read; never an underflow (over the limit is 0).
+///
+/// Why not `memory.current` alone, as the ckpt-wip version of this fix did: `memory.current`
+/// counts the page cache the scope's own checkpoint writes leave behind, and that cache is
+/// the first thing reclaim takes when the scope nears `memory.high`, with no stall. Measured
+/// on the live scope at 17:04 UTC: memory.current 50.4 GB, anon 21.3 GB, inactive_file
+/// 27.9 GB against a 50 GiB high. `high - current` read 3.25 GB of "headroom", under the
+/// 12,000 MB build floor, so it would have deferred every subtree build on a daemon with
+/// 31.2 GB actually free;
+/// `high - (current - inactive_file)` reads 31.2 GB. Active file pages stay counted, so the
+/// figure errs low, which is the safe side for a gate.
+fn cgroup_headroom_bytes_at(base: &std::path::Path) -> Option<u64> {
+    let ceiling = cgroup_ceiling_bytes_at(base)?;
+    let current = cgroup_knob_bytes(base, "memory.current")?;
+    let inactive_file = std::fs::read_to_string(base.join("memory.stat"))
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find_map(|l| l.strip_prefix("inactive_file "))
+                .and_then(|v| v.trim().parse::<u64>().ok())
+        })
+        .unwrap_or(0);
+    let working = current.saturating_sub(inactive_file);
+    Some(ceiling.saturating_sub(working))
+}
+
+/// The hosted subtree-build floor, capped at a quarter of this process's cgroup ceiling.
+///
+/// With [`mem_available_mb`] clamped to the scope, `--subtree-free-floor-mb` now means
+/// "this much must be free INSIDE walletd's own scope". The resident byte budget
+/// ([`resident_budget_bytes`]) lets resident wallets fill 70% of that same ceiling, so a
+/// floor above the remaining 30% (less transient work) could never be met once the budget is
+/// full: every optional build would defer forever and every fold would move onto the send
+/// path, the outcome 05-rebase.md §3 warned about. 142 runs `--subtree-free-floor-mb 12000`
+/// against a scope that starts at 44 GiB high (12000 MB = 27% of it) and is raised to
+/// 50 GiB by the watchdog floor (23%). Capping at 25% keeps the configured value wherever it
+/// is reachable (50 GiB → 12,800 MB cap, 12000 stands) and lowers it only where it would
+/// contradict the budget (44 GiB → 11,264 MB). No cgroup ceiling: the configured floor.
+fn cap_floor_to_scope(floor_mb: u64, scope_ceiling_mb: Option<u64>) -> u64 {
+    match scope_ceiling_mb {
+        Some(c) => floor_mb.min(c / 4),
+        None => floor_mb,
+    }
+}
+
+/// [`subtree_build_floor_mb`] with the hosted floor capped by [`cap_floor_to_scope`]
+/// against the live cgroup ceiling (re-read each call: the watchdog moves it at runtime).
+fn subtree_build_floor_now_mb(configured_mb: u64, leaves: u64, single_wallet: bool) -> u64 {
+    let floor = subtree_build_floor_mb(configured_mb, leaves, single_wallet);
+    if single_wallet {
+        return floor;
+    }
+    cap_floor_to_scope(floor, cgroup_memory_limit_bytes().map(|b| b >> 20))
 }
 
 /// The free-memory floor a subtree-cache build of `leaves` leaves must clear.
@@ -1797,7 +2052,7 @@ fn save_checkpoint(
     if db.poisoned() {
         return Err(std::io::Error::other("refusing to checkpoint a wallet that ingested inconsistent data"));
     }
-    let parts = checkpoint_bytes(genesis, low, scanned, db, boundaries, sink_blue, blind_below);
+    let parts = checkpoint_bytes(shared_leaf_upto(dir, token, db), genesis, low, scanned, db, boundaries, sink_blue, blind_below);
     write_checkpoint_bytes(dir, token, &parts)?;
     save_anchor_blocks(dir, token, boundary_blocks);
     Ok(())
@@ -1848,7 +2103,11 @@ impl CheckpointParts {
     }
 }
 
+/// `shared_upto` > 0 writes a v11 blob referencing leaves below it (see
+/// [`shared_leaf_upto`]); 0 writes the full v10 form.
+#[allow(clippy::too_many_arguments)]
 fn checkpoint_bytes(
+    shared_upto: u64,
     genesis: &RpcHash,
     low: &RpcHash,
     scanned: u64,
@@ -1857,7 +2116,7 @@ fn checkpoint_bytes(
     sink_blue: u64,
     blind_below: u64,
 ) -> CheckpointParts {
-    let db_blob = db.to_checkpoint();
+    let db_blob = if shared_upto > 0 { db.to_checkpoint_sharing_leaves(shared_upto) } else { db.to_checkpoint() };
     let mut head = Vec::with_capacity(SCAN_HEADER_LEN + 8);
     head.extend_from_slice(SCAN_MAGIC);
     head.push(SCAN_VERSION);
@@ -2163,7 +2422,9 @@ fn load_checkpoint_why(
 ) -> Result<(WalletDb, RpcHash, usize, VecDeque<(u64, u64)>, u64, u64), CheckpointReject> {
     let buf = std::fs::read(scan_path(dir, token)).map_err(|_| CheckpointReject::Malformed)?;
     let mut why = CheckpointReject::Malformed;
-    let (saved_genesis, rest) = parse_scan_bytes_why(&buf, key, tip, &mut why).ok_or(why)?;
+    // The shared tree is the stream a v11 blob references; it never borrows from itself.
+    let leaf_dir = (token != CHAIN_TREE_TOKEN).then_some(dir);
+    let (saved_genesis, rest) = parse_scan_bytes_why(&buf, key, tip, leaf_dir, &mut why).ok_or(why)?;
     if saved_genesis != *current_genesis {
         return Err(CheckpointReject::Malformed); // chain relaunched → rescan
     }
@@ -2173,15 +2434,17 @@ fn load_checkpoint_why(
 /// Parse one scan-file blob into `(genesis, (db, low, scanned, boundaries,
 /// sink_blue, blind_below))`. Factored out of [`load_checkpoint`] so the offline
 /// admin tooling (`--diagnose`, `--graft`) can read snapshots at arbitrary paths
-/// with exactly the daemon's own parser.
+/// with exactly the daemon's own parser. `leaf_dir` is the wallet directory whose shared
+/// chain tree serves a v11 blob's referenced leaves; `None` refuses v11 blobs.
 #[allow(clippy::type_complexity)]
 fn parse_scan_bytes(
     buf: &[u8],
     key: WalletKey,
     tip: Option<&kaspa_shielded_core::tree::FrontierState>,
+    leaf_dir: Option<&str>,
 ) -> Option<(RpcHash, (WalletDb, RpcHash, usize, VecDeque<(u64, u64)>, u64, u64))> {
     let mut why = CheckpointReject::Malformed;
-    parse_scan_bytes_why(buf, key, tip, &mut why)
+    parse_scan_bytes_why(buf, key, tip, leaf_dir, &mut why)
 }
 
 #[allow(clippy::type_complexity)]
@@ -2189,6 +2452,7 @@ fn parse_scan_bytes_why(
     buf: &[u8],
     key: WalletKey,
     tip: Option<&kaspa_shielded_core::tree::FrontierState>,
+    leaf_dir: Option<&str>,
     why: &mut CheckpointReject,
 ) -> Option<(RpcHash, (WalletDb, RpcHash, usize, VecDeque<(u64, u64)>, u64, u64))> {
     if buf.len() < SCAN_HEADER_LEN || &buf[0..4] != SCAN_MAGIC || !matches!(buf[4], SCAN_VERSION | SCAN_VERSION_PREV) {
@@ -2206,9 +2470,34 @@ fn parse_scan_bytes_why(
     };
     let db_len = u64::from_le_bytes(take(&mut pos, 8)?.try_into().ok()?) as usize;
     let blob = take(&mut pos, db_len)?;
-    let mut db = match tip {
-        Some(fs) => key.db_from_checkpoint_with_tip(blob, fs)?,
-        None => key.db_from_checkpoint(blob)?,
+    let mut db = match leaf_dir {
+        // Only a v11 blob ever calls the source; older ones restore exactly as before.
+        Some(dir) => {
+            let source_failed = std::cell::Cell::new(false);
+            let src = |lo: u64, n: usize, sink: &mut dyn FnMut(&[u8]) -> Option<()>| -> Option<()> {
+                let r = shared_tree_leaves(dir, lo, n, sink);
+                source_failed.set(r.is_none());
+                r
+            };
+            match key.db_from_checkpoint_src(blob, tip, &src) {
+                Some(db) => db,
+                None => {
+                    // The shared stream could not serve this blob's range right now (the chain
+                    // tree being rebuilt, a file mid-replacement). That says nothing against
+                    // the WALLET'S checkpoint: keep it and retry, like a node that cannot verify
+                    // a cursor yet, and rebuild only after UNVERIFIED_STRIKES_MAX attempts.
+                    if source_failed.get() {
+                        *why = CheckpointReject::Unverifiable;
+                        log::warn!("v11 checkpoint: the shared chain tree cannot serve its referenced leaves yet; keeping it");
+                    }
+                    return None;
+                }
+            }
+        }
+        None => match tip {
+            Some(fs) => key.db_from_checkpoint_with_tip(blob, fs)?,
+            None => key.db_from_checkpoint(blob)?,
+        },
     };
     // A syntactically valid checkpoint is not necessarily a canonical one. Older
     // walletd versions could ingest ordinary-accepted shielded bundles whose state
@@ -2444,7 +2733,7 @@ pub fn diagnose_wallets(dir: &str, secret: Option<&str>) -> String {
             out.push_str(&format!("{token}: scan file unreadable\n"));
             continue;
         };
-        let Some((_, (db, _, scanned, ..))) = parse_scan_bytes(&buf, key, None) else {
+        let Some((_, (db, _, scanned, ..))) = parse_scan_bytes(&buf, key, None, Some(dir)) else {
             out.push_str(&format!("{token}: scan checkpoint does not parse\n"));
             continue;
         };
@@ -2478,9 +2767,9 @@ pub fn graft_wallet(dir: &str, token: &str, older_scan: &str, secret: Option<&st
     let (key, ..) = load_wallet_meta(dir, token, secret).ok_or("wallet file missing/undecryptable (need --wallet-secret?)")?;
     let buf = std::fs::read(scan_path(dir, token)).map_err(|e| format!("read current scan: {e}"))?;
     let (genesis, (mut db, low, scanned, boundaries, sink_blue, blind_below)) =
-        parse_scan_bytes(&buf, key, None).ok_or("current scan checkpoint does not parse")?;
+        parse_scan_bytes(&buf, key, None, Some(dir)).ok_or("current scan checkpoint does not parse")?;
     let old_buf = std::fs::read(older_scan).map_err(|e| format!("read older snapshot: {e}"))?;
-    let (old_genesis, (old_db, ..)) = parse_scan_bytes(&old_buf, key, None).ok_or("older snapshot does not parse")?;
+    let (old_genesis, (old_db, ..)) = parse_scan_bytes(&old_buf, key, None, Some(dir)).ok_or("older snapshot does not parse")?;
     if old_genesis != genesis {
         return Err("older snapshot is from a different chain (genesis mismatch)".into());
     }
@@ -2554,6 +2843,10 @@ struct DecodedPage {
     /// builds `page_actions` in; a length mismatch makes the consumer fall back to
     /// decompressing, so a drift here costs time and never a note.
     epks: Vec<Option<kaspa_shielded_core::pasta_curves::pallas::Point>>,
+    /// Wall time of the node's `GetShieldedBlocks` for this page, and of its decode (blocks
+    /// plus shared epks), paid once by whichever wallet fetched it. Reported in `scan_stats`.
+    rpc_ns: u64,
+    decode_ns: u64,
 }
 
 /// Whether to trust a node-supplied coinbase commitment verbatim instead of
@@ -2921,6 +3214,17 @@ async fn fetch_shielded_page(
     low: RpcHash,
     limit: u64,
 ) -> Result<Arc<DecodedPage>, kaspa_rpc_core::RpcError> {
+    fetch_shielded_page_traced(client, cache, low, limit).await.map(|(page, _)| page)
+}
+
+/// [`fetch_shielded_page`], also saying whether THIS call fetched and decoded the page
+/// (`true`) or it was served from the shared cache or by a peer's in-flight fetch.
+async fn fetch_shielded_page_traced(
+    client: &GrpcClient,
+    cache: &Mutex<PageCache>,
+    low: RpcHash,
+    limit: u64,
+) -> Result<(Arc<DecodedPage>, bool), kaspa_rpc_core::RpcError> {
     let key = (low, limit);
     {
         let mut c = cache.lock().await;
@@ -2928,7 +3232,7 @@ async fn fetch_shielded_page(
             if at.elapsed() < *ttl {
                 let resp = resp.clone();
                 c.hits += 1;
-                return Ok(resp);
+                return Ok((resp, false));
             }
             // Still held, but past its TTL: this fetch is one the cache could have served.
             c.expired_refetch += 1;
@@ -2963,7 +3267,7 @@ async fn fetch_shielded_page(
             if at.elapsed() < *ttl {
                 let resp = resp.clone();
                 c.dedup_hits += 1;
-                return Ok(resp);
+                return Ok((resp, false));
             }
         }
         c.misses += 1;
@@ -2980,6 +3284,7 @@ async fn fetch_shielded_page(
     let pool = { cache.lock().await.pool.clone() };
     // Not held across the fetch/decode below: `_lead` is what serialises duplicates,
     // and taking the cache lock here would serialise every page instead of this one.
+    let t_rpc = std::time::Instant::now();
     let raw = match client.get_shielded_blocks(low, limit).await {
         Ok(raw) => raw,
         Err(e) => {
@@ -2994,6 +3299,8 @@ async fn fetch_shielded_page(
     // single-thread ceiling), and each block decodes independently. `block_in_place`
     // moves this task off the async worker pool so the rayon fan-out doesn't stall other
     // tokio tasks; the decode is done once here and shared by every wallet via the cache.
+    let rpc_ns = t_rpc.elapsed().as_nanos() as u64;
+    let t_decode = std::time::Instant::now();
     let decoded_blocks = tokio::task::block_in_place(|| {
         pool.install(|| {
             use rayon::prelude::*;
@@ -3025,7 +3332,9 @@ async fn fetch_shielded_page(
             (blocks, epks)
         })
     });
-    let decoded = Arc::new(DecodedPage { reorged: raw.reorged, sink_blue_score: raw.sink_blue_score, blocks, epks });
+    let decode_ns = t_decode.elapsed().as_nanos() as u64;
+    let decoded =
+        Arc::new(DecodedPage { reorged: raw.reorged, sink_blue_score: raw.sink_blue_score, blocks, epks, rpc_ns, decode_ns });
     let mut c = cache.lock().await;
     // Re-inserting a key must not leave a second copy in the eviction queue. A page
     // refetched after its TTL used to be pushed again while `map` still held one
@@ -3069,7 +3378,7 @@ async fn fetch_shielded_page(
         }
     }
     c.in_flight.remove(&key);
-    Ok(decoded)
+    Ok((decoded, true))
 }
 
 // ---------------------------------------------------------------------------
@@ -3237,6 +3546,8 @@ struct WalletEntry {
     /// Leaf count at the last scan-cost report, so it is emitted per unit of WORK
     /// rather than per tick (a tick can be a whole chunk or almost nothing).
     scan_cost_reported: u64,
+    /// The open `scan_stats` window (see [`ScanStats`]).
+    stats: ScanStats,
     /// Whether this wallet has already taken its decision on the subtree cache (built
     /// it, or been turned away by the daemon-wide budget). Stops an O(chain) build —
     /// or a budget probe — from being re-attempted on every sync tick.
@@ -3354,6 +3665,7 @@ impl WalletEntry {
             page_count: 0,
             page_actions: 0,
             scan_cost_reported: 0,
+            stats: ScanStats::default(),
             subtree_low_mem_logged: None,
             force_checkpoint: false,
             blind_below: 0,
@@ -3608,11 +3920,15 @@ impl WalletEntry {
             // A page is ~536 ms at the observed 1,865 blocks/s, of which ~10 ms is
             // decryption. This says where the other ~526 ms goes.
             let t_fetch = std::time::Instant::now();
-            let fetched = tokio::time::timeout(SYNC_RPC_TIMEOUT, fetch_shielded_page(client, cache, self.low, page_limit)).await;
-            self.page_fetch_ns += t_fetch.elapsed().as_nanos();
+            let fetched = tokio::time::timeout(SYNC_RPC_TIMEOUT, fetch_shielded_page_traced(client, cache, self.low, page_limit)).await;
+            let wait_ns = t_fetch.elapsed().as_nanos();
+            self.page_fetch_ns += wait_ns;
             self.page_count += 1;
             let resp = match fetched {
-                Ok(Ok(r)) => r,
+                Ok(Ok((r, fetched_here))) => {
+                    self.stats.page(wait_ns as u64, fetched_here.then_some((r.rpc_ns, r.decode_ns)), r.blocks.len() as u64);
+                    r
+                }
                 Err(_elapsed) => {
                     log::warn!("wallet sync page timed out after {SYNC_RPC_TIMEOUT:?} (checkpoint kept); will retry next pass");
                     self.error = Some("node is slow to answer; retrying".into());
@@ -3890,6 +4206,7 @@ impl WalletEntry {
                 (advanced, at_margin)
             });
             self.page_ingest_ns += t_ingest.elapsed().as_nanos();
+            self.stats.ingest_ns += t_ingest.elapsed().as_nanos() as u64;
             if self.db.poisoned() {
                 return;
             }
@@ -3970,6 +4287,7 @@ impl WalletEntry {
         // A wallet that has fallen behind the tip again will not reach the build block
         // below, so it would sit on its slot without using it. Hand it back now; it
         // re-queues when it catches up.
+        let t_witness = std::time::Instant::now();
         let warm_overlap = warm_overlap_allowed(self.warm_priority, self.chain_len, self.scanned as u64);
         if !self.caught_up && !warm_overlap && self.build_permit.is_some() {
             self.build_permit = None;
@@ -4102,7 +4420,7 @@ impl WalletEntry {
                         // Sized to the job on a single-wallet daemon — see
                         // `subtree_build_floor_mb`: a flat 1.2 GB floor kept laptops from
                         // ever pre-building, and then charged the same fold to the send.
-                        let floor = subtree_build_floor_mb(subtree_free_floor_mb, span, !state.build_shared_tree);
+                        let floor = subtree_build_floor_now_mb(subtree_free_floor_mb, span, !state.build_shared_tree);
                         match mem_available_mb() {
                             Some(free) if free < floor => {
                                 // Once per wallet per SUBTREE_LOW_MEM_RELOG, not once per sync pass.
@@ -4367,6 +4685,7 @@ impl WalletEntry {
                 }
             }
         }
+        self.stats.witness_ns += t_witness.elapsed().as_nanos() as u64;
         if !self.db.poisoned() {
             self.error = None;
         }
@@ -6213,7 +6532,7 @@ impl AppState {
             ommers: ts.ommers.iter().map(|o| o.as_bytes()).collect(),
         };
         let buf = std::fs::read(&path).ok()?;
-        let (saved_genesis, rest) = parse_scan_bytes(&buf, key, Some(&fs))?;
+        let (saved_genesis, rest) = parse_scan_bytes(&buf, key, Some(&fs), Some(self.wallet_dir.as_str()))?;
         if saved_genesis != *genesis {
             return None;
         }
@@ -6809,6 +7128,21 @@ impl AppState {
             entry.db.size(),
             entry.scanned,
         );
+        // The same load as one parseable line (see `ScanStats::line` for the conventions):
+        // `restore_ms` is the checkpoint READ (file read + parse + any v11 shared-leaf read).
+        log::info!(
+            "ckpt_load v=1 tok={} via_checkpoint={} total_ms={} queue_ms={} gate_ms={} verify_ms={} restore_ms={} ckpt_mb={:.1} notes={} leaves={}",
+            log_pseudonym(token),
+            u8::from(load_path == "checkpoint"),
+            t_load0.elapsed().as_millis(),
+            t_queued.as_millis(),
+            t_permit.saturating_sub(t_queued).as_millis(),
+            t_verify.saturating_sub(t_meta).as_millis(),
+            t_restore.saturating_sub(t_verify).as_millis(),
+            std::fs::metadata(scan_path(&self.wallet_dir, token)).map(|m| m.len()).unwrap_or(0) as f64 / 1e6,
+            entry.db.notes().len(),
+            entry.db.size(),
+        );
         let w = Arc::new(Mutex::new(entry));
         self.wallets.lock().await.insert(token.to_string(), w.clone());
         // The leaf stream is NOT decoded here, and nothing heavy happens on this path.
@@ -7049,6 +7383,153 @@ enum SyncOutcome {
 /// catch-up, reorg-strike handling, checkpoint, status snapshot). Factored out of
 /// [`sync_loop`] so several wallets can run **concurrently** (see [`SYNC_CONCURRENCY`]);
 /// the logic is identical to the old sequential body.
+/// One wallet's open `scan_stats` window: per-page sync timings summed since its last line.
+///
+/// The existing `scan cost so far` / `page pipeline` lines are CUMULATIVE since load and
+/// cover decryption and the tree only, so they could not show where one page's time went,
+/// nor checkpoint or witness cost at all (wallet-logging-2026-10-22 REPORT §7 gap 1). This
+/// emits one machine-parseable line per wallet per [`SCAN_STATS_EVERY`] with every stage of
+/// the window, rate-limited daemon-wide by [`SCAN_STATS_MAX_PER_MIN`]. A line that would
+/// exceed the limit is not dropped: the window keeps accumulating and the next line covers
+/// it (`deferred` counts how often). Format: see [`ScanStats::line`].
+#[derive(Default)]
+struct ScanStats {
+    since: Option<std::time::Instant>,
+    /// `ScanCost` at the window start; the line reports the difference.
+    cost0: kaspa_shielded_core::walletdb::ScanCost,
+    pages: u64,
+    /// Pages this wallet fetched and decoded itself (cache misses); the rest rode the cache.
+    fetched: u64,
+    blocks: u64,
+    wait_ns: u64,
+    wait_max_ns: u64,
+    rpc_ns: u64,
+    decode_ns: u64,
+    ingest_ns: u64,
+    witness_ns: u64,
+    ckpt_writes: u64,
+    ckpt_encode_ns: u64,
+    ckpt_write_ns: u64,
+    ckpt_bytes: u64,
+    deferred: u64,
+}
+
+/// Minimum spacing of one wallet's `scan_stats` lines.
+const SCAN_STATS_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+/// Daemon-wide ceiling on `scan_stats` lines per minute (~120 wallets resident at peak on
+/// 142 would otherwise write up to 2 lines/s).
+const SCAN_STATS_MAX_PER_MIN: u32 = 30;
+
+impl ScanStats {
+    fn page(&mut self, wait_ns: u64, fetched: Option<(u64, u64)>, blocks: u64) {
+        self.pages += 1;
+        self.blocks += blocks;
+        self.wait_ns += wait_ns;
+        self.wait_max_ns = self.wait_max_ns.max(wait_ns);
+        if let Some((rpc, decode)) = fetched {
+            self.fetched += 1;
+            self.rpc_ns += rpc;
+            self.decode_ns += decode;
+        }
+    }
+
+    /// The line, or `None` when the window is not due (or empty, or over the daemon-wide
+    /// limit). On `Some` the window restarts at `cost` and `now`.
+    fn take_line(
+        &mut self,
+        token: &str,
+        cost: kaspa_shielded_core::walletdb::ScanCost,
+        behind: u64,
+        now: std::time::Instant,
+        limiter: &std::sync::Mutex<(std::time::Instant, u32)>,
+    ) -> Option<String> {
+        let Some(since) = self.since else {
+            self.since = Some(now);
+            self.cost0 = cost;
+            return None;
+        };
+        if now.duration_since(since) < SCAN_STATS_EVERY || (self.pages == 0 && self.ckpt_writes == 0) {
+            return None;
+        }
+        {
+            let mut l = limiter.lock().unwrap_or_else(|p| p.into_inner());
+            if now.duration_since(l.0) >= std::time::Duration::from_secs(60) {
+                *l = (now, 0);
+            }
+            if l.1 >= SCAN_STATS_MAX_PER_MIN {
+                self.deferred += 1;
+                return None;
+            }
+            l.1 += 1;
+        }
+        let line = self.line(token, cost, behind, now.duration_since(since));
+        *self = ScanStats { since: Some(now), cost0: cost, ..Default::default() };
+        Some(line)
+    }
+
+    /// `scan_stats v=1 tok=<8 hex> window_s=… pages=… fetched=… blocks=… actions=… leaves=…
+    /// wait_ms=… wait_max_ms=… rpc_ms=… decode_ms=… ingest_ms=… decrypt_ms=…
+    /// decrypt_us_per_action=… tree_ms=… mirror_ms=… subtree_ms=… witness_ms=… ckpt_writes=…
+    /// ckpt_encode_ms=… ckpt_write_ms=… ckpt_mb=… behind=… deferred=…`
+    ///
+    /// Space-separated `key=value`, keys `[a-z_]+`, values decimal numbers except `tok`; new
+    /// keys may be appended, never renamed (`v` bumps if a meaning changes). `tok` is a
+    /// pseudonym, never the token. See 07-finish.md §3 for each field.
+    fn line(&self, token: &str, cost: kaspa_shielded_core::walletdb::ScanCost, behind: u64, window: std::time::Duration) -> String {
+        let ms = |ns: u64| ns as f64 / 1e6;
+        let d_actions = cost.actions.saturating_sub(self.cost0.actions);
+        let d_leaves = cost.leaves.saturating_sub(self.cost0.leaves);
+        let d = |a: u128, b: u128| a.saturating_sub(b) as f64 / 1e6;
+        let decrypt_ms = d(cost.decrypt_ns, self.cost0.decrypt_ns);
+        format!(
+            "scan_stats v=1 tok={} window_s={} pages={} fetched={} blocks={} actions={} leaves={} wait_ms={:.0} wait_max_ms={:.0} rpc_ms={:.0} decode_ms={:.0} ingest_ms={:.0} decrypt_ms={:.1} decrypt_us_per_action={:.2} tree_ms={:.1} mirror_ms={:.1} subtree_ms={:.1} witness_ms={:.1} ckpt_writes={} ckpt_encode_ms={:.0} ckpt_write_ms={:.0} ckpt_mb={:.1} behind={} deferred={}",
+            log_pseudonym(token),
+            window.as_secs(),
+            self.pages,
+            self.fetched,
+            self.blocks,
+            d_actions,
+            d_leaves,
+            ms(self.wait_ns),
+            ms(self.wait_max_ns),
+            ms(self.rpc_ns),
+            ms(self.decode_ns),
+            ms(self.ingest_ns),
+            decrypt_ms,
+            if d_actions == 0 { 0.0 } else { decrypt_ms * 1e3 / d_actions as f64 },
+            d(cost.tree_ns, self.cost0.tree_ns),
+            d(cost.mirror_ns, self.cost0.mirror_ns),
+            d(cost.subtree_ns, self.cost0.subtree_ns),
+            ms(self.witness_ns),
+            self.ckpt_writes,
+            ms(self.ckpt_encode_ns),
+            ms(self.ckpt_write_ns),
+            self.ckpt_bytes as f64 / 1e6,
+            behind,
+            self.deferred,
+        )
+    }
+}
+
+/// Daemon-wide `scan_stats` limiter: (window start, lines in it).
+fn scan_stats_limiter() -> &'static std::sync::Mutex<(std::time::Instant, u32)> {
+    static L: std::sync::OnceLock<std::sync::Mutex<(std::time::Instant, u32)>> = std::sync::OnceLock::new();
+    L.get_or_init(|| std::sync::Mutex::new((std::time::Instant::now(), 0)))
+}
+
+/// A stable 8-hex pseudonym for a wallet token in logs: SHA-256 under a fixed domain string,
+/// truncated. The token is the wallet's bearer credential, so neither it nor a prefix of it
+/// belongs in a log meant for diagnostics; the pseudonym still lets lines from one wallet be
+/// followed across a window, a restart, and the daemon's other lines that use it.
+fn log_pseudonym(token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    if token == CHAIN_TREE_TOKEN {
+        return "chaintree".into();
+    }
+    let h = Sha256::new().chain_update(b"zkas-walletd log pseudonym v1\0").chain_update(token.as_bytes()).finalize();
+    hex(&h[..4])
+}
+
 async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_len: u64) -> SyncOutcome {
     let mut e = w.lock().await;
     e.chain_len = chain_len;
@@ -7195,6 +7676,14 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
                     e.page_actions as f64 / e.page_count as f64,
                 );
             }
+        }
+    }
+    // One `scan_stats` line per wallet per SCAN_STATS_EVERY at most; see `ScanStats`.
+    {
+        let cost = e.db.scan_cost();
+        let behind = chain_len.saturating_sub(e.scanned as u64);
+        if let Some(line) = e.stats.take_line(&token, cost, behind, std::time::Instant::now(), scan_stats_limiter()) {
+            log::info!("{line}");
         }
     }
     // NB: the eager witness pre-advance and base compaction live in `sync_chunk`'s
@@ -7345,8 +7834,20 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
         && (due_by_blocks || (just_caught_up && advanced > 0) || force || overdue)
     {
         e.force_checkpoint = false;
+        let t_encode = std::time::Instant::now();
+        let parts = checkpoint_bytes(
+            shared_leaf_upto(&state.wallet_dir, &token, &e.db),
+            &e.genesis,
+            &e.low,
+            e.scanned as u64,
+            &e.db,
+            &e.boundaries,
+            e.sink_blue,
+            e.blind_below,
+        );
+        e.stats.ckpt_encode_ns += t_encode.elapsed().as_nanos() as u64;
         Some((
-            checkpoint_bytes(&e.genesis, &e.low, e.scanned as u64, &e.db, &e.boundaries, e.sink_blue, e.blind_below),
+            parts,
             e.scanned,
             // The anchor blocks of the boundaries just serialised, so a restarted daemon can
             // name a spend's anchor block without waiting to re-sync the matured ring.
@@ -7372,17 +7873,23 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
     if let Some((buf, scanned, blocks)) = pending_checkpoint {
         let dir = state.wallet_dir.clone();
         let who = token.clone();
+        let bytes = buf.len() as u64;
+        let t_write = std::time::Instant::now();
         let written = tokio::task::spawn_blocking(move || {
             write_checkpoint_bytes(&dir, &who, &buf)?;
             save_anchor_blocks(&dir, &who, &blocks);
             Ok::<(), std::io::Error>(())
         })
         .await;
+        let write_ns = t_write.elapsed().as_nanos() as u64;
         let mut e = w.lock().await;
         match written {
             Ok(Ok(())) => {
                 e.saved_scanned = scanned;
                 e.last_checkpoint_at = std::time::Instant::now();
+                e.stats.ckpt_writes += 1;
+                e.stats.ckpt_write_ns += write_ns;
+                e.stats.ckpt_bytes += bytes;
             }
             Ok(Err(err)) => {
                 eprintln!("checkpoint write failed for {token}: {err}");
@@ -7458,8 +7965,8 @@ fn own_cgroup_dir() -> Option<std::path::PathBuf> {
 }
 
 /// One cgroup v2 memory knob in bytes. "max" (unlimited) and an unreadable knob are `None`,
-/// never zero. Same parsing as the audit fix's `cgroup_headroom_mb_at`
-/// (zkas-ckpt-wip/rk-perf), so the two cannot disagree once that is ported.
+/// never zero. Shared by the resident budget and by [`cgroup_headroom_bytes_at`] (the
+/// `mem_available_mb` clamp), so the two can never read the scope differently.
 fn cgroup_knob_bytes(base: &std::path::Path, name: &str) -> Option<u64> {
     let raw = std::fs::read_to_string(base.join(name)).ok()?;
     let raw = raw.trim();
@@ -7515,7 +8022,7 @@ async fn enforce_resident_budget(state: &Arc<AppState>, incoming: Option<u64>) -
     for (t, w) in &resident {
         let (bytes, busy) = match w.try_lock() {
             Ok(e) => (e.db.approx_heap_bytes() as u64, false),
-            Err(_) => (std::fs::metadata(scan_path(&state.wallet_dir, t)).map(|m| m.len()).unwrap_or(0), true),
+            Err(_) => (scan_resident_estimate(&state.wallet_dir, t).unwrap_or(0), true),
         };
         // The chain tree is shared by everyone and never a victim, but its bytes count.
         let never = t.as_str() == CHAIN_TREE_TOKEN;
@@ -7581,7 +8088,7 @@ async fn admit_load(state: &Arc<AppState>, token: &str) -> Option<Admission> {
     // A restored wallet holds about its checkpoint's leaf and note sections; the file also
     // carries the nullifier section, which with the shared interner is not resident, so
     // this over-estimates — the conservative direction for an admission check.
-    let est = std::fs::metadata(scan_path(&state.wallet_dir, token)).map(|m| m.len()).unwrap_or(64 << 20).max(16 << 20);
+    let est = scan_resident_estimate(&state.wallet_dir, token).unwrap_or(64 << 20).max(16 << 20);
     let deadline = std::time::Instant::now() + ADMISSION_WAIT;
     loop {
         {
@@ -11652,7 +12159,7 @@ async fn wallet_warm(
     if !ready && !e.db.subtree_cache_failed() && !e.build_in_flight && notes > 0 && span >= SUBTREE_CACHE_MIN_SPAN {
         // Same memory floor the sync pass applies: warming must never squeeze a scan out.
         match mem_available_mb() {
-            Some(free) if free < subtree_build_floor_mb(state.resources.subtree_free_floor_mb, span, !state.build_shared_tree) => {}
+            Some(free) if free < subtree_build_floor_now_mb(state.resources.subtree_free_floor_mb, span, !state.build_shared_tree) => {}
             _ => {
                 e.wants_cache_build = true;
                 armed = true;
@@ -11999,7 +12506,7 @@ async fn warm_sweep_loop(state: Arc<AppState>) {
             // The wallet is not chosen yet, so size the floor to nothing: on a
             // single-wallet daemon that is the 256 MB minimum, on the hosted one the
             // configured floor.
-            if free < subtree_build_floor_mb(state.resources.subtree_free_floor_mb, 0, !state.build_shared_tree) {
+            if free < subtree_build_floor_now_mb(state.resources.subtree_free_floor_mb, 0, !state.build_shared_tree) {
                 continue;
             }
         }
@@ -12583,6 +13090,15 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
     if cfg.build_shared_tree && std::env::var("ZKAS_WALLETD_SHARED_NULLIFIERS").as_deref() != Ok("0") {
         let installed = WalletDb::set_default_nullifier_interner(kaspa_shielded_core::walletdb::NullifierInterner::new());
         log::info!("shared nullifier interner: {}", if installed { "installed (wallets keep a bitset)" } else { "already installed" });
+    }
+    // v11 checkpoints reference the shared chain tree, so they exist only where one does.
+    let shared_leaves = cfg.resources.shared_leaf_store && cfg.build_shared_tree;
+    SHARED_LEAF_STORE.store(shared_leaves, std::sync::atomic::Ordering::Relaxed);
+    if cfg.resources.shared_leaf_store {
+        log::warn!(
+            "shared leaf store (v11 checkpoints): {} — wallets rewritten this way cannot be read by a build older than v11",
+            if shared_leaves { "ON" } else { "requested but no shared chain tree in this mode; OFF" }
+        );
     }
     // `ZKAS_SECURITY_FORK_DAA` overrides the activation for a test network started with an
     // override-params file (refused on mainnet, as the node refuses overrides there).
@@ -13321,9 +13837,9 @@ mod sdk_api_tests {
         boundaries.push_back((33, 44));
 
         // What the old code would have produced: one contiguous buffer.
-        let expected = checkpoint_bytes(&genesis, &low, 777, &db, &boundaries, 100, 5).into_vec();
+        let expected = checkpoint_bytes(0, &genesis, &low, 777, &db, &boundaries, 100, 5).into_vec();
         // What the writer now puts on disk, piece by piece.
-        let parts = checkpoint_bytes(&genesis, &low, 777, &db, &boundaries, 100, 5);
+        let parts = checkpoint_bytes(0, &genesis, &low, 777, &db, &boundaries, 100, 5);
         assert_eq!(parts.len(), expected.len(), "encoded length changed");
         write_checkpoint_bytes(&dir, "t", &parts).unwrap();
         let on_disk = std::fs::read(scan_path(&dir, "t")).unwrap();
@@ -13338,6 +13854,195 @@ mod sdk_api_tests {
         assert_eq!(sink, 100);
         assert_eq!(blind, 5);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// F5 / v11 through the daemon: a wallet blob that references the shared chain tree's
+    /// leaves restores the same wallet from a real chain-tree file at its real offsets; a
+    /// range the file does not hold is refused; and a v11 blob whose shared file is missing
+    /// is UNVERIFIABLE (kept and retried), never Malformed (copied aside and rescanned).
+    #[test]
+    fn v11_checkpoint_round_trips_through_the_shared_chain_tree_file() {
+        // A db holding a known 64-leaf stream, built from the oldest blob form `restore`
+        // accepts (v3), so no test-only setter is needed on WalletDb.
+        fn v3_blob_with_leaves(n: u8) -> Vec<u8> {
+            let mut b = vec![3u8];
+            b.extend_from_slice(&0u64.to_le_bytes()); // base_size
+            b.push(0); // empty base frontier
+            b.extend_from_slice(&(n as u64).to_le_bytes()); // size
+            b.extend_from_slice(&(n as u64).to_le_bytes()); // leaf count
+            for i in 0..n {
+                b.extend_from_slice(&[i; 32]); // bytes <= 0x3f: canonical
+            }
+            b.extend_from_slice(&0u64.to_le_bytes()); // no notes
+            b.extend_from_slice(&0u64.to_le_bytes()); // no spent nullifiers
+            b
+        }
+        let tmp = std::env::temp_dir().join(format!("zkas-v11-daemon-{}", std::process::id()));
+        let dir = tmp.to_string_lossy().to_string();
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let genesis = RpcHash::from_bytes([3u8; 32]);
+        let low = RpcHash::from_bytes([4u8; 32]);
+        let seed = [11u8; 32];
+        let w = WalletDb::from_checkpoint(seed, &v3_blob_with_leaves(64)).expect("v3 restores");
+        let none: VecDeque<(u64, u64)> = VecDeque::new();
+
+        // The shared tree, in the full form the real chain tree always writes.
+        save_checkpoint(&dir, CHAIN_TREE_TOKEN, &genesis, &low, 64, &w, &none, &HashMap::new(), 0, 0).unwrap();
+        let (base, n, _) = shared_tree_extent(&dir).expect("extent readable");
+        assert_eq!((base, n), (0, 64));
+        let read = |lo: u64, n: usize| -> Option<Vec<u8>> {
+            let mut out = Vec::new();
+            shared_tree_leaves(&dir, lo, n, &mut |c: &[u8]| {
+                out.extend_from_slice(c);
+                Some(())
+            })?;
+            Some(out)
+        };
+        let got = read(10, 54).expect("an interior range");
+        assert_eq!(got.len(), 54 * 32);
+        assert_eq!(&got[..32], &[10u8; 32]);
+        assert_eq!(&got[got.len() - 32..], &[63u8; 32]);
+        assert!(read(0, 65).is_none(), "past the end of the shared stream: refused");
+        assert!(read(10, 55).is_none());
+
+        // A wallet blob referencing [0, 40) and carrying [40, 64) inline.
+        let full = checkpoint_bytes(0, &genesis, &low, 64, &w, &none, 0, 0).into_vec();
+        let thin = checkpoint_bytes(40, &genesis, &low, 64, &w, &none, 0, 0);
+        assert_eq!(full.len() - thin.len(), 40 * 32 - 8);
+        write_checkpoint_bytes(&dir, "thin", &thin).unwrap();
+        let (db, lo, scanned, ..) = load_checkpoint(&dir, "thin", WalletKey::Seed(seed), &genesis, None).expect("v11 loads");
+        assert_eq!((lo, scanned), (low, 64));
+        assert_eq!(db.to_checkpoint(), w.to_checkpoint(), "same wallet as the full form");
+        // The offline tools read it too, given the directory; with no directory it is refused.
+        let buf = std::fs::read(scan_path(&dir, "thin")).unwrap();
+        assert!(parse_scan_bytes(&buf, WalletKey::Seed(seed), None, Some(&dir)).is_some());
+        assert!(parse_scan_bytes(&buf, WalletKey::Seed(seed), None, None).is_none());
+
+        // The shared file gone (a chain-tree rebuild, a file mid-replacement): kept, not destroyed.
+        std::fs::rename(scan_path(&dir, CHAIN_TREE_TOKEN), format!("{dir}/moved")).unwrap();
+        assert!(matches!(
+            load_checkpoint_why(&dir, "thin", WalletKey::Seed(seed), &genesis, None),
+            Err(CheckpointReject::Unverifiable)
+        ));
+        // A v10 blob does not care.
+        write_checkpoint_bytes(&dir, "fat", &checkpoint_bytes(0, &genesis, &low, 64, &w, &none, 0, 0)).unwrap();
+        assert!(load_checkpoint(&dir, "fat", WalletKey::Seed(seed), &genesis, None).is_some());
+
+        // The resident estimate counts the referenced leaves a v11 file does not carry.
+        let thin_len = std::fs::metadata(scan_path(&dir, "thin")).unwrap().len();
+        assert_eq!(scan_resident_estimate(&dir, "thin"), Some(thin_len + 40 * 32));
+        let fat_len = std::fs::metadata(scan_path(&dir, "fat")).unwrap().len();
+        assert_eq!(scan_resident_estimate(&dir, "fat"), Some(fat_len));
+        // With the flag off (the default, and this test never sets it) the writer shares nothing.
+        assert_eq!(shared_leaf_upto(&dir, "thin", &w), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `scan_stats`: one parseable `key=value` line per wallet per window, every value a number
+    /// except the pseudonym, the token itself never present, and the daemon-wide limit defers
+    /// a line (its window keeps accumulating) rather than dropping it.
+    #[test]
+    fn scan_stats_line_is_parseable_rate_limited_and_never_carries_the_token() {
+        use std::time::Duration;
+        let token = "0123456789abcdef0123456789abcdef";
+        let limiter = std::sync::Mutex::new((std::time::Instant::now(), 0u32));
+        let t0 = std::time::Instant::now();
+        let mut s = ScanStats::default();
+        let mut cost = kaspa_shielded_core::walletdb::ScanCost::default();
+        assert!(s.take_line(token, cost, 0, t0, &limiter).is_none(), "the first call opens the window");
+        s.page(120_000_000, Some((100_000_000, 15_000_000)), 1000);
+        s.page(5_000_000, None, 16);
+        s.ingest_ns = 40_000_000;
+        s.witness_ns = 2_500_000;
+        s.ckpt_writes = 1;
+        s.ckpt_encode_ns = 50_000_000;
+        s.ckpt_write_ns = 300_000_000;
+        s.ckpt_bytes = 123_400_000;
+        cost.actions = 2000;
+        cost.decrypt_ns = 30_000_000;
+        cost.leaves = 1500;
+        cost.tree_ns = 9_000_000;
+        cost.mirror_ns = 1_000_000;
+        cost.subtree_ns = 8_000_000;
+        assert!(s.take_line(token, cost, 5, t0 + Duration::from_secs(30), &limiter).is_none(), "not due yet");
+        let line = s.take_line(token, cost, 5, t0 + Duration::from_secs(61), &limiter).expect("due");
+        let mut fields = line.split(' ');
+        assert_eq!(fields.next(), Some("scan_stats"));
+        let kv: HashMap<&str, &str> = fields.map(|f| f.split_once('=').expect("every field is key=value")).collect();
+        for (k, v) in &kv {
+            assert!(!k.is_empty() && k.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'), "key {k}");
+            if *k != "tok" {
+                assert!(v.parse::<f64>().is_ok(), "{k}={v} is a number");
+            }
+        }
+        for (k, v) in [
+            ("v", "1"),
+            ("window_s", "61"),
+            ("pages", "2"),
+            ("fetched", "1"),
+            ("blocks", "1016"),
+            ("actions", "2000"),
+            ("leaves", "1500"),
+            ("wait_ms", "125"),
+            ("wait_max_ms", "120"),
+            ("rpc_ms", "100"),
+            ("decode_ms", "15"),
+            ("ingest_ms", "40"),
+            ("decrypt_ms", "30.0"),
+            ("decrypt_us_per_action", "15.00"),
+            ("tree_ms", "9.0"),
+            ("subtree_ms", "8.0"),
+            ("witness_ms", "2.5"),
+            ("ckpt_writes", "1"),
+            ("ckpt_encode_ms", "50"),
+            ("ckpt_write_ms", "300"),
+            ("ckpt_mb", "123.4"),
+            ("behind", "5"),
+            ("deferred", "0"),
+        ] {
+            assert_eq!(kv.get(k), Some(&v), "{k} in {line}");
+        }
+        assert_eq!(kv["tok"].len(), 8);
+        assert_eq!(kv["tok"], log_pseudonym(token), "stable pseudonym");
+        assert!(!line.contains(token) && !line.contains(&token[..8]), "no token, no token prefix");
+        // The window restarted: nothing due 30 s later, and deltas are from the new start.
+        assert!(s.take_line(token, cost, 5, t0 + Duration::from_secs(91), &limiter).is_none());
+
+        // The daemon-wide limit: 30 lines a minute, the 31st deferred, then delivered with
+        // `deferred=1` once the minute rolls over.
+        let lim = std::sync::Mutex::new((t0, 0u32));
+        let mut many: Vec<ScanStats> = (0..31).map(|_| ScanStats::default()).collect();
+        for m in &mut many {
+            assert!(m.take_line("x", cost, 0, t0, &lim).is_none());
+            m.page(1, None, 1);
+        }
+        let due = t0 + Duration::from_secs(61);
+        let lines = many.iter_mut().filter_map(|m| m.take_line("x", cost, 0, due, &lim)).count();
+        assert_eq!(lines, SCAN_STATS_MAX_PER_MIN as usize);
+        let late = many.last_mut().unwrap();
+        assert_eq!(late.deferred, 1);
+        let next = late.take_line("x", cost, 0, due + Duration::from_secs(61), &lim).expect("next minute");
+        assert!(next.contains(" deferred=1") && next.contains(" window_s=122"), "{next}");
+    }
+
+    /// The v11 write gate's arithmetic: only the wallet's own range, only what the shared file
+    /// held, minus the reorg/persistence margin, and nothing below the shared base.
+    #[test]
+    fn shared_leaf_upto_keeps_a_margin_and_respects_both_bases() {
+        let m = SHARED_LEAF_TAIL_MARGIN;
+        let tip = 15_214_768u64;
+        // A full-history wallet at the tip: everything but the last `m` leaves is referenced.
+        assert_eq!(shared_leaf_upto_for((0, tip), 0, tip), tip - m);
+        // A compacted wallet: its own base onward.
+        assert_eq!(shared_leaf_upto_for((14_000_000, tip), 0, tip), tip - m);
+        // The shared file behind the wallet: never past what the file held minus the margin.
+        assert_eq!(shared_leaf_upto_for((0, tip), 0, tip - 1_000), tip - 1_000 - m);
+        // Wallet below the shared base, or entirely inside the margin: carry everything.
+        assert_eq!(shared_leaf_upto_for((5, tip), 10, tip), 0);
+        assert_eq!(shared_leaf_upto_for((tip - 10, tip), 0, tip), 0);
+        // A young shared tree shorter than the margin: nothing referenced.
+        assert_eq!(shared_leaf_upto_for((0, m / 2), 0, m / 2), 0);
     }
 
     /// A checkpoint adopted from a scan receipt is never cloned to another registration of
@@ -13483,7 +14188,7 @@ mod sdk_api_tests {
         let agreeing = FrontierState { size: db.size(), leaf: None, ommers: vec![] };
         let mut why = CheckpointReject::Malformed;
         assert!(
-            parse_scan_bytes_why(&buf, WalletKey::Seed(seed), Some(&agreeing), &mut why).is_some(),
+            parse_scan_bytes_why(&buf, WalletKey::Seed(seed), Some(&agreeing), None, &mut why).is_some(),
             "a frontier that matches the wallet's own tree must restore"
         );
 
@@ -13493,7 +14198,7 @@ mod sdk_api_tests {
         for size in [1u64, 5, 9_401_145] {
             let unusable = FrontierState { size, leaf: Some([1u8; 32]), ommers: vec![] };
             let mut why = CheckpointReject::Malformed;
-            let out = parse_scan_bytes_why(&buf, WalletKey::Seed(seed), Some(&unusable), &mut why);
+            let out = parse_scan_bytes_why(&buf, WalletKey::Seed(seed), Some(&unusable), None, &mut why);
             assert!(out.is_none(), "an unverifiable checkpoint is not installed");
             assert_eq!(
                 why,
@@ -14787,7 +15492,7 @@ mod day_diff_tests {
 /// Task 03: the hard resident rules are a real bound, unlike the soft count cap.
 #[cfg(test)]
 mod resident_budget_tests {
-    use super::{ResidentInfo, cgroup_ceiling_bytes_at, hard_victims};
+    use super::{ResidentInfo, cap_floor_to_scope, cgroup_ceiling_bytes_at, cgroup_headroom_bytes_at, hard_victims, subtree_build_floor_mb, subtree_build_floor_now_mb};
 
     /// The auto budget is 70% of the ceiling, so the ceiling must be the LOWER knob, "max"
     /// must read as unlimited (not zero, which would evict everything), and an unreadable
@@ -14810,6 +15515,66 @@ mod resident_budget_tests {
         assert_eq!(cgroup_ceiling_bytes_at(&dir), None, "both unlimited: no budget");
         assert_eq!(cgroup_ceiling_bytes_at(std::path::Path::new("/nonexistent-cgroup")), None, "unreadable is not zero");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F4: the headroom that clamps `mem_available_mb` is ceiling minus WORKING SET, not
+    /// minus `memory.current`. The figures are the live scope's at 17:04 UTC 2026-10-22,
+    /// where `memory.current` was mostly reclaimable page cache: reading it raw would have
+    /// reported 3.25 GB free (under the 12,000 MB floor) on a daemon with 31.2 GB free.
+    #[test]
+    fn cgroup_headroom_subtracts_the_working_set_not_the_page_cache() {
+        let dir = std::env::temp_dir().join(format!("zkas-cg-headroom-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let put = |name: &str, v: &str| std::fs::write(dir.join(name), v).unwrap();
+        let gb = 1024u64 * 1024 * 1024;
+        put("memory.high", "53687091200\n");
+        put("memory.max", "61203283968\n");
+        put("memory.current", "50435448832\n");
+        put("memory.stat", "anon 21347676160\nfile 28141383680\nactive_file 215498752\ninactive_file 27915395072\n");
+        let h = cgroup_headroom_bytes_at(&dir).expect("finite ceiling");
+        assert_eq!(h, 53687091200 - (50435448832 - 27915395072));
+        // 31,167,037,440 bytes: the "31.2 GB" quoted from the live scope is DECIMAL (29.03 GiB).
+        assert_eq!(h, 31_167_037_440);
+        assert!(h > 29 * gb && h < 30 * gb, "29.03 GiB = 31.2 GB, the live figure");
+        // The naive `high - current` is 3.25 GB: under 142's 12,000 MB build floor, so every
+        // build would have deferred on a daemon with 31.2 GB free.
+        assert_eq!(53687091200u64 - 50435448832, 3_251_642_368);
+        assert!((53687091200u64 - 50435448832) >> 20 < 12_000);
+        // No memory.stat: inactive_file counts as 0 (errs low, the safe side for a gate).
+        let _ = std::fs::remove_file(dir.join("memory.stat"));
+        assert_eq!(cgroup_headroom_bytes_at(&dir), Some(53687091200 - 50435448832));
+        // Over the ceiling is no headroom, never an underflow.
+        put("memory.current", &(60 * gb).to_string());
+        assert_eq!(cgroup_headroom_bytes_at(&dir), Some(0));
+        // No finite ceiling: no clamp (the host figure stands).
+        put("memory.high", "max");
+        put("memory.max", "max");
+        assert_eq!(cgroup_headroom_bytes_at(&dir), None);
+        // Unreadable memory.current: no clamp rather than a made-up one.
+        put("memory.high", &(50 * gb).to_string());
+        let _ = std::fs::remove_file(dir.join("memory.current"));
+        assert_eq!(cgroup_headroom_bytes_at(&dir), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F4: the hosted subtree floor never demands more than a quarter of the scope, so it
+    /// stays reachable while the resident budget holds 70% of the same ceiling.
+    #[test]
+    fn subtree_floor_is_capped_at_a_quarter_of_the_scope() {
+        // 142's flags: 12000 MB floor. Watchdog floor scope 50 GiB: the configured value stands.
+        assert_eq!(cap_floor_to_scope(12_000, Some(51_200)), 12_000);
+        // Supervisor's starting scope 44 GiB: capped to 11,264 MB.
+        assert_eq!(cap_floor_to_scope(12_000, Some(45_056)), 11_264);
+        // A small floor is never raised, and no ceiling means no cap.
+        assert_eq!(cap_floor_to_scope(1_200, Some(45_056)), 1_200);
+        assert_eq!(cap_floor_to_scope(12_000, None), 12_000);
+        // The cap leaves at least 5% of the ceiling between floor and budget.
+        for c in [8_192u64, 45_056, 51_200, 57_344, 61_440] {
+            let f = cap_floor_to_scope(u64::MAX, Some(c));
+            assert!(f + c / 10 * 7 <= c - c / 20, "floor {f} + 70% budget must fit in {c} with 5% spare");
+        }
+        // Single-wallet daemons keep their job-sized floor untouched.
+        assert_eq!(subtree_build_floor_now_mb(12_000, 1_000_000, true), subtree_build_floor_mb(12_000, 1_000_000, true));
     }
     use std::time::{Duration, Instant};
 
