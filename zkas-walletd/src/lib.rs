@@ -11958,10 +11958,27 @@ const WARM_ENDPOINT_BUDGET_SECS: u64 = 90;
 /// double-sync it, and yields the tree's lock between chunks so concurrent sends can still
 /// borrow. Auth is the ordinary token gate — the work is idempotent and is exactly what
 /// the daemon already does, so any authorized caller may trigger it.
+/// Operator routes answer a caller on this machine only.
+///
+/// They checked a token's format and nothing else, and the hosted daemon is reached through a
+/// public proxy, so anyone could force the shared tree's full subtree-cache build, which skips
+/// the memory floor and the not-while-proving gate on purpose. No connection info (a test
+/// router, an embedder that serves without it) is refused too.
+fn require_local_operator(
+    peer: Option<axum::extract::ConnectInfo<SocketAddr>>,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    match peer {
+        Some(axum::extract::ConnectInfo(addr)) if addr.ip().to_canonical().is_loopback() => Ok(()),
+        _ => Err(err(StatusCode::FORBIDDEN, "operator route: call it from the daemon's own host")),
+    }
+}
+
 async fn warm_chain_tree(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    peer: Option<axum::extract::ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    require_local_operator(peer)?;
     let _token = token_from(&headers, state.allow_default_token)?;
     let ct = state
         .wallets
@@ -12086,8 +12103,10 @@ async fn warm_chain_tree(
 /// later restart does not repeat it.
 async fn warm_wallet(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    peer: Option<axum::extract::ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    require_local_operator(peer)?;
     let token = token_from(&headers, state.allow_default_token)?;
     let w = state
         .get_wallet(&token)
@@ -13445,7 +13464,7 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
             });
             axum_server::bind_rustls(listen, tls_cfg)
                 .handle(handle)
-                .serve(app.into_make_service())
+                .serve(app.into_make_service_with_connect_info::<SocketAddr>())
                 .await
                 .map_err(|e| format!("server error: {e}"))
         }
@@ -13472,7 +13491,7 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
                 let _ = deadline_tx.send(());
             });
             tokio::select! {
-                r = axum::serve(listener, app).with_graceful_shutdown(async move { let _ = drain_rx.await; }) => {
+                r = axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).with_graceful_shutdown(async move { let _ = drain_rx.await; }) => {
                     r.map_err(|e| format!("server error: {e}"))
                 }
                 _ = async move {
@@ -13561,13 +13580,20 @@ async fn flush_checkpoints(state: &Arc<AppState>, only: Option<&str>) -> (usize,
 /// periodic save was redone on the next open — seen by users as the sync "going back to
 /// 0". The app calls this as it goes to the background, so the checkpoint is as fresh as
 /// that moment. Token-scoped: a hosted daemon flushes only the caller's wallet.
-async fn checkpoint(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Json<serde_json::Value> {
-    let only = token_from(&headers, state.allow_default_token).ok();
-    let (saved, total, blocks) = flush_checkpoints(&state, only.as_deref()).await;
+async fn checkpoint(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    // A token that failed the format check used to become `None` here, and `None` is
+    // flush_checkpoints' "every resident wallet" (the shutdown path's meaning). So any
+    // caller with a junk token rewrote every syncing wallet's checkpoint, each under that
+    // wallet's lock, as often as it liked. The caller's own wallet is the only one in scope.
+    let token = token_from(&headers, state.allow_default_token)?;
+    let (saved, total, blocks) = flush_checkpoints(&state, Some(&token)).await;
     if blocks > 0 {
         log::info!("checkpoint on request: saved {saved}/{total} wallet(s), preserving {blocks} block(s) of scan progress");
     }
-    Json(serde_json::json!({ "saved": saved, "resident": total, "blocks": blocks }))
+    Ok(Json(serde_json::json!({ "saved": saved, "resident": total, "blocks": blocks })))
 }
 
 /// Persist every resident wallet's scan progress on the way out.
@@ -13578,6 +13604,23 @@ async fn flush_checkpoints_on_exit(state: &Arc<AppState>) {
         "shutdown: flushed {saved}/{total} wallet checkpoint(s) in {:.1?}, preserving {blocks} block(s) of scan progress that a restart would otherwise redo",
         started.elapsed()
     );
+}
+
+#[cfg(test)]
+mod operator_route_tests {
+    use super::*;
+    use axum::extract::ConnectInfo;
+
+    #[test]
+    fn only_a_loopback_caller_reaches_an_operator_route() {
+        let at = |s: &str| Some(ConnectInfo(s.parse::<SocketAddr>().unwrap()));
+        assert!(require_local_operator(at("127.0.0.1:5000")).is_ok());
+        assert!(require_local_operator(at("[::1]:5000")).is_ok());
+        assert!(require_local_operator(at("[::ffff:127.0.0.1]:5000")).is_ok(), "a dual-stack listener reports v4 loopback mapped");
+        assert!(require_local_operator(at("160.187.211.153:5000")).is_err(), "the public proxy is not an operator");
+        assert!(require_local_operator(at("[::ffff:160.187.211.153]:5000")).is_err());
+        assert!(require_local_operator(None).is_err(), "no connection info is refused, not trusted");
+    }
 }
 
 #[cfg(test)]
