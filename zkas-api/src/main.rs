@@ -54,6 +54,13 @@ const BPS: u64 = 1;
 const RECENT_CAP: usize = 6_000;
 const RECENT_PUBLIC_CAP: usize = 200;
 const WORK_HISTORY_CAP: usize = 100_000;
+/// Rolling (timestamp, coinbase-tag) buffer behind `/info/miners`. Covers ~16h of
+/// DAG blocks at ~1 bps so the 1h/6h/12h windows all have data; the tag is short so
+/// the memory cost is a few MB.
+const MINER_WINDOW_CAP: usize = 60_000;
+/// How many reorg observations to retain behind `/info/reorgs`. Depth-1 tip settling
+/// is frequent on a BlockDAG, so this is generous to cover the 7d window.
+const REORG_CAP: usize = 20_000;
 /// How many transactions the id→location index retains. The live feed ring only
 /// covers RECENT_CAP blocks (~3 min at 1 BPS), which made EVERY transaction older
 /// than a few minutes report "not found" — the explorer had no tx index at all.
@@ -118,6 +125,18 @@ struct WorkPoint {
     difficulty: f64,
 }
 
+/// One observed selected-chain reorg (blocks that left the chain). Depth-1 is
+/// ordinary tip settling on a BlockDAG; depth >= 2 is notable.
+#[derive(Clone)]
+struct ReorgEvent {
+    /// epoch ms when observed
+    timestamp: u64,
+    /// number of blocks removed from the selected chain
+    depth: u64,
+    /// miner labels of the displaced blocks (gathered only for notable reorgs)
+    miners: Vec<String>,
+}
+
 /// Running shielded-pool aggregate, advanced as the follower ingests blocks.
 #[derive(Default, Clone)]
 struct ShieldedAgg {
@@ -132,6 +151,11 @@ struct AppState {
     client: GrpcClient,
     recent: RwLock<VecDeque<BlockSummary>>,
     work_history: RwLock<VecDeque<WorkPoint>>,
+    /// (block timestamp ms, coinbase miner tag) for every DAG block the follower
+    /// sees, behind `/info/miners`. Whole DAG, not just the chain.
+    miner_window: RwLock<VecDeque<(u64, String)>>,
+    /// Selected-chain reorg observations behind `/info/reorgs`.
+    reorgs: RwLock<VecDeque<ReorgEvent>>,
     shielded: RwLock<ShieldedAgg>,
     network_name: String,
     /// txid → where it landed. Survives the live ring so a transaction stays
@@ -292,6 +316,52 @@ fn coinbase_state_root(block: &RpcBlock) -> Option<String> {
     Some(cb.payload[COMMITMENT_OFFSET..end].iter().map(|b| format!("{b:02x}")).collect())
 }
 
+/// The self-identifying tag a miner writes into the tail of its coinbase payload.
+/// Layout: blue_score(8) | subsidy(8) | shielded_commitment(32) | script_version(2)
+/// | script_len(1) | script_pub_key(N) | extra_data. The extra_data is the miner's
+/// free-text tag, e.g. "2.0.1/K1PoolEU9Pool" or "2.0.1/RK-Stratum/zkas/s../g..".
+fn coinbase_miner_tag(block: &RpcBlock) -> Option<String> {
+    let cb = block.transactions.first()?;
+    let p = &cb.payload;
+    // index of the script-length byte: after commitment(32) + script-version(2)
+    let len_idx = COMMITMENT_OFFSET + 32 + 2;
+    if p.len() <= len_idx {
+        return None;
+    }
+    let script_len = p[len_idx] as usize;
+    let extra_start = len_idx + 1 + script_len;
+    if p.len() <= extra_start {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&p[extra_start..]).trim_matches(|c: char| c.is_control() || c == '\0').trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+/// Reduce a raw coinbase tag to a stable miner label: drop the leading node-version
+/// segment and any per-worker/group hex tokens, so every block from one pool groups
+/// under one name. Empty tag → "unnamed".
+fn miner_label(tag: &str) -> String {
+    let mut segs: Vec<&str> = tag.split('/').collect();
+    // Drop a leading node version like "2.0.1".
+    if let Some(first) = segs.first() {
+        if first.contains('.') && first.split('.').all(|c| !c.is_empty() && c.bytes().all(|b| b.is_ascii_digit())) {
+            segs.remove(0);
+        }
+    }
+    let kept: Vec<&str> = segs
+        .into_iter()
+        .filter(|s| !s.is_empty() && *s != "zkas")
+        // Drop per-worker/group ids like s0000..da17 / g0000..015a.
+        .filter(|s| !((s.starts_with('s') || s.starts_with('g')) && s.len() >= 12 && s[1..].bytes().all(|b| b.is_ascii_hexdigit())))
+        .collect();
+    let label = kept.join("/");
+    if label.is_empty() { "unnamed".to_string() } else { label }
+}
+
 /// Turn an `RpcBlock` into the summary the live feed serves, and fold its shielded
 /// effects into `agg`.
 fn ingest(block: &RpcBlock, agg: &mut ShieldedAgg) -> BlockSummary {
@@ -439,6 +509,13 @@ async fn follow(state: Arc<AppState>) {
                     work.pop_front();
                 }
             }
+            if let Some(tag) = coinbase_miner_tag(b) {
+                let mut mw = state.miner_window.write().await;
+                mw.push_back((b.header.timestamp, tag));
+                while mw.len() > MINER_WINDOW_CAP {
+                    mw.pop_front();
+                }
+            }
             recent.push_front(summary);
             if recent.len() > RECENT_CAP {
                 recent.pop_back();
@@ -500,6 +577,13 @@ async fn follow(state: Arc<AppState>) {
                 work.push_back(WorkPoint { timestamp: block.header.timestamp, difficulty: summary.difficulty });
                 while work.len() > WORK_HISTORY_CAP {
                     work.pop_front();
+                }
+            }
+            if let Some(tag) = coinbase_miner_tag(block) {
+                let mut mw = state.miner_window.write().await;
+                mw.push_back((block.header.timestamp, tag));
+                while mw.len() > MINER_WINDOW_CAP {
+                    mw.pop_front();
                 }
             }
             {
@@ -961,6 +1045,186 @@ async fn info_merged(State(s): State<Arc<AppState>>) -> impl IntoResponse {
         "nodes": rows,
     }))
     .into_response()
+}
+
+/// Watch the selected chain for reorgs. `get_virtual_chain_from_block(last_sink)`
+/// reports the blocks REMOVED from the chain since `last_sink` (a reorg) and the
+/// ADDED chain blocks; record each removal and advance the cursor to the new tip.
+async fn track_reorgs(state: Arc<AppState>) {
+    const NOTABLE: u64 = 2;
+    let mut last_sink = loop {
+        match state.client.get_block_dag_info().await {
+            Ok(d) => break d.sink,
+            Err(_) => tokio::time::sleep(std::time::Duration::from_secs(2)).await,
+        }
+    };
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let resp = match state.client.get_virtual_chain_from_block(last_sink, false, None).await {
+            Ok(r) => r,
+            Err(_) => {
+                // The cursor may have been pruned/invalidated — re-anchor on the live sink.
+                if let Ok(d) = state.client.get_block_dag_info().await {
+                    last_sink = d.sink;
+                }
+                continue;
+            }
+        };
+        let depth = resp.removed_chain_block_hashes.len() as u64;
+        if depth > 0 {
+            // Only resolve displaced miners for notable reorgs — depth-1 settling is
+            // constant on a BlockDAG and not worth an RPC per removed block.
+            let mut miners = Vec::new();
+            if depth >= NOTABLE {
+                for h in resp.removed_chain_block_hashes.iter().take(16) {
+                    if let Ok(b) = state.client.get_block(*h, true).await {
+                        if let Some(tag) = coinbase_miner_tag(&b) {
+                            miners.push(miner_label(&tag));
+                        }
+                    }
+                }
+            }
+            let mut rq = state.reorgs.write().await;
+            rq.push_back(ReorgEvent { timestamp: now_secs() * 1000, depth, miners });
+            while rq.len() > REORG_CAP {
+                rq.pop_front();
+            }
+        }
+        last_sink = resp.added_chain_block_hashes.last().copied().unwrap_or(last_sink);
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ReorgsQuery {
+    window: Option<String>,
+}
+
+/// How often the selected chain is re-picked, and how deeply — the first place a
+/// concentrated hashrate would show itself. Powers the /map reorg panel.
+async fn info_reorgs(State(s): State<Arc<AppState>>, Query(q): Query<ReorgsQuery>) -> impl IntoResponse {
+    const NOTABLE: u64 = 2;
+    let window_secs: u64 = match q.window.as_deref() {
+        Some("24h") => 24 * 3600,
+        Some("7d") => 7 * 24 * 3600,
+        _ => 3600,
+    };
+    let now_ms = now_secs() * 1000;
+    let cutoff = now_ms.saturating_sub(window_secs * 1000);
+    let mut count = 0u64;
+    let mut deepest = 0u64;
+    let mut deepest_since_start = 0u64;
+    let mut blocks_orphaned = 0u64;
+    let mut last_seen: Option<u64> = None;
+    let mut histo: Vec<u64> = Vec::new();
+    let mut notable: Vec<serde_json::Value> = Vec::new();
+    {
+        let rq = s.reorgs.read().await;
+        for e in rq.iter() {
+            if e.depth > deepest_since_start {
+                deepest_since_start = e.depth;
+            }
+            if e.timestamp < cutoff {
+                continue;
+            }
+            count += 1;
+            blocks_orphaned += e.depth;
+            if e.depth > deepest {
+                deepest = e.depth;
+            }
+            last_seen = Some(last_seen.map_or(e.timestamp, |t| t.max(e.timestamp)));
+            let d = e.depth as usize;
+            if histo.len() <= d {
+                histo.resize(d + 1, 0);
+            }
+            histo[d] += 1;
+            if e.depth >= NOTABLE {
+                notable.push(json!({ "depth": e.depth, "miners": e.miners, "timestamp": e.timestamp }));
+            }
+        }
+    }
+    notable.reverse(); // newest first
+    Json(json!({
+        "count": count,
+        "reorgs": count,
+        "deepest": deepest,
+        "deepestSinceStart": deepest_since_start,
+        "blocksOrphaned": blocks_orphaned,
+        "notableDepth": NOTABLE,
+        "notable": notable,
+        "depthHistogram": histo,
+        "lastSeen": last_seen,
+        "windowSeconds": window_secs,
+    }))
+}
+
+#[derive(serde::Deserialize)]
+struct MinersQuery {
+    window: Option<String>,
+}
+
+/// Share of blocks over the window by the miner each block names in its own coinbase
+/// tag. Whole DAG, not just the chain. Powers the /map "Hashrate distribution" panel.
+async fn info_miners(State(s): State<Arc<AppState>>, Query(q): Query<MinersQuery>) -> impl IntoResponse {
+    let window_secs: u64 = match q.window.as_deref() {
+        Some("6h") => 6 * 3600,
+        Some("12h") => 12 * 3600,
+        _ => 3600,
+    };
+    let now_ms = now_secs() * 1000;
+    let cutoff = now_ms.saturating_sub(window_secs * 1000);
+    let mut counts: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    let mut total: u64 = 0;
+    let mut oldest = u64::MAX;
+    {
+        let win = s.miner_window.read().await;
+        for (ts, tag) in win.iter() {
+            if *ts < cutoff {
+                continue;
+            }
+            *counts.entry(miner_label(tag)).or_insert(0) += 1;
+            total += 1;
+            if *ts < oldest {
+                oldest = *ts;
+            }
+        }
+    }
+    let mut miners: Vec<(String, u64)> = counts.into_iter().collect();
+    miners.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let miners_json: Vec<_> = miners
+        .iter()
+        .map(|(name, blocks)| {
+            json!({
+                "name": name,
+                "blocks": blocks,
+                "share": if total > 0 { *blocks as f64 / total as f64 } else { 0.0 },
+            })
+        })
+        .collect();
+    let difficulty = s.client.get_block_dag_info().await.map(|d| d.difficulty).unwrap_or(0.0);
+    let measured = if total > 0 && oldest != u64::MAX { now_ms.saturating_sub(oldest) / 1000 } else { 0 };
+    Json(json!({
+        "miners": miners_json,
+        "producers": miners.len(),
+        "windowBlocks": total,
+        // kHeavyHash network hashrate from difficulty (same scale the analytics
+        // chart and pool headline use: H/s ≈ difficulty × 2).
+        "networkHashrate": difficulty * 2.0,
+        "windowSeconds": window_secs,
+        "measuredSeconds": measured,
+    }))
+}
+
+/// Canonical difficulty history for the analytics chart. The full back-history is
+/// maintained out of process in work-history.json (see zkas-work-history-dump + its
+/// timer); serve that, falling back to the in-memory ring if the file is absent.
+async fn info_work_history(State(s): State<Arc<AppState>>) -> impl IntoResponse {
+    if let Ok(txt) = std::fs::read_to_string("/root/zkas/work-history.json") {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
+            return Json(v);
+        }
+    }
+    let w = s.work_history.read().await;
+    Json(serde_json::to_value(w.iter().cloned().collect::<Vec<_>>()).unwrap_or_else(|_| json!([])))
 }
 
 async fn info_blockdag(State(s): State<Arc<AppState>>) -> impl IntoResponse {
@@ -1668,6 +1932,8 @@ async fn main() {
         client,
         recent: RwLock::new(VecDeque::with_capacity(RECENT_CAP)),
         work_history: RwLock::new(VecDeque::with_capacity(WORK_HISTORY_CAP)),
+        miner_window: RwLock::new(VecDeque::with_capacity(4096)),
+        reorgs: RwLock::new(VecDeque::with_capacity(1024)),
         shielded: RwLock::new(ShieldedAgg::default()),
         network_name,
         tx_index: RwLock::new(load_tx_index(&cli.tx_index)),
@@ -1685,6 +1951,7 @@ async fn main() {
 
     tokio::spawn(follow(state.clone()));
     tokio::spawn(scan_merged(state.clone()));
+    tokio::spawn(track_reorgs(state.clone()));
 
     let cors = CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any);
     let app = Router::new()
@@ -1694,6 +1961,9 @@ async fn main() {
         .route("/info/nodes", get(info_nodes))
         .route("/info/relay", get(info_relay))
         .route("/info/merged-mining", get(info_merged))
+        .route("/info/miners", get(info_miners))
+        .route("/info/work-history", get(info_work_history))
+        .route("/info/reorgs", get(info_reorgs))
         .route("/info/coinsupply", get(info_coinsupply))
         .route("/info/blockreward", get(info_blockreward))
         .route("/info/halving", get(info_halving))
