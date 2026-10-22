@@ -709,7 +709,7 @@ fn save_anchor_blocks(dir: &str, token: &str, blocks: &HashMap<u64, [u8; 32]>) {
     });
     if written.is_err() {
         let _ = std::fs::remove_file(&tmp);
-        log::warn!("wallet {token}: could not persist anchor-block sidecar (sends after a restart wait for sync)");
+        log::warn!("wallet {token_p}: could not persist anchor-block sidecar (sends after a restart wait for sync)", token_p = log_pseudonym(&token));
     }
 }
 
@@ -1224,10 +1224,10 @@ fn load_wallet_meta(dir: &str, token: &str, secret: Option<&str>) -> Option<(Wal
     let seed = if wf.encrypted {
         let blob = unhex(&wf.seed_hex)?;
         let secret = secret.or_else(|| {
-            log::error!("wallet '{token}' is encrypted but no --wallet-secret / ZKAS_WALLET_SECRET is set");
+            log::error!("wallet '{token_p}' is encrypted but no --wallet-secret / ZKAS_WALLET_SECRET is set", token_p = log_pseudonym(&token));
             None
         })?;
-        decrypt_seed(&blob, secret).map_err(|e| log::error!("cannot decrypt wallet '{token}': {e}")).ok()?
+        decrypt_seed(&blob, secret).map_err(|e| log::error!("cannot decrypt wallet '{token_p}': {e}", token_p = log_pseudonym(&token))).ok()?
     } else {
         unhex(&wf.seed_hex).and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())?
     };
@@ -2308,7 +2308,7 @@ fn prune_retired_copies(dir: &str, token: &str) {
         let path = format!("{dir}/{name}");
         let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         if std::fs::remove_file(&path).is_ok() {
-            log::info!("wallet '{token}': removed orphaned partial checkpoint {name} ({bytes} bytes)");
+            log::info!("wallet '{token_p}': removed orphaned partial checkpoint {name} ({bytes} bytes)", token_p = log_pseudonym(&token));
         }
     }
     for kind in ["bak", "divergent", "stale"] {
@@ -2320,7 +2320,7 @@ fn prune_retired_copies(dir: &str, token: &str) {
             let path = format!("{dir}/{name}");
             let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
             if std::fs::remove_file(&path).is_ok() {
-                log::info!("wallet '{token}': removed superseded checkpoint copy {name} ({bytes} bytes)");
+                log::info!("wallet '{token_p}': removed superseded checkpoint copy {name} ({bytes} bytes)", token_p = log_pseudonym(&token));
             }
         }
     }
@@ -4157,18 +4157,16 @@ impl WalletEntry {
                         // halts for the operator.
                         if poison_rebuild_allowed(token) {
                             log::error!(
-                                "wallet {token}: the node served block {} with a nullifier this wallet already saw; \
+                                "wallet {token_p}: the node served block {} with a nullifier this wallet already saw; \
                                  retiring the checkpoint and rebuilding the wallet",
-                                b.hash
-                            );
+                                b.hash, token_p = log_pseudonym(&token));
                             self.audit_retire = true;
                             self.error = Some("inconsistent shielded data (repeated nullifier); rebuilding the wallet".into());
                         } else {
                             log::error!(
-                                "wallet {token}: the node served block {} with a nullifier this wallet already saw, again after \
+                                "wallet {token_p}: the node served block {} with a nullifier this wallet already saw, again after \
                                  a rebuild; refusing to continue from inconsistent data (point walletd at another node)",
-                                b.hash
-                            );
+                                b.hash, token_p = log_pseudonym(&token));
                             self.error = Some("inconsistent shielded data from the node (repeated nullifier); sync halted".into());
                         }
                         // Leaves the blocking section; the pass returns right after it.
@@ -5102,11 +5100,10 @@ async fn run_subtree_build(
                 let (done, _, _, _) = progress.snapshot();
                 let secs = progress.started.elapsed().as_secs_f64().max(1.0);
                 log::info!(
-                    "subtree cache build for {who}: {} — {:.0} leaves/s across {} threads",
+                    "subtree cache build for {who_p}: {} — {:.0} leaves/s across {} threads",
                     progress.describe(),
                     done as f64 / secs,
-                    rayon::current_num_threads(),
-                );
+                    rayon::current_num_threads(), who_p = log_pseudonym(&who));
             }
         }
     };
@@ -5127,7 +5124,7 @@ fn spawn_subtree_build(state: &Arc<AppState>, token: &str, w: &Wallet, job: kasp
     let who = token.to_string();
     tokio::spawn(async move {
         let leaves = job.leaves();
-        log::info!("subtree cache build started for {who} ({leaves} leaves, off the wallet lock, asked by {origin})");
+        log::info!("subtree cache build started for {who_p} ({leaves} leaves, off the wallet lock, asked by {origin})", who_p = log_pseudonym(&who));
         let t = std::time::Instant::now();
         let built = run_subtree_build(&state, &who, &who, job).await;
         let mut e = w2.lock().await;
@@ -5145,14 +5142,12 @@ fn spawn_subtree_build(state: &Arc<AppState>, token: &str, w: &Wallet, job: kasp
             // Persist at once: this was expensive and a restart must not repeat it.
             e.force_checkpoint = true;
             log::info!(
-                "subtree cache complete for {who} in {:.1?} ({leaves} leaves, built OFF the wallet lock, asked by {origin}) — spends now witness in O(depth)",
-                t.elapsed()
-            );
+                "subtree cache complete for {who_p} in {:.1?} ({leaves} leaves, built OFF the wallet lock, asked by {origin}) — spends now witness in O(depth)",
+                t.elapsed(), who_p = log_pseudonym(&who));
         } else {
             log::warn!(
-                "subtree cache build for {who} did not install after {:.1?} ({leaves} leaves, asked by {origin}) — {why}; keeping the replay path and retrying",
-                t.elapsed()
-            );
+                "subtree cache build for {who_p} did not install after {:.1?} ({leaves} leaves, asked by {origin}) — {why}; keeping the replay path and retrying",
+                t.elapsed(), who_p = log_pseudonym(&who));
         }
     });
 }
@@ -5199,7 +5194,7 @@ async fn build_send_cache_off_lock(state: &Arc<AppState>, token: &str, w: &Walle
             spawn_subtree_build(state, token, w, job, "send");
         }
         if started.elapsed() >= SEND_CACHE_BUILD_WAIT_MAX {
-            log::warn!("send: {token} waited {:.0?} for its subtree cache build; proceeding with the batch replay", started.elapsed());
+            log::warn!("send: {token_p} waited {:.0?} for its subtree cache build; proceeding with the batch replay", started.elapsed(), token_p = log_pseudonym(&token));
             return;
         }
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -6308,7 +6303,7 @@ impl AppState {
             // with no thread to pull. One line here is the difference between a diagnosis
             // and a guess.
             if state.get_wallet(&token).await.is_none() {
-                log::warn!("wallet {token}: load did not complete; it stays 'opening' until a later request succeeds");
+                log::warn!("wallet {token_p}: load did not complete; it stays 'opening' until a later request succeeds", token_p = log_pseudonym(&token));
             }
         });
     }
@@ -6517,13 +6512,13 @@ impl AppState {
         let ts = match tokio::time::timeout(std::time::Duration::from_secs(8), c.get_shielded_tree_state(Some(cursor))).await {
             Ok(Ok(ts)) => ts,
             Ok(Err(e)) => {
-                log::info!("wallet {token}: quarantined checkpoint {path} (DAA {scanned}) is not resumable on this node ({e})");
+                log::info!("wallet {token_p}: quarantined checkpoint {path} (DAA {scanned}) is not resumable on this node ({e})", token_p = log_pseudonym(&token));
                 return None;
             }
             Err(_) => return None,
         };
         if ts.block_hash != cursor {
-            log::info!("wallet {token}: node cannot serve the frontier at quarantined cursor {cursor} (served {}); not restoring", ts.block_hash);
+            log::info!("wallet {token_p}: node cannot serve the frontier at quarantined cursor {cursor} (served {}); not restoring", ts.block_hash, token_p = log_pseudonym(&token));
             return None;
         }
         let fs = kaspa_shielded_core::tree::FrontierState {
@@ -6540,7 +6535,7 @@ impl AppState {
         // to bind, and nothing another key could smuggle in — restore it. Only a copy whose
         // notes do NOT derive under this key is refused.
         if rest.0.notes_bound_to_key(8) == Some(false) {
-            log::warn!("wallet {token}: quarantined checkpoint {path} holds notes not derived under this wallet's key; not restoring");
+            log::warn!("wallet {token_p}: quarantined checkpoint {path} holds notes not derived under this wallet's key; not restoring", token_p = log_pseudonym(&token));
             return None;
         }
         // Keep the partial rebuild it replaces (its pending-spend bookkeeping, if any).
@@ -6556,8 +6551,7 @@ impl AppState {
         // takes a fresh copy of the live file anyway, so nothing is lost by retiring this one.
         let _ = std::fs::rename(&path, format!("{path}.restored"));
         log::warn!(
-            "wallet {token}: restored quarantined checkpoint {path} (cursor {cursor}, DAA {scanned}) — the node serves its cursor again; the rebuild had reached DAA {mine_scanned}"
-        );
+            "wallet {token_p}: restored quarantined checkpoint {path} (cursor {cursor}, DAA {scanned}) — the node serves its cursor again; the rebuild had reached DAA {mine_scanned}", token_p = log_pseudonym(&token));
         Some(rest)
     }
 
@@ -6724,7 +6718,7 @@ impl AppState {
             let own_scan = scan_path(&self.wallet_dir, token);
             let own_aside = format!("{own_scan}.own");
             if !std::path::Path::new(&own_scan).exists() && std::fs::rename(&own_aside, &own_scan).is_ok() {
-                log::warn!("wallet {token}: restored its own checkpoint set aside by an interrupted twin adoption");
+                log::warn!("wallet {token_p}: restored its own checkpoint set aside by an interrupted twin adoption", token_p = log_pseudonym(&token));
             }
         }
         // Resume from a persisted checkpoint when one is present and version/genesis
@@ -6801,7 +6795,7 @@ impl AppState {
                             // write would then replace the kept `.scan` with an empty
                             // wallet at a later cursor. The wallet stays "opening" until
                             // the node's floor passes the cursor or walletd is repointed.
-                            log::warn!("wallet {token}: {msg}");
+                            log::warn!("wallet {token_p}: {msg}", token_p = log_pseudonym(&token));
                             return None;
                         }
                     }
@@ -6894,13 +6888,11 @@ impl AppState {
                     };
                     if strikes < UNVERIFIED_STRIKES_MAX {
                         log::info!(
-                            "wallet '{token}': node cannot verify the checkpoint yet (attempt {strikes}/{UNVERIFIED_STRIKES_MAX}); keeping it and retrying on the next request"
-                        );
+                            "wallet '{token_p}': node cannot verify the checkpoint yet (attempt {strikes}/{UNVERIFIED_STRIKES_MAX}); keeping it and retrying on the next request", token_p = log_pseudonym(&token));
                         return None;
                     }
                     log::warn!(
-                        "wallet '{token}': node has failed to verify the checkpoint {strikes} times; rebuilding from the birthday"
-                    );
+                        "wallet '{token_p}': node has failed to verify the checkpoint {strikes} times; rebuilding from the birthday", token_p = log_pseudonym(&token));
                     unverified_strikes().lock().unwrap_or_else(|p| p.into_inner()).remove(token);
                     None
                 }
@@ -6981,7 +6973,7 @@ impl AppState {
                     if set_aside {
                         // Over whatever the adoption left at the name (a rejected copy, or nothing).
                         if let Err(e) = std::fs::rename(&own_aside, &own_scan) {
-                            log::warn!("wallet {token}: could not restore its own checkpoint after a declined twin ({e})");
+                            log::warn!("wallet {token_p}: could not restore its own checkpoint after a declined twin ({e})", token_p = log_pseudonym(&token));
                         }
                     }
                 };
@@ -6997,7 +6989,7 @@ impl AppState {
                         let twin_tip = match self.frontier_at_checkpoint_cursor(token, &genesis).await {
                             Ok(t) => t,
                             Err(e) => {
-                                log::warn!("wallet {token}: cannot verify the adopted twin checkpoint ({e}); retrying later");
+                                log::warn!("wallet {token_p}: cannot verify the adopted twin checkpoint ({e}); retrying later", token_p = log_pseudonym(&token));
                                 put_back();
                                 return None;
                             }
@@ -7005,8 +6997,7 @@ impl AppState {
                         match load_checkpoint(&self.wallet_dir, token, key, &genesis, twin_tip.as_ref()) {
                             Some(restored) => {
                                 log::info!(
-                                    "wallet {token}: adopted checkpoint from twin token {donor} (birthday {keep_birthday}) instead of rescanning from {birthday}"
-                                );
+                                    "wallet {token_p}: adopted checkpoint from twin token {donor_p} (birthday {keep_birthday}) instead of rescanning from {birthday}", token_p = log_pseudonym(&token), donor_p = log_pseudonym(&donor));
                                 if set_aside {
                                     let _ = std::fs::remove_file(&own_aside);
                                 }
@@ -7034,9 +7025,8 @@ impl AppState {
                                 let scan = scan_path(&self.wallet_dir, token);
                                 if std::fs::remove_file(&scan).is_ok() {
                                     log::warn!(
-                                        "wallet {token}: twin {donor}'s checkpoint was rejected too (same cursor); discarded it{}",
-                                        if set_aside { " and kept its own" } else { " and scanning clean" }
-                                    );
+                                        "wallet {token_p}: twin {donor_p}'s checkpoint was rejected too (same cursor); discarded it{}",
+                                        if set_aside { " and kept its own" } else { " and scanning clean" }, token_p = log_pseudonym(&token), donor_p = log_pseudonym(&donor));
                                 }
                                 // Its own checkpoint, if it had one, was verified above and is
                                 // still the best this wallet has.
@@ -7093,8 +7083,7 @@ impl AppState {
             && restored.as_ref().is_some_and(|(db, ..)| db.history().is_empty() && !db.notes().is_empty())
         {
             log::info!(
-                "wallet {token}: keeps history but its checkpoint has no history rows (scanned with recording off) — keeping the checkpoint and recording from here; \"Recover full history\" rescans on request"
-            );
+                "wallet {token_p}: keeps history but its checkpoint has no history rows (scanned with recording off) — keeping the checkpoint and recording from here; \"Recover full history\" rescans on request", token_p = log_pseudonym(&token));
         }
         let t_restore = t_load0.elapsed();
         // Which of the three ways this wallet came back, so a slow load can be read
@@ -7115,7 +7104,7 @@ impl AppState {
         let t_entry = t_load0.elapsed();
         // Cumulative marks; each phase is the gap to the one before it.
         log::info!(
-            "load {token} via {load_path}: total {:.1?} = queue {:.1?} + gate {:.1?} + meta {:.1?} + verify {:.1?} + restore {:.1?} + entry {:.1?} + publish {:.1?} ({} notes, {} leaves, scanned {}; decode deferred)",
+            "load {token_p} via {load_path}: total {:.1?} = queue {:.1?} + gate {:.1?} + meta {:.1?} + verify {:.1?} + restore {:.1?} + entry {:.1?} + publish {:.1?} ({} notes, {} leaves, scanned {}; decode deferred)",
             t_load0.elapsed(),
             t_queued,
             t_permit.saturating_sub(t_queued),
@@ -7126,8 +7115,7 @@ impl AppState {
             t_load0.elapsed().saturating_sub(t_entry),
             entry.db.notes().len(),
             entry.db.size(),
-            entry.scanned,
-        );
+            entry.scanned, token_p = log_pseudonym(&token));
         // The same load as one parseable line (see `ScanStats::line` for the conventions):
         // `restore_ms` is the checkpoint READ (file read + parse + any v11 shared-leaf read).
         log::info!(
@@ -7722,12 +7710,11 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
             // every ~1s lap for as long as the wallet stays parked.
             if e.reorged_strikes == REORG_STRIKES {
                 log::error!(
-                    "wallet '{token}': cursor is unusable ({}) but this node CANNOT SERVE GENESIS, \
+                    "wallet '{token_p}': cursor is unusable ({}) but this node CANNOT SERVE GENESIS, \
                      so rebuilding would drop every note minted below its pruning point — \
                      REFUSING to retire the checkpoint. The wallet is parked and its balance is \
                      stale until you point walletd at an archival node and restart.",
-                    e.error.as_deref().unwrap_or("no error recorded")
-                );
+                    e.error.as_deref().unwrap_or("no error recorded"), token_p = log_pseudonym(&token));
             }
             e.error = Some(
                 "cursor unusable and this node cannot serve genesis; checkpoint preserved — \
@@ -7744,21 +7731,19 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
             // pass the node stays behind, so this fires only on the pass that parks it.
             if !e.error.as_deref().is_some_and(|m| m.starts_with("node is behind the wallet cursor")) {
                 log::warn!(
-                    "wallet '{token}': cursor reported unusable for {} passes but the node has not reached it ({why}); \
+                    "wallet '{token_p}': cursor reported unusable for {} passes but the node has not reached it ({why}); \
                      keeping the checkpoint until it does",
-                    e.reorged_strikes
-                );
+                    e.reorged_strikes, token_p = log_pseudonym(&token));
             }
             e.error = Some(format!("node is behind the wallet cursor ({why}); waiting"));
             return SyncOutcome::Behind;
         }
         let scan = scan_path(&state.wallet_dir, &token);
         log::warn!(
-            "wallet '{token}': cursor off the selected chain for {} consecutive passes ({}) \
+            "wallet '{token_p}': cursor off the selected chain for {} consecutive passes ({}) \
              — retiring checkpoint to .bak and rescanning",
             e.reorged_strikes,
-            e.error.as_deref().unwrap_or("no error recorded")
-        );
+            e.error.as_deref().unwrap_or("no error recorded"), token_p = log_pseudonym(&token));
         // Never clobber an existing backup. The rename used to be unconditional, so a second
         // retirement overwrote the good pre-amputation checkpoint with the already-damaged one
         // and destroyed the only copy — exactly when a recovering operator is retrying.
@@ -7785,9 +7770,8 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
         for (txid, value) in e.db.reclaim_expired(now_daa, PENDING_SPEND_EXPIRY_DAA) {
             e.force_checkpoint = true; // persist the returned note promptly
             log::warn!(
-                "wallet '{token}': submitted spend {} ({value} sompi) never appeared on-chain within ~{PENDING_SPEND_EXPIRY_DAA}s of chain time — note returned to the spendable balance",
-                RpcHash::from_bytes(txid)
-            );
+                "wallet '{token_p}': submitted spend {} ({value} sompi) never appeared on-chain within ~{PENDING_SPEND_EXPIRY_DAA}s of chain time — note returned to the spendable balance",
+                RpcHash::from_bytes(txid), token_p = log_pseudonym(&token));
         }
     }
     let behind = !e.caught_up;
@@ -7892,11 +7876,11 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
                 e.stats.ckpt_bytes += bytes;
             }
             Ok(Err(err)) => {
-                eprintln!("checkpoint write failed for {token}: {err}");
+                eprintln!("checkpoint write failed for {token_p}: {err}", token_p = log_pseudonym(&token));
                 e.force_checkpoint |= force;
             }
             Err(err) => {
-                eprintln!("checkpoint write task failed for {token}: {err}");
+                eprintln!("checkpoint write task failed for {token_p}: {err}", token_p = log_pseudonym(&token));
                 e.force_checkpoint |= force;
             }
         }
@@ -8101,7 +8085,7 @@ async fn admit_load(state: &Arc<AppState>, token: &str) -> Option<Admission> {
             }
         }
         if std::time::Instant::now() >= deadline {
-            log::warn!("wallet {token}: load deferred: the resident budget is full and every resident wallet is busy");
+            log::warn!("wallet {token_p}: load deferred: the resident budget is full and every resident wallet is busy", token_p = log_pseudonym(&token));
             return None;
         }
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -8238,7 +8222,7 @@ async fn evict_wallet(state: &Arc<AppState>, token: &str, why: &str) -> bool {
     let mut map = state.wallets.lock().await;
     if map.get(token).map(|cur| Arc::ptr_eq(cur, &w)).unwrap_or(false) {
         map.remove(token);
-        log::info!("evicted {why} wallet '{token}' (checkpoint on disk; it reloads on its next request)");
+        log::info!("evicted {why} wallet '{token_p}' (checkpoint on disk; it reloads on its next request)", token_p = log_pseudonym(&token));
         return true;
     }
     false
@@ -9009,8 +8993,7 @@ async fn load_new_wallet(
                 if state.get_wallet(token).await.is_some() {
                     state.index_fvk(token, &key).await;
                     log::info!(
-                        "imported wallet for token {token}: adopted checkpoint from twin token {donor} (birthday {keep_birthday})"
-                    );
+                        "imported wallet for token {token_p}: adopted checkpoint from twin token {donor_p} (birthday {keep_birthday})", token_p = log_pseudonym(&token), donor_p = log_pseudonym(&donor));
                     return Ok(());
                 }
                 // The clone failed to load — fall back to the honest scan from the
@@ -9175,7 +9158,7 @@ async fn wallet_watch(
             .get_wallet(&token)
             .await
             .ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "failed to resume wallet from checkpoint"))?;
-        log::info!("re-registered watch-only wallet for token {token}: resumed from checkpoint (birthday kept {keep_birthday})");
+        log::info!("re-registered watch-only wallet for token {token_p}: resumed from checkpoint (birthday kept {keep_birthday})", token_p = log_pseudonym(&token));
         return Ok(Json(AddressResp { address, index: 0 }));
     }
 
@@ -9197,8 +9180,7 @@ async fn wallet_watch(
         if state.get_wallet(&token).await.is_some() {
             state.index_fvk(&token, &key).await;
             log::info!(
-                "registered watch-only wallet for token {token}: adopted checkpoint from twin token {donor} (birthday {keep_birthday})"
-            );
+                "registered watch-only wallet for token {token_p}: adopted checkpoint from twin token {donor_p} (birthday {keep_birthday})", token_p = log_pseudonym(&token), donor_p = log_pseudonym(&donor));
             return Ok(Json(AddressResp { address, index: 0 }));
         }
         // The clone failed to load (corrupt donor file, node hiccup) — scan honestly.
@@ -9216,7 +9198,7 @@ async fn wallet_watch(
     };
     state.wallets.lock().await.insert(token.clone(), Arc::new(Mutex::new(entry)));
     state.index_fvk(&token, &WalletKey::Fvk(fvk)).await;
-    log::info!("registered watch-only wallet for token {token} (birthday {req_birthday}, requested {})", req.birthday);
+    log::info!("registered watch-only wallet for token {token_p} (birthday {req_birthday}, requested {})", req.birthday, token_p = log_pseudonym(&token));
     Ok(Json(AddressResp { address, index: 0 }))
 }
 
@@ -9748,13 +9730,12 @@ async fn wallet_scan_receipt_import(
         .to_bytes();
     if db.size() != ts.size || db.anchor() != node_anchor {
         log::warn!(
-            "wallet {token}: refused a scan receipt at DAA {}: receipt size/root {}/{}, node size/root {}/{}",
+            "wallet {token_p}: refused a scan receipt at DAA {}: receipt size/root {}/{}, node size/root {}/{}",
             meta.scanned_daa,
             db.size(),
             hex(&db.anchor()),
             ts.size,
-            hex(&node_anchor),
-        );
+            hex(&node_anchor), token_p = log_pseudonym(&token));
         return Err(err(
             StatusCode::BAD_REQUEST,
             "this receipt's commitment tree does not match the chain at the block it resumes from",
@@ -9779,7 +9760,7 @@ async fn wallet_scan_receipt_import(
     e.boundaries.clear();
     e.error = None;
     drop(e);
-    log::info!("wallet {token}: adopted a scan receipt at DAA {} ({notes} notes) instead of rescanning", meta.scanned_daa);
+    log::info!("wallet {token_p}: adopted a scan receipt at DAA {} ({notes} notes) instead of rescanning", meta.scanned_daa, token_p = log_pseudonym(&token));
     Ok(Json(serde_json::json!({
         "adopted": true,
         "notes": notes,
@@ -9852,9 +9833,9 @@ async fn wallet_rescan(
     // they were never part of.
     let from = body.as_ref().and_then(|b| b.birthday).unwrap_or(0);
     match set_wallet_birthday(&state.wallet_dir, &token, from) {
-        Ok(()) if from == 0 => log::info!("wallet '{token}': rescan from genesis (no birthday given)"),
-        Ok(()) => log::info!("wallet '{token}': rescan from DAA {from} — the caller supplied a birthday"),
-        Err(e) => log::warn!("wallet '{token}': could not set birthday for rescan ({e}); reload uses stored birthday"),
+        Ok(()) if from == 0 => log::info!("wallet '{token_p}': rescan from genesis (no birthday given)", token_p = log_pseudonym(&token)),
+        Ok(()) => log::info!("wallet '{token_p}': rescan from DAA {from} — the caller supplied a birthday", token_p = log_pseudonym(&token)),
+        Err(e) => log::warn!("wallet '{token_p}': could not set birthday for rescan ({e}); reload uses stored birthday", token_p = log_pseudonym(&token)),
     }
     // Poison any in-flight sync pass first: checkpoint writes are gated on
     // `error.is_none()`, so this stops a concurrent pass from re-persisting the
@@ -9868,7 +9849,7 @@ async fn wallet_rescan(
     // A deliberate rescan must not be undone by `restore_quarantined` on the next load.
     retire_quarantine_copies(&state.wallet_dir, &token);
     prune_retired_copies(&state.wallet_dir, &token);
-    log::info!("wallet '{token}': rescan requested — checkpoint retired, will reload from birthday");
+    log::info!("wallet '{token_p}': rescan requested — checkpoint retired, will reload from birthday", token_p = log_pseudonym(&token));
     // Return NOW. Reloading a wallet means a fast-sync anchor fetch and a scan
     // from birthday; doing that inline would hold the request open for minutes and
     // starve the HTTP path (the 2026-07-12 "wallet won't connect" outage). The
@@ -11761,7 +11742,7 @@ async fn wallet_submit(
             "submit REJECTED for session {} (wallet token {}): finalize_payment failed with {n_sigs} device \
              signature(s) for action index/es {sig_indices:?}: {e:?}",
             req.session,
-            token.as_deref().unwrap_or("<none>"),
+            token.as_deref().map(log_pseudonym).unwrap_or_else(|| "<none>".into()),
         );
         err(
             StatusCode::BAD_REQUEST,
@@ -12126,9 +12107,8 @@ async fn warm_wallet(
         (ready, matured, notes)
     };
     log::info!(
-        "admin warm_wallet {token}: subtree cache ready={ready} (notes={notes}, matured={matured}) in {:.1?}",
-        started.elapsed(),
-    );
+        "admin warm_wallet {token_p}: subtree cache ready={ready} (notes={notes}, matured={matured}) in {:.1?}",
+        started.elapsed(), token_p = log_pseudonym(&token));
     Ok(Json(serde_json::json!({
         "subtree_cache_ready": ready,
         "notes": notes,
@@ -12608,7 +12588,7 @@ async fn warm_sweep_loop(state: Arc<AppState>) {
                 log::info!(
                     "warm maintenance: {kept} held open and at the tip, {pulled} pulled back in, rotating through {}{} ({} MB free, cap --warm-always {maintain})",
                     candidates.iter().filter(|(t, tier)| *tier <= ROTATE_MAX_TIER && !hot.contains(t)).count(),
-                    rotated.as_deref().map(|t| format!(" (now {})", &t[..8.min(t.len())])).unwrap_or_default(),
+                    rotated.as_deref().map(|t| format!(" (now {})", log_pseudonym(t))).unwrap_or_default(),
                     headroom
                 );
             }
@@ -12690,7 +12670,7 @@ async fn warm_sweep_loop(state: Arc<AppState>) {
         let Some(job) = job else { continue };
         let leaves = job.leaves();
         let t = std::time::Instant::now();
-        log::info!("warm sweep: building subtree cache for {token} ({leaves} leaves)");
+        log::info!("warm sweep: building subtree cache for {token_p} ({leaves} leaves)", token_p = log_pseudonym(&token));
         let built = run_subtree_build(&state, &token, &token, job).await;
         let mut e = w.lock().await;
         e.build_in_flight = false;
@@ -12707,12 +12687,12 @@ async fn warm_sweep_loop(state: Arc<AppState>) {
         }
         drop(e);
         if installed {
-            log::info!("warm sweep: {token} spend-ready in {:.1?} ({leaves} leaves, persisted)", t.elapsed());
+            log::info!("warm sweep: {token_p} spend-ready in {:.1?} ({leaves} leaves, persisted)", t.elapsed(), token_p = log_pseudonym(&token));
             done.insert(token);
         } else {
             let n = attempts.entry(token.clone()).or_insert(0);
             *n += 1;
-            log::warn!("warm sweep: {token} cache did not install (attempt {n}) — {why}; will retry");
+            log::warn!("warm sweep: {token_p} cache did not install (attempt {n}) — {why}; will retry", token_p = log_pseudonym(&token));
             if *n >= WARM_SWEEP_MAX_ATTEMPTS {
                 done.insert(token);
             }
@@ -14024,6 +14004,138 @@ mod sdk_api_tests {
         assert_eq!(late.deferred, 1);
         let next = late.take_line("x", cost, 0, due + Duration::from_secs(61), &lim).expect("next minute");
         assert!(next.contains(" deferred=1") && next.contains(" window_s=122"), "{next}");
+    }
+
+    /// Log calls (`log::*!`, `eprintln!`) in `src` that format a wallet token raw: an inline
+    /// capture (`{token}`, `{who}`, …), a bare token variable as a positional argument, or a
+    /// slice of one (a prefix is still a credential fragment). A call is clean when every
+    /// token it shows goes through `log_pseudonym`. Returns `file:line: call` for each hit.
+    fn raw_token_log_calls(file: &str, src: &str) -> Vec<String> {
+        // Built at run time so this function's own source does not contain the patterns.
+        let macros: Vec<String> = ["info", "warn", "error", "debug", "trace"]
+            .iter()
+            .map(|l| format!("{}{}!(", "log::", l))
+            .chain(std::iter::once(format!("{}!(", "eprintln")))
+            .collect();
+        const NAMES: [&str; 7] = ["token", "who", "donor", "victim", "tok", "wallet_token", "access_token"];
+        let b = src.as_bytes();
+        let mut hits = Vec::new();
+        for mac in &macros {
+            let mut from = 0;
+            while let Some(off) = src[from..].find(mac.as_str()) {
+                let start = from + off;
+                from = start + mac.len();
+                // `eprintln!(` also matches inside a longer identifier; require a boundary.
+                if start > 0 && (b[start - 1].is_ascii_alphanumeric() || b[start - 1] == b'_') {
+                    continue;
+                }
+                // The call text up to its matching `)`, skipping string contents.
+                let (mut depth, mut j, mut in_str, mut esc) = (1usize, from, false, false);
+                let mut args: Vec<String> = vec![String::new()];
+                let mut fmt = String::new();
+                let mut first_str_done = false;
+                while j < b.len() && depth > 0 {
+                    let c = b[j] as char;
+                    if in_str {
+                        if esc {
+                            esc = false;
+                        } else if c == '\\' {
+                            esc = true;
+                        } else if c == '"' {
+                            in_str = false;
+                            first_str_done = true;
+                        }
+                        if !first_str_done {
+                            fmt.push(c);
+                        }
+                    } else {
+                        match c {
+                            '"' => in_str = true,
+                            '(' | '[' | '{' => depth += 1,
+                            ')' | ']' | '}' => depth -= 1,
+                            ',' if depth == 1 => args.push(String::new()),
+                            _ => {}
+                        }
+                        if depth > 0 && !(c == ',' && depth == 1) {
+                            args.last_mut().unwrap().push(c);
+                        }
+                    }
+                    j += 1;
+                }
+                let call = &src[start..j.min(src.len())];
+                let mut bad = false;
+                for n in NAMES {
+                    if fmt.contains(&format!("{{{n}}}")) || fmt.contains(&format!("{{{n}:")) {
+                        bad = true;
+                    }
+                }
+                for a in args.iter().skip(1) {
+                    let a = a.trim().trim_start_matches('&');
+                    if a.contains("log_pseudonym") {
+                        continue;
+                    }
+                    // A slice of a token (`&t[..8]`, the old rotation line) is a credential
+                    // prefix. Only slices of token-named variables count: a blanket "any `[..`"
+                    // rule flagged `&unserved[..6]`, a slice of tree positions, which is not a
+                    // token at all.
+                    for v in NAMES.iter().copied().chain(["t"]) {
+                        let pat = format!("{v}[..");
+                        let ab = a.as_bytes();
+                        let whole_ident = a.match_indices(pat.as_str()).any(|(i, _)| {
+                            i == 0 || !(ab[i - 1].is_ascii_alphanumeric() || ab[i - 1] == b'_')
+                        });
+                        if whole_ident && !a.starts_with("hex(") {
+                            bad = true;
+                        }
+                    }
+                    for n in NAMES {
+                        if a == n || a.starts_with(&format!("{n}.")) || a.starts_with(&format!("{n}[")) {
+                            bad = true;
+                        }
+                    }
+                }
+                if bad {
+                    let line = src[..start].matches('\n').count() + 1;
+                    hits.push(format!("{file}:{line}: {}", call.split_whitespace().collect::<Vec<_>>().join(" ")));
+                }
+            }
+        }
+        hits
+    }
+
+    /// A wallet token is the wallet's bearer credential: no log line may carry it, or any
+    /// prefix of it. walletd.log on 142 held every active wallet's full token in its `load …`,
+    /// eviction, rescan and checkpoint lines until 2026-10-22. Every log call now shows tokens
+    /// only as `log_pseudonym`, and this fails on any new call that does not. (The interactive
+    /// operator CLI in main.rs — `--diagnose`/`--graft`, which echo the token the operator
+    /// typed — and the self-host pairing URI printed for the user to scan are not logs.)
+    #[test]
+    fn no_log_call_formats_a_raw_wallet_token() {
+        // Negative control: each leak shape is caught, the pseudonymised forms are not.
+        let w = format!("{}{}", "log::", "warn!(");
+        for leak in [
+            format!("{w}\"wallet {{token}}: x\");"),
+            format!("{w}\"wallet {{}}: x\", token);"),
+            format!("{w}\"wallet {{}}: x\", &token);"),
+            format!("{w}\"x {{}}\", token.as_deref().unwrap_or(\"-\"));"),
+            format!("{w}\"now {{}}\", &t[..8]);"),
+            format!("{w}\"build for {{who}} in {{:?}}\", t);"),
+            format!("{}!(\"write failed for {{token}}: {{err}}\");", "eprintln"),
+        ] {
+            assert_eq!(raw_token_log_calls("x", &leak).len(), 1, "not caught: {leak}");
+        }
+        for clean in [
+            format!("{w}\"wallet {{token_p}}: x\", token_p = log_pseudonym(&token));"),
+            format!("{w}\"wallet {{}}: x\", log_pseudonym(&token));"),
+            format!("{w}\"token {{}}\", if session_token.is_some() {{ \"yes\" }} else {{ \"no\" }});"),
+            format!("{w}\"first {{:?}}\", &unserved[..unserved.len().min(6)]);"),
+            format!("{w}\"x {{:?}}\", &list[..2]);"),
+        ] {
+            assert!(raw_token_log_calls("x", &clean).is_empty(), "false positive: {clean}");
+        }
+        let mut hits = raw_token_log_calls("lib.rs", include_str!("lib.rs"));
+        hits.extend(raw_token_log_calls("selfhost.rs", include_str!("selfhost.rs")));
+        assert!(hits.is_empty(), "log calls that format a raw wallet token:\n{}", hits.join("\n"));
     }
 
     /// The v11 write gate's arithmetic: only the wallet's own range, only what the shared file
