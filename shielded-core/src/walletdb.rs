@@ -536,6 +536,15 @@ pub struct WalletDb {
     /// Excluded from the balance and from spend selection (like spent notes), but
     /// recoverable if the transaction is lost.
     pending_spends: Vec<PendingSpend>,
+    /// Every nullifier held in `notes` or `pending_spends`, and possibly a few that no longer
+    /// are: a SUPERSET, never a subset. Ingest probes it once per action and touches `notes`
+    /// and `pending_spends` only on a hit, which is what makes per-action bookkeeping O(1)
+    /// instead of two linear scans of the wallet's notes for every action on the chain (spec
+    /// 10 B6: a 10,000-note wallet lost 14–34 s per chain-day to those scans). Superset is the
+    /// safe direction: a stale entry only costs the old retain on that one action, while a
+    /// missing entry would leave a spent note in the balance. Every insertion into either Vec
+    /// adds here (`index_owned_nf`); removal happens only where ingest removes the note.
+    owned_nfs: HashSet<[u8; 32]>,
     /// Change owed back by each parked spend, keyed by txid — see
     /// [`Self::note_pending_outflow`]. Display-only: `mark_spent` removes the WHOLE
     /// input note from the balance, so without this a one-note wallet reads 0 from
@@ -941,6 +950,7 @@ impl WalletDb {
             borrow_tree: false,
             tree_valid: true,
             pending_spends: Vec::new(),
+            owned_nfs: HashSet::new(),
             pending_change: HashMap::new(),
             last_daa: 0,
             subtree: SubtreeCache::default(),
@@ -994,6 +1004,7 @@ impl WalletDb {
             borrow_tree: false,
             tree_valid: true,
             pending_spends: Vec::new(),
+            owned_nfs: HashSet::new(),
             pending_change: HashMap::new(),
             last_daa: 0,
             subtree: SubtreeCache::default(),
@@ -1214,6 +1225,7 @@ impl WalletDb {
     /// spent in this stream appends nothing (see `spent_nullifiers`). Shared by both
     /// ingest paths above.
     fn ingest_bundles(&mut self, txs: &[&ShieldedBundle], meta: Option<&BlockMeta>) {
+        let mut pruned_change = false;
         for (bi, bundle) in txs.iter().enumerate() {
             if bundle.actions.iter().any(|a| self.nf_contains(&a.nullifier)) {
                 self.poisoned = true;
@@ -1232,9 +1244,7 @@ impl WalletDb {
                 // balance and spend-selection never count or re-offer it. A pending
                 // spend whose nullifier appears is CONFIRMED: the parked note is gone
                 // for good.
-                self.notes.retain(|n| n.nullifier != action.nullifier);
-                self.pending_spends.retain(|p| p.note.nullifier != action.nullifier);
-                self.prune_pending_change();
+                self.forget_spent_owned(&action.nullifier, &mut pruned_change);
                 self.nf_insert(&action.nullifier);
 
                 let Some(cmx) = Option::<ExtractedNoteCommitment>::from(ExtractedNoteCommitment::from_bytes(&action.cmx)) else {
@@ -1316,6 +1326,7 @@ impl WalletDb {
     /// Compact counterpart of [`Self::ingest_bundles`] — identical drop rule and
     /// tree-append order, over compact action records.
     fn ingest_bundles_compact(&mut self, txs: &[Vec<CompactActionRecord>], meta: Option<&BlockMeta>) {
+        let mut pruned_change = false;
         for (bi, records) in txs.iter().enumerate() {
             if records.iter().any(|a| self.nf_contains(&a.nullifier)) {
                 self.poisoned = true;
@@ -1351,9 +1362,7 @@ impl WalletDb {
                 self.scan_cost.actions += records.len() as u64;
             }
             for (i, rec) in records.iter().enumerate() {
-                self.notes.retain(|n| n.nullifier != rec.nullifier);
-                self.pending_spends.retain(|p| p.note.nullifier != rec.nullifier);
-                self.prune_pending_change();
+                self.forget_spent_owned(&rec.nullifier, &mut pruned_change);
                 self.nf_insert(&rec.nullifier);
 
                 let Some(cmx) = Option::<ExtractedNoteCommitment>::from(ExtractedNoteCommitment::from_bytes(&rec.cmx)) else {
@@ -1417,9 +1426,53 @@ impl WalletDb {
         self.push_history(entry);
     }
 
+    /// Record that `notes` or `pending_spends` now holds a note with this nullifier.
+    fn index_owned_nf(&mut self, nullifier: [u8; 32]) {
+        self.owned_nfs.insert(nullifier);
+    }
+
+    /// Rebuild [`Self::owned_nfs`] from scratch, for code that replaces `notes` or
+    /// `pending_spends` wholesale.
+    fn reindex_owned_nfs(&mut self) {
+        self.owned_nfs = self.notes.iter().map(|n| n.nullifier).chain(self.pending_spends.iter().map(|p| p.note.nullifier)).collect();
+    }
+
+    /// An action on the chain revealed `nullifier`: if it spends one of our notes (unspent or
+    /// parked), that note is gone for good. The same effect as the two `retain`s and the
+    /// `pending_change` prune ingest used to run for EVERY action, paid only on a hit.
+    ///
+    /// `pruned_change` keeps the prune exactly where it was observable: the old code pruned
+    /// after the first action of an ingest call even without a hit (clearing change of spends
+    /// that had left `pending_spends` some other way), and after every hit. Between those it
+    /// was a no-op, because nothing else in the loop changes `pending_spends`.
+    fn forget_spent_owned(&mut self, nullifier: &[u8; 32], pruned_change: &mut bool) {
+        if self.owned_nfs.remove(nullifier) {
+            self.notes.retain(|n| &n.nullifier != nullifier);
+            self.pending_spends.retain(|p| &p.note.nullifier != nullifier);
+            self.prune_pending_change();
+            *pruned_change = true;
+        } else if !*pruned_change {
+            self.prune_pending_change();
+            *pruned_change = true;
+        }
+        #[cfg(test)]
+        self.assert_owned_nfs_cover_notes();
+    }
+
+    #[cfg(test)]
+    fn assert_owned_nfs_cover_notes(&self) {
+        for nf in self.notes.iter().map(|n| &n.nullifier).chain(self.pending_spends.iter().map(|p| &p.note.nullifier)) {
+            assert!(self.owned_nfs.contains(nf), "owned-nullifier index lost a held note");
+        }
+    }
+
     /// Value of the owned note (unspent or pending-spend) this nullifier would
     /// reveal, if it is one of ours.
     fn owned_note_value(&self, nullifier: &[u8; 32]) -> Option<u64> {
+        // Called for every action on the chain; nearly all of them are someone else's.
+        if !self.owned_nfs.contains(nullifier) {
+            return None;
+        }
         self.notes
             .iter()
             .find(|n| &n.nullifier == nullifier)
@@ -2205,6 +2258,7 @@ impl WalletDb {
             // never offer the note as spendable.
             if !self.nf_contains(&nullifier) {
                 self.notes.push(OwnedNote { note, position: self.size, nullifier });
+                self.index_owned_nf(nullifier);
             }
         }
         self.size += 1;
@@ -3357,6 +3411,7 @@ impl WalletDb {
         witnesses.retain(|(p, _)| owned.contains(p));
 
         db.notes = kept;
+        db.reindex_owned_nfs();
         db.witnesses = witnesses;
         db.witnessed_upto = size;
         db.lag_tree = db.tree.clone();
@@ -3713,6 +3768,7 @@ impl WalletDb {
             let addr = Option::<Address>::from(Address::from_raw_address_bytes(&recipient))?;
             let note = Option::<Note>::from(Note::from_parts(addr, NoteValue::from_raw(value), rho, rseed, orchard::note::NoteVersion::V2))?;
             db.notes.push(OwnedNote { note, position, nullifier });
+            db.index_owned_nf(nullifier);
         }
         let n_nfs = r.u64()? as usize;
         for _ in 0..n_nfs {
@@ -3887,6 +3943,7 @@ impl WalletDb {
         if let Some((last_daa, pending)) = parse(&mut r) {
             db.last_daa = last_daa;
             db.pending_spends = pending;
+            db.reindex_owned_nfs();
         }
     }
 
@@ -4383,6 +4440,165 @@ mod tests {
 
     fn address_of(seed: [u8; 32]) -> [u8; 43] {
         crate::wallet::scan::address_bytes_from_seed(seed).unwrap()
+    }
+
+    // ---- per-action note bookkeeping (spec 10 B6) ----
+
+    /// A deterministic foreign action: random nullifier/epk/ciphertext and a canonical cmx
+    /// (top two bits cleared puts it below the Pallas base modulus), so it appends a leaf and
+    /// decrypts to nothing.
+    fn foreign_record(tag: u64, i: u64) -> CompactActionRecord {
+        let b = |k: u8| {
+            let mut st = blake2b_simd::Params::new().hash_length(32).personal(b"zkas-b6-bench-v1").to_state();
+            st.update(&tag.to_le_bytes());
+            st.update(&i.to_le_bytes());
+            st.update(&[k]);
+            let mut o = [0u8; 32];
+            o.copy_from_slice(st.finalize().as_bytes());
+            o
+        };
+        let mut cmx = b(1);
+        cmx[31] &= 0x3f;
+        let mut enc = [0u8; 52];
+        enc[..32].copy_from_slice(&b(3));
+        CompactActionRecord { nullifier: b(0), cmx, ephemeral_key: b(2), enc_ciphertext: enc }
+    }
+
+    /// `n` coinbase notes to `db`'s own address, ingested as blocks of up to 500 outputs.
+    fn give_coinbase_notes(db: &mut WalletDb, n: usize, value: u64) {
+        use rayon::prelude::*;
+        let addr = db.my_address_bytes();
+        for chunk in (0..n).collect::<Vec<_>>().chunks(500) {
+            let cb: Vec<(CoinbaseNoteDesc, u64, ExtractedNoteCommitment)> = chunk
+                .par_iter()
+                .map(|i| {
+                    let (desc, v) = coinbase_for(addr, &(*i as u64).to_le_bytes(), value);
+                    let cmx = crate::coinbase::coinbase_note_commitment(&desc, v).unwrap();
+                    (desc, v, cmx)
+                })
+                .collect();
+            db.ingest_block_compact_precomputed_with_meta(&cb, &[], None);
+        }
+    }
+
+    /// A record that SPENDS `nf` (one of ours) and is otherwise foreign.
+    fn spending(nf: [u8; 32], i: u64) -> CompactActionRecord {
+        let mut r = foreign_record(99, i);
+        r.nullifier = nf;
+        r
+    }
+
+    /// The owned-nullifier index may hold stale entries but never miss a held note, and ingest
+    /// must remove exactly the notes whose nullifiers appear: unspent ones from the balance,
+    /// parked ones for good (with their change), across a checkpoint round trip too.
+    #[test]
+    fn owned_nullifier_index_finds_every_spend_and_nothing_else() {
+        let mut db = WalletDb::from_seed([41u8; 32]).unwrap();
+        give_coinbase_notes(&mut db, 40, 1_000);
+        assert_eq!(db.notes().len(), 40);
+        db.assert_owned_nfs_cover_notes();
+        let nfs: Vec<[u8; 32]> = db.notes().iter().map(|n| n.nullifier).collect();
+        let pos: Vec<u64> = db.notes().iter().map(|n| n.position).collect();
+
+        // Park three notes as one in-flight send with change; reclaim none yet.
+        db.mark_spent(pos[0], [0xA1; 32], 10);
+        db.mark_spent(pos[1], [0xA1; 32], 10);
+        db.mark_spent(pos[2], [0xA2; 32], 10);
+        db.note_pending_outflow([0xA1; 32], 600);
+        db.assert_owned_nfs_cover_notes();
+        assert_eq!(db.balance(), 37 * 1_000);
+
+        // A block of foreign txs with spends of: an unspent note (3), a parked note (0) and,
+        // in the same tx, an unspent note (4). The rest of the actions are foreign.
+        let txs = vec![
+            vec![foreign_record(1, 0), foreign_record(1, 1)],
+            vec![spending(nfs[3], 2), foreign_record(1, 3)],
+            vec![spending(nfs[0], 4), spending(nfs[4], 5)],
+            vec![foreign_record(1, 6)],
+        ];
+        db.ingest_block_compact_precomputed_with_meta(&[], &txs, None);
+        assert!(!db.poisoned());
+        let held: HashSet<[u8; 32]> = db.notes().iter().map(|n| n.nullifier).collect();
+        assert!(!held.contains(&nfs[3]) && !held.contains(&nfs[4]), "spent unspent notes leave the balance");
+        assert_eq!(db.notes().len(), 40 - 3 - 2);
+        assert!(db.pending_spends.iter().all(|p| p.note.nullifier != nfs[0]), "a parked note seen on chain is gone for good");
+        assert_eq!(db.pending_spends.len(), 2, "its sibling stays parked until its own nullifier appears");
+        assert_eq!(db.balance(), 35 * 1_000);
+        db.assert_owned_nfs_cover_notes();
+
+        // Reclaiming the expired parked spends puts their notes back; spending one later still
+        // removes it (the index kept its nullifier through park and reclaim).
+        let back = db.reclaim_expired(10_000, 100);
+        assert_eq!(back.len(), 2);
+        assert_eq!(db.pending_change(), 0, "a reclaimed spend owes no change");
+        db.assert_owned_nfs_cover_notes();
+        db.ingest_block_compact_precomputed_with_meta(&[], &[vec![spending(nfs[1], 7)]], None);
+        assert!(db.notes().iter().all(|n| n.nullifier != nfs[1]));
+
+        // Round trip: the restored wallet rebuilds the index and still sees a spend.
+        let bytes = db.to_checkpoint();
+        let mut back = WalletDb::from_checkpoint([41u8; 32], &bytes).expect("restores");
+        back.assert_owned_nfs_cover_notes();
+        let before = back.notes().len();
+        back.ingest_block_compact_precomputed_with_meta(&[], &[vec![spending(nfs[10], 8)]], None);
+        assert_eq!(back.notes().len(), before - 1, "the restored index must cover restored notes");
+        assert!(back.notes().iter().all(|n| n.nullifier != nfs[10]));
+    }
+
+    /// Bookkeeping cost per foreign action as a function of how many notes the wallet holds
+    /// (spec 10 B6). Decryption is done by `predecrypt_page_cached` OUTSIDE the timed section,
+    /// as walletd does per page, so the timed ingest is tree append + nullifier set +
+    /// bookkeeping. Runs on the pre-fix code unchanged (public API only), for before/after.
+    ///
+    ///   B6_NOTES=0,1000,10000 B6_ACTIONS=20000 cargo test --release -p kaspa-shielded-core \
+    ///     bench_bookkeeping_per_action_by_note_count -- --ignored --nocapture
+    #[test]
+    #[ignore = "benchmark"]
+    fn bench_bookkeeping_per_action_by_note_count() {
+        let counts: Vec<usize> = std::env::var("B6_NOTES")
+            .unwrap_or_else(|_| "0,1000,10000".into())
+            .split(',')
+            .map(|x| x.trim().parse().unwrap())
+            .collect();
+        let actions: u64 = std::env::var("B6_ACTIONS").ok().and_then(|v| v.parse().ok()).unwrap_or(20_000);
+        const PER_DAY: f64 = 77_104.0; // actions per chain-day [MEASURED spec 10 S1]
+        let mut base_us = None;
+        for n in counts {
+            let mut db = WalletDb::from_seed([42u8; 32]).unwrap();
+            give_coinbase_notes(&mut db, n, 1);
+            assert_eq!(db.notes().len(), n);
+            // Pages of 2,000 actions: 500 blocks of 2 txs of 2 actions.
+            let mut timed = std::time::Duration::ZERO;
+            let mut done = 0u64;
+            let mut page = 0u64;
+            while done < actions {
+                let blocks: Vec<Vec<Vec<CompactActionRecord>>> = (0..500)
+                    .map(|b| (0..2).map(|t| (0..2).map(|a| foreign_record(page, b * 4 + t * 2 + a)).collect()).collect())
+                    .collect();
+                let flat: Vec<CompactActionRecord> = blocks.iter().flatten().flatten().copied().collect();
+                db.predecrypt_page_cached(&flat, None);
+                let t = std::time::Instant::now();
+                for txs in &blocks {
+                    db.ingest_block_compact_precomputed_with_meta(&[], txs, None);
+                }
+                timed += t.elapsed();
+                db.end_page();
+                done += flat.len() as u64;
+                page += 1;
+            }
+            assert_eq!(db.notes().len(), n, "foreign actions spend nothing");
+            let us = timed.as_secs_f64() * 1e6 / done as f64;
+            let extra = base_us.map(|b: f64| us - b);
+            if base_us.is_none() {
+                base_us = Some(us);
+            }
+            println!(
+                "B6 notes {n:>7} actions {done} ingest {:.3} s = {us:.2} us/action -> {:.2} s per chain-day; over 0 notes: {}",
+                timed.as_secs_f64(),
+                us * PER_DAY / 1e6,
+                extra.map(|e| format!("{e:+.2} us/action = {:+.2} s/chain-day", e * PER_DAY / 1e6)).unwrap_or_else(|| "-".into())
+            );
+        }
     }
 
     /// A coinbase paid to a DIVERSIFIED address is ours too.
