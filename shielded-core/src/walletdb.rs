@@ -80,6 +80,12 @@ impl OwnedNote {
     pub fn nullifier(&self) -> [u8; 32] {
         self.nullifier
     }
+
+    /// For the multi-wallet engine ([`crate::engine::WalletLite`]), which derives the
+    /// nullifier exactly as [`WalletDb`]'s ingest does.
+    pub(crate) fn new(note: Note, position: u64, nullifier: [u8; 32]) -> Self {
+        Self { note, position, nullifier }
+    }
 }
 
 /// A note whose spend has been **submitted** to the network but not yet observed
@@ -888,7 +894,7 @@ impl SubtreeCache {
 /// row per block, so an uncapped history would grow by ~86K rows/day at 1 BPS;
 /// 20K keeps weeks of ordinary use and days of solo mining while bounding the
 /// checkpoint blob.
-const HISTORY_CAP: usize = 20_000;
+pub(crate) const HISTORY_CAP: usize = 20_000;
 
 /// How many diversified addresses to derive up front for coinbase recognition.
 ///
@@ -897,7 +903,7 @@ const HISTORY_CAP: usize = 20_000;
 /// operation on half of every block's leaves. 256 covers per-customer deposit
 /// addresses at the scale this daemon actually serves; see `known_addresses` for
 /// what it does not cover.
-const COINBASE_DIVERSIFIER_SCAN: u32 = 256;
+pub(crate) const COINBASE_DIVERSIFIER_SCAN: u32 = 256;
 
 impl WalletDb {
     /// Build a wallet view from a 32-byte seed. Returns `None` if the seed is not
@@ -2320,7 +2326,19 @@ impl WalletDb {
         // is supposed to measure is worse than none, and I nearly reported it as a win.
         let t_dec = std::time::Instant::now();
         let found = crate::wallet::scan_compact_auto_prepared(&self.prepared_ivk, self.agree_scalar.as_ref(), all, prep, epks);
-        self.scan_cost.decrypt_ns += t_dec.elapsed().as_nanos();
+        self.install_predecrypted(all, found, t_dec.elapsed().as_nanos());
+    }
+
+    /// Install a page memo that somebody else decided: `found` must be exactly what
+    /// [`Self::predecrypt_page_prepared`] would have computed for `all` with this wallet's
+    /// key (the multi-wallet detector, [`crate::engine::detect`], computes it for a whole
+    /// cohort at once). `decrypt_ns` is charged to this wallet's scan cost. Like the memo it
+    /// replaces it is purely an optimisation input: [`Self::end_page`] drops it.
+    pub fn install_predecrypted(&mut self, all: &[CompactActionRecord], found: Vec<ReceivedNote>, decrypt_ns: u128) {
+        if self.leaves_only || all.is_empty() {
+            return;
+        }
+        self.scan_cost.decrypt_ns += decrypt_ns;
         self.scan_cost.actions += all.len() as u64;
         let mut map: std::collections::HashMap<[u8; 32], Option<ReceivedNote>> = all.iter().map(|r| (r.nullifier, None)).collect();
         for n in found {
@@ -2329,6 +2347,12 @@ impl WalletDb {
             }
         }
         self.predecrypted = Some(map);
+    }
+
+    /// The prepared external viewing key and its agreement scalar — what a multi-wallet
+    /// detector needs to decide this wallet's actions ([`crate::engine::IvkKey`]).
+    pub fn incoming_viewing_key(&self) -> &IncomingViewingKey {
+        &self.ivk
     }
 
     /// Drop the page memo. Always call after the page's blocks are ingested — a stale
@@ -2371,6 +2395,12 @@ impl WalletDb {
             }
             Some(sh) => sh.insert(nf),
         }
+    }
+
+    /// Whether the stream this wallet ingested has applied `nf` (the set the consensus drop
+    /// rule and the "spent before it appeared" rule read).
+    pub fn applied_nullifier(&self, nf: &[u8; 32]) -> bool {
+        self.nf_contains(nf)
     }
 
     /// Number of applied nullifiers this wallet's stream holds (either representation).
@@ -4224,7 +4254,7 @@ const CREDITS_CAP: usize = 256;
 /// One [`Credit`] per note this transaction paid us, in ingest order — the
 /// breakdown a payer's single transaction to several of our diversified addresses
 /// needs in order to be reconciled per address.
-fn credits_from_received(received: &[ReceivedNote]) -> Vec<Credit> {
+pub(crate) fn credits_from_received(received: &[ReceivedNote]) -> Vec<Credit> {
     received
         .iter()
         .take(CREDITS_CAP)
