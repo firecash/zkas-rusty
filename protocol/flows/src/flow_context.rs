@@ -71,6 +71,10 @@ pub(crate) fn shielded_proof_ban_exempt(peer_protocol_version: u32, user_agent: 
         || crate::user_agent_rule::advertises_newer_release(user_agent, kaspa_core::kaspad_env::name(), kaspa_core::kaspad_env::version())
 }
 
+/// Concurrent pruning-point nullifier exports one node serves (spec 08 R3.3). Each one walks the
+/// whole set from a database snapshot; a third requester waits (and past its timeout, tries another
+/// peer) instead of adding a third full read.
+pub const MAX_CONCURRENT_SHIELDED_EXPORTS: usize = 2;
 
 /// See `check_orphan_resolution_range`
 const BASELINE_ORPHAN_RESOLUTION_RANGE: u32 = 5;
@@ -305,10 +309,19 @@ pub struct FlowContextInner {
     /// Global limit on pruning-point proof serves, see `serve_policy`.
     pub(crate) proof_serve_gate: ProofServeGate,
 
+    /// At most this many pruning-point nullifier exports at once (N1, spec 08 R3.3).
+    shielded_export_permits: Arc<tokio::sync::Semaphore>,
+
+    /// IBD flows of peers that serve ranged nullifier streams and are idle, by peer: a range-split
+    /// import hands them one range at a time (N1, spec 08 R3.4.1).
+    shielded_range_helpers: Mutex<HashMap<PeerKey, tokio::sync::mpsc::Sender<crate::ibd::ShieldedRangeJob>>>,
+
+    /// Failed integrity checks of range-split imports, per pruning point (N1, spec 08 R3.4.4/R3.5).
+    shielded_import_suspects: Mutex<crate::ibd::ShieldedImportSuspects>,
+
     /// Node-wide shielded proof-verification budget for relayed transactions (N1, spec 08 R1.4).
     verify_budget_params: crate::verify_budget::BudgetParams,
     verify_budget_global: Mutex<crate::verify_budget::TokenBucket>,
-
 
     bps: usize,
 
@@ -421,6 +434,9 @@ impl FlowContext {
                 relay_credit: Default::default(),
                 auto_ban_budget: Default::default(),
                 proof_serve_gate: Default::default(),
+                shielded_export_permits: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SHIELDED_EXPORTS)),
+                shielded_range_helpers: Default::default(),
+                shielded_import_suspects: Default::default(),
                 verify_budget_params: crate::verify_budget::BudgetParams::for_cores(crate::verify_budget::default_verify_cores()),
                 verify_budget_global: Mutex::new(
                     crate::verify_budget::BudgetParams::for_cores(crate::verify_budget::default_verify_cores())
@@ -433,6 +449,25 @@ impl FlowContext {
                 mining_rule_engine,
             }),
         }
+    }
+
+    /// Offer this peer's idle IBD flow as a ranged-stream source (N1, spec 08 R3.4.1).
+    pub fn register_shielded_range_helper(&self, key: PeerKey, jobs: tokio::sync::mpsc::Sender<crate::ibd::ShieldedRangeJob>) {
+        self.inner.shielded_range_helpers.lock().insert(key, jobs);
+    }
+
+    pub fn unregister_shielded_range_helper(&self, key: &PeerKey) {
+        self.inner.shielded_range_helpers.lock().remove(key);
+    }
+
+    /// The registered range helpers other than `me`.
+    pub fn shielded_range_helpers_except(&self, me: &PeerKey) -> Vec<(PeerKey, tokio::sync::mpsc::Sender<crate::ibd::ShieldedRangeJob>)> {
+        self.inner.shielded_range_helpers.lock().iter().filter(|(k, _)| *k != me).map(|(k, s)| (*k, s.clone())).collect()
+    }
+
+    /// The suspect record of range-split imports (N1, spec 08 R3.4.4/R3.5).
+    pub fn shielded_import_suspects(&self) -> parking_lot::MutexGuard<'_, crate::ibd::ShieldedImportSuspects> {
+        self.inner.shielded_import_suspects.lock()
     }
 
     /// The node-wide verification budget parameters (N1, spec 08 R1.4).
@@ -448,6 +483,11 @@ impl FlowContext {
         now: std::time::Instant,
     ) -> crate::verify_budget::Admission {
         crate::verify_budget::charge(peer, &mut self.inner.verify_budget_global.lock(), vu, now)
+    }
+
+    /// The gate on concurrent pruning-point nullifier exports (N1, spec 08 R3.3).
+    pub fn shielded_export_permits(&self) -> Arc<tokio::sync::Semaphore> {
+        self.inner.shielded_export_permits.clone()
     }
 
     pub fn block_invs_channel_size(&self) -> usize {
@@ -1005,6 +1045,7 @@ impl FlowContext {
         let mut self_version_message =
             Version::new(local_address, self.node_id, network_name.clone(), None, advertised_protocol_version);
         self_version_message.add_user_agent(name(), version(), &self.config.user_agent_comments);
+        self_version_message.services |= kaspa_p2p_lib::common::SERVICE_NF_SORTED_STREAM;
         // TODO: disable_relay_tx from config/cmd
 
         // Perform the handshake
@@ -1088,6 +1129,7 @@ impl FlowContext {
         // Build and register the peer properties
         let peer_properties = Arc::new(PeerProperties {
             user_agent: peer_version.user_agent,
+            services: peer_version.services,
             advertised_protocol_version: peer_version.protocol_version,
             protocol_version: applied_protocol_version,
             disable_relay_tx: peer_version.disable_relay_tx,

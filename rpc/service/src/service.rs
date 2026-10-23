@@ -921,7 +921,19 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         // make to anchor a scan, so a wallet learns the node's floor at the moment it decides
         // where to start — rather than discovering it as a wrong balance later.
         let (history_from_daa_score, history_complete) = session.async_get_shielded_history_status().await?;
-        Ok(GetShieldedTreeStateResponse { block_hash, daa_score, size, leaf, ommers, history_from_daa_score, history_complete })
+        // N1 (spec 08 R3.7): the maintained set size at the served block. A count that cannot be
+        // read is reported as absent, never guessed.
+        let nullifier_count = session.async_get_shielded_nullifier_count(block_hash).await.ok().flatten();
+        Ok(GetShieldedTreeStateResponse {
+            block_hash,
+            daa_score,
+            size,
+            leaf,
+            ommers,
+            history_from_daa_score,
+            history_complete,
+            nullifier_count,
+        })
     }
 
     async fn get_shielded_blocks_call(

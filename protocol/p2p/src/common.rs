@@ -7,6 +7,12 @@ use thiserror::Error;
 /// Default P2P communication timeout
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120); // 2 minutes
 
+/// Version-message service bit (spec 08 R3.4.2, bit 6): this node serves the pruning-point nullifier
+/// set as a sorted stream and answers `RequestPruningPointShieldedChunkFrom` (resume after a given
+/// nullifier). An older node closes the connection on a message it does not know, so a requester
+/// sends that message only to peers that advertise this bit.
+pub const SERVICE_NF_SORTED_STREAM: u64 = 1 << 6;
+
 #[derive(Error, Debug, Clone)]
 pub enum ProtocolError {
     #[error("timeout expired after {0:?}")]

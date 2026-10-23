@@ -133,9 +133,16 @@ impl DbNullifierSetStore {
         })
     }
 
-    /// Number of spent nullifiers in the global set (for export progress / sizing).
+    /// Number of spent nullifiers in the global set (for export progress / sizing). O(set) walk;
+    /// the maintained per-block count is `ShieldedStateManager::nullifier_count_at` (N1, 08 R3.7).
     pub fn count(&self) -> usize {
         self.access.iterator().count()
+    }
+
+    /// Stage a delete of the whole set as one range tombstone over the store prefix (N1, spec 08
+    /// R3.2d), and forget the cache.
+    pub fn delete_all_batch(&self, batch: &mut WriteBatch) -> StoreResult<()> {
+        self.access.delete_all(BatchDbWriter::new(batch))
     }
 
     /// Insert a spent nullifier tagged with the tree era its spend anchored in (spec 08 R5.1).
@@ -751,6 +758,50 @@ impl ShieldedBurnStoreReader for DbShieldedBurnStore {
             Err(StoreError::KeyNotFound(_)) => Ok(BurnReceipts::default()),
             Err(e) => Err(e),
         }
+    }
+}
+
+// ------------------------ Nullifier-set size per chain block (N1) ------------------------
+
+/// The size of the global spent-nullifier set as of each chain block (08 R3.7, the `nullifierCount`
+/// measurement). Kept per block exactly like the MuHash accumulator, so it is intrinsic to the block
+/// and needs no reorg handling: `count(block) = count(selected_parent) + |block's new nullifiers|`.
+/// A block whose selected parent has no count (a database an older build wrote, before the one-time
+/// backfill at the cursor) has none either; readers get `None`, never a guess.
+#[derive(Clone)]
+pub struct DbShieldedNullifierCountStore {
+    db: Arc<DB>,
+    access: CachedDbAccess<Hash, u64, BlockHasher>,
+}
+
+impl DbShieldedNullifierCountStore {
+    pub fn new(db: Arc<DB>, cache_policy: CachePolicy) -> Self {
+        Self { db: Arc::clone(&db), access: CachedDbAccess::new(db, cache_policy, DatabaseStorePrefixes::ShieldedNullifierCount.into()) }
+    }
+
+    pub fn clear_cache(&self) {
+        self.access.clear_cache();
+    }
+
+    pub fn clone_with_new_cache(&self, cache_policy: CachePolicy) -> Self {
+        Self::new(Arc::clone(&self.db), cache_policy)
+    }
+
+    /// The count at `block`, `None` if this node never recorded one.
+    pub fn get(&self, block: Hash) -> StoreResult<Option<u64>> {
+        match self.access.read(block) {
+            Ok(c) => Ok(Some(c)),
+            Err(StoreError::KeyNotFound(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub fn set_batch(&self, batch: &mut WriteBatch, block: Hash, count: u64) -> StoreResult<()> {
+        self.access.write(BatchDbWriter::new(batch), block, count)
+    }
+
+    pub fn delete_batch(&self, batch: &mut WriteBatch, block: Hash) -> StoreResult<()> {
+        self.access.delete(BatchDbWriter::new(batch), block)
     }
 }
 

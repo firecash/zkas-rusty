@@ -20,10 +20,19 @@ use kaspa_hashes::Hash;
 use kaspa_p2p_lib::{
     IncomingRoute, Router,
     common::ProtocolError,
-    dequeue, dequeue_with_timeout, make_message,
+    dequeue_with_timeout, make_message,
     pb::{ShieldedMetadataMessage, ShieldedNullifierChunkMessage, UnexpectedPruningPointMessage, kaspad_message::Payload},
 };
 use std::sync::Arc;
+
+/// One export request: a full stream (`ranged == false`, every protocol version) or one key range.
+struct ExportRequest {
+    pp: Hash,
+    from: Option<[u8; 32]>,
+    before: Option<[u8; 32]>,
+    with_metadata: bool,
+    ranged: bool,
+}
 
 /// Server side of pruning-point shielded-state IBD transfer (PLAN §2.8/§2.9):
 /// sends the shielded metadata at the pruning point followed by the whole
@@ -54,9 +63,35 @@ impl RequestPruningPointShieldedStateFlow {
     async fn start_impl(&mut self) -> Result<(), ProtocolError> {
         let mut last_served: Option<std::time::Instant> = None;
         loop {
-            let expected_pp = dequeue!(self.incoming_route, Payload::RequestPruningPointShieldedState)?.try_into()?;
-            // Space out repeat exports from one peer. An honest syncer asks once, so this costs it
-            // nothing; the loop previously had no bound whatsoever.
+            // A full request (every version), or (N1, spec 08 R3.3/R3.4.1) one key range of the set.
+            let msg = match self.incoming_route.recv().await {
+                Some(msg) => msg,
+                None => return Err(ProtocolError::ConnectionClosed),
+            };
+            let request = match msg.payload {
+                Some(Payload::RequestPruningPointShieldedState(m)) => {
+                    let pp: Hash = m.try_into()?;
+                    ExportRequest { pp, from: None, before: None, with_metadata: true, ranged: false }
+                }
+                Some(Payload::RequestPruningPointShieldedChunkFrom(m)) => {
+                    let (pp, from, before, with_metadata): kaspa_p2p_lib::convert::messages::ShieldedRangeRequest = m.try_into()?;
+                    if let (Some(f), Some(b)) = (from, before)
+                        && f >= b
+                    {
+                        return Err(ProtocolError::Other("shielded range request with from >= before"));
+                    }
+                    ExportRequest { pp, from, before, with_metadata, ranged: true }
+                }
+                other => {
+                    return Err(ProtocolError::UnexpectedMessage(
+                        "Payload::RequestPruningPointShieldedState | Payload::RequestPruningPointShieldedChunkFrom",
+                        other.as_ref().map(|v| v.into()),
+                    ));
+                }
+            };
+            // Space out repeat exports from one peer. A full export is requested once by an honest
+            // syncer; a range-split import asks one peer for its ranges one after the other, which
+            // this spacing paces (16 ranges = 30 s of spacing at most per source).
             if let Some(last) = last_served {
                 let elapsed = last.elapsed();
                 if elapsed < SHIELDED_STATE_MIN_INTERVAL {
@@ -64,72 +99,69 @@ impl RequestPruningPointShieldedStateFlow {
                 }
             }
             last_served = Some(std::time::Instant::now());
-            self.handle_request(expected_pp).await?
+            // At most `MAX_CONCURRENT_SHIELDED_EXPORTS` exports per node (spec 08 R3.3). A requester
+            // that has to wait past its timeout tries another source, which is the "busy" answer an
+            // older requester also understands.
+            let permits = self.ctx.shielded_export_permits();
+            let _permit = permits.acquire_owned().await.map_err(|_| ProtocolError::Other("shielded export gate closed"))?;
+            self.handle_request(request).await?
         }
     }
 
-    async fn handle_request(&mut self, expected_pp: Hash) -> Result<(), ProtocolError> {
+    async fn handle_request(&mut self, req: ExportRequest) -> Result<(), ProtocolError> {
+        let ExportRequest { pp: expected_pp, from, before, with_metadata, ranged } = req;
         let consensus = self.ctx.consensus();
-        let session = consensus.session().await;
+        let mut nullifier_count: Option<u64> = None;
+        if with_metadata {
+            let session = consensus.session().await;
+            let metadata = match session.async_get_pruning_point_shielded_metadata(expected_pp).await {
+                Err(ConsensusError::UnexpectedPruningPoint) => return self.send_unexpected_pruning_point().await,
+                res => res,
+            }?;
+            drop(session);
 
-        let metadata = match session.async_get_pruning_point_shielded_metadata(expected_pp).await {
-            Err(ConsensusError::UnexpectedPruningPoint) => return self.send_unexpected_pruning_point().await,
-            res => res,
-        }?;
-        drop(session);
-
-        // No shielded state at the pruning point: signal it with empty metadata.
-        let Some(ShieldedExportMetadata { data, nullifier_count }) = metadata else {
+            // No shielded state at the pruning point: signal it with empty metadata.
+            let Some(ShieldedExportMetadata { data, nullifier_count: count }) = metadata else {
+                self.router
+                    .enqueue(make_message!(Payload::ShieldedMetadata, ShieldedMetadataMessage { data: vec![], nullifier_count: 0 }))
+                    .await?;
+                debug!("Finished sending shielded state for pruning point {}: no shielded state", expected_pp);
+                return Ok(());
+            };
+            // `nullifier_count` is the size of the WHOLE set, also for a range request.
             self.router
-                .enqueue(make_message!(Payload::ShieldedMetadata, ShieldedMetadataMessage { data: vec![], nullifier_count: 0 }))
+                .enqueue(make_message!(Payload::ShieldedMetadata, ShieldedMetadataMessage { data, nullifier_count: count }))
                 .await?;
-            debug!("Finished sending shielded state for pruning point {}: no shielded state", expected_pp);
-            return Ok(());
-        };
-
-        self.router.enqueue(make_message!(Payload::ShieldedMetadata, ShieldedMetadataMessage { data, nullifier_count })).await?;
-
-        if nullifier_count == 0 {
-            debug!("Finished sending shielded state for pruning point {}: 0 nullifiers", expected_pp);
-            return Ok(());
+            if count == 0 && !ranged {
+                debug!("Finished sending shielded state for pruning point {}: 0 nullifiers", expected_pp);
+                return Ok(());
+            }
+            nullifier_count = Some(count);
         }
 
         // Read-ahead is bounded to what the send loop needs: this channel is invisible to the
         // router's byte budget (see `EXPORT_READ_AHEAD_CHUNKS`).
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<[u8; 32]>>(EXPORT_READ_AHEAD_CHUNKS);
 
+        // N1 (spec 08 R3.3): the set is streamed from a database snapshot in ascending order and
+        // never materialised; an unbounded stream is checked against the committed accumulator
+        // before its last chunk is handed over (a torn view errors here instead of completing).
         let session_for_reader = consensus.unguarded_session();
-        let stream = match session_for_reader.open_pruning_point_shielded_nullifier_stream(expected_pp) {
-            Err(ConsensusError::UnexpectedPruningPoint) => return self.send_unexpected_pruning_point().await,
-            res => res,
-        }?;
-        drop(session_for_reader);
         let reader_handle = tokio::task::spawn_blocking(move || -> Result<u64, ConsensusError> {
-            let mut count: u64 = 0;
-            let mut batch: Vec<[u8; 32]> = Vec::with_capacity(SHIELDED_CHUNK_SIZE);
-            for item in stream {
-                batch.push(item?);
-                if batch.len() == SHIELDED_CHUNK_SIZE {
-                    count += batch.len() as u64;
-                    if tx.blocking_send(std::mem::take(&mut batch)).is_err() {
-                        return Err(ConsensusError::General("receiver went away"));
-                    }
-                    batch.reserve(SHIELDED_CHUNK_SIZE);
-                }
-            }
-            if !batch.is_empty() {
-                count += batch.len() as u64;
-                if tx.blocking_send(batch).is_err() {
-                    return Err(ConsensusError::General("receiver went away"));
-                }
-            }
-            Ok(count)
+            session_for_reader.stream_pruning_point_shielded_nullifiers(expected_pp, from, before, SHIELDED_CHUNK_SIZE, &mut |chunk| {
+                tx.blocking_send(chunk).is_ok()
+            })
         });
 
         let mut sent: u64 = 0;
         let mut chunks_sent: usize = 0;
 
-        while let Some(batch) = rx.recv().await {
+        // Fetch one chunk ahead. A full stream skips the flow-control wait exactly when no chunk
+        // follows (its requester asks for the next window only while it still expects nullifiers);
+        // a ranged stream always waits after a full window, because its requester cannot know the
+        // range's size and always asks.
+        let mut next = rx.recv().await;
+        while let Some(batch) = next {
             let nullifiers: Vec<Vec<u8>> = batch.into_iter().map(|nf| nf.to_vec()).collect();
             let chunk_len = nullifiers.len() as u64;
             self.router
@@ -139,9 +171,8 @@ impl RequestPruningPointShieldedStateFlow {
             sent += chunk_len;
             chunks_sent += 1;
 
-            // Flow-control round-trip; skip on the last window so the peer never has
-            // to send a trailing RequestNext just to unblock us.
-            if sent < nullifier_count && chunks_sent.is_multiple_of(SMT_FLOW_CONTROL_WINDOW) {
+            next = rx.recv().await;
+            if (next.is_some() || ranged) && chunks_sent.is_multiple_of(SMT_FLOW_CONTROL_WINDOW) {
                 // Bounded: see `EXPORT_NEXT_WINDOW_TIMEOUT`.
                 dequeue_with_timeout!(self.incoming_route, Payload::RequestNextPruningPointShieldedChunk, EXPORT_NEXT_WINDOW_TIMEOUT)?;
             }
@@ -154,18 +185,31 @@ impl RequestPruningPointShieldedStateFlow {
             Err(e) => return Err(ProtocolError::OtherOwned(format!("shielded nullifier reader task panicked: {e}"))),
         };
 
-        // F-03: the metadata (count) and the stream are produced by two separate
-        // consensus calls; a concurrent virtual update (e.g. a reorg walk) can
-        // transiently desync them. Abort the transfer cleanly — the peer detects the
-        // torn stream and retries — rather than panicking the whole node.
-        if sent != reader_count || sent != nullifier_count {
+        // F-03: the metadata (count) and the stream are produced by two separate consensus calls; a
+        // concurrent virtual update (e.g. a reorg walk) can transiently desync them. Abort the
+        // transfer cleanly -- the peer detects the torn stream and retries -- rather than panicking.
+        let drifted = sent != reader_count
+            || nullifier_count.is_some_and(|n| sent > n || (!ranged && from.is_none() && before.is_none() && sent != n));
+        if drifted {
             return Err(ProtocolError::OtherOwned(format!(
                 "shielded nullifier stream for pruning point {expected_pp} drifted during transfer: \
-                 sent {sent}, reader streamed {reader_count}, metadata declared {nullifier_count}; aborting"
+                 sent {sent}, reader streamed {reader_count}, metadata declared {nullifier_count:?}; aborting"
             )));
         }
+        if ranged {
+            // The end of the range: one empty chunk.
+            self.router
+                .enqueue(make_message!(Payload::ShieldedNullifierChunk, ShieldedNullifierChunkMessage { nullifiers: vec![] }))
+                .await?;
+        }
 
-        info!("Finished sending shielded state for pruning point {}: {} nullifiers in {} chunks", expected_pp, sent, chunks_sent);
+        info!(
+            "Finished sending shielded state for pruning point {}: {} nullifiers in {} chunks{}",
+            expected_pp,
+            sent,
+            chunks_sent,
+            if ranged { " (one range)" } else { "" }
+        );
         Ok(())
     }
 

@@ -552,6 +552,111 @@ impl<'a, 'b> ShieldedStream<'a, 'b> {
     }
 }
 
+/// One key range of the pruning-point nullifier set from a peer that advertises
+/// `SERVICE_NF_SORTED_STREAM` (N1, spec 08 R3.3/R3.4.1): optionally the metadata frame, then
+/// ascending chunks, then one empty chunk that ends the range. The requester does not know the
+/// range's size, so after every [`SMT_FLOW_CONTROL_WINDOW`]-th chunk it always asks for the next
+/// window (the server always waits for it in this mode).
+pub struct ShieldedRangeStream<'a, 'b> {
+    router: &'a Router,
+    incoming_route: &'b mut IncomingRoute,
+    chunks_received: usize,
+    received: u64,
+    done: bool,
+}
+
+impl<'a, 'b> ShieldedRangeStream<'a, 'b> {
+    /// Send the range request and return the stream that reads its answer.
+    pub async fn request(
+        router: &'a Router,
+        incoming_route: &'b mut IncomingRoute,
+        pruning_point: Hash,
+        from: Option<[u8; 32]>,
+        before: Option<[u8; 32]>,
+        with_metadata: bool,
+    ) -> Result<ShieldedRangeStream<'a, 'b>, ProtocolError> {
+        router
+            .enqueue(make_message!(
+                Payload::RequestPruningPointShieldedChunkFrom,
+                kaspa_p2p_lib::pb::RequestPruningPointShieldedChunkFromMessage {
+                    pruning_point_hash: Some(pruning_point.into()),
+                    from_key: from.map(|b| b.to_vec()).unwrap_or_default(),
+                    before_key: before.map(|b| b.to_vec()).unwrap_or_default(),
+                    with_metadata,
+                }
+            ))
+            .await?;
+        Ok(Self { router, incoming_route, chunks_received: 0, received: 0, done: false })
+    }
+
+    /// The metadata frame (only when the request asked for it).
+    pub async fn recv_metadata(&mut self) -> Result<kaspa_consensus_core::api::ShieldedExportMetadata, ProtocolError> {
+        match timeout(DEFAULT_TIMEOUT, self.incoming_route.recv()).await {
+            Ok(Some(msg)) => match msg.payload {
+                Some(Payload::ShieldedMetadata(payload)) => {
+                    Ok(kaspa_consensus_core::api::ShieldedExportMetadata { data: payload.data, nullifier_count: payload.nullifier_count })
+                }
+                Some(Payload::UnexpectedPruningPoint(_)) => Err(ProtocolError::ConsensusError(ConsensusError::UnexpectedPruningPoint)),
+                _ => Err(ProtocolError::UnexpectedMessage(stringify!(Payload::ShieldedMetadata), msg.payload.as_ref().map(|v| v.into()))),
+            },
+            Ok(None) => Err(ProtocolError::ConnectionClosed),
+            Err(_) => Err(ProtocolError::Timeout(DEFAULT_TIMEOUT)),
+        }
+    }
+
+    /// The next chunk, `Ok(None)` at the end of the range.
+    pub async fn next_chunk(&mut self) -> Result<Option<Vec<[u8; 32]>>, ProtocolError> {
+        if self.done {
+            return Ok(None);
+        }
+        let payload = match timeout(DEFAULT_TIMEOUT, self.incoming_route.recv()).await {
+            Ok(Some(msg)) => match msg.payload {
+                Some(Payload::ShieldedNullifierChunk(payload)) => payload,
+                Some(Payload::UnexpectedPruningPoint(_)) => {
+                    return Err(ProtocolError::ConsensusError(ConsensusError::UnexpectedPruningPoint));
+                }
+                _ => {
+                    return Err(ProtocolError::UnexpectedMessage(
+                        stringify!(Payload::ShieldedNullifierChunk),
+                        msg.payload.as_ref().map(|v| v.into()),
+                    ));
+                }
+            },
+            Ok(None) => return Err(ProtocolError::ConnectionClosed),
+            Err(_) => return Err(ProtocolError::Timeout(DEFAULT_TIMEOUT)),
+        };
+        if payload.nullifiers.is_empty() {
+            self.done = true;
+            return Ok(None);
+        }
+        if payload.nullifiers.len() > SHIELDED_CHUNK_SIZE {
+            return Err(ProtocolError::Other("ShieldedNullifierChunk exceeds SHIELDED_CHUNK_SIZE"));
+        }
+        let mut out = Vec::with_capacity(payload.nullifiers.len());
+        for nf in payload.nullifiers {
+            let bytes: [u8; 32] = nf.as_slice().try_into().map_err(|_| ProtocolError::Other("nullifier must be exactly 32 bytes"))?;
+            out.push(bytes);
+        }
+        self.received += out.len() as u64;
+        self.chunks_received += 1;
+        if self.chunks_received.is_multiple_of(SMT_FLOW_CONTROL_WINDOW) {
+            self.router
+                .enqueue(make_message!(Payload::RequestNextPruningPointShieldedChunk, RequestNextPruningPointShieldedChunkMessage {}))
+                .await?;
+        }
+        Ok(Some(out))
+    }
+
+    /// Whether the end-of-range marker arrived.
+    pub fn is_done(&self) -> bool {
+        self.done
+    }
+
+    pub fn count(&self) -> u64 {
+        self.received
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

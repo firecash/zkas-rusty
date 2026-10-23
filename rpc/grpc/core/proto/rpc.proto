@@ -262,6 +262,9 @@ message GetShieldedTreeStateResponseMessage {
   uint64 historyFromDaaScore = 6;
   // Whether this node can enumerate shielded history to genesis.
   bool historyComplete = 7;
+  // N1: size of the spent-nullifier set as of blockHash (a maintained counter, not a scan).
+  // Absent when this node holds no count for that block, and from older nodes.
+  optional uint64 nullifierCount = 8;
   RPCError error = 1000;
 }
 

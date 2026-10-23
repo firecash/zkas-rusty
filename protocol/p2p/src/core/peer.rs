@@ -5,7 +5,8 @@ use std::{fmt::Display, net::SocketAddr, sync::Arc, time::Instant};
 #[derive(Debug, Clone, Default)]
 pub struct PeerProperties {
     pub user_agent: String,
-    // TODO: add services
+    /// The service bits the peer advertised in its version message (see `SERVICE_NF_SORTED_STREAM`).
+    pub services: u64,
     pub advertised_protocol_version: u32,
     pub protocol_version: u32,
     pub disable_relay_tx: bool,

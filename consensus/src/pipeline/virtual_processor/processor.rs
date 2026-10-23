@@ -238,7 +238,8 @@ pub struct VirtualStateProcessor {
     /// `nullifier_count`) and the streaming call so one request serves a single
     /// captured view. Keyed by pruning-point hash; the PP-time set is immutable per
     /// pruning point, so the cached value never goes stale.
-    pub(super) pp_nullifier_export_cache: Mutex<Option<(Hash, Arc<Vec<[u8; 32]>>)>>,
+    /// Since N1 only the COUNT is cached, never the set (spec 08 R3.3).
+    pub(super) pp_nullifier_export_cache: Mutex<Option<(Hash, u64)>>,
     /// The serialized shielded export of the last pruning point served. Immutable per pruning point,
     /// and rebuilding it walks the anchor indexes, so every syncing peer re-paid that walk.
     pp_export_metadata_cache: Mutex<Option<(Hash, kaspa_consensus_core::api::ShieldedExportMetadata)>>,
@@ -284,6 +285,9 @@ pub struct VerifiedShieldedImport {
     proven_entries: Vec<(kaspa_shielded_core::anchor_window::WindowEntry, kaspa_shielded_core::anchor_window::AnchorLog)>,
     nullifiers: Vec<[u8; 32]>,
     n: usize,
+    /// N1 (spec 08 R3.2): the set was streamed to sorted files and is NOT in `nullifiers`; staging
+    /// deletes the live set by range and records only the count. The caller ingests the files.
+    streamed: bool,
 }
 
 impl VirtualStateProcessor {
@@ -462,7 +466,7 @@ impl VirtualStateProcessor {
     ///
     /// F-03: `nullifier_count` must count the **PP-time** nullifier set (the set the
     /// PP MuHash snapshot in `md` commits to), not the tip-time global set — see
-    /// [`Self::pruning_point_nullifier_set`].
+    /// [`Self::pruning_point_nullifier_count`].
     pub fn export_pruning_point_shielded(
         &self,
         pp: kaspa_hashes::Hash,
@@ -545,7 +549,7 @@ impl VirtualStateProcessor {
             md.window_entries = entries;
             md.window_prefix = prefix;
         }
-        let nullifier_count = self.pruning_point_nullifier_set(pp)?.len() as u64;
+        let nullifier_count = self.pruning_point_nullifier_count(pp)?;
         let export = kaspa_consensus_core::api::ShieldedExportMetadata { data: md.to_wire_bytes(), nullifier_count };
         // Only a complete post-fork export is kept: one missing its anchor log (a node that does not hold
         // the whole stretch yet) is rebuilt on the next request rather than served for hours. Pre-fork
@@ -558,57 +562,87 @@ impl VirtualStateProcessor {
         Ok(Some(export))
     }
 
-    /// Server side: the spent-nullifier set **as of the pruning point** (for shielded
-    /// IBD streaming) — the same captured view the metadata call counted (F-03).
+    /// Forget the shielded store caches (after a write that bypassed them, e.g. an SST ingest).
+    pub fn discard_cached_shielded_writes(&self) {
+        self.shielded_state_manager.discard_cached_shielded_writes();
+    }
+
+    /// See `ShieldedStateManager::backfill_nullifier_count_at_cursor` (N1, 08 R3.7).
+    pub fn backfill_shielded_nullifier_count(&self) -> kaspa_database::prelude::StoreResult<Option<(kaspa_hashes::Hash, u64)>> {
+        self.shielded_state_manager.backfill_nullifier_count_at_cursor()
+    }
+
+    /// Size of the spent-nullifier set as of chain block `block` (N1, 08 R3.7), `None` if unknown here.
+    pub fn shielded_nullifier_count_at(&self, block: kaspa_hashes::Hash) -> kaspa_database::prelude::StoreResult<Option<u64>> {
+        self.shielded_state_manager.nullifier_count_at(block)
+    }
+
+    /// The spent-nullifier set as of `pp`, collected into memory. Kept for tests and diagnostics
+    /// only: since N1 the IBD server streams the set ([`Self::stream_pruning_point_nullifiers`]) and
+    /// never materialises it.
     pub fn collect_pruning_point_nullifiers(
         &self,
         pp: kaspa_hashes::Hash,
     ) -> Result<Arc<Vec<[u8; 32]>>, kaspa_database::prelude::StoreError> {
-        self.pruning_point_nullifier_set(pp)
+        let mut all = Vec::new();
+        self.stream_pruning_point_nullifiers(pp, None, None, 4096, &mut |chunk| {
+            all.extend(chunk);
+            true
+        })?;
+        Ok(Arc::new(all))
     }
 
-    /// The spent-nullifier set as of pruning point `pp` (audit finding F-03): the
-    /// current global set (which tracks the virtual selected tip, typically a full
-    /// pruning period ahead of the PP) minus the nullifiers added by selected-chain
-    /// blocks in `(pp, virtual selected tip]`, read from the per-block diff store.
+    /// Size of the spent-nullifier set as of pruning point `pp` (the metadata's `nullifier_count`).
     ///
-    /// The computed set is cached per pruning point and shared by the metadata
-    /// (count) and stream calls of one request, so both serve a single captured
-    /// view. The PP-time set is immutable per pruning point, so the cache never
-    /// goes stale; a different PP simply replaces it.
-    ///
-    /// Race note: the tip-time set is snapshotted BEFORE the tip is captured. A
-    /// block committed while the snapshot streams has its commit ordered before the
-    /// virtual-state update, so the tip captured afterward is at/after it and the
-    /// subtraction window covers it — the result still lands on the exact PP-time
-    /// set. A concurrent reorg walk can transiently desync the global set; that is
-    /// tolerated by the serving flow, which aborts the transfer cleanly on drift
-    /// instead of panicking.
-    fn pruning_point_nullifier_set(&self, pp: kaspa_hashes::Hash) -> Result<Arc<Vec<[u8; 32]>>, kaspa_database::prelude::StoreError> {
-        if let Some((cached_pp, set)) = self.pp_nullifier_export_cache.lock().as_ref() {
-            if *cached_pp == pp {
-                return Ok(Arc::clone(set));
+    /// F-03: it must count the PP-time set (the set the PP MuHash snapshot commits to), not the
+    /// tip-time global set. Computed by one full verified stream pass and cached per pruning point;
+    /// only the count is cached (8 bytes), never the set (N1, spec 08 R3.3). A pass whose view was
+    /// torn by a concurrent reorg walk fails the accumulator check, is not cached, and errors, so the
+    /// requester retries.
+    fn pruning_point_nullifier_count(&self, pp: kaspa_hashes::Hash) -> Result<u64, kaspa_database::prelude::StoreError> {
+        if let Some((cached_pp, n)) = *self.pp_nullifier_export_cache.lock() {
+            if cached_pp == pp {
+                return Ok(n);
             }
         }
-        let snapshot = self.shielded_state_manager.nullifier_set_snapshot()?;
-        let tip = self.lkg_virtual_state.load().ghostdag_data.selected_parent;
-        // `forward_chain_iterator(pp, tip, true)` yields `[pp, tip]` along the
-        // selected chain; `skip(1)` drops the PP itself, leaving exactly `(pp, tip]`.
-        // The PP is finality-deep, so it is always a chain ancestor of the tip.
-        let post_blocks = self.reachability_service.forward_chain_iterator(pp, tip, true).skip(1);
-        let set = Arc::new(self.shielded_state_manager.subtract_nullifier_diffs(snapshot, post_blocks)?);
-        // Never cache (or serve) a torn view. The raw store iteration above is not synchronized with
-        // a reorg walk that is committing nullifiers, so the derived set can include a branch the tip
-        // has not adopted yet. It is cached until the pruning point moves (hours), and every syncing
-        // peer would fail against it. Check it against the accumulator the pruning point committed;
-        // on mismatch return an error so the requester retries and nothing bad is kept.
-        if !self.shielded_state_manager.set_matches_snapshot(&set, pp)? {
-            return Err(kaspa_database::prelude::StoreError::DataInconsistency(format!(
-                "pruning-point nullifier set at {pp} was captured mid-reorg; not serving it"
-            )));
-        }
-        *self.pp_nullifier_export_cache.lock() = Some((pp, Arc::clone(&set)));
-        Ok(set)
+        let n = self.stream_pruning_point_nullifiers(pp, None, None, 4096, &mut |_| true)?;
+        *self.pp_nullifier_export_cache.lock() = Some((pp, n));
+        Ok(n)
+    }
+
+    /// Stream the spent-nullifier set as of pruning point `pp` in ascending order, restricted to
+    /// `[from, before)`, in chunks of `chunk_size`, to `sink` (which returns `false` to stop). Returns
+    /// the number streamed. An unbounded stream is checked against the accumulator the pruning point
+    /// committed before its last chunk is released, so a torn view never completes. (A ranged
+    /// stream cannot be checked alone; the importer checks the union of its ranges.)
+    ///
+    /// The set is the current global set (which tracks the virtual selected tip) minus the
+    /// nullifiers added by selected-chain blocks in `(pp, tip]` (audit finding F-03). Race note: the
+    /// snapshot is taken BEFORE the tip is read, so every block whose nullifiers are in the snapshot
+    /// is at or below that tip (and subtracted); only a reorg walk caught between its batches can
+    /// tear the view, and then the full-stream fold differs and the stream fails cleanly.
+    pub fn stream_pruning_point_nullifiers(
+        &self,
+        pp: kaspa_hashes::Hash,
+        from: Option<[u8; 32]>,
+        before: Option<[u8; 32]>,
+        chunk_size: usize,
+        sink: &mut dyn FnMut(Vec<[u8; 32]>) -> bool,
+    ) -> Result<u64, kaspa_database::prelude::StoreError> {
+        assert!(chunk_size > 0);
+        // Read after the snapshot is taken (see `stream_nullifier_set_snapshot`).
+        let post_blocks = || {
+            let tip = self.lkg_virtual_state.load().ghostdag_data.selected_parent;
+            // `forward_chain_iterator(pp, tip, true)` yields `[pp, tip]` along the
+            // selected chain; `skip(1)` drops the PP itself, leaving exactly `(pp, tip]`.
+            // The PP is finality-deep, so it is always a chain ancestor of the tip.
+            self.reachability_service.forward_chain_iterator(pp, tip, true).skip(1).collect::<Vec<kaspa_hashes::Hash>>()
+        };
+        let unbounded = from.is_none() && before.is_none();
+        let expected = if unbounded { Some(self.shielded_state_manager.nullifier_muhash_at(pp)?) } else { None };
+        let (n, _completed) =
+            self.shielded_state_manager.stream_nullifier_set_snapshot(from, before, post_blocks, chunk_size, expected.as_ref(), sink)?;
+        Ok(n)
     }
 
     /// Receiver side: verify + seed the shielded state at a pruning point from
@@ -770,7 +804,39 @@ impl VirtualStateProcessor {
         expected_state_root: Option<[u8; 32]>,
         nullifiers: Vec<[u8; 32]>,
     ) -> Result<VerifiedShieldedImport, String> {
-        use crate::processes::shielded::{PruningPointShieldedMetadata, ShieldedStateManager};
+        use crate::processes::shielded::ShieldedStateManager;
+        self.verify_pruning_point_shielded_import_with(pp, metadata, expected_state_root, |md| {
+            let n = ShieldedStateManager::verify_pruning_point_shielded(md, nullifiers.iter())?;
+            Ok((n, nullifiers, false))
+        })
+    }
+
+    /// [`Self::verify_pruning_point_shielded_import`] for a set that was streamed to staged files
+    /// (N1, spec 08 R3.2): the caller hands over the element count and the MuHash fold it built
+    /// while the set streamed. Same checks; the result stages no nullifier rows.
+    pub fn verify_pruning_point_shielded_import_folded(
+        &self,
+        pp: kaspa_hashes::Hash,
+        metadata: kaspa_consensus_core::api::ShieldedExportMetadata,
+        expected_state_root: Option<[u8; 32]>,
+        count: u64,
+        fold: kaspa_muhash::MuHash,
+    ) -> Result<VerifiedShieldedImport, String> {
+        use crate::processes::shielded::ShieldedStateManager;
+        self.verify_pruning_point_shielded_import_with(pp, metadata, expected_state_root, |md| {
+            let n = ShieldedStateManager::verify_pruning_point_shielded_folded(md, count, fold)?;
+            Ok((n as usize, Vec::new(), true))
+        })
+    }
+
+    fn verify_pruning_point_shielded_import_with(
+        &self,
+        pp: kaspa_hashes::Hash,
+        metadata: kaspa_consensus_core::api::ShieldedExportMetadata,
+        expected_state_root: Option<[u8; 32]>,
+        check_set: impl FnOnce(&crate::processes::shielded::PruningPointShieldedMetadata) -> Result<(usize, Vec<[u8; 32]>, bool), String>,
+    ) -> Result<VerifiedShieldedImport, String> {
+        use crate::processes::shielded::PruningPointShieldedMetadata;
         let mut md = PruningPointShieldedMetadata::from_wire_bytes(&metadata.data)?;
         // F-02: reject the import before seeding if it does not match the
         // PoW-committed shielded state root (peer can be dropped; another syncer
@@ -779,7 +845,7 @@ impl VirtualStateProcessor {
             Some(committed) => self.verify_import_binding_versioned(pp, &md, committed)?,
             None => None,
         };
-        let n = ShieldedStateManager::verify_pruning_point_shielded(&md, nullifiers.iter())?;
+        let (n, nullifiers, streamed) = check_set(&md)?;
         self.retain_provable_window_anchors(pp, &mut md)?;
         // Post-fork: the replayed log entries are proven, so they are authoritative for the blocks
         // they cover, and the only anchor state a post-fork pruning point keeps. Add them as
@@ -821,7 +887,7 @@ impl VirtualStateProcessor {
         if n as u64 != metadata.nullifier_count {
             return Err(format!("nullifier count mismatch: metadata says {}, streamed {}", metadata.nullifier_count, n));
         }
-        Ok(VerifiedShieldedImport { pp, md, window, proven_entries, nullifiers, n })
+        Ok(VerifiedShieldedImport { pp, md, window, proven_entries, nullifiers, n, streamed })
     }
 
     /// Stage a verified import into `batch`: the clear of the old state, then the seed. The clear
@@ -840,15 +906,28 @@ impl VirtualStateProcessor {
     }
 
     fn stage_verified_shielded_import_inner(&self, batch: &mut WriteBatch, verified: VerifiedShieldedImport) -> Result<usize, String> {
-        let VerifiedShieldedImport { pp, md, window, proven_entries, nullifiers, n } = verified;
+        let VerifiedShieldedImport { pp, md, window, proven_entries, nullifiers, n, streamed } = verified;
         // Clear first, then seed, in the same batch. Every seed write is an overwrite, and a
         // WriteBatch applies in order, so a nullifier in both the old and the new set ends present.
-        self.shielded_state_manager
-            .clear_for_pruning_reimport(batch, pp)
-            .map_err(|e| format!("staging the shielded clear failed: {e:?}"))?;
+        // A streamed import deletes the live set by range instead of key by key (no O(set) walk,
+        // no O(set) batch); its staged files are ingested after this batch is written.
+        if streamed {
+            self.shielded_state_manager
+                .clear_for_pruning_reimport_by_range(batch, pp)
+                .map_err(|e| format!("staging the shielded clear failed: {e:?}"))?;
+        } else {
+            self.shielded_state_manager
+                .clear_for_pruning_reimport(batch, pp)
+                .map_err(|e| format!("staging the shielded clear failed: {e:?}"))?;
+        }
         self.shielded_state_manager
             .seed_pruning_point_shielded(batch, pp, &md, nullifiers.iter())
             .map_err(|e| format!("seeding shielded stores failed: {e:?}"))?;
+        if streamed {
+            self.shielded_state_manager
+                .seed_nullifier_set_bookkeeping(batch, pp, n as u64)
+                .map_err(|e| format!("seeding the nullifier count failed: {e:?}"))?;
+        }
         if let Some(window) = window {
             self.shielded_state_manager.persist_window_only(batch, pp, window).map_err(|e| format!("seeding the anchor window: {e:?}"))?;
             for (e, log_before) in proven_entries {

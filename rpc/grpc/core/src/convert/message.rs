@@ -232,6 +232,7 @@ from!(item: RpcResult<&kaspa_rpc_core::GetShieldedTreeStateResponse>, protowire:
         ommers: item.ommers.iter().map(|h| h.to_string()).collect(),
         history_from_daa_score: item.history_from_daa_score,
         history_complete: item.history_complete,
+        nullifier_count: item.nullifier_count,
         error: None,
     }
 });
@@ -847,6 +848,7 @@ try_from!(item: &protowire::GetShieldedTreeStateResponseMessage, RpcResult<kaspa
         // safe reading: never let an old node's silence pass as a promise of full history.
         history_from_daa_score: item.history_from_daa_score,
         history_complete: item.history_complete,
+        nullifier_count: item.nullifier_count,
     }
 });
 

@@ -358,6 +358,20 @@ message ShieldedNullifierChunkMessage {
 message RequestNextPruningPointShieldedChunkMessage {
 }
 
+// N1 (spec 08 R3.3/R3.4.1): one key range of the pruning-point nullifier set, [fromKey, beforeKey)
+// (each 32 bytes; empty = unbounded). Sent only to peers advertising SERVICE_NF_SORTED_STREAM.
+// Reply: if withMetadata, first the same ShieldedMetadataMessage as the full request
+// (nullifierCount = the WHOLE set's size); then ShieldedNullifierChunkMessages with the range's
+// nullifiers in ascending order; then ONE EMPTY ShieldedNullifierChunkMessage, which ends the range.
+// Flow control: after every SMT_FLOW_CONTROL_WINDOW-th non-empty chunk the server waits for a
+// RequestNextPruningPointShieldedChunk, and the requester always sends it at that point.
+message RequestPruningPointShieldedChunkFromMessage {
+  Hash pruningPointHash = 1;
+  bytes fromKey = 2;
+  bytes beforeKey = 3;
+  bool withMetadata = 4;
+}
+
 // ---- Shielded history backfill (ZKas) ----
 //
 // A fresh node syncs from a headers proof and only ever writes scan records for blocks it
