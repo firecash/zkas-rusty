@@ -16106,6 +16106,20 @@ mod engine_shadow_tests {
                     old.push(db);
                 }
             }
+            // `--shared-scan-engine` itself: per-wallet WalletDbs fed by one cohort pass
+            // (`install_predecrypted`), exactly as `engine_cohort_memo` does in `sync_chunk`.
+            let run_cohort = run_old && run_new && env_u64("SHADOW_COHORT", 1) == 1;
+            let mut coh: Vec<WalletDb> = Vec::new();
+            if run_cohort {
+                for i in 0..total {
+                    let src = if i == n { 0 } else { i as u64 };
+                    let (mut db, _) = seed_wallet(&tag, src);
+                    db.apply_frontier(&fs0).expect("frontier");
+                    coh.push(db);
+                }
+            }
+            let eng_kernel = kernel(&kname);
+            let coh_keys: Vec<IvkKey> = coh.iter().map(|d| IvkKey::from_ivk(d.incoming_viewing_key()).expect("key")).collect();
             let mut eng = ScanEngine::new(SharedChain::from_frontier(&fs0).expect("frontier"), kernel(&kname));
             let ids: Vec<WalletId> = if run_new { fvks.iter().map(|f| eng.register(f.clone()).expect("register")).collect() } else { Vec::new() };
             let stranger = OAddr::from_raw_address_bytes(&seed_wallet(b"stranger", 0).0.address_bytes_at(7)).unwrap();
@@ -16154,6 +16168,10 @@ mod engine_shadow_tests {
                                     old[w].mark_spent(pos, txid, b.daa_score);
                                     old[w].note_pending_outflow(txid, outflow);
                                 }
+                                if run_cohort {
+                                    coh[w].mark_spent(pos, txid, b.daa_score);
+                                    coh[w].note_pending_outflow(txid, outflow);
+                                }
                                 if run_new {
                                     eng.mark_spent(ids[w], pos, txid, b.daa_score);
                                     eng.note_pending_outflow(ids[w], txid, outflow);
@@ -16179,6 +16197,9 @@ mod engine_shadow_tests {
                                 let txid = r.b32();
                                 if run_old {
                                     old[w].mark_spent(pos, txid, b.daa_score);
+                                }
+                                if run_cohort {
+                                    coh[w].mark_spent(pos, txid, b.daa_score);
                                 }
                                 if run_new {
                                     eng.mark_spent(ids[w], pos, txid, b.daa_score);
@@ -16261,6 +16282,26 @@ mod engine_shadow_tests {
                     cpu_old += cpu_secs() - c0;
                     wall_old += t0.elapsed().as_secs_f64();
                 }
+                // The daemon flag path: one detection for the cohort, installed per wallet.
+                if run_cohort {
+                    let refs: Vec<&IvkKey> = coh_keys.iter().collect();
+                    let found = if flat.is_empty() { vec![Vec::new(); refs.len()] } else { detect(eng_kernel.as_ref(), &refs, &flat, &epks) };
+                    for (db, f) in coh.iter_mut().zip(found) {
+                        if !flat.is_empty() {
+                            db.install_predecrypted(&flat, f, 0);
+                        }
+                        for b in &decoded {
+                            let meta = (b.timestamp > 0 && b.txids.len() == b.compact.len()).then(|| BlockMeta {
+                                coinbase_txid: b.coinbase_txid,
+                                txids: b.txids.clone(),
+                                timestamp_ms: b.timestamp,
+                                daa_score: b.daa_score,
+                            });
+                            db.ingest_block_compact_precomputed_with_meta(&b.coinbase, &b.compact, meta.as_ref());
+                        }
+                        db.end_page();
+                    }
+                }
                 // NEW: one engine pass for every wallet.
                 if run_new {
                     let (c0, t0) = (cpu_secs(), Instant::now());
@@ -16278,12 +16319,25 @@ mod engine_shadow_tests {
                         if run_old && run_new {
                             assert_eq!(a, b, "page {n_pages} wallet {w}: reclaimed");
                         }
+                        if run_cohort {
+                            assert_eq!(a, coh[w].reclaim_expired(last_daa, PENDING_SPEND_EXPIRY_DAA), "page {n_pages} cohort wallet {w}: reclaimed");
+                        }
                         n_reclaimed += a.len().max(b.len()) as u64;
                     }
                 }
                 if run_old && run_new {
                     for w in 0..total {
                         compare(&old[w], &eng, ids[w], &format!("page {n_pages} wallet {w}"));
+                    }
+                }
+                if run_cohort {
+                    for w in 0..total {
+                        let ctx = format!("page {n_pages} cohort wallet {w}");
+                        assert_eq!(old[w].notes().iter().map(note_key).collect::<Vec<_>>(), coh[w].notes().iter().map(note_key).collect::<Vec<_>>(), "{ctx}: notes");
+                        assert_eq!(format!("{:?}", old[w].history()), format!("{:?}", coh[w].history()), "{ctx}: history");
+                        let pk = |p: &PendingSpend| (note_key(&p.note), p.txid, p.submitted_daa);
+                        assert_eq!(old[w].pending_spends().iter().map(pk).collect::<Vec<_>>(), coh[w].pending_spends().iter().map(pk).collect::<Vec<_>>(), "{ctx}: pending");
+                        assert_eq!((old[w].size(), old[w].anchor(), old[w].nf_len(), old[w].pending_change()), (coh[w].size(), coh[w].anchor(), coh[w].nf_len(), coh[w].pending_change()), "{ctx}: tree");
                     }
                 }
                 n_blocks += blocks.len() as u64;
@@ -16340,7 +16394,7 @@ mod engine_shadow_tests {
             let (heap_chain, heap_wallets) = if run_new { eng.approx_heap_bytes() } else { (0, 0) };
             let st = eng.stats();
             let line = format!(
-                "label={} mode={mode} kernel={} digest={} start={} end={} span_daa={span} pages={n_pages} blocks={n_blocks} actions={n_act} wallets={total} keys={} planted={n_planted} parked={n_parked} reclaimed={n_reclaimed} found={found} witnesses_compared={n_witness} root_check=[{root_check}] \
+                "label={} mode={mode} kernel={} digest={} start={} end={} span_daa={span} pages={n_pages} blocks={n_blocks} actions={n_act} wallets={total} keys={} cohort_path={run_cohort} planted={n_planted} parked={n_parked} reclaimed={n_reclaimed} found={found} witnesses_compared={n_witness} root_check=[{root_check}] \
                  wall_s={wall:.1} shared_decode_cpu_s={cpu_shared:.2} shared_decode_wall_s={wall_shared:.2} old_cpu_s={cpu_old:.2} old_wall_s={wall_old:.2} new_cpu_s={cpu_new:.2} new_wall_s={wall_new:.2} \
                  new_detect_s={:.2} new_fold_s={:.3} new_tree_s={:.2} engine_hits={} engine_cb_hits={} engine_folds={} \
                  heap_old_mib={:.1} heap_new_chain_mib={:.1} heap_new_wallets_mib={:.3} vmhwm_mib={:.0} rayon_threads={}",

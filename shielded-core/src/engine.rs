@@ -1360,6 +1360,16 @@ mod tests {
                 d
             })
             .collect();
+        // The daemon's `--shared-scan-engine` path: per-wallet WalletDbs fed by ONE cohort
+        // detection (`install_predecrypted`) instead of their own `predecrypt_page_cached`.
+        let mut cohort: Vec<WalletDb> = fvks
+            .iter()
+            .map(|f| {
+                let mut d = WalletDb::from_fvk(&f.to_bytes()).unwrap();
+                d.apply_frontier(&fs0).unwrap();
+                d
+            })
+            .collect();
         let mut eng = ScanEngine::new(SharedChain::from_frontier(&fs0).unwrap(), Box::new(LadderKernel));
         let ids: Vec<WalletId> = fvks.iter().map(|f| eng.register(f.clone()).unwrap()).collect();
         // Wallet 5 is a twin of wallet 0 (same key, two tokens).
@@ -1438,19 +1448,37 @@ mod tests {
                 let _ = w;
             }
             eng.ingest_page(&sp);
-            // Park a note as a pending spend on both sides now and then.
+            {
+                let keys: Vec<IvkKey> = cohort.iter().map(|d| IvkKey::from_ivk(d.incoming_viewing_key()).unwrap()).collect();
+                let refs: Vec<&IvkKey> = keys.iter().collect();
+                let found = detect(&CombKernel { w: Some(4) }, &refs, &sp.actions, &sp.epks);
+                for (db, f) in cohort.iter_mut().zip(found) {
+                    db.install_predecrypted(&sp.actions, f, 0);
+                    for b in &blocks {
+                        db.ingest_block_compact_precomputed_with_meta(&b.coinbase, &b.txs, b.meta.as_ref());
+                    }
+                    db.end_page();
+                }
+            }
+            // Park a note as a pending spend on every side now and then.
             if page % 2 == 1 {
                 for (w, db) in old.iter_mut().enumerate() {
                     if let Some(p) = db.notes().first().map(|n| n.position) {
                         db.mark_spent(p, [page as u8; 32], daa);
                         eng.mark_spent(ids[w], p, [page as u8; 32], daa);
+                        cohort[w].mark_spent(p, [page as u8; 32], daa);
                     }
                 }
             }
             if page == 4 {
                 for (w, db) in old.iter_mut().enumerate() {
-                    assert_eq!(db.reclaim_expired(daa + 10_000, 100), eng.reclaim_expired(ids[w], daa + 10_000, 100));
+                    let a = db.reclaim_expired(daa + 10_000, 100);
+                    assert_eq!(a, eng.reclaim_expired(ids[w], daa + 10_000, 100));
+                    assert_eq!(a, cohort[w].reclaim_expired(daa + 10_000, 100));
                 }
+            }
+            for (w, db) in old.iter().enumerate() {
+                assert_same_db(db, &cohort[w], &format!("page {page} cohort wallet {w}"));
             }
             for (w, db) in old.iter().enumerate() {
                 assert_same(db, &eng, ids[w], &format!("page {page} wallet {w}"));
@@ -1471,6 +1499,16 @@ mod tests {
                 assert_eq!(format!("{pa:?}"), format!("{pb:?}"), "wallet {w} witness at {p}");
             }
         }
+    }
+
+    /// Two per-wallet databases with identical observable state.
+    pub(crate) fn assert_same_db(a: &WalletDb, b: &WalletDb, ctx: &str) {
+        let key = |n: &OwnedNote| (n.position, n.value(), n.nullifier(), ExtractedNoteCommitment::from(n.note.commitment()).to_bytes());
+        assert_eq!(a.notes().iter().map(key).collect::<Vec<_>>(), b.notes().iter().map(key).collect::<Vec<_>>(), "{ctx}: notes");
+        let pk = |p: &PendingSpend| (key(&p.note), p.txid, p.submitted_daa);
+        assert_eq!(a.pending_spends().iter().map(pk).collect::<Vec<_>>(), b.pending_spends().iter().map(pk).collect::<Vec<_>>(), "{ctx}: pending");
+        assert_eq!(format!("{:?}", a.history()), format!("{:?}", b.history()), "{ctx}: history");
+        assert_eq!((a.size(), a.anchor(), a.nf_len(), a.poisoned(), a.last_daa()), (b.size(), b.anchor(), b.nf_len(), b.poisoned(), b.last_daa()), "{ctx}: tree");
     }
 
     pub(crate) fn assert_same(db: &WalletDb, eng: &ScanEngine, id: WalletId, ctx: &str) {
