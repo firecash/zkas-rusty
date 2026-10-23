@@ -56,7 +56,7 @@ explorer API.
 
 ## Run a node
 
-Binaries: [Releases](https://github.com/firecash/zkas-rusty/releases) · to compile instead,
+Binaries: [Releases](https://gitlab.com/zkas-group/zkas-rusty/-/releases) · to compile instead,
 see **[docs/BUILDING.md](docs/BUILDING.md)**.
 
 ```bash

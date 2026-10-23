@@ -1,7 +1,7 @@
 # Running a ZKas node
 
 `kaspad` is the ZKas node. Binaries are on the
-[Releases](https://github.com/firecash/zkas-rusty/releases) page; to compile instead see
+[Releases](https://gitlab.com/zkas-group/zkas-rusty/-/releases) page; to compile instead see
 [docs/BUILDING.md](BUILDING.md).
 
 ```bash
