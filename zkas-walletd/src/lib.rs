@@ -451,6 +451,14 @@ pub struct ResourceLimits {
     /// blob cannot be read by a build that predates it, so enabling it is a one-way door for
     /// every wallet it rewrites. See `CHECKPOINT_VERSION_V11` and [`shared_leaf_upto`].
     pub shared_leaf_store: bool,
+    /// `--shared-scan-engine` (task E1, phase 1 of `02-multitenant-engine.md`): wallets that
+    /// ingest the same decoded page share ONE multi-key trial-decryption pass
+    /// ([`kaspa_shielded_core::engine::detect`]) instead of each decrypting the page alone.
+    /// The ephemeral-key preparation is paid once per action for the whole cohort and each
+    /// wallet receives exactly the page memo its own `predecrypt_page_cached` would have
+    /// computed (orchard decides every candidate). OFF by default; nothing else changes.
+    /// Bypassed while a GPU backend is installed (the device path keeps its own batching).
+    pub shared_scan_engine: bool,
     /// Keep the N most recently active wallets resident and fully prepared, exempt from
     /// BOTH eviction rules. 0 = off (the old behaviour exactly).
     ///
@@ -531,6 +539,7 @@ impl Default for ResourceLimits {
             hard_max_resident_wallets: 0,
             resident_budget_mb: Some(0),
             shared_leaf_store: false,
+            shared_scan_engine: false,
             warm_always: 0,
             warm_budget_pct: 60,
             subtree_free_floor_mb: 1_200,
@@ -2878,6 +2887,13 @@ struct DecodedPage {
     /// plus shared epks), paid once by whichever wallet fetched it. Reported in `scan_stats`.
     rpc_ns: u64,
     decode_ns: u64,
+    /// The request this page answers (`GetShieldedBlocks(low, limit)`), so the shared scan
+    /// engine can tell which resident wallets ride it.
+    low: RpcHash,
+    limit: u64,
+    /// `--shared-scan-engine`: the page memo per viewing key (`IvkKey` id), filled by the
+    /// first wallet of a cohort to reach the page for every wallet registered at this cursor.
+    cohort: std::sync::Mutex<HashMap<[u8; 64], Arc<Vec<kaspa_shielded_core::wallet::ReceivedNote>>>>,
 }
 
 /// Whether to trust a node-supplied coinbase commitment verbatim instead of
@@ -3072,6 +3088,81 @@ async fn fetch_bundle_for_tx(client: &GrpcClient, chain: RpcHash, txid: &[u8; 32
         }
     }
     None
+}
+
+/// The detector kernel for `--shared-scan-engine`: `ZKAS_ENGINE_KERNEL=ladder|comb` (default
+/// ladder: the shared GLV-table path, see 08-engine-phase1.md for the M-A measurement).
+fn engine_kernel_from_env() -> Box<dyn kaspa_shielded_core::engine::AgreeKernel> {
+    match std::env::var("ZKAS_ENGINE_KERNEL").as_deref() {
+        Ok("comb") => Box::new(kaspa_shielded_core::engine::CombKernel { w: None }),
+        _ => Box::new(kaspa_shielded_core::engine::LadderKernel),
+    }
+}
+
+/// `--shared-scan-engine`: this wallet's page memo, computed once for the cohort.
+///
+/// Registers (or refreshes) the wallet's key at the page's cursor, then takes the page's memo
+/// lock: the first wallet in runs ONE [`kaspa_shielded_core::engine::detect`] over every key
+/// registered at this cursor that the memo does not hold yet, and stores each key's result;
+/// later wallets of the cohort only clone theirs. `None` (engine off, GPU installed, a page
+/// shape the engine does not cover) means the caller decrypts the page itself, as before.
+/// The result is the same set `WalletDb::predecrypt_page_cached` computes: `detect` hands a
+/// superset of candidates to orchard and orchard decides each (asserted by the
+/// `engine_shadow_tests` and the core `engine::tests`).
+fn engine_cohort_memo(
+    state: &Arc<AppState>,
+    page: &DecodedPage,
+    token: &str,
+    db: &WalletDb,
+    actions: &[CompactActionRecord],
+    epks: &[Option<kaspa_shielded_core::pasta_curves::pallas::Point>],
+) -> Option<(Vec<kaspa_shielded_core::wallet::ReceivedNote>, u128)> {
+    use kaspa_shielded_core::engine::{IvkKey, detect};
+    let kernel = state.engine_kernel.as_ref()?;
+    if kaspa_shielded_core::wallet::gpu_enabled() || kaspa_shielded_core::wallet::gpu_filter_enabled() || epks.len() != actions.len() {
+        return None;
+    }
+    let t = std::time::Instant::now();
+    let ivk = db.incoming_viewing_key();
+    let id = ivk.to_bytes();
+    let key: Arc<IvkKey> = {
+        let mut reg = state.engine_cohort.lock().ok()?;
+        let key = match reg.get(token) {
+            Some((k, _, _)) if k_id(k) == id => k.clone(),
+            _ => Arc::new(IvkKey::from_ivk(ivk)?),
+        };
+        reg.insert(token.to_string(), (key.clone(), page.low, page.limit));
+        key
+    };
+    let mut memo = page.cohort.lock().ok()?;
+    if let Some(found) = memo.get(&id) {
+        return Some(((**found).clone(), t.elapsed().as_nanos()));
+    }
+    let cohort: Vec<Arc<IvkKey>> = {
+        let reg = state.engine_cohort.lock().ok()?;
+        let mut seen: HashSet<[u8; 64]> = HashSet::new();
+        let mut v: Vec<Arc<IvkKey>> = vec![key.clone()];
+        seen.insert(id);
+        for (k, low, limit) in reg.values() {
+            if *low == page.low && *limit == page.limit && !memo.contains_key(&k_id(k)) && seen.insert(k_id(k)) {
+                v.push(k.clone());
+            }
+        }
+        v
+    };
+    let refs: Vec<&IvkKey> = cohort.iter().map(|k| k.as_ref()).collect();
+    let found = tokio::task::block_in_place(|| detect(kernel.as_ref(), &refs, actions, epks));
+    let n = cohort.len() as u128;
+    for (k, f) in cohort.iter().zip(found) {
+        memo.insert(k_id(k), Arc::new(f));
+    }
+    let mine = memo.get(&id)?.as_ref().clone();
+    // Charge this wallet its share of the pass; the rest of the cohort pays nothing later.
+    Some((mine, t.elapsed().as_nanos() / n.max(1)))
+}
+
+fn k_id(k: &kaspa_shielded_core::engine::IvkKey) -> [u8; 64] {
+    k.id()
 }
 
 fn decode_compact_actions(bytes: &[u8]) -> Option<Vec<CompactActionRecord>> {
@@ -3365,7 +3456,17 @@ async fn fetch_shielded_page_traced(
     });
     let decode_ns = t_decode.elapsed().as_nanos() as u64;
     let decoded =
-        Arc::new(DecodedPage { reorged: raw.reorged, sink_blue_score: raw.sink_blue_score, blocks, epks, rpc_ns, decode_ns });
+        Arc::new(DecodedPage {
+            reorged: raw.reorged,
+            sink_blue_score: raw.sink_blue_score,
+            blocks,
+            epks,
+            rpc_ns,
+            decode_ns,
+            low,
+            limit,
+            cohort: std::sync::Mutex::new(HashMap::new()),
+        });
     let mut c = cache.lock().await;
     // Re-inserting a key must not leave a second copy in the eviction queue. A page
     // refetched after its TTL used to be pushed again while `map` still held one
@@ -4093,7 +4194,13 @@ impl WalletEntry {
                         // then decompresses for itself rather than indexing into the
                         // wrong page.
                         let shared = (resp.epks.len() == page_actions.len()).then_some(resp.epks.as_slice());
-                        tokio::task::block_in_place(|| self.db.predecrypt_page_cached(&page_actions, shared));
+                        // `--shared-scan-engine`: one multi-key pass for the cohort riding this
+                        // page; this wallet gets exactly the memo its own call would compute.
+                        let from_engine = shared.and_then(|e| engine_cohort_memo(state, &resp, token, &self.db, &page_actions, e));
+                        match from_engine {
+                            Some((found, ns)) => self.db.install_predecrypted(&page_actions, found, ns),
+                            None => tokio::task::block_in_place(|| self.db.predecrypt_page_cached(&page_actions, shared)),
+                        }
                     }
                 }
                 for (i, b) in resp.blocks.iter().enumerate() {
@@ -5451,6 +5558,13 @@ struct AppState {
     /// [`Config::allow_custodial`] and [`require_custodial`].
     allow_custodial: bool,
     resources: ResourceLimits,
+    /// `--shared-scan-engine`: the multi-key detector kernel (`None` = engine off).
+    engine_kernel: Option<Box<dyn kaspa_shielded_core::engine::AgreeKernel>>,
+    /// `--shared-scan-engine`: every syncing wallet's prepared key and the page request it
+    /// is ingesting (token -> (key, low, limit)). The first wallet of a cohort to reach a
+    /// page decrypts it for every key registered at that cursor. A std mutex held only for
+    /// an insert, a remove or a snapshot.
+    engine_cohort: std::sync::Mutex<HashMap<String, (Arc<kaspa_shielded_core::engine::IvkKey>, RpcHash, u64)>>,
 }
 
 /// Build a status snapshot from a locked wallet entry. Shared by the sync loop and the
@@ -8288,6 +8402,9 @@ async fn evict_wallet(state: &Arc<AppState>, token: &str, why: &str) -> bool {
     let mut map = state.wallets.lock().await;
     if map.get(token).map(|cur| Arc::ptr_eq(cur, &w)).unwrap_or(false) {
         map.remove(token);
+        if let Ok(mut c) = state.engine_cohort.lock() {
+            c.remove(token);
+        }
         log::info!("evicted {why} wallet '{token_p}' (checkpoint on disk; it reloads on its next request)", token_p = log_pseudonym(&token));
         return true;
     }
@@ -13247,8 +13364,17 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
         auto_consolidate: cfg.auto_consolidate,
         build_shared_tree: cfg.build_shared_tree,
         allow_custodial: cfg.allow_custodial,
+        engine_kernel: resources.shared_scan_engine.then(engine_kernel_from_env),
+        engine_cohort: std::sync::Mutex::new(HashMap::new()),
         resources,
     });
+    if let Some(k) = &state.engine_kernel {
+        log::info!(
+            "shared scan engine: ON (kernel {}): wallets on the same page share one multi-key trial-decryption pass{}",
+            k.name(),
+            if kaspa_shielded_core::wallet::gpu_enabled() || kaspa_shielded_core::wallet::gpu_filter_enabled() { "; bypassed while the GPU backend is installed" } else { "" }
+        );
+    }
     // Publish a weak handle so an embedder (Android onTrimMemory) can reclaim memory
     // without owning the daemon. See `release_memory`.
     if let Ok(mut g) = LIVE_STATE.lock() {

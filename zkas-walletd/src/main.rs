@@ -195,6 +195,11 @@ struct Cli {
     /// cannot read those checkpoints, so this is a one-way door for every wallet it rewrites.
     #[arg(long)]
     shared_leaf_store: bool,
+    /// Phase 1 of the multi-wallet scan engine: wallets ingesting the same page share one
+    /// multi-key trial-decryption pass (identical results; ephemeral-key work paid once per
+    /// action for the cohort). Off by default. Kernel: ZKAS_ENGINE_KERNEL=ladder|comb.
+    #[arg(long)]
+    shared_scan_engine: bool,
     /// Defer optional subtree-index builds below this MemAvailable value.
     #[arg(long, value_name = "MIB")]
     subtree_free_floor_mb: Option<u64>,
@@ -323,6 +328,7 @@ async fn run(cli: Cli) {
         resources.resident_budget_mb = None;
     }
     resources.shared_leaf_store = cli.shared_leaf_store;
+    resources.shared_scan_engine = cli.shared_scan_engine;
     if let Some(v) = cli.subtree_free_floor_mb {
         resources.subtree_free_floor_mb = v;
     }
