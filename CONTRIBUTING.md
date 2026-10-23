@@ -10,7 +10,7 @@ Follow along the R&D Telegram group [@kasparnd](https://t.me/kasparnd).
 
 ## Quick summary
 
-- Open a GitHub Issue or Pull Request to start any discussion. Use Issues for design or spec discussions and PRs when you have code to share.
+- Open a GitLab issue or merge request (https://gitlab.com/zkas-group/zkas-rusty/-/issues) to start any discussion. Use Issues for design or spec discussions and PRs when you have code to share.
 - Look for `good first issue` if you're getting started; these are intentionally approachable.
 - Write detailed pull requests descriptions: explain what you changed, why, design decisions, and any trade-offs.
 - **Anyone** willing to contribute is encouraged to review pull requests and ask questions. Your approval and review counts!
@@ -54,7 +54,7 @@ If you can meaningfully review a pull request, please do so even if you have not
 
 ## Using Issues and Pull Requests for discussion
 
-- Use a GitHub Issue to propose or discuss ideas before writing code if the change affects APIs, consensus, or requires design feedback.
+- Use a GitLab issue to propose or discuss ideas before writing code if the change affects APIs, consensus, or requires design feedback.
 - You can also contribute by participating in existing discussions.
 - When you start implementing, link the Issue in your Pull Request and mention any related discussions.
 - If a PR is experimental or a work in progress, create the Pull Request in your fork of the repository first.

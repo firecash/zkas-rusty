@@ -3,7 +3,7 @@
 The TypeScript SDK moved to its own repository so integrators get a clean
 package without the node workspace:
 
-    https://github.com/zkas/zkas-sdk
+    https://gitlab.com/zkas-group/zkas-sdk
 
 It has no Rust build dependency (it talks to `zkas-walletd` over HTTP and takes
 the WASM signer by injection), so nothing here needs it at build time. The wire
