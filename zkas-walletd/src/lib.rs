@@ -3119,41 +3119,69 @@ fn engine_cohort_memo(
     actions: &[CompactActionRecord],
     epks: &[Option<kaspa_shielded_core::pasta_curves::pallas::Point>],
 ) -> Option<(Vec<kaspa_shielded_core::wallet::ReceivedNote>, u128)> {
-    use kaspa_shielded_core::engine::{IvkKey, detect};
     let kernel = state.engine_kernel.as_ref()?;
-    if kaspa_shielded_core::wallet::gpu_enabled() || kaspa_shielded_core::wallet::gpu_filter_enabled() || epks.len() != actions.len() {
+    if kaspa_shielded_core::wallet::gpu_enabled() || kaspa_shielded_core::wallet::gpu_filter_enabled() {
+        return None;
+    }
+    cohort_memo_with(kernel.as_ref(), &state.engine_cohort, (page.low, page.limit), &page.cohort, token, db, actions, epks)
+}
+
+/// The registry key of one page request.
+type PageReq = (RpcHash, u64);
+
+/// [`engine_cohort_memo`] without the daemon around it (testable): `registry` is
+/// `AppState::engine_cohort`, `req` and `memo` are the page's request and memo.
+#[allow(clippy::too_many_arguments)]
+fn cohort_memo_with(
+    kernel: &dyn kaspa_shielded_core::engine::AgreeKernel,
+    registry: &std::sync::Mutex<HashMap<String, (Arc<kaspa_shielded_core::engine::IvkKey>, RpcHash, u64)>>,
+    req: PageReq,
+    memo: &std::sync::Mutex<HashMap<[u8; 64], Arc<Vec<kaspa_shielded_core::wallet::ReceivedNote>>>>,
+    token: &str,
+    db: &WalletDb,
+    actions: &[CompactActionRecord],
+    epks: &[Option<kaspa_shielded_core::pasta_curves::pallas::Point>],
+) -> Option<(Vec<kaspa_shielded_core::wallet::ReceivedNote>, u128)> {
+    use kaspa_shielded_core::engine::{IvkKey, detect};
+    if epks.len() != actions.len() {
         return None;
     }
     let t = std::time::Instant::now();
     let ivk = db.incoming_viewing_key();
     let id = ivk.to_bytes();
     let key: Arc<IvkKey> = {
-        let mut reg = state.engine_cohort.lock().ok()?;
+        let mut reg = registry.lock().ok()?;
         let key = match reg.get(token) {
             Some((k, _, _)) if k_id(k) == id => k.clone(),
             _ => Arc::new(IvkKey::from_ivk(ivk)?),
         };
-        reg.insert(token.to_string(), (key.clone(), page.low, page.limit));
+        reg.insert(token.to_string(), (key.clone(), req.0, req.1));
         key
     };
-    let mut memo = page.cohort.lock().ok()?;
+    let mut memo = memo.lock().ok()?;
     if let Some(found) = memo.get(&id) {
         return Some(((**found).clone(), t.elapsed().as_nanos()));
     }
     let cohort: Vec<Arc<IvkKey>> = {
-        let reg = state.engine_cohort.lock().ok()?;
+        let reg = registry.lock().ok()?;
         let mut seen: HashSet<[u8; 64]> = HashSet::new();
         let mut v: Vec<Arc<IvkKey>> = vec![key.clone()];
         seen.insert(id);
         for (k, low, limit) in reg.values() {
-            if *low == page.low && *limit == page.limit && !memo.contains_key(&k_id(k)) && seen.insert(k_id(k)) {
+            if (*low, *limit) == req && !memo.contains_key(&k_id(k)) && seen.insert(k_id(k)) {
                 v.push(k.clone());
             }
         }
         v
     };
     let refs: Vec<&IvkKey> = cohort.iter().map(|k| k.as_ref()).collect();
-    let found = tokio::task::block_in_place(|| detect(kernel.as_ref(), &refs, actions, epks));
+    // `block_in_place` needs a multi-threaded runtime; outside one (tests) just run it.
+    let run = || detect(kernel, &refs, actions, epks);
+    let found = if tokio::runtime::Handle::try_current().is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread) {
+        tokio::task::block_in_place(run)
+    } else {
+        run()
+    };
     let n = cohort.len() as u128;
     for (k, f) in cohort.iter().zip(found) {
         memo.insert(k_id(k), Arc::new(f));
@@ -15944,6 +15972,77 @@ mod day_diff_tests {
         let mut f = std::fs::OpenOptions::new().create(true).append(true).open(format!("{out}.ivk")).expect("out");
         for l in lines {
             writeln!(f, "{l}").unwrap();
+        }
+    }
+}
+
+/// `--shared-scan-engine`'s cohort memo (`cohort_memo_with`), without a daemon: one pass for
+/// every key at the page cursor, each wallet's memo equal to its own `predecrypt` result,
+/// other cursors excluded, late keys computed on their own, twins share.
+#[cfg(test)]
+mod engine_cohort_tests {
+    use super::day_diff_tests::{Det, plant_retry, seed_wallet};
+    use super::*;
+    use kaspa_shielded_core::engine::{CombKernel, IvkKey, LadderKernel};
+    use kaspa_shielded_core::wallet::{decompress_epk, scan_compact_auto_cached};
+    use orchard::Address as OAddr;
+
+    #[test]
+    fn a_cohort_shares_one_pass_and_each_wallet_gets_its_own_memo() {
+        let mut r = Det::from(&[b"cohort-test"]);
+        let dbs: Vec<WalletDb> = (0..5).map(|i| seed_wallet(b"cohort", i).0).collect();
+        let twin = seed_wallet(b"cohort", 0).0;
+        let stranger = OAddr::from_raw_address_bytes(&seed_wallet(b"cohort-stranger", 0).0.address_bytes_at(3)).unwrap();
+        let mut actions: Vec<CompactActionRecord> = (0..300).map(|_| plant_retry(stranger, 1, &mut r)).collect();
+        for (w, db) in dbs.iter().enumerate() {
+            for j in 0..3u32 {
+                let to = OAddr::from_raw_address_bytes(&db.address_bytes_at(j * 7 + w as u32)).unwrap();
+                let at = (r.next() % (actions.len() as u64 + 1)) as usize;
+                actions.insert(at, plant_retry(to, 100 + w as u64, &mut r));
+            }
+        }
+        actions[17].ephemeral_key = [0u8; 32];
+        let epks: Vec<_> = actions.iter().map(|a| decompress_epk(&a.ephemeral_key)).collect();
+        let want = |db: &WalletDb| -> Vec<(usize, u64)> {
+            let ivk = db.incoming_viewing_key();
+            let sc = kaspa_shielded_core::wallet::ivk_agreement_scalar(ivk).unwrap();
+            scan_compact_auto_cached(&ivk.prepare(), Some(&sc), &actions, Some(&epks)).iter().map(|n| (n.action_index, n.note.value().inner())).collect()
+        };
+        let got = |v: &[kaspa_shielded_core::wallet::ReceivedNote]| -> Vec<(usize, u64)> { v.iter().map(|n| (n.action_index, n.note.value().inner())).collect() };
+        for kernel in [&LadderKernel as &dyn kaspa_shielded_core::engine::AgreeKernel, &CombKernel { w: Some(4) }] {
+            let registry = std::sync::Mutex::new(HashMap::new());
+            let memo = std::sync::Mutex::new(HashMap::new());
+            let here = (RpcHash::from_bytes([1u8; 32]), SHIELDED_PAGE);
+            let elsewhere = (RpcHash::from_bytes([2u8; 32]), SHIELDED_PAGE);
+            // Wallets 0..3 and the twin are at this page's cursor; wallet 3 is elsewhere.
+            for (i, db) in dbs.iter().enumerate().take(4) {
+                let req = if i == 3 { elsewhere } else { here };
+                let key = Arc::new(IvkKey::from_ivk(db.incoming_viewing_key()).unwrap());
+                registry.lock().unwrap().insert(format!("tok{i}"), (key, req.0, req.1));
+            }
+            let tw = Arc::new(IvkKey::from_ivk(twin.incoming_viewing_key()).unwrap());
+            registry.lock().unwrap().insert("twin".into(), (tw, here.0, here.1));
+            // First wallet in: one pass covers wallets 0, 1, 2 (and the twin's key = wallet 0's).
+            let (m0, _) = cohort_memo_with(kernel, &registry, here, &memo, "tok0", &dbs[0], &actions, &epks).unwrap();
+            assert_eq!(got(&m0), want(&dbs[0]), "{}: wallet 0", kernel.name());
+            assert!(!got(&m0).is_empty(), "planted notes must be found");
+            assert_eq!(memo.lock().unwrap().len(), 3, "{}: one pass for the three distinct keys at this cursor", kernel.name());
+            for (i, db) in dbs.iter().enumerate().take(3).skip(1) {
+                let (m, _) = cohort_memo_with(kernel, &registry, here, &memo, &format!("tok{i}"), db, &actions, &epks).unwrap();
+                assert_eq!(got(&m), want(db), "{}: wallet {i}", kernel.name());
+            }
+            let (mt, _) = cohort_memo_with(kernel, &registry, here, &memo, "twin", &twin, &actions, &epks).unwrap();
+            assert_eq!(got(&mt), want(&dbs[0]), "{}: twin", kernel.name());
+            assert_eq!(memo.lock().unwrap().len(), 3, "{}: served from the memo", kernel.name());
+            // Wallet 4 arrives late (not registered when the pass ran): computed on its own.
+            let (m4, _) = cohort_memo_with(kernel, &registry, here, &memo, "tok4", &dbs[4], &actions, &epks).unwrap();
+            assert_eq!(got(&m4), want(&dbs[4]), "{}: late wallet", kernel.name());
+            assert_eq!(memo.lock().unwrap().len(), 4);
+            // Wallet 3 reaches this page later: its cursor moved here, so it is recomputed, correctly.
+            let (m3, _) = cohort_memo_with(kernel, &registry, here, &memo, "tok3", &dbs[3], &actions, &epks).unwrap();
+            assert_eq!(got(&m3), want(&dbs[3]), "{}: wallet from another cursor", kernel.name());
+            // A misaligned epk cache is refused, never indexed.
+            assert!(cohort_memo_with(kernel, &registry, here, &memo, "tok0", &dbs[0], &actions, &epks[1..]).is_none());
         }
     }
 }
