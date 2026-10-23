@@ -197,7 +197,7 @@ struct Cli {
     shared_leaf_store: bool,
     /// Phase 1 of the multi-wallet scan engine: wallets ingesting the same page share one
     /// multi-key trial-decryption pass (identical results; ephemeral-key work paid once per
-    /// action for the cohort). Off by default. Kernel: ZKAS_ENGINE_KERNEL=ladder|comb.
+    /// action for the cohort). Off by default. Kernel: ZKAS_ENGINE_KERNEL=comb|ladder (default comb).
     #[arg(long)]
     shared_scan_engine: bool,
     /// Defer optional subtree-index builds below this MemAvailable value.

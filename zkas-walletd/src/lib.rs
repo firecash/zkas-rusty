@@ -3090,12 +3090,14 @@ async fn fetch_bundle_for_tx(client: &GrpcClient, chain: RpcHash, txid: &[u8; 32
     None
 }
 
-/// The detector kernel for `--shared-scan-engine`: `ZKAS_ENGINE_KERNEL=ladder|comb` (default
-/// ladder: the shared GLV-table path, see 08-engine-phase1.md for the M-A measurement).
+/// The detector kernel for `--shared-scan-engine`: `ZKAS_ENGINE_KERNEL=comb|ladder`. Default
+/// comb (auto width, ladder below `COMB_MIN_KEYS` keys): experiment M-A measured it 1.7x
+/// cheaper than the per-wallet path at 64 keys and 2.8x at 1,024-4,096, with identical hits
+/// (08-engine-phase1.md §3).
 fn engine_kernel_from_env() -> Box<dyn kaspa_shielded_core::engine::AgreeKernel> {
     match std::env::var("ZKAS_ENGINE_KERNEL").as_deref() {
-        Ok("comb") => Box::new(kaspa_shielded_core::engine::CombKernel { w: None }),
-        _ => Box::new(kaspa_shielded_core::engine::LadderKernel),
+        Ok("ladder") => Box::new(kaspa_shielded_core::engine::LadderKernel),
+        _ => Box::new(kaspa_shielded_core::engine::CombKernel { w: None }),
     }
 }
 
@@ -15964,7 +15966,7 @@ mod day_diff_tests {
 ///
 /// Env: `SHADOW_RPC` (or `DAYDIFF_RPC`), `SHADOW_OUT`, `SHADOW_START` / saved `{out}.start`,
 /// `SHADOW_SPAN` (DAA, default 86400), `SHADOW_WALLETS` (default 8), `SHADOW_PLANT` (default 1),
-/// `SHADOW_MODE` (both), `SHADOW_KERNEL` (ladder|comb).
+/// `SHADOW_MODE` (both), `SHADOW_KERNEL` (comb|ladder, default comb).
 #[cfg(test)]
 mod engine_shadow_tests {
     use super::day_diff_tests::{Det, connect, env_u64, frontier, h32, hex32, plant_retry, seed_wallet};
@@ -15999,8 +16001,8 @@ mod engine_shadow_tests {
 
     fn kernel(name: &str) -> Box<dyn AgreeKernel> {
         match name {
-            "comb" => Box::new(CombKernel { w: None }),
-            _ => Box::new(LadderKernel),
+            "ladder" => Box::new(LadderKernel),
+            _ => Box::new(CombKernel { w: None }),
         }
     }
 
@@ -16068,7 +16070,7 @@ mod engine_shadow_tests {
         let n = env_u64("SHADOW_WALLETS", 8) as usize;
         let plant_mode = env_u64("SHADOW_PLANT", 1) == 1;
         let mode = std::env::var("SHADOW_MODE").unwrap_or_else(|_| "both".into());
-        let kname = std::env::var("SHADOW_KERNEL").unwrap_or_else(|_| "ladder".into());
+        let kname = std::env::var("SHADOW_KERNEL").unwrap_or_else(|_| "comb".into());
         let (run_old, run_new) = (mode != "new", mode != "old");
         COINBASE_SEED_ACTIVATION_DAA.store(
             kaspa_consensus_core::config::params::MAINNET_PARAMS.shielded_coinbase_seed_activation.daa_score(),

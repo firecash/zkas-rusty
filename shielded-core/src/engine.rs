@@ -367,10 +367,18 @@ impl CombScalar {
 /// N scalars vary, so a table `T[j][m] = (m+1)·2^{wj}·epk` built once per action turns each
 /// key's agreement into ≈ 2·⌈128/w⌉ mixed additions with no doublings (the GLV endomorphism
 /// φ(x, y) = (ζx, y) = λ·P serves the second half from the same table, applied once to the
-/// second accumulator). `w = None` picks the width from the key count.
+/// second accumulator). `w = None` picks the width from the key count, and below
+/// [`COMB_MIN_KEYS`] keys hands the batch to [`LadderKernel`] (the table cannot amortise).
+///
+/// Measured (M-A, `08-engine-phase1.md` §3, real pages, 4 threads, CPU-µs per (action, key)):
+/// today's per-wallet path 36.9–38.7 at every N; comb 21.4 at N = 64, 13.8 at 1,024, 13.1–13.9
+/// at 4,096; crossover with the ladder at N ≈ 16; identical hit sets throughout.
 pub struct CombKernel {
     pub w: Option<u32>,
 }
+
+/// Below this many keys the auto-width comb defers to the ladder (measured crossover, M-A).
+pub const COMB_MIN_KEYS: usize = 16;
 
 impl CombKernel {
     /// Window width minimising (table build)/N + per-key additions, from the cost model
@@ -449,6 +457,9 @@ impl AgreeKernel for CombKernel {
         use rayon::prelude::*;
         if epks.len() != actions.len() {
             return None;
+        }
+        if self.w.is_none() && keys.len() < COMB_MIN_KEYS {
+            return LadderKernel.candidates(keys, actions, epks);
         }
         let live = live_actions(epks);
         if live.is_empty() || keys.is_empty() {
