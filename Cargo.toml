@@ -66,6 +66,7 @@ members = [
     "mining",
     "mining/errors",
     "protocol/p2p",
+    "protocol/zkt2",
     "protocol/flows",
     "components/addressmanager",
     "components/connectionmanager",
@@ -139,6 +140,7 @@ kaspa-muhash = { version = "2.0.1", path = "crypto/muhash" }
 kaspa-notify = { version = "2.0.1", path = "notify" }
 kaspa-p2p-flows = { version = "2.0.1", path = "protocol/flows" }
 kaspa-p2p-lib = { version = "2.0.1", path = "protocol/p2p" }
+kaspa-zkt2 = { version = "2.0.1", path = "protocol/zkt2" }
 kaspa-p2p-mining = { version = "2.0.1", path = "protocol/mining" }
 kaspa-perf-monitor = { version = "2.0.1", path = "metrics/perf_monitor" }
 kaspa-pow = { version = "2.0.1", path = "consensus/pow" }
