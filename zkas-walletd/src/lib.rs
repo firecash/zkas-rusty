@@ -15431,11 +15431,11 @@ mod day_diff_tests {
     use std::time::{Duration, Instant};
     use zcash_note_encryption::Domain;
 
-    fn env_u64(k: &str, d: u64) -> u64 {
+    pub(super) fn env_u64(k: &str, d: u64) -> u64 {
         std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
     }
 
-    fn h32(parts: &[&[u8]]) -> [u8; 32] {
+    pub(super) fn h32(parts: &[&[u8]]) -> [u8; 32] {
         let mut st = blake2b_simd::Params::new().hash_length(32).personal(b"zkas-daydiff-t03").to_state();
         for p in parts {
             st.update(p);
@@ -15446,20 +15446,20 @@ mod day_diff_tests {
     }
 
     /// Deterministic stream (splitmix64), so the asm and portable runs plant identically.
-    struct Det(u64);
+    pub(super) struct Det(u64);
     impl Det {
-        fn from(parts: &[&[u8]]) -> Self {
+        pub(super) fn from(parts: &[&[u8]]) -> Self {
             let b = h32(parts);
             Det(u64::from_le_bytes(b[..8].try_into().unwrap()))
         }
-        fn next(&mut self) -> u64 {
+        pub(super) fn next(&mut self) -> u64 {
             self.0 = self.0.wrapping_add(0x9e3779b97f4a7c15);
             let mut z = self.0;
             z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
             z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
             z ^ (z >> 31)
         }
-        fn b32(&mut self) -> [u8; 32] {
+        pub(super) fn b32(&mut self) -> [u8; 32] {
             let mut o = [0u8; 32];
             for c in o.chunks_mut(8) {
                 c.copy_from_slice(&self.next().to_le_bytes());
@@ -15469,7 +15469,7 @@ mod day_diff_tests {
     }
 
     /// The coinbase leaf exactly as it was derived before the change: two NoteCommits.
-    fn old_coinbase_cmx(desc: &CoinbaseNoteDesc, value: u64) -> Option<ExtractedNoteCommitment> {
+    pub(super) fn old_coinbase_cmx(desc: &CoinbaseNoteDesc, value: u64) -> Option<ExtractedNoteCommitment> {
         let recipient: OAddr = Option::from(OAddr::from_raw_address_bytes(&desc.recipient))?;
         let rho: Rho = Option::from(Rho::from_bytes(&desc.rho))?;
         let rseed: RandomSeed = Option::from(RandomSeed::from_bytes(desc.rseed, &rho))?;
@@ -15495,7 +15495,7 @@ mod day_diff_tests {
 
     /// A compact record carrying a real note to `addr` (nf doubles as the note's rho, as
     /// `for_compact_action` reads it). `None` on the rare non-canonical draw.
-    fn plant(addr: OAddr, value: u64, rng: &mut Det) -> Option<CompactActionRecord> {
+    pub(super) fn plant(addr: OAddr, value: u64, rng: &mut Det) -> Option<CompactActionRecord> {
         let mut nf = rng.b32();
         nf[31] &= 0x3f;
         let rho: Rho = Option::from(Rho::from_bytes(&nf))?;
@@ -15514,11 +15514,11 @@ mod day_diff_tests {
         })
     }
 
-    fn plant_retry(addr: OAddr, value: u64, rng: &mut Det) -> CompactActionRecord {
+    pub(super) fn plant_retry(addr: OAddr, value: u64, rng: &mut Det) -> CompactActionRecord {
         (0..64).find_map(|_| plant(addr, value, rng)).expect("a canonical draw within 64 tries")
     }
 
-    fn seed_wallet(tag: &[u8], i: u64) -> (WalletDb, [u8; 32]) {
+    pub(super) fn seed_wallet(tag: &[u8], i: u64) -> (WalletDb, [u8; 32]) {
         let mut k = 0u64;
         loop {
             let s = h32(&[b"throwaway-key", tag, &i.to_le_bytes(), &k.to_le_bytes()]);
@@ -15529,7 +15529,7 @@ mod day_diff_tests {
         }
     }
 
-    async fn connect(rpc: &str) -> GrpcClient {
+    pub(super) async fn connect(rpc: &str) -> GrpcClient {
         GrpcClient::connect_with_args(
             NotificationMode::Direct,
             format!("grpc://{rpc}"),
@@ -15544,21 +15544,21 @@ mod day_diff_tests {
         .expect("connect to DAYDIFF_RPC")
     }
 
-    fn frontier(ts: &kaspa_rpc_core::GetShieldedTreeStateResponse) -> FrontierState {
+    pub(super) fn frontier(ts: &kaspa_rpc_core::GetShieldedTreeStateResponse) -> FrontierState {
         FrontierState { size: ts.size, leaf: (ts.size > 0).then(|| ts.leaf.as_bytes()), ommers: ts.ommers.iter().map(|h| h.as_bytes()).collect() }
     }
 
-    fn hex32(b: &[u8; 32]) -> String {
+    pub(super) fn hex32(b: &[u8; 32]) -> String {
         b.iter().map(|x| format!("{x:02x}")).collect()
     }
 
-    fn parse_hash(s: &str) -> RpcHash {
+    pub(super) fn parse_hash(s: &str) -> RpcHash {
         let v = hex::decode(s.trim()).expect("hex block hash");
         RpcHash::from_bytes(v.try_into().expect("32 bytes"))
     }
 
     /// Start block for the run: explicit, or saved by an earlier run, or chosen now.
-    async fn start_block(client: &GrpcClient, out: &str, span: u64) -> kaspa_rpc_core::GetShieldedTreeStateResponse {
+    pub(super) async fn start_block(client: &GrpcClient, out: &str, span: u64) -> kaspa_rpc_core::GetShieldedTreeStateResponse {
         let saved = std::env::var("DAYDIFF_START").ok().or_else(|| std::fs::read_to_string(format!("{out}.start")).ok());
         if let Some(h) = saved {
             let h = parse_hash(&h);
@@ -15940,6 +15940,543 @@ mod day_diff_tests {
         }
         use std::io::Write as _;
         let mut f = std::fs::OpenOptions::new().create(true).append(true).open(format!("{out}.ivk")).expect("out");
+        for l in lines {
+            writeln!(f, "{l}").unwrap();
+        }
+    }
+}
+
+/// Task E1 — the shadow-mode harness for the multi-wallet scan engine, and experiment M-A.
+///
+/// `real_days_shared_engine_equals_per_wallet` runs the shared engine
+/// (`kaspa_shielded_core::engine::ScanEngine`: one decode, one multi-key detection pass, one
+/// tree, per-wallet state = own notes) ALONGSIDE today's per-wallet path (N `WalletDb`s, each
+/// `predecrypt_page_cached` + `ingest_block_compact_precomputed_with_meta`, exactly what
+/// `sync_chunk` calls) over real mainnet days from the node, for throwaway wallets (plus a
+/// twin), and asserts after every page: identical notes (position, value, nullifier,
+/// commitment), balance, pending spends and pending change, history rows, chain clock,
+/// poison flag, tree size, anchor and applied-nullifier count; at the end identical witnesses
+/// for every note and (unplanted) the node's own root. Planted mode (default) inserts
+/// receipts to diversified addresses, coinbase rewards, spends of held notes (half of them
+/// first parked with `mark_spent`), lost sends that `reclaim_expired` must hand back, and
+/// hostile encodings, so the comparison is not vacuous. `SHADOW_MODE=old|new` runs one side
+/// only, for CPU/RAM measurement.
+///
+/// Env: `SHADOW_RPC` (or `DAYDIFF_RPC`), `SHADOW_OUT`, `SHADOW_START` / saved `{out}.start`,
+/// `SHADOW_SPAN` (DAA, default 86400), `SHADOW_WALLETS` (default 8), `SHADOW_PLANT` (default 1),
+/// `SHADOW_MODE` (both), `SHADOW_KERNEL` (ladder|comb).
+#[cfg(test)]
+mod engine_shadow_tests {
+    use super::day_diff_tests::{Det, connect, env_u64, frontier, h32, hex32, plant_retry, seed_wallet};
+    use super::*;
+    use kaspa_shielded_core::ExtractedNoteCommitment;
+    use kaspa_shielded_core::engine::{AgreeKernel, CombKernel, IvkKey, LadderKernel, ScanEngine, SharedBlock, SharedChain, SharedPage, WalletId, detect};
+    use kaspa_shielded_core::wallet::{decompress_epk, scan_compact_auto_cached};
+    use kaspa_shielded_core::walletdb::PendingSpend;
+    use orchard::Address as OAddr;
+    use orchard::keys::{FullViewingKey, Scope, SpendingKey};
+    use rayon::prelude::*;
+    use sha2::{Digest, Sha256};
+    use std::time::Instant;
+
+    /// Process CPU seconds (user + system), from /proc/self/stat at 100 Hz.
+    fn cpu_secs() -> f64 {
+        let s = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
+        let f: Vec<&str> = s.rsplit_once(") ").map(|x| x.1).unwrap_or("").split_whitespace().collect();
+        let g = |i: usize| f.get(i).and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
+        (g(11) + g(12)) / 100.0
+    }
+
+    fn status_kb(key: &str) -> u64 {
+        std::fs::read_to_string("/proc/self/status")
+            .unwrap_or_default()
+            .lines()
+            .find(|l| l.starts_with(key))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    }
+
+    fn kernel(name: &str) -> Box<dyn AgreeKernel> {
+        match name {
+            "comb" => Box::new(CombKernel { w: None }),
+            _ => Box::new(LadderKernel),
+        }
+    }
+
+    /// The engine's block from the daemon's own decoded block, with `sync_chunk`'s meta rule.
+    fn shared_block(b: &DecodedBlock) -> SharedBlock {
+        SharedBlock {
+            hash: b.hash.as_bytes(),
+            blue_score: b.blue_score,
+            daa_score: b.daa_score,
+            coinbase: b.coinbase.clone(),
+            txs: b.compact.clone(),
+            meta: (b.timestamp > 0 && b.txids.len() == b.compact.len()).then(|| BlockMeta {
+                coinbase_txid: b.coinbase_txid,
+                txids: b.txids.clone(),
+                timestamp_ms: b.timestamp,
+                daa_score: b.daa_score,
+            }),
+        }
+    }
+
+    fn note_key(n: &OwnedNote) -> (u64, u64, [u8; 32], [u8; 32]) {
+        (n.position, n.value(), n.nullifier(), ExtractedNoteCommitment::from(n.note.commitment()).to_bytes())
+    }
+
+    fn compare(db: &WalletDb, eng: &ScanEngine, id: WalletId, ctx: &str) {
+        let w = eng.wallet(id);
+        assert_eq!(db.notes().iter().map(note_key).collect::<Vec<_>>(), w.notes().iter().map(note_key).collect::<Vec<_>>(), "{ctx}: notes");
+        assert_eq!(db.balance(), w.balance(), "{ctx}: balance");
+        let pk = |p: &PendingSpend| (note_key(&p.note), p.txid, p.submitted_daa);
+        assert_eq!(db.pending_spends().iter().map(pk).collect::<Vec<_>>(), w.pending_spends().iter().map(pk).collect::<Vec<_>>(), "{ctx}: pending");
+        assert_eq!(db.pending_change(), w.pending_change(), "{ctx}: pending change");
+        assert_eq!(format!("{:?}", db.history()), format!("{:?}", w.history()), "{ctx}: history");
+        assert_eq!(db.last_daa(), w.last_daa(), "{ctx}: chain clock");
+        assert_eq!(db.poisoned(), w.poisoned(), "{ctx}: poisoned");
+        assert_eq!(db.size(), eng.chain().size(), "{ctx}: tree size");
+        assert_eq!(db.anchor(), eng.chain().anchor(), "{ctx}: anchor");
+        assert_eq!(db.nf_len(), eng.chain().nf_len(), "{ctx}: applied nullifiers");
+        for n in db.notes() {
+            assert!(!eng.chain().nf_seen(&n.nullifier()), "{ctx}: an unspent note's nullifier is applied");
+        }
+    }
+
+    fn fold_digest(h: &mut Sha256, notes: &[OwnedNote], pending: &[PendingSpend], history: &[kaspa_shielded_core::walletdb::HistoryEntry], balance: u128) {
+        for n in notes {
+            let (p, v, nf, cm) = note_key(n);
+            h.update(p.to_le_bytes());
+            h.update(v.to_le_bytes());
+            h.update(nf);
+            h.update(cm);
+        }
+        for p in pending {
+            h.update(p.note.nullifier());
+            h.update(p.txid);
+        }
+        h.update(format!("{history:?}").as_bytes());
+        h.update(balance.to_le_bytes());
+    }
+
+    #[test]
+    #[ignore = "needs a node: SHADOW_RPC=127.0.0.1:16810"]
+    fn real_days_shared_engine_equals_per_wallet() {
+        let rpc = std::env::var("SHADOW_RPC").or_else(|_| std::env::var("DAYDIFF_RPC")).expect("SHADOW_RPC");
+        let out = std::env::var("SHADOW_OUT").unwrap_or_else(|_| "/tmp/shadow".into());
+        let span = env_u64("SHADOW_SPAN", 86_400);
+        let n = env_u64("SHADOW_WALLETS", 8) as usize;
+        let plant_mode = env_u64("SHADOW_PLANT", 1) == 1;
+        let mode = std::env::var("SHADOW_MODE").unwrap_or_else(|_| "both".into());
+        let kname = std::env::var("SHADOW_KERNEL").unwrap_or_else(|_| "ladder".into());
+        let (run_old, run_new) = (mode != "new", mode != "old");
+        COINBASE_SEED_ACTIVATION_DAA.store(
+            kaspa_consensus_core::config::params::MAINNET_PARAMS.shielded_coinbase_seed_activation.daa_score(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        rt.block_on(async move {
+            let client = connect(&rpc).await;
+            let ts0 = {
+                let saved = std::env::var("SHADOW_START").ok().or_else(|| std::fs::read_to_string(format!("{out}.start")).ok());
+                if let Some(h) = saved {
+                    let h = super::day_diff_tests::parse_hash(&h);
+                    client.get_shielded_tree_state(Some(h)).await.expect("tree state at start")
+                } else {
+                    super::day_diff_tests::start_block(&client, &out, span).await
+                }
+            };
+            let end_daa = ts0.daa_score + span;
+            let fs0 = frontier(&ts0);
+            let tag = ts0.block_hash.as_bytes();
+            // n throwaway wallets plus a twin of wallet 0 (same key, second token).
+            let total = n + usize::from(n >= 2);
+            let mut old: Vec<WalletDb> = Vec::new();
+            let mut fvks: Vec<FullViewingKey> = Vec::new();
+            let mut addrs: Vec<Vec<[u8; 43]>> = Vec::new();
+            for i in 0..total {
+                let src = if i == n { 0 } else { i as u64 };
+                let (mut db, seed) = seed_wallet(&tag, src);
+                db.apply_frontier(&fs0).expect("frontier");
+                addrs.push((0..300u32).map(|j| db.address_bytes_at(j)).collect());
+                fvks.push(FullViewingKey::from(&Option::<SpendingKey>::from(SpendingKey::from_bytes(seed)).expect("seed")));
+                if run_old {
+                    old.push(db);
+                }
+            }
+            let mut eng = ScanEngine::new(SharedChain::from_frontier(&fs0).expect("frontier"), kernel(&kname));
+            let ids: Vec<WalletId> = if run_new { fvks.iter().map(|f| eng.register(f.clone()).expect("register")).collect() } else { Vec::new() };
+            let stranger = OAddr::from_raw_address_bytes(&seed_wallet(b"stranger", 0).0.address_bytes_at(7)).unwrap();
+            let mut planted_spends: HashSet<[u8; 32]> = HashSet::new();
+            let (mut n_pages, mut n_blocks, mut n_act, mut n_planted, mut n_parked, mut n_reclaimed) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+            let (mut cpu_old, mut cpu_new, mut wall_old, mut wall_new, mut cpu_shared, mut wall_shared) = (0f64, 0f64, 0f64, 0f64, 0f64, 0f64);
+            let mut low = ts0.block_hash;
+            let mut last = ts0.block_hash;
+            let mut last_daa = ts0.daa_score;
+            let t_all = Instant::now();
+            loop {
+                let resp = client.get_shielded_blocks(low, SHIELDED_PAGE).await.expect("get_shielded_blocks");
+                assert!(!resp.reorged, "start block reorged off the chain");
+                let mut blocks: Vec<RpcShieldedChainBlock> = resp.blocks.into_iter().take_while(|b| b.daa_score < end_daa).collect();
+                if blocks.is_empty() {
+                    break;
+                }
+                let page_done = blocks.len() < SHIELDED_PAGE as usize;
+                n_pages += 1;
+                if plant_mode {
+                    // Held notes (wallet, position, nf, unspent?) from whichever side runs; both
+                    // sides are asserted equal, so the plan is the same either way.
+                    let mut held: Vec<(usize, u64, [u8; 32], bool)> = Vec::new();
+                    for w in 0..total {
+                        let (notes, pend): (Vec<(u64, [u8; 32])>, Vec<(u64, [u8; 32])>) = if run_old {
+                            (old[w].notes().iter().map(|x| (x.position, x.nullifier())).collect(), old[w].pending_spends().iter().map(|p| (p.note.position, p.note.nullifier())).collect())
+                        } else {
+                            let lw = eng.wallet(ids[w]);
+                            (lw.notes().iter().map(|x| (x.position, x.nullifier())).collect(), lw.pending_spends().iter().map(|p| (p.note.position, p.note.nullifier())).collect())
+                        };
+                        held.extend(notes.into_iter().map(|(p, nf)| (w, p, nf, true)));
+                        held.extend(pend.into_iter().map(|(p, nf)| (w, p, nf, false)));
+                    }
+                    held.retain(|h| !planted_spends.contains(&h.2));
+                    for b in blocks.iter_mut() {
+                        let mut r = Det::from(&[b"shadow-plant", &tag, &b.hash.as_bytes()]);
+                        let mut txs: Vec<Vec<CompactActionRecord>> = Vec::new();
+                        if !held.is_empty() && r.next() % 25 == 0 {
+                            let (w, pos, nf, unspent) = held.swap_remove((r.next() % held.len() as u64) as usize);
+                            planted_spends.insert(nf);
+                            // Half of the spends are first parked as our own submitted send.
+                            if unspent && r.next() % 2 == 0 {
+                                let txid = r.b32();
+                                let outflow = 1 + r.next() % 1000;
+                                if run_old {
+                                    old[w].mark_spent(pos, txid, b.daa_score);
+                                    old[w].note_pending_outflow(txid, outflow);
+                                }
+                                if run_new {
+                                    eng.mark_spent(ids[w], pos, txid, b.daa_score);
+                                    eng.note_pending_outflow(ids[w], txid, outflow);
+                                }
+                                n_parked += 1;
+                            }
+                            let mut rec = plant_retry(stranger, 5, &mut r);
+                            rec.nullifier = nf;
+                            let mut tx = vec![rec];
+                            if r.next() % 2 == 0 {
+                                // Change back to the spender.
+                                let to = OAddr::from_raw_address_bytes(&addrs[w][(r.next() % 300) as usize]).unwrap();
+                                tx.push(plant_retry(to, 1 + r.next() % 1_000_000, &mut r));
+                            }
+                            txs.push(tx);
+                        } else if !held.is_empty() && r.next() % 90 == 0 {
+                            // A send that never lands: parked, never spent on chain.
+                            let k = (r.next() % held.len() as u64) as usize;
+                            let (w, pos, nf, unspent) = held[k];
+                            if unspent {
+                                held.swap_remove(k);
+                                planted_spends.insert(nf);
+                                let txid = r.b32();
+                                if run_old {
+                                    old[w].mark_spent(pos, txid, b.daa_score);
+                                }
+                                if run_new {
+                                    eng.mark_spent(ids[w], pos, txid, b.daa_score);
+                                }
+                                n_parked += 1;
+                            }
+                        }
+                        if r.next() % 30 == 0 {
+                            let w = (r.next() % total as u64) as usize;
+                            let to = OAddr::from_raw_address_bytes(&addrs[w][(r.next() % 300) as usize]).unwrap();
+                            let mut tx = vec![plant_retry(stranger, 1 + r.next() % 1_000_000, &mut r), plant_retry(to, 1 + r.next() % 1_000_000_000, &mut r)];
+                            if r.next() % 3 == 0 {
+                                // A second output to another of our wallets in the same tx.
+                                let w2 = (r.next() % total as u64) as usize;
+                                let to2 = OAddr::from_raw_address_bytes(&addrs[w2][(r.next() % 300) as usize]).unwrap();
+                                tx.push(plant_retry(to2, 1 + r.next() % 1_000_000, &mut r));
+                            }
+                            if r.next() % 4 == 0 {
+                                let mut bad = plant_retry(stranger, 9, &mut r);
+                                match r.next() % 3 {
+                                    0 => bad.ephemeral_key = [0u8; 32],
+                                    1 => bad.ephemeral_key = [0xff; 32],
+                                    _ => bad.cmx = [0xff; 32],
+                                }
+                                tx.push(bad);
+                            }
+                            if r.next() % 2 == 0 {
+                                tx.reverse();
+                            }
+                            txs.push(tx);
+                        }
+                        if r.next() % 50 == 0 {
+                            let w = (r.next() % total as u64) as usize;
+                            let j = (r.next() % 256) as usize;
+                            let i = b.coinbase_outputs.len();
+                            let value = 1 + r.next() % 50_000_000_000;
+                            let desc = derive_coinbase_note_desc(addrs[w][j], &coinbase_note_seed(&b.hash, b.daa_score, &b.coinbase_txid, i));
+                            let cm = super::day_diff_tests::old_coinbase_cmx(&desc, value).expect("planted coinbase derives");
+                            b.coinbase_outputs.push(kaspa_rpc_core::RpcShieldedCoinbaseOutput { script_public_key: addrs[w][j].to_vec(), value, commitment: Some(cm.to_bytes()) });
+                            n_planted += 1;
+                        }
+                        for tx in txs {
+                            n_planted += 1;
+                            let pos = (r.next() % (b.accepted_actions.len() as u64 + 1)) as usize;
+                            let bytes: Vec<u8> = tx.iter().flat_map(|a| a.to_bytes()).collect();
+                            b.accepted_actions.insert(pos, bytes);
+                            if !b.accepted_txids.is_empty() {
+                                b.accepted_txids.insert(pos, RpcHash::from_bytes(r.b32()));
+                            }
+                        }
+                    }
+                }
+                // The shared half both paths get from the daemon's page cache: decode once,
+                // epks once.
+                let (c0, t0) = (cpu_secs(), Instant::now());
+                let decoded: Vec<DecodedBlock> = blocks.par_iter().map(decode_block).collect::<Result<_, _>>().expect("decode_block");
+                let flat: Vec<CompactActionRecord> = decoded.iter().flat_map(|b| b.compact.iter().flatten().copied()).collect();
+                let epks: Vec<_> = flat.par_iter().map(|r| decompress_epk(&r.ephemeral_key)).collect();
+                cpu_shared += cpu_secs() - c0;
+                wall_shared += t0.elapsed().as_secs_f64();
+                n_act += flat.len() as u64;
+                // OLD: today's per-wallet path, wallet by wallet.
+                if run_old {
+                    let (c0, t0) = (cpu_secs(), Instant::now());
+                    for db in old.iter_mut() {
+                        if !flat.is_empty() {
+                            db.predecrypt_page_cached(&flat, Some(epks.as_slice()));
+                        }
+                        for b in &decoded {
+                            let meta = (b.timestamp > 0 && b.txids.len() == b.compact.len()).then(|| BlockMeta {
+                                coinbase_txid: b.coinbase_txid,
+                                txids: b.txids.clone(),
+                                timestamp_ms: b.timestamp,
+                                daa_score: b.daa_score,
+                            });
+                            db.ingest_block_compact_precomputed_with_meta(&b.coinbase, &b.compact, meta.as_ref());
+                        }
+                        db.end_page();
+                    }
+                    cpu_old += cpu_secs() - c0;
+                    wall_old += t0.elapsed().as_secs_f64();
+                }
+                // NEW: one engine pass for every wallet.
+                if run_new {
+                    let (c0, t0) = (cpu_secs(), Instant::now());
+                    let page = SharedPage::with_epks(decoded.iter().map(shared_block).collect(), epks.clone());
+                    eng.ingest_page(&page);
+                    cpu_new += cpu_secs() - c0;
+                    wall_new += t0.elapsed().as_secs_f64();
+                }
+                last_daa = decoded.last().map(|b| b.daa_score).unwrap_or(last_daa);
+                // Lost sends come back after the expiry window, identically.
+                if plant_mode {
+                    for w in 0..total {
+                        let a = if run_old { old[w].reclaim_expired(last_daa, PENDING_SPEND_EXPIRY_DAA) } else { Vec::new() };
+                        let b = if run_new { eng.reclaim_expired(ids[w], last_daa, PENDING_SPEND_EXPIRY_DAA) } else { Vec::new() };
+                        if run_old && run_new {
+                            assert_eq!(a, b, "page {n_pages} wallet {w}: reclaimed");
+                        }
+                        n_reclaimed += a.len().max(b.len()) as u64;
+                    }
+                }
+                if run_old && run_new {
+                    for w in 0..total {
+                        compare(&old[w], &eng, ids[w], &format!("page {n_pages} wallet {w}"));
+                    }
+                }
+                n_blocks += blocks.len() as u64;
+                last = blocks.last().unwrap().hash;
+                low = last;
+                if page_done {
+                    break;
+                }
+            }
+            let wall = t_all.elapsed().as_secs_f64();
+            // Witnesses for every note, from each wallet's own stream and from the one shared tree.
+            let mut n_witness = 0usize;
+            let mut found = 0usize;
+            let mut h = Sha256::new();
+            for w in 0..total {
+                if run_old && run_new {
+                    let pos: Vec<u64> = old[w].notes().iter().map(|x| x.position).chain(old[w].pending_spends().iter().map(|p| p.note.position)).collect();
+                    let size = eng.chain().size();
+                    let a = old[w].witness_paths_at(&pos, size);
+                    let b = eng.witness_paths_at(&pos, size);
+                    for ((pa, pb), p) in a.iter().zip(&b).zip(&pos) {
+                        let pa = pa.as_ref().expect("own witness");
+                        let pb = pb.as_ref().expect("shared witness");
+                        assert_eq!(format!("{pa:?}"), format!("{pb:?}"), "wallet {w}: witness at {p}");
+                        n_witness += 1;
+                    }
+                }
+                if run_new {
+                    let lw = eng.wallet(ids[w]);
+                    fold_digest(&mut h, lw.notes(), lw.pending_spends(), lw.history(), lw.balance());
+                    found += lw.notes().len() + lw.pending_spends().len();
+                } else {
+                    fold_digest(&mut h, old[w].notes(), old[w].pending_spends(), old[w].history(), old[w].balance());
+                    found += old[w].notes().len() + old[w].pending_spends().len();
+                }
+            }
+            let (size, anchor) = if run_new { (eng.chain().size(), eng.chain().anchor()) } else { (old[0].size(), old[0].anchor()) };
+            h.update(size.to_le_bytes());
+            h.update(anchor);
+            let digest: [u8; 32] = h.finalize().as_slice().try_into().unwrap();
+            if plant_mode {
+                assert!(found > 0 && n_parked > 0, "planted mode must find and park notes ({found} found, {n_parked} parked)");
+            }
+            let root_check = if plant_mode {
+                "skipped (planted)".to_string()
+            } else {
+                let ts1 = client.get_shielded_tree_state(Some(last)).await.expect("tree state at end");
+                let node_root = GlobalTree::from_state(&frontier(&ts1)).expect("node frontier").anchor().to_bytes();
+                assert_eq!(size, ts1.size, "leaf count vs node at {last}");
+                assert_eq!(anchor, node_root, "root vs node at {last}");
+                format!("node root {} at size {} == {}", hex32(&node_root), ts1.size, mode)
+            };
+            let heap_old: usize = old.iter().map(|d| d.approx_heap_bytes()).sum();
+            let (heap_chain, heap_wallets) = if run_new { eng.approx_heap_bytes() } else { (0, 0) };
+            let st = eng.stats();
+            let line = format!(
+                "label={} mode={mode} kernel={} digest={} start={} end={} span_daa={span} pages={n_pages} blocks={n_blocks} actions={n_act} wallets={total} keys={} planted={n_planted} parked={n_parked} reclaimed={n_reclaimed} found={found} witnesses_compared={n_witness} root_check=[{root_check}] \
+                 wall_s={wall:.1} shared_decode_cpu_s={cpu_shared:.2} shared_decode_wall_s={wall_shared:.2} old_cpu_s={cpu_old:.2} old_wall_s={wall_old:.2} new_cpu_s={cpu_new:.2} new_wall_s={wall_new:.2} \
+                 new_detect_s={:.2} new_fold_s={:.3} new_tree_s={:.2} engine_hits={} engine_cb_hits={} engine_folds={} \
+                 heap_old_mib={:.1} heap_new_chain_mib={:.1} heap_new_wallets_mib={:.3} vmhwm_mib={:.0} rayon_threads={}",
+                if cfg!(feature = "pasta-asm") { "asm" } else { "portable" },
+                eng.kernel_name(),
+                hex32(&digest),
+                hex32(&ts0.block_hash.as_bytes()),
+                hex32(&last.as_bytes()),
+                eng.key_count(),
+                st.detect_ns as f64 / 1e9,
+                st.fold_ns as f64 / 1e9,
+                st.tree_ns as f64 / 1e9,
+                st.hits,
+                st.coinbase_hits,
+                st.folds,
+                heap_old as f64 / 1048576.0,
+                heap_chain as f64 / 1048576.0,
+                heap_wallets as f64 / 1048576.0,
+                status_kb("VmHWM:") as f64 / 1024.0,
+                rayon::current_num_threads(),
+            );
+            println!("SHADOW {line}");
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&out).expect("SHADOW_OUT");
+            writeln!(f, "{line}").unwrap();
+        });
+    }
+
+    /// Experiment M-A (02 §4.3): cost per (action, key) of today's per-wallet CPU path
+    /// (`scan_compact_auto_cached` with the page's shared epks, one call per wallet — what
+    /// `predecrypt_page_cached` runs), the shared-table ladder kernel and the fixed-base comb,
+    /// at `MA_IVKS` (default 1,64,1024,4096) throwaway keys over `MA_PAGES` (default 2) real
+    /// pages plus two planted notes. Hit sets must be identical. Reports wall and process-CPU
+    /// microseconds per pair. `MA_WIDTHS` (comma list) adds fixed-width comb runs.
+    #[test]
+    #[ignore = "needs a node: SHADOW_RPC=127.0.0.1:16810"]
+    fn ma_comb_vs_ladder_vs_current() {
+        let rpc = std::env::var("SHADOW_RPC").or_else(|_| std::env::var("DAYDIFF_RPC")).expect("SHADOW_RPC");
+        let out = std::env::var("SHADOW_OUT").unwrap_or_else(|_| "/tmp/shadow".into());
+        let pages = env_u64("MA_PAGES", 2);
+        let ns: Vec<usize> = std::env::var("MA_IVKS").unwrap_or_else(|_| "1,64,1024,4096".into()).split(',').filter_map(|s| s.trim().parse().ok()).collect();
+        let widths: Vec<u32> = std::env::var("MA_WIDTHS").unwrap_or_default().split(',').filter_map(|s| s.trim().parse().ok()).collect();
+        let skip_current_above = env_u64("MA_CURRENT_MAX", u64::MAX) as usize;
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let (mut actions, tag) = rt.block_on(async {
+            let client = connect(&rpc).await;
+            let saved = std::env::var("SHADOW_START").ok().or_else(|| std::fs::read_to_string(format!("{out}.start")).ok());
+            let ts0 = match saved {
+                Some(h) => client.get_shielded_tree_state(Some(super::day_diff_tests::parse_hash(&h))).await.expect("tree state"),
+                None => super::day_diff_tests::start_block(&client, &out, 86_400).await,
+            };
+            let mut low = ts0.block_hash;
+            let mut acts: Vec<CompactActionRecord> = Vec::new();
+            for _ in 0..pages {
+                let resp = client.get_shielded_blocks(low, SHIELDED_PAGE).await.expect("page");
+                let Some(l) = resp.blocks.last() else { break };
+                low = l.hash;
+                for b in &resp.blocks {
+                    for bytes in &b.accepted_actions {
+                        acts.extend(decode_compact_actions(bytes).expect("whole records"));
+                    }
+                }
+            }
+            (acts, ts0.block_hash.as_bytes())
+        });
+        let nmax = ns.iter().copied().max().unwrap_or(1);
+        let t = Instant::now();
+        let keys: Vec<(FullViewingKey, IvkKey)> = (0..nmax as u64)
+            .into_par_iter()
+            .map(|i| {
+                let mut k = 0u64;
+                loop {
+                    let s = h32(&[b"ma-key", &tag, &i.to_le_bytes(), &k.to_le_bytes()]);
+                    if let Some(sk) = Option::<SpendingKey>::from(SpendingKey::from_bytes(s)) {
+                        let fvk = FullViewingKey::from(&sk);
+                        let key = IvkKey::from_fvk(&fvk).expect("key");
+                        return (fvk, key);
+                    }
+                    k += 1;
+                }
+            })
+            .collect();
+        let t_keys = t.elapsed().as_secs_f64();
+        let mut r = Det::from(&[b"ma-plant", &tag]);
+        for who in [0usize, nmax - 1] {
+            let to = keys[who].0.address_at((r.next() % 1000) as u32, Scope::External);
+            let rec = plant_retry(to, 4242 + who as u64, &mut r);
+            let pos = (r.next() % (actions.len() as u64 + 1)) as usize;
+            actions.insert(pos, rec);
+        }
+        let epks: Vec<_> = actions.par_iter().map(|a| decompress_epk(&a.ephemeral_key)).collect();
+        let hits = |v: &[Vec<kaspa_shielded_core::wallet::ReceivedNote>]| -> Vec<Vec<(usize, u64)>> {
+            v.iter().map(|x| x.iter().map(|n| (n.action_index, n.note.value().inner())).collect()).collect()
+        };
+        let mut lines = Vec::new();
+        for &n in &ns {
+            let refs: Vec<&IvkKey> = keys[..n].iter().map(|(_, k)| k).collect();
+            let pairs = (actions.len() * n) as f64;
+            let mut runs: Vec<(String, f64, f64, Vec<Vec<(usize, u64)>>)> = Vec::new();
+            if n <= skip_current_above {
+                let (c0, t0) = (cpu_secs(), Instant::now());
+                let v: Vec<_> = refs.iter().map(|k| scan_compact_auto_cached(k.prepared(), Some(k.scalar()), &actions, Some(&epks))).collect();
+                runs.push(("current".into(), t0.elapsed().as_secs_f64(), cpu_secs() - c0, hits(&v)));
+            }
+            let mut kernels: Vec<(String, Box<dyn AgreeKernel>)> = vec![("ladder".into(), Box::new(LadderKernel)), ("comb-auto".into(), Box::new(CombKernel { w: None }))];
+            for &w in &widths {
+                kernels.push((format!("comb-w{w}"), Box::new(CombKernel { w: Some(w) })));
+            }
+            for (name, k) in &kernels {
+                let (c0, t0) = (cpu_secs(), Instant::now());
+                let v = detect(k.as_ref(), &refs, &actions, &epks);
+                runs.push((name.clone(), t0.elapsed().as_secs_f64(), cpu_secs() - c0, hits(&v)));
+            }
+            let want = runs[0].3.clone();
+            let total_hits: usize = want.iter().map(|v| v.len()).sum();
+            assert!(total_hits >= 1, "planted notes not found at N={n}");
+            for (name, _, _, got) in &runs {
+                assert_eq!(got, &want, "hit sets differ at N={n}: {name} vs {}", runs[0].0);
+            }
+            let auto_w = CombKernel { w: None }.width_for(n);
+            for (name, wall, cpu, _) in &runs {
+                let line = format!(
+                    "label={} N={n} actions={} hits={total_hits} run={name}{} wall_s={wall:.3} cpu_s={cpu:.2} wall_us_per_pair={:.3} cpu_us_per_pair={:.3} rayon_threads={} load1={}",
+                    if cfg!(feature = "pasta-asm") { "asm" } else { "portable" },
+                    actions.len(),
+                    if name == "comb-auto" { format!("(w={auto_w})") } else { String::new() },
+                    wall * 1e6 / pairs,
+                    cpu * 1e6 / pairs,
+                    rayon::current_num_threads(),
+                    std::fs::read_to_string("/proc/loadavg").unwrap_or_default().split_whitespace().next().unwrap_or("?"),
+                );
+                println!("MA {line}");
+                lines.push(line);
+            }
+        }
+        println!("MA keys={nmax} key_setup_s={t_keys:.2}");
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(format!("{out}.ma")).expect("out");
         for l in lines {
             writeln!(f, "{l}").unwrap();
         }
