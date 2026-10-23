@@ -141,6 +141,15 @@ impl Mempool {
             }
         }
 
+        let fee = transaction.calculated_fee.unwrap();
+        self.check_relay_fee(transaction, fee, priority, virtual_daa_score)
+    }
+
+    /// The relay-fee rule, shared by the in-context check (fee from the populated transaction) and
+    /// the shielded fee-first check (fee read from the bundle header before any proof work), so the
+    /// two can never disagree (N1, spec 08 R1.1.1).
+    fn check_relay_fee(&self, transaction: &MutableTransaction, fee: u64, priority: Priority, virtual_daa_score: u64) -> NonStandardResult<()> {
+        let transaction_id = transaction.id();
         // Minimum relay fee applies to normalized non-contextual mass so block-space usage has a
         // minimum cost, whether dominated by compute or by transient byte footprint.
         // Storage mass does not require an additional relay-fee floor here since storage growth is
@@ -164,7 +173,6 @@ impl Mempool {
         };
         let minimum_fee = self.minimum_required_transaction_relay_fee(fee_mass, relay_fee);
 
-        let fee = transaction.calculated_fee.unwrap();
         if fee < minimum_fee {
             return if use_prior_p2p_fee_rules || masses.compute_mass >= normalized_transient_mass {
                 Err(NonStandardError::RejectInsufficientComputeFee(transaction_id, fee, minimum_fee, masses.compute_mass))
@@ -175,6 +183,37 @@ impl Mempool {
         // end-TODO
 
         Ok(())
+    }
+
+    /// Fee-first admission for shielded transactions (N1, spec 08 R1.1): the relay-fee rule, applied
+    /// to the fee the bundle header declares, BEFORE consensus validation runs the Halo 2 proof.
+    ///
+    /// Sound because a shielded transaction has no transparent inputs or outputs, so its storage mass
+    /// is 0 and the relay minimum depends only on the non-contextual masses already populated, and
+    /// its fee is exactly the declared value balance (consensus: `fee = value_balance`, which must be
+    /// >= 0). The in-context check after consensus validation stays (R1.1.2). A header too short to
+    /// carry a value balance is left to consensus, which rejects it while parsing, before any proof.
+    /// Every rejection here is one proof verification not spent (counter
+    /// `shielded_verify_skipped_fee`, R1.1.3).
+    pub(crate) fn check_shielded_fee_first(
+        &self,
+        transaction: &MutableTransaction,
+        priority: Priority,
+        virtual_daa_score: u64,
+    ) -> NonStandardResult<()> {
+        if !transaction.tx.is_shielded() || self.config.accept_non_standard {
+            return Ok(());
+        }
+        let Some(value_balance) = kaspa_shielded_core::bundle::value_balance_from_bytes(&transaction.tx.payload) else {
+            return Ok(());
+        };
+        // A negative balance is invalid in consensus; as a fee it is 0, which fails any floor.
+        let fee = u64::try_from(value_balance).unwrap_or(0);
+        let res = self.check_relay_fee(transaction, fee, priority, virtual_daa_score);
+        if res.is_err() {
+            self.counters.shielded_verify_skipped_fee.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        res
     }
 
     /// minimum_required_transaction_relay_fee returns the minimum transaction fee required

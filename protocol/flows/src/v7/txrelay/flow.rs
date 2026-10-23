@@ -55,6 +55,11 @@ pub struct RelayTransactionsFlow {
 
     /// Track the number of spam txs coming from this peer
     spam_counter: u64,
+
+    /// This peer's shielded proof-verification budget (N1, spec 08 R1.4).
+    verify_budget: crate::verify_budget::PeerBudget,
+    /// Shielded transactions of this peer dropped for budget (not misbehaviour).
+    budget_dropped: u64,
 }
 
 /// Holds the state information for whether we will throttle tx relay or not
@@ -77,7 +82,54 @@ impl Flow for RelayTransactionsFlow {
 
 impl RelayTransactionsFlow {
     pub fn new(ctx: FlowContext, router: Arc<Router>, invs_route: IncomingRoute, msg_route: IncomingRoute) -> Self {
-        Self { ctx, router, invs_route, msg_route, spam_counter: 0 }
+        // Flows are created when the connection is registered, so "now" is the connection's start.
+        let verify_budget = crate::verify_budget::PeerBudget::new(&ctx.verify_budget_params(), router.is_outbound(), std::time::Instant::now());
+        Self { ctx, router, invs_route, msg_route, spam_counter: 0, verify_budget, budget_dropped: 0 }
+    }
+
+    /// Admit this batch's shielded transactions against the peer's and the node's verification
+    /// budgets (N1, spec 08 R1.4), in order. A transaction that cannot be admitted within
+    /// `MAX_BUDGET_WAIT` is dropped silently; transparent transactions pass untouched.
+    async fn apply_verify_budget(&mut self, transactions: Vec<Transaction>) -> Vec<Transaction> {
+        use crate::verify_budget::{Admission, verify_units};
+        let mut out = Vec::with_capacity(transactions.len());
+        for tx in transactions {
+            if !tx.is_shielded() {
+                out.push(tx);
+                continue;
+            }
+            // A header that does not parse costs no proof work (consensus rejects it while parsing).
+            let Some(n) = kaspa_shielded_core::bundle::action_count_from_bytes(&tx.payload) else {
+                out.push(tx);
+                continue;
+            };
+            let vu = verify_units(n);
+            let mut waited = false;
+            loop {
+                match self.ctx.charge_verify_budget(&mut self.verify_budget, vu, std::time::Instant::now()) {
+                    Admission::Admitted => {
+                        out.push(tx);
+                        break;
+                    }
+                    Admission::Wait(d) if !waited => {
+                        waited = true;
+                        tokio::time::sleep(d).await;
+                    }
+                    _ => {
+                        self.budget_dropped += 1;
+                        if self.budget_dropped.is_power_of_two() {
+                            kaspa_core::debug!(
+                                "Peer {} exceeds its shielded verification budget; {} shielded txs dropped so far",
+                                self.router,
+                                self.budget_dropped
+                            );
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        out
     }
 
     pub fn invs_channel_size() -> usize {
@@ -219,6 +271,8 @@ impl RelayTransactionsFlow {
                 transactions.push(transaction);
             }
         }
+        // N1 (spec 08 R1.4): charge the shielded proofs to the verification budgets first.
+        let transactions = self.apply_verify_budget(transactions).await;
         let insert_results = self
             .ctx
             .mining_manager()
@@ -236,8 +290,16 @@ impl RelayTransactionsFlow {
                 Err(MiningManagerError::MempoolError(RuleError::RejectTxRule(TxRuleError::InvalidShieldedProof(reason)))) => {
                     // A failed Halo 2 proof or signature is context-free: an honest peer verifies
                     // before relaying, so it could not have sent this. Without this arm the peer
-                    // paid nothing for making us run proof verification on garbage.
-                    return Err(ProtocolError::MisbehavingPeer(format!("relayed a shielded transaction with an invalid proof: {reason}")));
+                    // paid nothing for making us run proof verification on garbage. N1 (spec 08
+                    // R1.4.4): a ban class of its own, on by default, with a newer-version exemption.
+                    return Err(ProtocolError::InvalidShieldedProof(format!("relayed a shielded transaction with an invalid proof: {reason}")));
+                }
+                Err(MiningManagerError::InvalidShieldedBatch { txid, reason, proof_failure }) => {
+                    // N1 (spec 08 R1.3.6): the peer's whole batch was discarded for one invalid bundle.
+                    // A failed proof or signature is the ban class (R1.4.4); an encoding failure only
+                    // disconnects, as before.
+                    let what = format!("relayed a batch with shielded transaction {txid} that fails verification: {reason}");
+                    return Err(if *proof_failure { ProtocolError::InvalidShieldedProof(what) } else { ProtocolError::MisbehavingPeer(what) });
                 }
                 Err(MiningManagerError::MempoolError(RuleError::RejectNonStandard(..))) => {
                     self.spam_counter += 1;

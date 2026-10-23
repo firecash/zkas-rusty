@@ -327,7 +327,7 @@ impl MiningManager {
     ) -> MiningManagerResult<TransactionInsertion> {
         // read lock on mempool
         let TransactionPreValidation { mut transaction, feerate_threshold } =
-            self.mempool.read().pre_validate_and_populate_transaction(consensus, transaction, rbf_policy)?;
+            self.mempool.read().pre_validate_and_populate_transaction(consensus, transaction, priority, rbf_policy)?;
         let args = TransactionValidationArgs::new(feerate_threshold);
         // no lock on mempool
         let validation_result = validate_mempool_transaction(consensus, &mut transaction, &args);
@@ -453,7 +453,7 @@ impl MiningManager {
             let mempool = self.mempool.read();
             let txs = chunk.filter_map(|tx| {
                 let transaction_id = tx.id();
-                match mempool.pre_validate_and_populate_transaction(consensus, tx, rbf_policy) {
+                match mempool.pre_validate_and_populate_transaction(consensus, tx, priority, rbf_policy) {
                     Ok(TransactionPreValidation { transaction, feerate_threshold }) => {
                         if let Some(threshold) = feerate_threshold {
                             args.set_feerate_threshold(transaction.id(), threshold);
@@ -480,6 +480,23 @@ impl MiningManager {
                 }
             });
             transactions.extend(txs);
+        }
+
+        // N1 (spec 08 R1.3.6): a relayed batch is ONE peer's batch. Batch-verify its shielded
+        // bundles (after the fee-first check in pre-validation, so under-paying ones cost nothing)
+        // before any per-transaction consensus validation; the per-tx checks that follow are then
+        // cache hits. The pass stops at the first failing bundle, and that failure discards the whole
+        // batch: nothing of it is inserted, and the relay flow disconnects the peer (and bans it for a
+        // failed proof). No bisection: honest transactions in it reach this node again from other
+        // peers. Proof validity is context-free, so an honest peer of the same rules never sends one.
+        if priority == Priority::Low && transactions.iter().any(|t| t.tx.is_shielded()) {
+            let shielded: Vec<&Transaction> = transactions.iter().filter(|t| t.tx.is_shielded()).map(|t| t.tx.as_ref()).collect();
+            if let Err((txid, e)) = consensus.preverify_shielded_batch(&shielded) {
+                self.counters.shielded_invalid_proof_batches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let proof_failure = matches!(e, TxRuleError::InvalidShieldedProof(_));
+                insert_results.push(Err(MiningManagerError::InvalidShieldedBatch { txid, reason: e.to_string(), proof_failure }));
+                return insert_results;
+            }
         }
 
         // no lock on mempool

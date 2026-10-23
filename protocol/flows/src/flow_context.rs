@@ -64,6 +64,14 @@ use uuid::Uuid;
 /// The P2P protocol version.
 const PROTOCOL_VERSION: u32 = 10;
 
+/// Whether a peer that relayed an invalid shielded proof is exempt from the ban (N1, spec 08
+/// R1.4.4): it advertises a protocol version above ours, or a newer release of this node software.
+pub(crate) fn shielded_proof_ban_exempt(peer_protocol_version: u32, user_agent: &str) -> bool {
+    peer_protocol_version > PROTOCOL_VERSION
+        || crate::user_agent_rule::advertises_newer_release(user_agent, kaspa_core::kaspad_env::name(), kaspa_core::kaspad_env::version())
+}
+
+
 /// See `check_orphan_resolution_range`
 const BASELINE_ORPHAN_RESOLUTION_RANGE: u32 = 5;
 
@@ -297,6 +305,11 @@ pub struct FlowContextInner {
     /// Global limit on pruning-point proof serves, see `serve_policy`.
     pub(crate) proof_serve_gate: ProofServeGate,
 
+    /// Node-wide shielded proof-verification budget for relayed transactions (N1, spec 08 R1.4).
+    verify_budget_params: crate::verify_budget::BudgetParams,
+    verify_budget_global: Mutex<crate::verify_budget::TokenBucket>,
+
+
     bps: usize,
 
     // Orphan parameters
@@ -408,6 +421,11 @@ impl FlowContext {
                 relay_credit: Default::default(),
                 auto_ban_budget: Default::default(),
                 proof_serve_gate: Default::default(),
+                verify_budget_params: crate::verify_budget::BudgetParams::for_cores(crate::verify_budget::default_verify_cores()),
+                verify_budget_global: Mutex::new(
+                    crate::verify_budget::BudgetParams::for_cores(crate::verify_budget::default_verify_cores())
+                        .global_bucket(std::time::Instant::now()),
+                ),
                 bps,
                 orphan_resolution_range,
                 max_orphans,
@@ -415,6 +433,21 @@ impl FlowContext {
                 mining_rule_engine,
             }),
         }
+    }
+
+    /// The node-wide verification budget parameters (N1, spec 08 R1.4).
+    pub fn verify_budget_params(&self) -> crate::verify_budget::BudgetParams {
+        self.inner.verify_budget_params
+    }
+
+    /// Charge `vu` verify units to `peer` and the node-wide budget (N1, spec 08 R1.4).
+    pub fn charge_verify_budget(
+        &self,
+        peer: &mut crate::verify_budget::PeerBudget,
+        vu: f64,
+        now: std::time::Instant,
+    ) -> crate::verify_budget::Admission {
+        crate::verify_budget::charge(peer, &mut self.inner.verify_budget_global.lock(), vu, now)
     }
 
     pub fn block_invs_channel_size(&self) -> usize {
@@ -465,6 +498,25 @@ impl FlowContext {
     /// and both the permanent-request check and `ConnectionManager::ban` take that lock, so
     /// awaiting them here would deadlock the connection loop.
     pub(crate) fn ban_if_protocol_violation(&self, router: &Router, err: &ProtocolError) {
+        // N1 (spec 08 R1.4.4): relaying an invalid shielded proof is its own ban class, ON by
+        // default (`--no-ban-shielded` turns it off) and independent of `--enablebanning`. A proof
+        // fails for every honest peer of the SAME rules, which verify before relaying; the one
+        // honest way to send one is to run newer rules (a circuit upgrade makes an upgraded peer's
+        // proofs invalid here), so a peer advertising a newer protocol or release is only
+        // disconnected. `spawn_auto_ban` keeps the other exemptions (non-routable addresses,
+        // operator-chosen peers, the ban budget).
+        if let ProtocolError::InvalidShieldedProof(reason) = err {
+            if !self.config.ban_invalid_shielded_proofs {
+                return;
+            }
+            let props = router.properties();
+            if shielded_proof_ban_exempt(props.advertised_protocol_version, &props.user_agent) {
+                info!("P2P, not banning peer {} for an invalid shielded proof ({}): it advertises newer rules", router, reason);
+                return;
+            }
+            self.spawn_auto_ban(router, format!("invalid shielded proof: {reason}"), false);
+            return;
+        }
         if !self.config.enable_banning {
             return;
         }
@@ -1071,5 +1123,27 @@ impl FlowContext {
         // it is considered a protocol error and the connection will disconnect
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod n1_tests {
+    use super::*;
+
+    /// N1 (spec 08 R1.4.4): an invalid shielded proof bans by default, except from a peer that
+    /// advertises newer rules (newer protocol version or newer release of this software); and the
+    /// class stays out of `--enablebanning`'s narrow gate.
+    #[test]
+    fn invalid_shielded_proof_ban_class_and_version_exemption() {
+        let name = kaspa_core::kaspad_env::name();
+        let ours = kaspa_core::kaspad_env::version();
+        let same = format!("/{name}:{ours}/");
+        assert!(!shielded_proof_ban_exempt(PROTOCOL_VERSION, &same), "same version, same release: banned");
+        assert!(!shielded_proof_ban_exempt(PROTOCOL_VERSION - 1, &same), "older protocol: banned");
+        assert!(shielded_proof_ban_exempt(PROTOCOL_VERSION + 1, &same), "newer protocol: exempt");
+        assert!(shielded_proof_ban_exempt(PROTOCOL_VERSION, &format!("/{name}:999.0.0/")), "newer release: exempt");
+        assert!(!shielded_proof_ban_exempt(PROTOCOL_VERSION, "/someone-else:999.0.0/"), "another software's version is not ours");
+        assert!(!ProtocolError::InvalidShieldedProof("x".into()).is_auto_ban_eligible());
+        assert!(Config::new(kaspa_consensus_core::config::params::MAINNET_PARAMS).ban_invalid_shielded_proofs, "on by default");
     }
 }

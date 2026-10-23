@@ -860,6 +860,14 @@ impl ConsensusApi for Consensus {
             .map_err(|e| ConsensusError::GeneralOwned(format!("shielded transaction rejected: {e}")))
     }
 
+    fn preverify_shielded_batch(
+        &self,
+        transactions: &[&Transaction],
+    ) -> Result<(), (kaspa_consensus_core::tx::TransactionId, kaspa_consensus_core::errors::tx::TxRuleError)> {
+        let daa = self.lkg_virtual_state.load().daa_score;
+        self.services.transaction_validator.preverify_shielded_batch(transactions, daa)
+    }
+
     fn get_shielded_tree_frontier(&self, block: Hash) -> ConsensusResult<(u64, Option<[u8; 32]>, Vec<[u8; 32]>)> {
         // Below the lowest block this node indexed itself a retained frontier is a peer-derived replay
         // checkpoint: its leaf COUNT follows the peer's split of leaves between blocks, which nothing

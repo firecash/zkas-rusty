@@ -4097,6 +4097,7 @@ dependencies = [
  "kaspa-p2p-lib",
  "kaspa-p2p-mining",
  "kaspa-seq-commit",
+ "kaspa-shielded-core",
  "kaspa-smt",
  "kaspa-utils",
  "kaspa-utils-tower",

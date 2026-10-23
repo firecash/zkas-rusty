@@ -41,6 +41,9 @@ pub struct Args {
     pub unsafe_rpc: bool,
     #[serde(rename = "enablebanning")]
     pub enable_banning: bool,
+    /// N1: disable the default-on ban of peers that relay invalid shielded proofs.
+    #[serde(rename = "no-ban-shielded")]
+    pub no_ban_shielded: bool,
     pub wrpc_verbose: bool,
     #[serde(rename = "loglevel")]
     pub log_level: String,
@@ -126,6 +129,7 @@ impl Default for Args {
             rpclisten_json: None,
             unsafe_rpc: false,
             enable_banning: false,
+            no_ban_shielded: false,
             async_threads: num_cpus::get(),
             utxoindex: false,
             consensus_diag: None,
@@ -188,6 +192,7 @@ impl Args {
         config.disable_upnp = self.disable_upnp;
         config.unsafe_rpc = self.unsafe_rpc;
         config.enable_banning = self.enable_banning;
+        config.ban_invalid_shielded_proofs = !self.no_ban_shielded;
         config.enable_unsynced_mining = self.enable_unsynced_mining;
         config.enable_mainnet_mining = self.enable_mainnet_mining;
         config.is_archival = self.archival;
@@ -307,6 +312,10 @@ pub fn cli() -> Command {
         .arg(
             arg!(--enablebanning "Ban for 24h a peer that sends a malformed fixed-width field (a wrong-length hash, IP or peer id). Never bans for consensus rejections, nor --addpeer/--connect peers, nor non-routable (loopback/private) addresses.")
                 .env("KASPAD_ENABLEBANNING"),
+        )
+        .arg(
+            arg!(--"no-ban-shielded" "Do not ban (24h) peers that relay a shielded transaction with an invalid proof. The ban is on by default; it never applies to peers advertising a newer protocol or release, to --addpeer/--connect peers, or to non-routable addresses.")
+                .env("KASPAD_NO_BAN_SHIELDED"),
         )
         .arg(
             Arg::new("connect-peers")
@@ -605,6 +614,7 @@ impl Args {
             rpclisten_json: m.get_one::<WrpcNetAddress>("rpclisten-json").cloned().or(defaults.rpclisten_json),
             unsafe_rpc: arg_match_unwrap_or::<bool>(&m, "unsaferpc", defaults.unsafe_rpc),
             enable_banning: arg_match_unwrap_or::<bool>(&m, "enablebanning", defaults.enable_banning),
+            no_ban_shielded: arg_match_unwrap_or::<bool>(&m, "no-ban-shielded", defaults.no_ban_shielded),
             wrpc_verbose: false,
             log_level: arg_match_unwrap_or::<String>(&m, "log_level", defaults.log_level),
             async_threads: arg_match_unwrap_or::<usize>(&m, "async_threads", defaults.async_threads),

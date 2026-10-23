@@ -561,6 +561,20 @@ pub trait ConsensusApi: Send + Sync {
         Ok(())
     }
 
+    /// [`Self::preverify_shielded_transaction`] for one peer's relayed batch (N1, spec 08 R1.3.5),
+    /// batch-verified (at most 16 bundles / 160 actions per batch) and stopping at the first failure:
+    /// `Err((txid, error))` names the first transaction whose bundle fails
+    /// (`TxRuleError::InvalidShieldedProof` for a proof or signature, `InvalidShieldedBundle` for an
+    /// encoding rule); nothing after the verification wave that held it was verified. Successes are
+    /// cached, so the per-transaction checks that follow are cache hits. Non-shielded transactions
+    /// and payloads that do not parse are skipped (the per-transaction path judges them).
+    fn preverify_shielded_batch(
+        &self,
+        _transactions: &[&Transaction],
+    ) -> Result<(), (crate::tx::TransactionId, crate::errors::tx::TxRuleError)> {
+        Ok(())
+    }
+
     /// The shielded turnstile totals as of `block`, as raw parts
     /// `(cumulative_coinbase, cumulative_fees, cumulative_burns)` in sompi — the
     /// public form of the PLAN §2.7 invariant `pool = minted - fees - burns`. Raw

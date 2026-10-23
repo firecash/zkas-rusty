@@ -1877,6 +1877,73 @@ mod tests {
         );
     }
 
+    /// N1 (spec 08 R1.1): a relayed shielded transaction whose declared fee (the bundle header's
+    /// value balance) is below the relay minimum is refused BEFORE consensus validation, i.e.
+    /// before any proof work, with the same error the in-context check gives; the counter records
+    /// each skipped verification. A garbage proof registered for it is never reached.
+    #[test]
+    fn test_shielded_fee_is_checked_before_the_proof() {
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let config = Config::build_default(TARGET_TIME_PER_BLOCK, false, BlockMassLimits::with_shared_limit(MAX_BLOCK_MASS), BLOCK_LANE_LIMITS);
+        let mining_manager = MiningManager::with_config(config, ForkActivation::never(), None, counters.clone());
+        let cheap = shielded_mutable_tx(&[shielded_nf(41)], 1).tx;
+        consensus.set_status(cheap.id(), Err(TxRuleError::InvalidShieldedProof("would cost a Halo 2 verification".to_string())));
+        let paying = shielded_mutable_tx(&[shielded_nf(42)], 3_000_000).tx;
+        let results = mining_manager.validate_and_insert_transaction_batch(
+            consensus.as_ref(),
+            vec![(*cheap).clone(), (*paying).clone()],
+            Priority::Low,
+            Orphan::Allowed,
+            RbfPolicy::Allowed,
+        );
+        let fee_err = results.iter().filter(|r| matches!(r, Err(MiningManagerError::MempoolError(RuleError::RejectNonStandard(..))))).count();
+        let proof_err = results.iter().filter(|r| matches!(r, Err(MiningManagerError::MempoolError(RuleError::RejectTxRule(TxRuleError::InvalidShieldedProof(_)))))).count();
+        assert_eq!(fee_err, 1, "the under-paying tx is refused for its fee: {results:?}");
+        assert_eq!(proof_err, 0, "its proof is never examined: {results:?}");
+        assert!(results.iter().any(|r| r.as_ref().is_ok_and(|t| t.id() == paying.id())), "the paying tx is admitted: {results:?}");
+        assert_eq!(counters.shielded_verify_skipped_fee.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(consensus.validate_calls.load(std::sync::atomic::Ordering::SeqCst), 1, "only the paying tx reached consensus validation");
+    }
+
+    /// N1 (spec 08 R1.3.6, adversarial "invalid-proof flood"): one peer's relayed batch is
+    /// batch-pre-verified, and a single bundle that fails discards the WHOLE batch before any
+    /// per-transaction consensus validation: nothing is inserted, the failure is reported as the
+    /// ban-class batch error, and no transaction of the batch reaches `validate_mempool_transaction`.
+    /// An RPC (high-priority) submission is not batch-pre-verified.
+    #[test]
+    fn test_one_invalid_proof_discards_the_whole_relayed_batch_before_validation() {
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let config = Config::build_default(TARGET_TIME_PER_BLOCK, false, BlockMassLimits::with_shared_limit(MAX_BLOCK_MASS), BLOCK_LANE_LIMITS);
+        let mining_manager = MiningManager::with_config(config, ForkActivation::never(), None, counters.clone());
+        let flood: Vec<Transaction> = (0..40u8).map(|i| (*shielded_mutable_tx(&[shielded_nf(100 + i)], 3_000_000).tx).clone()).collect();
+        let bad_id = flood[17].id();
+        consensus.set_status(bad_id, Err(TxRuleError::InvalidShieldedProof("garbage".to_string())));
+        let results =
+            mining_manager.validate_and_insert_transaction_batch(consensus.as_ref(), flood, Priority::Low, Orphan::Allowed, RbfPolicy::Allowed);
+        assert!(
+            results.iter().any(|r| matches!(r, Err(MiningManagerError::InvalidShieldedBatch { txid, proof_failure: true, .. }) if *txid == bad_id)),
+            "the batch error names the failing tx and is a proof failure: {results:?}"
+        );
+        assert!(results.iter().all(|r| r.is_err()), "nothing of the batch is admitted");
+        assert_eq!(mining_manager.get_all_transactions(TransactionQuery::TransactionsOnly).0.len(), 0);
+        assert_eq!(consensus.validate_calls.load(std::sync::atomic::Ordering::SeqCst), 0, "no per-tx validation ran");
+        assert_eq!(counters.shielded_invalid_proof_batches.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+        // A clean batch from the next peer is admitted whole.
+        let clean: Vec<Transaction> = (0..10u8).map(|i| (*shielded_mutable_tx(&[shielded_nf(200 + i)], 3_000_000).tx).clone()).collect();
+        let results =
+            mining_manager.validate_and_insert_transaction_batch(consensus.as_ref(), clean, Priority::Low, Orphan::Allowed, RbfPolicy::Allowed);
+        assert!(results.iter().all(|r| r.is_ok()) && results.len() == 10, "{results:?}");
+
+        // RPC submissions are judged one by one (attributable errors), not batch-pre-verified.
+        let calls = consensus.preverify_calls.load(std::sync::atomic::Ordering::SeqCst);
+        let rpc = shielded_mutable_tx(&[shielded_nf(250)], 3_000_000);
+        let _ = mining_manager.validate_and_insert_mutable_transaction(consensus.as_ref(), rpc, Priority::High, Orphan::Forbidden, RbfPolicy::Forbidden);
+        assert_eq!(consensus.preverify_calls.load(std::sync::atomic::Ordering::SeqCst), calls);
+    }
+
     /// F-02 regression: a shielded tx whose note is spent by a *different*,
     /// now-confirmed transaction must be evicted from the mempool the instant that
     /// block is accepted — not left to relay and be re-templated until age-expiry.
