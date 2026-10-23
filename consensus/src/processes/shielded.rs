@@ -535,7 +535,7 @@ impl NullifierSet for LayeredNullifierSet<'_> {
 // The external anchor-override mechanism was removed (2026-09): the multi-producer anchor
 // resolution (`anchor_producer_blocks`, active on mainnet) makes the last-write-wins index
 // order-independent, so no external pin is needed; and bulk-pinning a dump was measured to
-// corrupt shielded state (the index is time-dependent). See GitHub issue #11.
+// corrupt shielded state (the index is time-dependent). See issue #11 on the former GitHub repository (now offline).
 
 /// Why one shielded transaction was kept or dropped.
 ///
