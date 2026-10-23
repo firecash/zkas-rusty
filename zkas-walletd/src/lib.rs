@@ -3081,6 +3081,47 @@ fn decode_compact_actions(bytes: &[u8]) -> Option<Vec<CompactActionRecord>> {
     bytes.chunks_exact(CompactActionRecord::SERIALIZED_LEN).map(CompactActionRecord::from_bytes).collect()
 }
 
+/// What the node's DAA birthday locator (`GetShieldedTreeState` with `below_daa_score`) said.
+enum BirthdayPlacement {
+    /// A retained frontier strictly below the birthday: start there.
+    Placed((RpcHash, u64, u64, RpcHash, Vec<RpcHash>)),
+    /// The node understood the request and has no frontier it will start a wallet from below
+    /// this birthday (its `get_shielded_tree_state_call` refusal, rpc/service `service.rs`).
+    NoneBelow,
+    /// No answer that decides it: a node without the locator (it answers with its finality
+    /// point), a timeout, or a transport error. The metadata walks may still find a start.
+    Unknown,
+}
+
+impl BirthdayPlacement {
+    /// The locator's refusal text. Matched on the stable prefix the node has sent since the
+    /// locator shipped; anything else is `Unknown`, so a changed message only costs the walk.
+    const REFUSAL: &'static str = "no chain block with a retained shielded frontier below daa";
+
+    fn from_refusal(err: &str) -> Self {
+        if err.contains(Self::REFUSAL) { Self::NoneBelow } else { Self::Unknown }
+    }
+}
+
+#[cfg(test)]
+mod birthday_placement_tests {
+    use super::BirthdayPlacement;
+
+    /// The refusal walletd keys on must be the one the node sends. Read from the node's
+    /// source in this workspace, so a reworded message fails here instead of silently
+    /// bringing back the futile walk.
+    #[test]
+    fn the_refusal_matches_the_node_message_and_nothing_else_skips_the_walk() {
+        let node = include_str!("../../rpc/service/src/service.rs");
+        assert!(node.contains(BirthdayPlacement::REFUSAL), "rpc/service no longer sends the locator refusal walletd matches");
+        let sent = format!("General error: {} 3000000", BirthdayPlacement::REFUSAL);
+        assert!(matches!(BirthdayPlacement::from_refusal(&sent), BirthdayPlacement::NoneBelow));
+        for other in ["connection reset", "timeout", "shielded history below the pruning point is not verified yet", ""] {
+            assert!(matches!(BirthdayPlacement::from_refusal(other), BirthdayPlacement::Unknown), "{other:?} must not skip the walk");
+        }
+    }
+}
+
 struct PageCache {
     /// Keyed page -> (fetched at, how long THIS page stays reusable, decoded page).
     ///
@@ -3124,6 +3165,9 @@ struct PageCache {
     hits: u64,
     dedup_hits: u64,
     misses: u64,
+    /// What a scouted page boundary costs against what a page fetch costs, measured on the
+    /// node this daemon talks to. `deep_prefetch` scouts only while scouting can pay.
+    scout: ScoutCost,
     /// Fetches that found the page already cached but EXPIRED — pure waste, and
     /// indistinguishable from a first fetch in `misses` alone. Without this nobody can say
     /// how much of the miss rate is the cache giving up on pages it still had.
@@ -3148,7 +3192,98 @@ impl PageCache {
             hits: 0,
             dedup_hits: 0,
             misses: 0,
+            scout: ScoutCost::default(),
             expired_refetch: 0,
+        }
+    }
+}
+
+/// Whether `deep_prefetch` may scout page boundaries with `metadata_only` pages.
+///
+/// Scouting buys concurrency: a boundary known in advance lets that page's fetch run
+/// alongside the others instead of after its predecessor. What it can save per boundary is
+/// therefore at most one page fetch's latency, and only when the loop is fetch-bound. What it
+/// costs is node time on the same connection, ahead of the real pages. Spec 10 measured the
+/// shipped node at 0.9–1.65 s per 2,000-block scout (two boundaries) against 80–257 ms for a
+/// whole page, because it read every full header and GHOSTDAG record to return three integers
+/// (`rpc/service` `metadata_only`): a 1-day restore with 4 pages in flight scanned in 4.75 s
+/// and then waited 18.1 s for its scouts. The phone runs `prefetch_depth = 8`, so it paid that.
+///
+/// The rule: keep an EWMA of both costs as this daemon observes them, and scout only while a
+/// boundary costs at most `MAX_FRACTION` of a page fetch. Above that, scouting is switched off
+/// for `BACKOFF` and the read-ahead falls back to the chained fetch (`chain_ahead`), which
+/// needs no boundary it does not already hold. After the backoff one scout is measured
+/// afresh, so a node that was busy, or has since been upgraded to answer `metadata_only` from
+/// compact headers (task S), turns scouting back on by itself.
+#[derive(Default, Debug)]
+struct ScoutCost {
+    /// EWMA of node wall time per scouted boundary, ns (one 2,000-block call / 2).
+    boundary_ns: Option<f64>,
+    /// EWMA of node wall time of one full `SHIELDED_PAGE` fetch, ns.
+    page_ns: Option<f64>,
+    /// Scouting is off until this instant.
+    off_until: Option<std::time::Instant>,
+}
+
+impl ScoutCost {
+    const ALPHA: f64 = 0.3;
+    /// Half a page: with less margin a scout and the page it unblocks cost more node time
+    /// than the serial fetch it replaces, and the scout sits on the critical path first.
+    const MAX_FRACTION: f64 = 0.5;
+    const BACKOFF: std::time::Duration = std::time::Duration::from_secs(600);
+
+    fn ewma(slot: &mut Option<f64>, x: f64) {
+        *slot = Some(match *slot {
+            Some(v) => v + Self::ALPHA * (x - v),
+            None => x,
+        });
+    }
+
+    fn record_page(&mut self, rpc_ns: u64) {
+        Self::ewma(&mut self.page_ns, rpc_ns as f64);
+    }
+
+    /// May the read-ahead scout now? An expired backoff forgets the old scout cost, so the
+    /// next scout is judged on its own.
+    fn allowed(&mut self, now: std::time::Instant) -> bool {
+        match self.off_until {
+            Some(t) if now < t => false,
+            Some(_) => {
+                self.off_until = None;
+                self.boundary_ns = None;
+                true
+            }
+            None => true,
+        }
+    }
+
+    /// Record one scout. Returns true when this measurement switched scouting off.
+    fn record_scout(&mut self, ns_per_boundary: f64, now: std::time::Instant) -> bool {
+        Self::ewma(&mut self.boundary_ns, ns_per_boundary);
+        let (Some(b), Some(p)) = (self.boundary_ns, self.page_ns) else { return false };
+        if b > Self::MAX_FRACTION * p && self.off_until.is_none() {
+            self.off_until = Some(now + Self::BACKOFF);
+            return true;
+        }
+        false
+    }
+}
+
+/// Read-ahead without scouting: fetch the page at `anchor`, take its last block as the next
+/// cursor, and repeat, up to `remaining` pages. Each fetch goes through the shared cache, so it
+/// dedups against the sync loop's own fetch and its one-page prefetch. This keeps the node busy
+/// back to back while the loop ingests, at the cost of one fetch in flight at a time; it never
+/// spends node time on anything but pages the loop will read.
+async fn chain_ahead(state: std::sync::Arc<AppState>, client: GrpcClient, mut anchor: RpcHash, mut remaining: usize) {
+    while remaining > 0 {
+        let fetched = tokio::time::timeout(SYNC_RPC_TIMEOUT, fetch_shielded_page(&client, &state.page_cache, anchor, SHIELDED_PAGE)).await;
+        match fetched {
+            Ok(Ok(page)) if !page.reorged && page.blocks.len() as u64 == SHIELDED_PAGE => {
+                anchor = page.blocks.last().map(|b| b.hash).unwrap_or(anchor);
+                remaining -= 1;
+            }
+            // Error, reorg, or a short page (the tip): nothing further to read ahead.
+            _ => return,
         }
     }
 }
@@ -3206,6 +3341,15 @@ async fn deep_prefetch(state: std::sync::Arc<AppState>, client: GrpcClient, star
         }
     }
     while warmed < depth {
+        let now = std::time::Instant::now();
+        if !state.page_cache.lock().await.scout.allowed(now) {
+            // Scouting costs more than it saves on this node: read ahead along the chain of
+            // pages instead. `anchor`'s page is already warming (or known); the chain starts
+            // there and covers the rest of the depth.
+            chain_ahead(state.clone(), client.clone(), anchor, depth - warmed + 1).await;
+            return;
+        }
+        let t_scout = std::time::Instant::now();
         let meta = match tokio::time::timeout(
             SYNC_RPC_TIMEOUT,
             client.get_shielded_block_metadata(anchor, 2 * SHIELDED_PAGE),
@@ -3217,6 +3361,21 @@ async fn deep_prefetch(state: std::sync::Arc<AppState>, client: GrpcClient, star
             // covers `start`; the next chunk retries the read-ahead.
             _ => break,
         };
+        // Two boundaries per full call. A short call reached the tip, and then there is
+        // nothing left to save, so only full calls are measured.
+        if meta.blocks.len() as u64 == 2 * SHIELDED_PAGE {
+            let per_boundary = t_scout.elapsed().as_nanos() as f64 / 2.0;
+            let mut c = state.page_cache.lock().await;
+            if c.scout.record_scout(per_boundary, std::time::Instant::now()) {
+                log::info!(
+                    "read-ahead: a scouted page boundary costs {:.0} ms against {:.0} ms for a page on this node; \
+                     scouting off for {} s, reading ahead page by page instead",
+                    c.scout.boundary_ns.unwrap_or(0.0) / 1e6,
+                    c.scout.page_ns.unwrap_or(0.0) / 1e6,
+                    ScoutCost::BACKOFF.as_secs()
+                );
+            }
+        }
         // The 1000th and 2000th block after `anchor` are the exclusive cursors of the
         // next two full pages.
         for boundary in [page - 1, 2 * page - 1] {
@@ -3384,6 +3543,9 @@ async fn fetch_shielded_page_traced(
     // more. A short page is at the frontier and keeps the configured TTL, which is the only
     // place the freshness argument holds.
     let page_ttl = if decoded.blocks.len() as u64 >= limit { FINAL_PAGE_TTL } else { c.ttl };
+    if limit == SHIELDED_PAGE && decoded.blocks.len() as u64 == limit {
+        c.scout.record_page(rpc_ns);
+    }
     if c.map.insert(key, (std::time::Instant::now(), page_ttl, decoded.clone())).is_some() {
         if let Some(pos) = c.order.iter().position(|k| *k == key) {
             c.order.remove(pos);
@@ -6026,14 +6188,30 @@ impl AppState {
             // strictly below the birthday and serves the nearest retained frontier at-or-before
             // it. A node without the locator answers with the finality point instead, which
             // `frontier_below_daa` rejects, and the walks below take over.
-            let mut w = self.frontier_below_daa(birthday).await;
-            if w.is_none() {
+            let placement = self.frontier_below_daa(birthday).await;
+            let refused = matches!(placement, BirthdayPlacement::NoneBelow);
+            let mut w = match placement {
+                BirthdayPlacement::Placed(s) => Some(s),
+                _ => None,
+            };
+            if refused {
+                // The node HAS the locator and says no frontier it will vouch for lies below
+                // this birthday: older than its history base, or inside history it took from a
+                // peer (whose split of leaves between blocks nothing binds, so no frontier there
+                // may start a wallet). Both walks below can only end at that same refusal, the
+                // genesis one after up to WALK_PAGES_ARCHIVE pages read through the archive.
+                // Go straight to the full scan, which sees every leaf.
+                log::info!(
+                    "wallet birthday {birthday}: the node serves no frontier below it (older than the history it vouches for); full scan without the futile walk"
+                );
+            }
+            if w.is_none() && !refused {
                 let pp = self.request_client().await?.get_block_dag_info().await.ok().map(|i| i.pruning_point_hash);
                 if let Some(pp) = pp {
                     w = self.birthday_start(pp, birthday, WALK_PAGES_HEADERS).await;
                 }
             }
-            if w.is_none() {
+            if w.is_none() && !refused {
                 // Bounded: a page costs ~0.3 s and the import/open request blocks for the
                 // whole walk, so past this budget a full scan (which runs in the background
                 // and survives restarts) is the better experience than a hung "Opening".
@@ -6119,17 +6297,19 @@ impl AppState {
     /// that predates the field ignores it and answers with its finality point — which, in the
     /// only branch that calls this, lies at-or-past the birthday — so the `< birthday` check
     /// tells the two apart and never lets an overshooting frontier skip the birthday's notes.
-    async fn frontier_below_daa(&self, birthday: u64) -> Option<(RpcHash, u64, u64, RpcHash, Vec<RpcHash>)> {
+    async fn frontier_below_daa(&self, birthday: u64) -> BirthdayPlacement {
         let req = kaspa_rpc_core::GetShieldedTreeStateRequest { block_hash: None, below_daa_score: Some(birthday) };
-        let ts = tokio::time::timeout(std::time::Duration::from_secs(30), self.request_client().await?.get_shielded_tree_state_call(None, req))
-            .await
-            .ok()?
-            .ok()?;
+        let Some(client) = self.request_client().await else { return BirthdayPlacement::Unknown };
+        let ts = match tokio::time::timeout(std::time::Duration::from_secs(30), client.get_shielded_tree_state_call(None, req)).await {
+            Ok(Ok(ts)) => ts,
+            Ok(Err(e)) => return BirthdayPlacement::from_refusal(&e.to_string()),
+            Err(_) => return BirthdayPlacement::Unknown,
+        };
         if ts.daa_score >= birthday {
-            return None;
+            return BirthdayPlacement::Unknown;
         }
         log::info!("node placed birthday {birthday} at frontier daa {} (block {}) in one call", ts.daa_score, ts.block_hash);
-        Some((ts.block_hash, ts.daa_score, ts.size, ts.leaf, ts.ommers))
+        BirthdayPlacement::Placed((ts.block_hash, ts.daa_score, ts.size, ts.leaf, ts.ommers))
     }
 
     async fn birthday_start(&self, from: RpcHash, birthday: u64, max_pages: u32) -> Option<(RpcHash, u64, u64, RpcHash, Vec<RpcHash>)> {
@@ -12782,6 +12962,73 @@ async fn warm_sweep_loop(state: Arc<AppState>) {
                 done.insert(token);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod scout_cost_tests {
+    use super::ScoutCost;
+    use std::time::{Duration, Instant};
+
+    const MS: f64 = 1e6;
+
+    /// Spec 10's measured shipped-node figures: a page 80–257 ms, a 2,000-block scout
+    /// 0.9–1.65 s, i.e. 450–825 ms per boundary. Scouting must switch off on the first full
+    /// scout, at either end of both ranges.
+    #[test]
+    fn the_shipped_node_scout_cost_switches_scouting_off() {
+        for (page, boundary) in [(80.0, 450.0), (257.0, 450.0), (80.0, 825.0), (257.0, 825.0)] {
+            let mut s = ScoutCost::default();
+            let now = Instant::now();
+            s.record_page((page * MS) as u64);
+            assert!(s.allowed(now));
+            assert!(s.record_scout(boundary * MS, now), "page {page} ms, boundary {boundary} ms must stop scouting");
+            assert!(!s.allowed(now + Duration::from_secs(1)));
+            assert!(!s.allowed(now + ScoutCost::BACKOFF - Duration::from_secs(1)));
+            // Switched off once: a later scout does not re-arm (or extend) the backoff.
+            assert!(!s.record_scout(boundary * MS, now));
+        }
+    }
+
+    /// A node that answers `metadata_only` from compact headers keeps scouting on, and a
+    /// node with no page measured yet is never judged.
+    #[test]
+    fn a_cheap_scout_keeps_scouting_on_and_no_page_means_no_verdict() {
+        let mut s = ScoutCost::default();
+        let now = Instant::now();
+        assert!(!s.record_scout(5_000.0 * MS, now), "no page cost yet: no verdict");
+        assert!(s.allowed(now));
+        let mut s = ScoutCost::default();
+        s.record_page((130.0 * MS) as u64);
+        for _ in 0..50 {
+            assert!(!s.record_scout(6.0 * MS, now));
+        }
+        assert!(s.allowed(now));
+        // The boundary between: exactly half a page is still allowed, just above is not.
+        let mut s = ScoutCost::default();
+        s.record_page((100.0 * MS) as u64);
+        assert!(!s.record_scout(50.0 * MS, now));
+        assert!(s.record_scout(50.0 * MS + 2.0 * 50.0 * MS, now));
+    }
+
+    /// After the backoff the old verdict is forgotten: one cheap scout keeps scouting on
+    /// (an upgraded or quieter node), one expensive scout switches it off again.
+    #[test]
+    fn after_the_backoff_one_scout_is_judged_afresh() {
+        let mut s = ScoutCost::default();
+        let now = Instant::now();
+        s.record_page((130.0 * MS) as u64);
+        assert!(s.record_scout(600.0 * MS, now));
+        let later = now + ScoutCost::BACKOFF + Duration::from_secs(1);
+        assert!(s.allowed(later));
+        assert!(!s.record_scout(5.0 * MS, later), "a cheap scout after the backoff is judged on its own");
+        assert!(s.allowed(later));
+        let mut s2 = ScoutCost::default();
+        s2.record_page((130.0 * MS) as u64);
+        assert!(s2.record_scout(600.0 * MS, now));
+        assert!(s2.allowed(later));
+        assert!(s2.record_scout(600.0 * MS, later), "still expensive: off again");
+        assert!(!s2.allowed(later + Duration::from_secs(1)));
     }
 }
 
