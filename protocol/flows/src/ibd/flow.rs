@@ -679,15 +679,32 @@ impl IbdFlow {
             )));
         }
 
-        self.router.enqueue(make_message!(Payload::RequestPruningPointProof, RequestPruningPointProofMessage {})).await?;
+        // N1 (spec 13 L1): ask for the deduplicated form; an older server ignores the field and
+        // sends the full form, which is still accepted.
+        self.router
+            .enqueue(make_message!(Payload::RequestPruningPointProof, RequestPruningPointProofMessage { dedup_headers: true }))
+            .await?;
 
         // Pruning proof generation and communication might take several minutes, so we allow a long 10 minute timeout
         let msg = dequeue_with_timeout!(self.incoming_route, Payload::PruningPointProof, Duration::from_secs(600))?;
-        let proof: PruningPointProof = Versioned(self.header_format, msg).try_into()?;
+        let wire_bytes = prost::Message::encoded_len(&msg);
+        let dedup = !msg.levels.is_empty();
+        let proof: PruningPointProof = if dedup {
+            let params = &self.ctx.config.params;
+            let max_levels = params.max_block_level as usize + 1;
+            // Spec 13 R-1.2(c): (max_block_level + 1) x 4 x pruning_proof_m slots at most (~904K on
+            // mainnet; an honest proof has ~79K).
+            let max_refs = max_levels.saturating_mul(4).saturating_mul(params.pruning_proof_m as usize);
+            kaspa_p2p_lib::convert::pruning::undedup_pruning_point_proof(self.header_format, msg, max_levels, max_refs)?
+        } else {
+            Versioned(self.header_format, msg).try_into()?
+        };
         info!(
-            "Received headers proof with overall {} headers ({} unique)",
+            "Received headers proof with overall {} headers ({} unique), {} wire bytes ({})",
             proof.iter().map(|l| l.len()).sum::<usize>(),
-            proof.iter().flatten().unique_by(|h| h.hash).count()
+            proof.iter().flatten().unique_by(|h| h.hash).count(),
+            wire_bytes,
+            if dedup { "deduplicated" } else { "full" }
         );
 
         let proof_metadata = PruningProofMetadata::new(relay_block.header.blue_work);

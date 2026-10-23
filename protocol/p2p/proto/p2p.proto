@@ -290,10 +290,22 @@ message PruningPointsMessage {
 }
 
 message RequestPruningPointProofMessage {
+  // N1 (spec 13 L1): ask for the deduplicated form. An older server ignores the field and answers
+  // with `headers`, which every requester still accepts.
+  bool dedupHeaders = 1;
 }
 
 message PruningPointProofMessage {
   repeated PruningPointProofHeaderArray headers = 1;
+  // N1 (spec 13 L1), sent only when the request set dedupHeaders (then `headers` is empty): each
+  // distinct header once, and per proof level the indices into it, in the level's order. The
+  // levels share most headers, so this is ~35 MB instead of ~215 MB on mainnet.
+  repeated BlockHeader distinctHeaders = 2;
+  repeated PruningPointProofLevelIndices levels = 3;
+}
+
+message PruningPointProofLevelIndices {
+  repeated uint32 indices = 1;
 }
 
 message PruningPointProofHeaderArray {

@@ -4103,6 +4103,7 @@ dependencies = [
  "kaspa-utils-tower",
  "log",
  "parking_lot",
+ "prost",
  "rand 0.8.6",
  "regex",
  "semver",
