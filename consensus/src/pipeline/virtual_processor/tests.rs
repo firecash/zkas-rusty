@@ -2085,6 +2085,48 @@ async fn shielded_chain_range_is_fully_servable_from_the_retained_archive() {
     assert!(minting >= 3, "expected several minting blocks in the range, got {minting}");
 }
 
+/// `metadata_only` pages (wallet scouts and birthday walks) are answered from the compact header
+/// row instead of the full header + GHOSTDAG record. That is only a speed change if the three values
+/// are the same ones the old read produced, for every chain block, and if a block the node does not
+/// hold is still an error rather than zeros.
+#[tokio::test]
+async fn shielded_chain_block_meta_equals_the_header_and_ghostdag_read_it_replaces() {
+    let mut params = MAINNET_PARAMS.clone();
+    params.shielded_coinbase = true;
+    params.toccata_activation = ForkActivation::always();
+    let config = ConfigBuilder::new(params).skip_proof_of_work().build();
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+    let recipient = kaspa_shielded_core::wallet::address_bytes_from_seed([9u8; 32]).expect("valid orchard address");
+    ctx.miner_data = MinerData::new(ScriptPublicKey::new(0, ScriptVec::from_slice(&recipient)), vec![]);
+    for _ in 0..4 {
+        ctx.build_block_template_row(0..1).validate_and_insert_row().await;
+    }
+    // A merge, so blue scores and DAA scores of chain blocks diverge from their heights.
+    ctx.build_block_template_row(0..3).validate_and_insert_row().await;
+    for _ in 0..3 {
+        ctx.build_block_template_row(0..1).validate_and_insert_row().await;
+    }
+    let range = ctx.consensus.get_shielded_chain_range(config.genesis.hash, 1000).unwrap().expect("genesis is on chain");
+    assert!(range.len() >= 8, "expected the whole chain, got {}", range.len());
+    let mut chain = vec![config.genesis.hash];
+    chain.extend(range);
+    for hash in &chain {
+        let header = ctx.consensus.get_header(*hash).unwrap();
+        let gd = ctx.consensus.get_ghostdag_data(*hash).unwrap();
+        let old = (gd.blue_score, header.daa_score, header.timestamp);
+        assert_eq!(ctx.consensus.get_shielded_chain_block_meta(*hash).unwrap(), old, "compact read differs at {hash}");
+        if *hash != config.genesis.hash {
+            // And it agrees with the scan record that serves the same block once the header is pruned.
+            let d = ctx.consensus.get_shielded_chain_block_data(*hash).unwrap();
+            assert_eq!((d.blue_score, d.daa_score, d.timestamp), old, "archive record differs at {hash}");
+        }
+    }
+    assert!(
+        ctx.consensus.get_shielded_chain_block_meta(Hash::from_bytes([0xcd; 32])).is_err(),
+        "an unknown block must be an error, never a zero row a wallet would take for a page boundary"
+    );
+}
+
 /// AUDIT 2026-10-05 B-1 / F-1 (ZK-01), ported from the lead auditor's proof of concept and
 /// extended. The import must refuse peer anchor pairs whose source is not a provable window
 /// block (future block, block that never existed), must not take the peer's blue score, and

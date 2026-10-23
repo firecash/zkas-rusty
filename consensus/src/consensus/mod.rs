@@ -952,6 +952,23 @@ impl ConsensusApi for Consensus {
         Ok(Some(hashes))
     }
 
+    fn get_shielded_chain_block_meta(&self, block: Hash) -> ConsensusResult<(u64, u64, u64)> {
+        // The compact header row is 28 bytes (daa, timestamp, bits, blue score) and is written in
+        // the same batch as the full header, so it holds exactly the header's values; the header's
+        // blue score is validated against GHOSTDAG when the header is accepted. Measured on the
+        // 142 mainnet node DB (2026-10-23, task S), first read of each block: a 2,000-block scout
+        // took 845–2,530 ms with the full header + GHOSTDAG read this replaces and 82–991 ms with
+        // this one (82 vs 1,655 ms over the last chain-day). Deep history stays bound by random
+        // reads, since compact rows are keyed by hash.
+        if let Some(c) = self.headers_store.get_compact_header_data(block).optional().unwrap() {
+            return Ok((c.blue_score, c.daa_score, c.timestamp));
+        }
+        // Headers are gone below the pruning point; the retained scan record carries the same
+        // three values (it is what a full-history scan reads anyway).
+        let d = self.get_shielded_chain_block_data(block)?;
+        Ok((d.blue_score, d.daa_score, d.timestamp))
+    }
+
     fn get_shielded_frontier_block_below_daa(&self, daa: u64) -> ConsensusResult<Option<Hash>> {
         // Below the pruning point one chain block in ~1,000 keeps a frontier checkpoint, so a
         // bounded backward search from the located block always reaches one; above it every

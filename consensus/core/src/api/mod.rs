@@ -615,6 +615,26 @@ pub trait ConsensusApi: Send + Sync {
         unimplemented!()
     }
 
+    /// `(blue_score, daa_score, timestamp)` of a selected-chain block: everything a
+    /// `metadata_only` `GetShieldedBlocks` page carries. Wallets read these pages to discover
+    /// page boundaries and to place birthdays, so this is called for up to 2,000 blocks per
+    /// request.
+    ///
+    /// The default reads the full header and the full GHOSTDAG record, which is correct for any
+    /// implementation but is the slow path: a mainnet header is ~2.6 KB with 48 parent levels and
+    /// the GHOSTDAG record carries the whole mergeset, all to read three integers. Implementations
+    /// with a compact header store should answer from it (see `Consensus`). Below the pruning
+    /// point, where headers are gone, the retained scan record carries the same three values.
+    fn get_shielded_chain_block_meta(&self, block: Hash) -> ConsensusResult<(u64, u64, u64)> {
+        match (self.get_header(block), self.get_ghostdag_data(block)) {
+            (Ok(header), Ok(gd)) => Ok((gd.blue_score, header.daa_score, header.timestamp)),
+            _ => {
+                let d = self.get_shielded_chain_block_data(block)?;
+                Ok((d.blue_score, d.daa_score, d.timestamp))
+            }
+        }
+    }
+
     /// Serve a shielded-history backfill request: this node's scan records for the chain blocks
     /// immediately BELOW `anchor` on its own selected chain, newest first, plus whether the walk
     /// reached genesis.

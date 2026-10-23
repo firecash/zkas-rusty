@@ -986,13 +986,10 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
                             // the same hash/blue/daa/timestamp, so a birthday walk can continue
                             // from genesis instead of dying at the first pruned block. Only the
                             // metadata is sent; the record's action payload stays here.
-                            let (blue_score, daa_score, timestamp) = match (c.get_header(hash), c.get_ghostdag_data(hash)) {
-                                (Ok(header), Ok(gd)) => (gd.blue_score, header.daa_score, header.timestamp),
-                                _ => {
-                                    let d = c.get_shielded_chain_block_data(hash)?;
-                                    (d.blue_score, d.daa_score, d.timestamp)
-                                }
-                            };
+                            //
+                            // Read from the compact header row, not the full header + GHOSTDAG
+                            // record: a scout asks for 2,000 blocks and only these three integers.
+                            let (blue_score, daa_score, timestamp) = c.get_shielded_chain_block_meta(hash)?;
                             out.push(RpcShieldedChainBlock {
                                 hash,
                                 blue_score,
