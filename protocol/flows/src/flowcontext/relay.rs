@@ -394,6 +394,16 @@ impl FlowContext {
         rest
     }
 
+    /// `peer` fetched `id` from us (getdata served). It has the transaction now: never announce it
+    /// to that peer, and for an own transaction this proves it left the origin, which is what
+    /// D-11's "announced back" is for. Without it, an own transaction the origin fluffed itself
+    /// was re-stemmed three times for nothing: the known-inventory filter means no peer ever
+    /// announces it back to the node that announced it.
+    pub fn note_transaction_served(&self, peer: PeerKey, id: TransactionId) {
+        self.relay_privacy.trickle.lock().note_known(&peer, &[id]);
+        self.relay_privacy.dandelion.lock().note_announced(&id);
+    }
+
     /// Sends a verified `ShieldedConflict` notice to every v11 peer that wants them, once per
     /// nullifier (spec 06 D-9, 12 S4.1).
     pub(crate) async fn emit_conflict(&self, nullifier: [u8; 32], resident: TransactionId, tx: Arc<Transaction>, except: Option<PeerKey>) {
