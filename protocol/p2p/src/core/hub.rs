@@ -198,6 +198,38 @@ impl Hub {
         !self.peers.read().is_empty()
     }
 
+    /// Whether an outbound connection to exactly this address is registered. With per-connection
+    /// node ids (spec 06 H-2) the `(identity, ip)` key no longer deduplicates two connections to
+    /// one node, so outbound connections are deduplicated by address.
+    pub fn has_outbound_to(&self, address: std::net::SocketAddr) -> bool {
+        self.peers.read().values().any(|r| r.is_outbound() && r.net_address() == address)
+    }
+
+    /// Registered inbound connections from `ip`, and from its /24 (IPv4) or /48 (IPv6).
+    pub fn inbound_counts(&self, ip: std::net::IpAddr) -> (usize, usize) {
+        let ip = ip.to_canonical();
+        let group = |a: std::net::IpAddr| -> Vec<u8> {
+            match a.to_canonical() {
+                std::net::IpAddr::V4(v4) => v4.octets()[..3].to_vec(),
+                std::net::IpAddr::V6(v6) => v6.octets()[..6].to_vec(),
+            }
+        };
+        let g = group(ip);
+        let peers = self.peers.read();
+        let inbound = peers.values().filter(|r| !r.is_outbound());
+        let (mut same_ip, mut same_group) = (0, 0);
+        for r in inbound {
+            let rip = r.net_address().ip().to_canonical();
+            if rip == ip {
+                same_ip += 1;
+            }
+            if group(rip) == g {
+                same_group += 1;
+            }
+        }
+        (same_ip, same_group)
+    }
+
     /// Returns whether a peer matching `peer_key` is registered
     pub fn has_peer(&self, peer_key: PeerKey) -> bool {
         self.peers.read().contains_key(&peer_key)

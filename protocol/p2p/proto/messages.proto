@@ -65,6 +65,12 @@ message KaspadMessage {
     ShieldedHistoryChunkMessage shieldedHistoryChunk = 71;
     RequestNextShieldedHistoryChunkMessage requestNextShieldedHistoryChunk = 72;
     RequestNextPruningPointShieldedChunkMessage requestNextPruningPointShieldedChunk = 67;
+    // Protocol v11 (spec 06 H-7; ids per 16 A8.12). Sent only to peers that negotiated v11 and
+    // advertise the matching service bit, so a v10 peer never receives them.
+    StemTransactionMessage stemTransaction = 80;
+    AuthRequestMessage authRequest = 86;
+    AuthResponseMessage authResponse = 87;
+    ShieldedConflictMessage shieldedConflict = 88;
   }
 }
 

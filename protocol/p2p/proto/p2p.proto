@@ -398,3 +398,29 @@ message ShieldedHistoryEntry {
 
 message RequestNextShieldedHistoryChunkMessage {
 }
+
+// Protocol v11: a transaction in its Dandelion++ stem phase (spec 06 §3.3). Forwarded to one peer;
+// never announced by inv until it is fluffed.
+message StemTransactionMessage{
+  TransactionMessage transaction = 1;
+}
+
+// Protocol v11 pinned-key authentication (spec 06 T-8). commit = SHA256("zkas-p2p-auth-req" ||
+// session_id || xonly_pubkey), 32 bytes. A peer whose key does not match stays silent.
+message AuthRequestMessage{
+  bytes commit = 1;
+}
+
+// sig = BIP 340 Schnorr signature over SHA256("zkas-p2p-auth" || session_id), 64 bytes.
+message AuthResponseMessage{
+  bytes sig = 1;
+}
+
+// Protocol v11 conflict notice (spec 12 S4.1; emitted for stemmed conflicts per 06 D-9 / 16 F12):
+// txB spends `nullifier`, which the resident mempool transaction txidA already spends. txB's proof
+// verified before the notice was sent.
+message ShieldedConflictMessage{
+  bytes nullifier = 1;
+  TransactionId txidA = 2;
+  TransactionMessage txB = 3;
+}

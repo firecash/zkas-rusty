@@ -59,6 +59,10 @@ pub enum KaspadMessagePayloadType {
     ShieldedHistoryChunk,
     RequestNextShieldedHistoryChunk,
     RequestNextPruningPointShieldedChunk,
+    StemTransaction,
+    AuthRequest,
+    AuthResponse,
+    ShieldedConflict,
 }
 
 impl From<&KaspadMessagePayload> for KaspadMessagePayloadType {
@@ -128,6 +132,10 @@ impl From<&KaspadMessagePayload> for KaspadMessagePayloadType {
             KaspadMessagePayload::RequestNextPruningPointShieldedChunk(_) => {
                 KaspadMessagePayloadType::RequestNextPruningPointShieldedChunk
             }
+            KaspadMessagePayload::StemTransaction(_) => KaspadMessagePayloadType::StemTransaction,
+            KaspadMessagePayload::AuthRequest(_) => KaspadMessagePayloadType::AuthRequest,
+            KaspadMessagePayload::AuthResponse(_) => KaspadMessagePayloadType::AuthResponse,
+            KaspadMessagePayload::ShieldedConflict(_) => KaspadMessagePayloadType::ShieldedConflict,
         }
     }
 }
