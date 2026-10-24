@@ -565,9 +565,13 @@ fn ingest_shielded_chain_block(db: &mut WalletDb, blk: &RpcShieldedChainBlock) {
 /// The shielded sighash **network domain**: the chain's genesis hash — what
 /// consensus verifies signatures against (`params.genesis.hash`). Read from the
 /// compile-time mainnet params: an RPC walk to genesis fails on pruned nodes.
-async fn resolve_genesis(_client: &GrpcClient) -> RpcHash {
-    use kaspa_consensus_core::{config::params::Params, network::NetworkType};
-    RpcHash::from_bytes(Params::from(NetworkType::Mainnet).genesis.hash.as_bytes())
+/// The genesis of the network the node is on: consensus binds every shielded sighash to it
+/// (`shielded_network_domain` = `params.genesis.hash`). It was hard-coded to mainnet, so a
+/// payment built against a devnet or testnet node failed with `BindingSigInvalid`.
+async fn resolve_genesis(client: &GrpcClient) -> RpcHash {
+    use kaspa_consensus_core::config::params::Params;
+    let dag = client.get_block_dag_info().await.unwrap_or_else(|e| fatal(format!("get_block_dag_info failed: {e}")));
+    RpcHash::from_bytes(Params::from(dag.network).genesis.hash.as_bytes())
 }
 
 async fn balance(rpc_server: String, seed: [u8; 32]) {
