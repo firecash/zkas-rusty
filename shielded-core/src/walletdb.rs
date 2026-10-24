@@ -364,6 +364,14 @@ impl SharedNfSet {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test builds check the owned-nullifier index after every ingested action. That check is
+    /// itself O(notes) per action, so the bookkeeping bench turns it off for its own thread;
+    /// left on, the bench measures the check instead of the code.
+    static OWNED_NF_INDEX_CHECK: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
 /// A wallet's running view of the global note-commitment tree: it walks the
 /// canonical commitment stream, recognises its own notes, and keeps a spendable
 /// witness for each.
@@ -1456,7 +1464,9 @@ impl WalletDb {
             *pruned_change = true;
         }
         #[cfg(test)]
-        self.assert_owned_nfs_cover_notes();
+        if OWNED_NF_INDEX_CHECK.with(|c| c.get()) {
+            self.assert_owned_nfs_cover_notes();
+        }
     }
 
     #[cfg(test)]
@@ -4561,6 +4571,8 @@ mod tests {
             .map(|x| x.trim().parse().unwrap())
             .collect();
         let actions: u64 = std::env::var("B6_ACTIONS").ok().and_then(|v| v.parse().ok()).unwrap_or(20_000);
+        // Measure the code, not the test-only per-action index check (if this build has one).
+        OWNED_NF_INDEX_CHECK.with(|c| c.set(false));
         const PER_DAY: f64 = 77_104.0; // actions per chain-day [MEASURED spec 10 S1]
         let mut base_us = None;
         for n in counts {
