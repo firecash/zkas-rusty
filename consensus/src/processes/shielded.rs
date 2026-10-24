@@ -27,6 +27,7 @@ use kaspa_shielded_core::state::CoinbaseNote;
 use kaspa_shielded_core::state::{BlockShieldedOutcome, CoinbaseMint, ShieldedStateError, ShieldedTx, apply_chain_block_to};
 use kaspa_shielded_core::tree::{FrontierState, GlobalTree, NoteCommitmentTree, TreeStateError};
 use kaspa_shielded_core::turnstile::SupplyLedger;
+use kaspa_shielded_core::commitment::{FrozenEra, NuaState};
 use kaspa_shielded_core::wallet::CompactActionRecord;
 
 use rocksdb::WriteBatch;
@@ -40,6 +41,7 @@ use crate::model::stores::shielded::{
     DbNullifierCursorStore, DbNullifierDiffStore, DbNullifierSetStore, DbShieldedAnchorSourceScoreStore, DbShieldedBurnStore,
     DbShieldedDevAccruedStore,
     DbShieldedMinerAccrualStore,
+    DbShieldedNuaStore,
     DbShieldedNullifierMuHashStore,
     DbShieldedScanBlockStore, DbShieldedSupplyStore, DbShieldedTreeStore, NullifierDiffStoreReader, NullifierSetStore,
     NullifierSetStoreReader, ShieldedBurnStoreReader, ShieldedNullifierMuHashStoreReader, ShieldedScanBlockData,
@@ -63,11 +65,30 @@ pub const MAX_IMPORTED_IN_WINDOW_ANCHORS: usize = 1 << 18;
 /// is enabled.
 pub const MAX_IMPORTED_BURN_RECEIPTS: usize = 1 << 20;
 
+/// Receiver-side ceiling on imported frozen tree eras. One era closes per ~4.29 billion leaves on
+/// mainnet, so any honest list is tiny; this only bounds the hashing before the root comparison.
+pub const MAX_IMPORTED_FROZEN_ERAS: usize = 1 << 16;
+
+/// NU-A context of one chain block's shielded transition, passed to [`ShieldedStateManager::compute`]
+/// when NU-A is active at the block's own DAA score: arms the tree-era rollover.
+#[derive(Clone, Copy, Debug)]
+pub struct NuaCompute {
+    /// `Params::tree_rollover_threshold`.
+    pub rollover_threshold: u64,
+    /// Blue score of the block's selected parent (the freeze block if this block rolls over).
+    pub parent_blue_score: u64,
+}
+
 /// A computed (not-yet-persisted) shielded transition for one chain block.
 ///
 /// Produced by [`ShieldedStateManager::compute`] in the validation phase and
 /// persisted by [`ShieldedStateManager::persist`] in the commit phase.
 pub struct ComputedBlockShielded {
+    /// NU-A state after this block: the selected parent's, plus this block's burned floor, plus a
+    /// frozen era if this block rolled the tree over. The default before NU-A.
+    pub nua: NuaState,
+    /// Whether this block started a new tree era (its leaves are the first of `nua.tree_era`).
+    pub tree_era_started: bool,
     /// The global note-commitment tree frontier after this block.
     pub frontier_state: FrontierState,
     /// The turnstile cumulative totals after this block.
@@ -230,6 +251,52 @@ pub struct PruningPointShieldedMetadata {
     /// starts inside the window (the transition after the fork).
     #[serde(default)]
     pub window_prefix: kaspa_shielded_core::anchor_window::AnchorLog,
+    /// NU-A: the burned-floor total, tree era and frozen eras at the pruning point, bound by
+    /// `zkas_state_root2`. Default for a pre-NU-A pruning point. Trailing, like every field before it.
+    #[serde(default)]
+    pub nua: NuaState,
+}
+
+/// The layout before `nua`: the current struct minus its trailing field.
+#[derive(serde::Deserialize)]
+struct PreNuaPruningPointShieldedMetadata {
+    frontier: FrontierState,
+    supply: SupplyTotals,
+    nullifier_muhash: MuHash,
+    #[serde(default)]
+    burns: BurnReceipts,
+    state_root: [u8; 32],
+    #[serde(default)]
+    in_window_anchors: Vec<([u8; 32], Hash)>,
+    #[serde(default)]
+    dev_accrued: u64,
+    #[serde(default)]
+    in_window_anchor_source_scores: Vec<(Hash, u64)>,
+    #[serde(default)]
+    window_entries: Vec<kaspa_shielded_core::anchor_window::WindowEntry>,
+    #[serde(default)]
+    miner_accrual: kaspa_consensus_core::coinbase::MinerAccrual,
+    #[serde(default)]
+    window_prefix: kaspa_shielded_core::anchor_window::AnchorLog,
+}
+
+impl From<PreNuaPruningPointShieldedMetadata> for PruningPointShieldedMetadata {
+    fn from(v: PreNuaPruningPointShieldedMetadata) -> Self {
+        Self {
+            frontier: v.frontier,
+            supply: v.supply,
+            nullifier_muhash: v.nullifier_muhash,
+            burns: v.burns,
+            state_root: v.state_root,
+            in_window_anchors: v.in_window_anchors,
+            dev_accrued: v.dev_accrued,
+            in_window_anchor_source_scores: v.in_window_anchor_source_scores,
+            window_entries: v.window_entries,
+            miner_accrual: v.miner_accrual,
+            window_prefix: v.window_prefix,
+            nua: NuaState::default(),
+        }
+    }
 }
 
 /// The layout before `window_entries`: the current struct minus its trailing field.
@@ -263,6 +330,7 @@ impl From<PreWindowPruningPointShieldedMetadata> for PruningPointShieldedMetadat
             window_entries: Vec::new(),
             miner_accrual: Default::default(),
             window_prefix: Default::default(),
+            nua: NuaState::default(),
         }
     }
 }
@@ -296,6 +364,7 @@ impl From<LegacyPruningPointShieldedMetadata> for PruningPointShieldedMetadata {
             window_entries: Vec::new(),
             miner_accrual: Default::default(),
             window_prefix: Default::default(),
+            nua: NuaState::default(),
         }
     }
 }
@@ -334,6 +403,7 @@ impl From<PreAnchorScoresPruningPointShieldedMetadata> for PruningPointShieldedM
             window_entries: Vec::new(),
             miner_accrual: Default::default(),
             window_prefix: Default::default(),
+            nua: NuaState::default(),
         }
     }
 }
@@ -366,8 +436,9 @@ impl PruningPointShieldedMetadata {
         // succeed against a NEW blob and silently discard the fields it does not know.
         match bincode::deserialize::<Self>(bytes) {
             Ok(md) => Ok(md),
-            Err(primary) => bincode::deserialize::<PreWindowPruningPointShieldedMetadata>(bytes)
+            Err(primary) => bincode::deserialize::<PreNuaPruningPointShieldedMetadata>(bytes)
                 .map(Into::into)
+                .or_else(|_| bincode::deserialize::<PreWindowPruningPointShieldedMetadata>(bytes).map(Into::into))
                 .or_else(|_| bincode::deserialize::<PreAnchorScoresPruningPointShieldedMetadata>(bytes).map(Into::into))
                 .or_else(|_| bincode::deserialize::<LegacyPruningPointShieldedMetadata>(bytes).map(Into::into))
                 .map_err(|_: bincode::Error| format!("malformed shielded pruning-point metadata: {primary}")),
@@ -588,6 +659,8 @@ pub struct ShieldedStateManager {
     anchor_source_scores: DbShieldedAnchorSourceScoreStore,
     /// Security fork: per-block anchor window and window entries.
     anchor_window: DbAnchorWindowStore,
+    /// NU-A: per-block burned-floor total, tree era and frozen eras.
+    nua_store: DbShieldedNuaStore,
 }
 
 impl ShieldedStateManager {
@@ -611,7 +684,8 @@ impl ShieldedStateManager {
             scan_block: DbShieldedScanBlockStore::new(Arc::clone(&db), cache_policy),
             burn_store: DbShieldedBurnStore::new(Arc::clone(&db), cache_policy),
             anchor_source_scores: DbShieldedAnchorSourceScoreStore::new(Arc::clone(&db), cache_policy),
-            anchor_window: DbAnchorWindowStore::new(db, cache_policy),
+            anchor_window: DbAnchorWindowStore::new(Arc::clone(&db), cache_policy),
+            nua_store: DbShieldedNuaStore::new(db, cache_policy),
         }
     }
 
@@ -695,6 +769,18 @@ impl ShieldedStateManager {
             &window.commitment(),
             miner_accrual_ref(&slot),
         ))
+    }
+
+    /// NU-A state (burned floor, tree era, frozen eras) as of `block`; the default before NU-A.
+    pub fn nua_at(&self, block: Hash) -> StoreResult<NuaState> {
+        self.nua_store.get(block)
+    }
+
+    /// The NU-A state root (`zkas_state_root2`) as of `block`: the v1 root plus the NU-A state. The
+    /// caller decides the version from `block`'s own DAA score.
+    pub fn state_root_v2_at(&self, block: Hash, is_genesis: bool) -> StoreResult<[u8; 32]> {
+        let v1 = self.state_root_v1_at(block, is_genesis)?;
+        Ok(kaspa_shielded_core::commitment::shielded_state_root_v2(&v1, &self.nua_store.get(block)?))
     }
 
     /// Peer-attested blue score of an in-window anchor source, or `None` if nothing was
@@ -911,6 +997,7 @@ impl ShieldedStateManager {
         self.burn_store.clear_cache();
         self.anchor_source_scores.clear_cache();
         self.anchor_window.clear_cache();
+        self.nua_store.clear_cache();
     }
 
     /// Test helper: make the database look like one an older build wrote (no cursor).
@@ -1131,6 +1218,7 @@ impl ShieldedStateManager {
         self.burn_store.delete_batch(batch, block)?;
         self.dev_accrued_store.delete_batch(batch, block)?;
         self.miner_accrual_store.delete_batch(batch, block)?;
+        self.nua_store.delete_batch(batch, block)?;
         // The per-block window is a snapshot like the others; the ENTRY is kept (GC'd with the
         // anchor indexes) because the export for a later pruning point still needs it.
         self.anchor_window.delete_window_batch(batch, block)?;
@@ -1288,17 +1376,46 @@ impl ShieldedStateManager {
     /// validation phase, `verify_expected_utxo_state`). The finalized nullifier
     /// check reads the global set, which — because each chain block is committed
     /// before the next is validated — already reflects the selected-parent chain.
+    ///
+    /// `nua` is `Some` when NU-A is active at the block's own DAA score. It arms the tree-era
+    /// rollover (spec 08 R4.2.3): if the selected parent's era already holds at least
+    /// `rollover_threshold` leaves, the parent's tree is frozen (its root, the parent as freeze block,
+    /// the parent's blue score and the era's size are recorded) and this block's leaves, coinbase
+    /// first, start the next era on an empty tree. A block's leaves therefore never straddle two eras,
+    /// and the decision is a pure function of the parent's committed state. The burned floor of the
+    /// applied transactions is added to the carried total whatever `nua` is: it is non-zero only for
+    /// transactions carried by NU-A blocks, which only NU-A chain blocks can merge.
     pub fn compute(
         &self,
         selected_parent: Hash,
         coinbase: Option<&CoinbaseMint>,
         txs: &[ShieldedTx],
+        nua: Option<NuaCompute>,
     ) -> Result<ComputedBlockShielded, ShieldedManagerError> {
         // Anchor finality (maturity + canonical ancestry, PLAN §2.5) is checked by
         // the caller (virtual processor) before `compute`, since it needs
         // reachability and the spending block's blue score. Here we only apply the
         // transition against the selected parent's persisted state.
         let mut tree = self.load_tree(selected_parent)?;
+        let mut nua_state = self.nua_store.get(selected_parent)?;
+        let mut tree_era_started = false;
+        if let Some(c) = nua {
+            let size = tree.size();
+            if kaspa_shielded_core::commitment::starts_new_tree_era(true, size, c.rollover_threshold) {
+                nua_state.frozen.push(FrozenEra {
+                    era: nua_state.tree_era,
+                    final_root: tree.anchor().to_bytes(),
+                    freeze_block: selected_parent.as_bytes(),
+                    freeze_blue_score: c.parent_blue_score,
+                    size,
+                });
+                // u32 eras at one per ~2^32 leaves cannot overflow in any reachable chain; saturate
+                // rather than wrap if a test network sets an absurd threshold.
+                nua_state.tree_era = nua_state.tree_era.saturating_add(1);
+                tree = GlobalTree::new();
+                tree_era_started = true;
+            }
+        }
         let mut supply = self.load_supply(selected_parent)?;
         // Extend the selected parent's burn accumulator, so a reorg naturally rebuilds from the
         // new selected parent rather than replaying every burn from genesis.
@@ -1316,7 +1433,12 @@ impl ShieldedStateManager {
         for nf in &outcome.new_nullifiers {
             nullifier_muhash.add_element(nf);
         }
+        for &i in &outcome.accepted {
+            nua_state.cumulative_fee_burn = nua_state.cumulative_fee_burn.saturating_add(txs[i].fee_burn as u128);
+        }
         Ok(ComputedBlockShielded {
+            nua: nua_state,
+            tree_era_started,
             frontier_state: tree.to_state(),
             supply_totals: SupplyTotals {
                 cumulative_coinbase: supply.cumulative_coinbase(),
@@ -1354,6 +1476,10 @@ impl ShieldedStateManager {
         // default a missing key reads back as.
         if !computed.burns.receipts.is_empty() {
             self.burn_store.set_batch(batch, block, computed.burns.clone())?;
+        }
+        // NU-A state: only non-default values are written; a missing key reads as the default.
+        if computed.nua != NuaState::default() {
+            self.nua_store.set_batch(batch, block, computed.nua.clone())?;
         }
         if !computed.outcome.new_nullifiers.is_empty() {
             self.nullifier_diffs.set_batch(batch, block, computed.outcome.new_nullifiers.clone())?;
@@ -1418,7 +1544,9 @@ impl ShieldedStateManager {
     /// (F-03: the raw global set reflects the virtual tip, not the pruning point).
     pub fn export_pruning_point_shielded(&self, block: Hash) -> StoreResult<Option<PruningPointShieldedMetadata>> {
         let frontier = self.tree_store.get(block)?;
-        if frontier.size == 0 {
+        // NU-A: right after a tree-era rollover the current era can be empty while the chain has
+        // shielded state (frozen eras, a burn total), so only a default NU-A state means "nothing".
+        if frontier.size == 0 && self.nua_store.get(block)? == NuaState::default() {
             return Ok(None);
         }
         let supply = self.supply_store.get(block)?;
@@ -1428,6 +1556,7 @@ impl ShieldedStateManager {
             .map_err(|e| StoreError::DataInconsistency(format!("stored shielded frontier at {block} is corrupt: {e:?}")))?;
         let dev_accrued = self.dev_accrued_store.get(block)?;
         let miner_accrual = self.miner_accrual_store.get(block)?;
+        let nua = self.nua_store.get(block)?;
         Ok(Some(PruningPointShieldedMetadata {
             frontier,
             supply,
@@ -1443,6 +1572,7 @@ impl ShieldedStateManager {
             window_entries: Vec::new(),
             miner_accrual,
             window_prefix: Default::default(),
+            nua,
         }))
     }
 
@@ -1529,6 +1659,12 @@ impl ShieldedStateManager {
                 md.burns.receipts.len()
             ));
         }
+        if md.nua.frozen.len() > MAX_IMPORTED_FROZEN_ERAS {
+            return Err(format!(
+                "pruning-point metadata carries {} frozen tree eras, above the {MAX_IMPORTED_FROZEN_ERAS} ceiling",
+                md.nua.frozen.len()
+            ));
+        }
         if md.burns.receipts.len() > MAX_IMPORTED_BURN_RECEIPTS {
             return Err(format!(
                 "pruning-point metadata carries {} burn receipts, above the {MAX_IMPORTED_BURN_RECEIPTS} ceiling",
@@ -1551,10 +1687,13 @@ impl ShieldedStateManager {
         // (`MAX_SHIELDED_NULLIFIER_IMPORT_COUNT`, 2^26 ≈ 2 GiB of raw nullifiers) is far above the
         // memory of the machines this runs on, while this bound is free and comes from the metadata
         // the peer already committed to.
-        if count as u64 > md.frontier.size {
+        // NU-A: after a tree-era rollover the frontier holds only the current era's leaves; every
+        // frozen era's notes can be spent too (one global nullifier set across eras), so the bound is
+        // the leaves of all eras together. Both terms are committed by `zkas_state_root2`.
+        let committed_leaves = md.frontier.size.saturating_add(md.nua.frozen_leaves());
+        if count as u64 > committed_leaves {
             return Err(format!(
-                "streamed nullifier set ({count}) exceeds the committed note count ({}); a spend implies a note",
-                md.frontier.size
+                "streamed nullifier set ({count}) exceeds the committed note count ({committed_leaves}); a spend implies a note"
             ));
         }
         // 2. The declared state root must be consistent with the transferred parts.
@@ -1671,6 +1810,12 @@ impl ShieldedStateManager {
         if !md.miner_accrual.is_empty() {
             self.miner_accrual_store.set_batch(batch, block, md.miner_accrual.clone())?;
         }
+        // NU-A state, by the same delete-then-write rule. Bound to `zkas_state_root2` by the caller
+        // (`verify_import_binding_versioned`) before this runs.
+        self.nua_store.delete_batch(batch, block)?;
+        if md.nua != NuaState::default() {
+            self.nua_store.set_batch(batch, block, md.nua.clone())?;
+        }
         // The whole append-only global membership set (unbounded, PLAN §2.9).
         for nf in nullifiers {
             self.nullifiers.insert_batch(batch, *nf)?;
@@ -1744,6 +1889,7 @@ impl ShieldedStateManager {
         // inconsistency.
         self.dev_accrued_store.delete_batch(batch, pruning_point)?;
         self.miner_accrual_store.delete_batch(batch, pruning_point)?;
+        self.nua_store.delete_batch(batch, pruning_point)?;
         self.anchor_window.delete_window_batch(batch, pruning_point)?;
         self.anchor_block.delete_all_batch(batch)?;
         self.anchor_producers.delete_all_batch(batch)?;
@@ -1830,6 +1976,7 @@ mod tests {
                 amount: 5,
             },
             window_prefix: Default::default(),
+            nua: NuaState::default(),
         };
         let base = md.to_wire_bytes();
         let mut x: u64 = 0xfeed_face_0bad_f00d;
@@ -1882,6 +2029,7 @@ mod tests {
                 amount: 999,
             },
             window_prefix: Default::default(),
+            nua: NuaState::default(),
         };
         // What an empty trailing slot costs on the wire, so each older layout can be cut exactly.
         let slot_len = bincode::serialized_size(&kaspa_consensus_core::coinbase::MinerAccrual::default()).unwrap() as usize;
@@ -1976,6 +2124,7 @@ mod tests {
             window_entries: Vec::new(),
             miner_accrual: Default::default(),
             window_prefix: Default::default(),
+            nua: NuaState::default(),
         };
 
         let mut batch = WriteBatch::default();
@@ -2154,6 +2303,7 @@ mod tests {
         ShieldedTx {
             burn: None,
             anchor_block: None,
+            fee_burn: 0,
             nullifiers: nfs.iter().map(|&n| nf(n)).collect(),
             commitments: cmxs.iter().map(|&c| cmx(c)).collect(),
             fee,
@@ -2187,7 +2337,7 @@ mod tests {
         coinbase: Option<CoinbaseMint>,
         txs: Vec<ShieldedTx>,
     ) -> ComputedBlockShielded {
-        let computed = mgr.compute(parent, coinbase.as_ref(), &txs).unwrap();
+        let computed = mgr.compute(parent, coinbase.as_ref(), &txs, None).unwrap();
         let mut batch = WriteBatch::default();
         mgr.persist(&mut batch, block, &computed).unwrap();
         db.write(batch).unwrap();
@@ -2217,7 +2367,7 @@ mod tests {
         assert!(mgr2.nullifiers().contains(&nf(1)).unwrap());
 
         // A later block reusing nf(1) is still caught against the persisted set.
-        let c3 = mgr2.compute(b2, None, &[stx(&[1], &[300], 0)]).unwrap();
+        let c3 = mgr2.compute(b2, None, &[stx(&[1], &[300], 0)], None).unwrap();
         assert!(c3.outcome.accepted.is_empty(), "double-spend caught across sessions");
     }
 
@@ -2225,6 +2375,7 @@ mod tests {
         ShieldedTx {
             burn: Some(kaspa_shielded_core::burn::ExitReceipt { v: burn_v, recipient: [tag; 32], n: [tag.wrapping_add(0x90); 32] }),
             anchor_block: None,
+            fee_burn: 0,
             nullifiers: nfs.iter().map(|&n| nf(n)).collect(),
             commitments: cmxs.iter().map(|&c| cmx(c)).collect(),
             fee: value_balance,
@@ -2299,6 +2450,7 @@ mod tests {
             window_entries: Vec::new(),
             miner_accrual: Default::default(),
             window_prefix: Default::default(),
+            nua: NuaState::default(),
         };
 
         let mut batch = WriteBatch::default();
@@ -2345,6 +2497,7 @@ mod tests {
             window_entries: Vec::new(),
             miner_accrual: Default::default(),
             window_prefix: Default::default(),
+            nua: NuaState::default(),
         };
         let (fake_root, real_block) = ([0xEE; 32], h(5));
         let (root, sib_a, sib_b) = ([0x11; 32], h(6), h(7));
@@ -2524,9 +2677,9 @@ mod tests {
         // A descendant of the pruning point extends the tree and still catches a
         // re-spend of a pre-pruning nullifier against the seeded global set, while
         // accepting a genuinely new spend.
-        let dbl = seeded.compute(pp, Some(&coinbase(50, 40)), &[stx(&[2], &[400], 5)]).unwrap();
+        let dbl = seeded.compute(pp, Some(&coinbase(50, 40)), &[stx(&[2], &[400], 5)], None).unwrap();
         assert!(dbl.outcome.accepted.is_empty(), "re-spend of a pre-pruning nullifier dropped");
-        let ok = seeded.compute(pp, Some(&coinbase(50, 41)), &[stx(&[9], &[401], 5)]).unwrap();
+        let ok = seeded.compute(pp, Some(&coinbase(50, 41)), &[stx(&[9], &[401], 5)], None).unwrap();
         assert_eq!(ok.outcome.accepted, vec![0], "a genuinely new spend is accepted on the seeded node");
     }
 
@@ -2602,7 +2755,7 @@ mod tests {
         assert!(!mgr.nullifiers().contains(&nf(1)).unwrap(), "reverted nullifier removed");
 
         // The new branch can now spend nf(1).
-        let c = mgr.compute(h(0), Some(&coinbase(10, 2)), &[stx(&[1], &[101], 0)]).unwrap();
+        let c = mgr.compute(h(0), Some(&coinbase(10, 2)), &[stx(&[1], &[101], 0)], None).unwrap();
         assert_eq!(c.outcome.accepted, vec![0], "spend of reverted nullifier accepted on new branch");
     }
 
@@ -2676,7 +2829,7 @@ mod tests {
     fn rejects_overspend() {
         let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
         let mgr = manager(&db);
-        let res = mgr.compute(h(0), Some(&coinbase(10, 1)), &[stx(&[7], &[2], 11)]);
+        let res = mgr.compute(h(0), Some(&coinbase(10, 1)), &[stx(&[7], &[2], 11)], None);
         assert!(matches!(res, Err(ShieldedManagerError::State(ShieldedStateError::Turnstile(_)))));
     }
 
@@ -2714,6 +2867,7 @@ mod tests {
                         stx(&[1], &[200], 5), // Y's spend of nf(1) — dropped (double-spend)
                         stx(&[2], &[300], 5), // independent spend — survives
                     ],
+                    None,
                 )
                 .unwrap();
             // Release all DB references before `_lt` drops (its Drop asserts the DB has
@@ -2774,12 +2928,12 @@ mod tests {
 
         // The transition applied to the FULL set accepts exactly the kept indices —
         // the partition is a faithful precomputation of the transition's drops.
-        let computed = mgr.compute(h(1), None, &candidates).unwrap();
+        let computed = mgr.compute(h(1), None, &candidates, None).unwrap();
         let kept_indices: Vec<usize> = keep.iter().enumerate().filter(|(_, k)| **k).map(|(i, _)| i).collect();
         // `compute` has no anchor predicate (the caller pre-filters), so exclude
         // the anchor-dropped tx from the comparison by feeding the pre-filtered set.
         let anchor_ok: Vec<ShieldedTx> = candidates.iter().filter(|s| s.anchor != bad_anchor).cloned().collect();
-        let computed_filtered = mgr.compute(h(1), None, &anchor_ok).unwrap();
+        let computed_filtered = mgr.compute(h(1), None, &anchor_ok, None).unwrap();
         assert_eq!(computed_filtered.outcome.accepted.len(), kept_indices.len());
         // And on the full set the nullifier-only drops agree (indices 1 and 2 dropped).
         assert_eq!(computed.outcome.accepted, vec![0, 3, 4, 5], "nullifier rules agree with the mask (anchor rule aside)");
@@ -2814,7 +2968,7 @@ mod tests {
         // pool by the dropped 7 — silent unbacked supply. This is what
         // verify_expected_utxo_state's pool-delta check now turns into an
         // InvalidShieldedState rejection.
-        let c_bad = mgr.compute(h(1), Some(&coinbase(SUBSIDY + 5 + 7, 21)), &applied).unwrap();
+        let c_bad = mgr.compute(h(1), Some(&coinbase(SUBSIDY + 5 + 7, 21)), &applied, None).unwrap();
         let bad_pool = c_bad.supply_totals.cumulative_coinbase - c_bad.supply_totals.cumulative_fees;
         assert_eq!(bad_pool - pool_before, (SUBSIDY + 7) as u128, "the old behavior mints the dropped fee unbacked");
 
@@ -3058,7 +3212,7 @@ mod tests {
         assert!(!mgr.nullifiers().contains(&nf(2)).unwrap(), "stale nullifier of the abandoned state is gone");
         assert_eq!(mgr.state_root_at(pp).unwrap(), cpp.state_root(), "re-seeded root matches the new state");
         // And a spend of nf(1) — unspent on the new chain — is accepted, not frozen.
-        let ok = mgr.compute(pp, Some(&coinbase(50, 30)), &[stx(&[1], &[400], 5)]).unwrap();
+        let ok = mgr.compute(pp, Some(&coinbase(50, 30)), &[stx(&[1], &[400], 5)], None).unwrap();
         assert_eq!(ok.outcome.accepted, vec![0], "previously-frozen note is spendable again after the clean re-seed");
     }
 
@@ -3129,6 +3283,7 @@ mod tests {
             window_entries: Vec::new(),
             miner_accrual: Default::default(),
             window_prefix: Default::default(),
+            nua: NuaState::default(),
         };
         let mut batch = WriteBatch::default();
         mgr.seed_pruning_point_shielded(&mut batch, pp, &md, std::iter::empty()).unwrap();

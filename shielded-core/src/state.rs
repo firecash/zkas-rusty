@@ -51,6 +51,11 @@ pub struct ShieldedTx {
     pub burn: Option<crate::burn::ExitReceipt>,
     /// The block the spend names as the producer of `anchor` (security fork); `None` before it.
     pub anchor_block: Option<[u8; 32]>,
+    /// NU-A (spec 08 R2.3): the part of `fee` that is burned, `shielded_fee_floor(actions)` for a
+    /// transaction carried by a block at or past the activation, else 0. Set by the consensus layer,
+    /// which knows the carrying block; [`Self::from_bundle`] leaves it 0. Only `fee - fee_burn` (the
+    /// tip) is re-minted to miners, so the pool shrinks by the burn.
+    pub fee_burn: u64,
 }
 
 /// Error extracting a [`ShieldedTx`] from an on-wire [`ShieldedBundle`].
@@ -120,7 +125,7 @@ impl ShieldedTx {
             }
             None => None,
         };
-        Ok(ShieldedTx { nullifiers, commitments, fee: bundle.value_balance as u64, anchor: bundle.anchor, burn, anchor_block: bundle.anchor_block })
+        Ok(ShieldedTx { nullifiers, commitments, fee: bundle.value_balance as u64, anchor: bundle.anchor, burn, anchor_block: bundle.anchor_block, fee_burn: 0 })
     }
 }
 
@@ -395,6 +400,7 @@ mod tests {
         ShieldedTx {
             burn: None,
             anchor_block: None,
+            fee_burn: 0,
             nullifiers: nfs.iter().map(|&n| nf(n)).collect(),
             commitments: cmxs.iter().map(|&c| cmx(c)).collect(),
             fee,
@@ -450,6 +456,7 @@ mod tests {
         ShieldedTx {
             burn: Some(crate::burn::ExitReceipt { v: burn_v, recipient: [tag; 32], n: [tag.wrapping_add(0x90); 32] }),
             anchor_block: None,
+            fee_burn: 0,
             nullifiers: nfs.iter().map(|&n| nf(n)).collect(),
             commitments: cmxs.iter().map(|&c| cmx(c)).collect(),
             fee: value_balance,

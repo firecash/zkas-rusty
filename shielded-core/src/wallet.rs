@@ -1200,6 +1200,23 @@ pub mod build {
         Ok(wire.to_bytes())
     }
 
+    /// The coinbase note minted to `owner_seed`'s address as output `out_index` of the coinbase
+    /// `coinbase_txid` (pre-F-02 seed `txid || index`), ready to pair with a witness from any source
+    /// (for example [`crate::era::EraTracker::witness`]) in [`build_wallet_payment_anchored`].
+    pub fn coinbase_note_for(owner_seed: [u8; 32], coinbase_txid: [u8; 32], out_index: u32, note_value: u64) -> Result<Note, BuildError> {
+        use crate::coinbase::derive_coinbase_note_desc;
+        use orchard::note::{RandomSeed, Rho};
+        let keys = ShieldedKeys::from_seed(owner_seed).ok_or(BuildError::Empty)?;
+        let mut seed = Vec::with_capacity(36);
+        seed.extend_from_slice(&coinbase_txid);
+        seed.extend_from_slice(&out_index.to_le_bytes());
+        let desc = derive_coinbase_note_desc(keys.address().to_raw_address_bytes(), &seed);
+        let rho = Option::<Rho>::from(Rho::from_bytes(&desc.rho)).ok_or(BuildError::Empty)?;
+        let rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes(desc.rseed, &rho)).ok_or(BuildError::Empty)?;
+        Option::<Note>::from(Note::from_parts(keys.address(), NoteValue::from_raw(note_value), rho, rseed, orchard::note::NoteVersion::V2))
+            .ok_or(BuildError::Empty)
+    }
+
     /// [`build_singleleaf_coinbase_spend`] that names `anchor_block` (security fork). Same note and
     /// single-leaf witness, built through [`build_wallet_payment_multi_anchored`] so the name is
     /// set before the sighash. The fee is `note_value - output_value`; no change is left over.

@@ -215,6 +215,11 @@ pub struct VirtualStateProcessor {
     pub(crate) shielded_anchor_multi_activation: ForkActivation,
     /// See `Params::security_fork_activation`.
     pub(crate) security_fork_activation: ForkActivation,
+    /// See `Params::nu_a_activation`: burned fee floor, state root v2, tree-era rollover and the
+    /// frozen-era anchor exemption.
+    pub(crate) nu_a_activation: ForkActivation,
+    /// See `Params::tree_rollover_threshold`.
+    pub(crate) tree_rollover_threshold: u64,
     /// See `Params::dev_fee_accrual_activation` / `Params::dev_fee_end_activation`: outside the
     /// window between them no dev fee is carried, so an imported pruning point must carry none.
     dev_fee_accrual_activation: ForkActivation,
@@ -386,6 +391,8 @@ impl VirtualStateProcessor {
             toccata_activation: params.toccata_activation,
             shielded_anchor_multi_activation: params.shielded_anchor_multi_activation,
             security_fork_activation: params.security_fork_activation,
+            nu_a_activation: params.nu_a_activation,
+            tree_rollover_threshold: params.tree_rollover_threshold,
             dev_fee_accrual_activation: params.dev_fee_accrual_activation,
             dev_fee_end_activation: params.dev_fee_end_activation,
             shielded_coinbase_seed_activation: params.shielded_coinbase_seed_activation,
@@ -698,6 +705,12 @@ impl VirtualStateProcessor {
         if md.dev_accrued != 0 && (!self.dev_fee_accrual_activation.is_active(pp_daa) || self.dev_fee_end_activation.is_active(pp_daa)) {
             return Err(format!("pruning-point metadata carries a dev balance {} where none can exist", md.dev_accrued));
         }
+        // NU-A state exists only from NU-A; before it the root covers none of it, so a peer could seed
+        // a burn total or a frozen era nothing proves.
+        let nua_active = self.nu_a_activation.is_active(pp_daa);
+        if !nua_active && md.nua != kaspa_shielded_core::commitment::NuaState::default() {
+            return Err("pruning-point metadata carries NU-A state (burn total, tree era or frozen eras) before NU-A".to_string());
+        }
         if !self.security_fork_activation.is_active(pp_daa) {
             if !md.miner_accrual.is_empty() {
                 return Err("pruning-point metadata carries a miner accrual slot before the security fork".to_string());
@@ -729,12 +742,19 @@ impl VirtualStateProcessor {
         if md.window_prefix.count != 0 && first_bs > oldest_usable {
             return Err(format!("pruning-point anchor log stops above the oldest usable anchor (blue {first_bs} > {oldest_usable})"));
         }
-        let expected = kaspa_shielded_core::commitment::shielded_state_root_v1(
+        let expected_v1 = kaspa_shielded_core::commitment::shielded_state_root_v1(
             &md.state_root,
             md.dev_accrued,
             &window.commitment(),
             crate::processes::shielded::miner_accrual_ref(&md.miner_accrual),
         );
+        // NU-A: the committed value is v2 over v1 and the imported NU-A state, so the burn total, the
+        // tree era and every frozen era are proven together with everything v1 proves.
+        let expected = if nua_active {
+            kaspa_shielded_core::commitment::shielded_state_root_v2(&expected_v1, &md.nua)
+        } else {
+            expected_v1
+        };
         if expected != committed {
             return Err("imported shielded state (with its dev accrual, anchor window and miner accrual) does not match the \
                  PoW-committed root"
@@ -865,6 +885,11 @@ impl VirtualStateProcessor {
     /// shielded state). Used on the IBD import path to detect whether local state
     /// already matches the PoW-committed root (F-02/F-15).
     pub fn shielded_state_root_at(&self, block: kaspa_hashes::Hash) -> Result<[u8; 32], kaspa_database::prelude::StoreError> {
+        // NU-A (15 A8.13): `zkas_state_root2` = v1 plus the burned-floor total, the tree era and the
+        // frozen eras, selected by the block's own DAA score like v1.
+        if self.nu_a_activation.is_active(self.headers_store.get_daa_score(block)?) {
+            return self.shielded_state_manager.state_root_v2_at(block, block == self.genesis.hash);
+        }
         if self.is_post_security_fork(block)? {
             self.shielded_state_manager.state_root_v1_at(block, block == self.genesis.hash)
         } else {
@@ -1501,6 +1526,35 @@ impl VirtualStateProcessor {
         // spend (carried by a pre-fork block merged after the fork) or one naming a pre-fork block is
         // dropped, not disqualifying: its fee is deducted and the wallet re-sends against a post-fork
         // anchor. The price is one maturity span right after the fork with no anchor mature enough.
+        // NU-A (spec 08 R4.2.4): a spend of a note from a frozen tree era names the era's freeze
+        // block and proves against its final root. No newer root of that era will ever exist, so
+        // such an anchor is exempt from `max_shielded_anchor_age` (otherwise every unspent note of
+        // the era would become unspendable ~7.9 h after the rollover). It must still be mature.
+        // Membership in the selected parent's committed frozen list already proves that the freeze
+        // block is a selected-chain ancestor (the list is inherited along the selected chain only),
+        // so no reachability query is needed, which matters because the freeze block is eventually
+        // far below the pruning point.
+        if self.nu_a_activation.is_active(block_daa_score) {
+            if let Some(named) = anchor_block {
+                let nua = self
+                    .shielded_state_manager
+                    .nua_at(selected_parent)
+                    .expect("NU-A state store read failed; refusing to treat an IO error as an unknown anchor");
+                if let Some(frozen) = nua.frozen_anchor(&named, anchor) {
+                    let source = kaspa_hashes::Hash::from_bytes(named);
+                    let age = block_blue_score.saturating_sub(frozen.freeze_blue_score);
+                    let mature = block_blue_score >= frozen.freeze_blue_score.saturating_add(self.shielded_anchor_depth);
+                    return AnchorVerdict {
+                        is_final: mature,
+                        source: Some(source),
+                        source_blue_score: Some(frozen.freeze_blue_score),
+                        is_chain_ancestor: Some(true),
+                        age: Some(age),
+                        reject_reason: (!mature).then_some("frozen-era anchor is not yet mature"),
+                    };
+                }
+            }
+        }
         if self.security_fork_activation.is_active(block_daa_score) {
             let Some(named) = anchor_block else {
                 return AnchorVerdict {

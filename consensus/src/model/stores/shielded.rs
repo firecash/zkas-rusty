@@ -436,6 +436,48 @@ impl DbShieldedDevAccruedStore {
     }
 }
 
+/// NU-A: the per-chain-block [`NuaState`](kaspa_shielded_core::commitment::NuaState) (cumulative
+/// burned fee floor, tree era, frozen eras). Its own prefix for the same reason as
+/// [`DbShieldedDevAccruedStore`]: an absent key reads as the default, which is the value of every
+/// block before NU-A, so no existing row changes shape and only non-default states are written.
+#[derive(Clone)]
+pub struct DbShieldedNuaStore {
+    db: Arc<DB>,
+    access: CachedDbAccess<Hash, StoredNuaState, BlockHasher>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct StoredNuaState(pub kaspa_shielded_core::commitment::NuaState);
+impl MemSizeEstimator for StoredNuaState {}
+
+impl DbShieldedNuaStore {
+    pub fn new(db: Arc<DB>, cache_policy: CachePolicy) -> Self {
+        Self { db: Arc::clone(&db), access: CachedDbAccess::new(db, cache_policy, DatabaseStorePrefixes::ShieldedNuaState.into()) }
+    }
+
+    /// Forget every cached entry (see `CachedDbAccess::clear_cache`).
+    pub fn clear_cache(&self) {
+        self.access.clear_cache();
+    }
+
+    pub fn set_batch(&self, batch: &mut WriteBatch, block: Hash, state: kaspa_shielded_core::commitment::NuaState) -> StoreResult<()> {
+        self.access.write(BatchDbWriter::new(batch), block, StoredNuaState(state))
+    }
+
+    pub fn delete_batch(&self, batch: &mut WriteBatch, block: Hash) -> StoreResult<()> {
+        self.access.delete(BatchDbWriter::new(batch), block)
+    }
+
+    /// The state as of `block`; the default for any block that never wrote one.
+    pub fn get(&self, block: Hash) -> StoreResult<kaspa_shielded_core::commitment::NuaState> {
+        match self.access.read(block) {
+            Ok(v) => Ok(v.0),
+            Err(StoreError::KeyNotFound(_)) => Ok(Default::default()),
+            Err(e) => Err(e),
+        }
+    }
+}
+
 /// Security fork: the miner accrual slot carried by each chain block (see
 /// `kaspa_consensus_core::coinbase::MinerAccrual`). A missing key is the empty slot, which is the
 /// value of every pre-fork block, so only non-empty slots are written.

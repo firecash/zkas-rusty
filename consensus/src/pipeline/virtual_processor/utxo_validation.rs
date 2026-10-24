@@ -12,7 +12,7 @@ use crate::{
     model::stores::{
         block_transactions::BlockTransactionsStoreReader,
         daa::DaaStoreReader,
-        ghostdag::{CompactGhostdagData, GhostdagData},
+        ghostdag::{CompactGhostdagData, GhostdagData, GhostdagStoreReader},
         headers::HeaderStoreReader,
     },
     processes::{
@@ -201,6 +201,11 @@ impl VirtualStateProcessor {
             let merged_block_daa_score = self.headers_store.get_daa_score(merged_block).unwrap();
             // The bundle format follows the carrying block's DAA score, as in validation.
             let merged_format_post_fork = self.security_fork_activation.is_active(merged_block_daa_score);
+            // NU-A (spec 08 R2.3): the fee floor of a transaction is burned iff the block that CARRIES
+            // it is at or past the activation. Only those transactions are guaranteed (by the header-
+            // context rule) to pay at least the floor; a transaction carried earlier and merged later
+            // keeps today's accounting, so the tip can never go negative.
+            let merged_burns_floor = self.nu_a_activation.is_active(merged_block_daa_score);
             let (validated_transactions, inner_multiset) = self.validate_transactions_with_muhash_in_parallel(
                 &txs,
                 &composed_view,
@@ -227,10 +232,17 @@ impl VirtualStateProcessor {
                     // it somehow does not, we DROP that transaction rather than disqualify
                     // the merging block: a single unusable merged tx must never be able to
                     // halt the chain (see the accepted-order drop principle, PLAN §2.4).
-                    if let Some((stx, bundle)) = ShieldedBundle::from_bytes_at(&validated_tx.tx().payload, merged_format_post_fork)
+                    if let Some((mut stx, bundle)) = ShieldedBundle::from_bytes_at(&validated_tx.tx().payload, merged_format_post_fork)
                         .ok()
                         .and_then(|b| ShieldedTx::from_bundle(&b).ok().map(|stx| (stx, b)))
                     {
+                        if merged_burns_floor {
+                            // Header context already refused any carried tx below the floor, so this
+                            // cannot exceed the fee; `min` keeps the split total if that ever changed.
+                            stx.fee_burn = kaspa_consensus_core::config::params::shielded_fee_floor(bundle.actions.len()).min(stx.fee);
+                            // Only the tip goes to this source block's miner.
+                            block_fee -= stx.fee_burn;
+                        }
                         // Distill the bundle's actions to compact scan records now, while
                         // the ciphertexts are in hand (kept parallel to shielded_txs).
                         let mut action_bytes = Vec::with_capacity(bundle.actions.len() * CompactActionRecord::SERIALIZED_LEN);
@@ -356,8 +368,9 @@ impl VirtualStateProcessor {
                 if !keep_it {
                     // The fee was accumulated into this source block's `block_fee`
                     // above from the same `value_balance`, so this cannot underflow.
+                    // Only the tip was added (NU-A burns the floor; zero before it).
                     mergeset_rewards.get_mut(&source).expect("every collected shielded tx has a rewarded source block").total_fees -=
-                        stx.fee;
+                        stx.fee - stx.fee_burn;
                     dropped += 1;
                 }
                 keep_it
@@ -505,7 +518,12 @@ impl VirtualStateProcessor {
         // transition will apply and the coinbase re-mints exactly their fees.
         // `compute`'s own conflict resolution re-runs on this set as defense in
         // depth (it is a no-op for a correctly partitioned set).
-        match self.shielded_state_manager.compute(ctx.selected_parent(), coinbase_mint.as_ref(), &ctx.shielded_txs) {
+        // NU-A, judged at THIS block's DAA score: arms the tree-era rollover on the selected parent's era.
+        let nua_compute = self.nu_a_activation.is_active(header.daa_score).then(|| crate::processes::shielded::NuaCompute {
+            rollover_threshold: self.tree_rollover_threshold,
+            parent_blue_score: self.ghostdag_store.get_blue_score(ctx.selected_parent()).unwrap(),
+        });
+        match self.shielded_state_manager.compute(ctx.selected_parent(), coinbase_mint.as_ref(), &ctx.shielded_txs, nua_compute) {
             Ok(mut computed) => {
                 // Build the compact scan archive from the block-time applied set:
                 // `outcome.accepted` indexes the retained `shielded_txs`, which is kept
@@ -591,6 +609,21 @@ impl VirtualStateProcessor {
             let parent_slot = self.shielded_state_manager.miner_accrual_at(ctx.selected_parent()).unwrap().amount as i128;
             let this_slot = ctx.miner_accrual.amount as i128;
             expected_delta -= this_slot - parent_slot;
+            // NU-A: the burned floor of every applied transaction leaves the pool and is never
+            // re-minted (zero before NU-A). Summed from the applied set the coinbase was built from,
+            // independently of the burn total the transition commits.
+            let burned: i128 = ctx.shielded_txs.iter().map(|t| t.fee_burn as i128).sum();
+            expected_delta -= burned;
+            let parent_nua = self.shielded_state_manager.nua_at(ctx.selected_parent()).unwrap();
+            if computed.nua.cumulative_fee_burn != parent_nua.cumulative_fee_burn + burned as u128 {
+                return Err(InvalidShieldedState(
+                    header.hash,
+                    format!(
+                        "burned fee total {} != parent {} + applied floors {burned}",
+                        computed.nua.cumulative_fee_burn, parent_nua.cumulative_fee_burn
+                    ),
+                ));
+            }
             if actual_delta != expected_delta {
                 return Err(InvalidShieldedState(
                     header.hash,

@@ -96,9 +96,144 @@ pub fn shielded_state_root_v1(
     root
 }
 
+/// NU-A (spec 08 R4.2.1): one closed note-commitment tree era. When a chain block is applied whose
+/// selected parent's era holds at least the rollover threshold of leaves, the parent's tree is
+/// frozen as this record and the block starts the next era on an empty tree. A spend of a note from
+/// a frozen era names `freeze_block` as its anchor block and proves against `final_root`; such an
+/// anchor is exempt from the maximum anchor age, because no newer root of that era will ever exist.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FrozenEra {
+    /// The era this record closes (0 for the first).
+    pub era: u32,
+    /// The era's final tree root (the freeze block's anchor).
+    pub final_root: [u8; 32],
+    /// The selected-chain block whose tree is the era's last state.
+    pub freeze_block: [u8; 32],
+    /// Blue score of `freeze_block` (the maturity reference for frozen-era spends).
+    pub freeze_blue_score: u64,
+    /// Number of leaves in the era.
+    pub size: u64,
+}
+
+/// NU-A tree-era state carried per chain block and committed by [`shielded_state_root_v2`].
+/// All zero / empty before NU-A, and until the first rollover apart from the burn counter.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct NuaState {
+    /// Total fee floor burned by applied shielded transactions since NU-A (spec 08 R2.4).
+    pub cumulative_fee_burn: u128,
+    /// The current tree era (0 until the first rollover).
+    pub tree_era: u32,
+    /// Every closed era, oldest first. Grows by one record per rollover (one per ~4.29 billion leaves).
+    pub frozen: Vec<FrozenEra>,
+}
+
+impl NuaState {
+    /// Leaves in every frozen era together (the current era's leaves are the tree frontier's size).
+    pub fn frozen_leaves(&self) -> u64 {
+        self.frozen.iter().fold(0u64, |acc, f| acc.saturating_add(f.size))
+    }
+
+    /// The frozen era a spend names, if `(anchor_block, anchor)` is exactly a freeze record.
+    pub fn frozen_anchor(&self, anchor_block: &[u8; 32], anchor: &[u8; 32]) -> Option<&FrozenEra> {
+        self.frozen.iter().find(|f| f.freeze_block == *anchor_block && f.final_root == *anchor)
+    }
+
+    /// [`frozen_eras_hash`] of this state's frozen list.
+    pub fn frozen_hash(&self) -> [u8; 32] {
+        frozen_eras_hash(&self.frozen)
+    }
+}
+
+/// NU-A (spec 08 R4.2.3): whether the chain block about to be applied starts a new tree era, given
+/// whether NU-A is active at ITS DAA score and how many leaves its selected parent's era holds. The
+/// one rule consensus and every wallet use, so they cannot disagree about where an era ends: a wallet
+/// replaying chain blocks in order knows each block's DAA score and its own era's leaf count.
+pub fn starts_new_tree_era(nua_active_at_block: bool, parent_era_size: u64, rollover_threshold: u64) -> bool {
+    nua_active_at_block && parent_era_size > 0 && parent_era_size >= rollover_threshold
+}
+
+/// Personalization of the frozen-era list hash.
+const FROZEN_ERAS_PERSONAL: &[u8; 16] = b"zkas_frozen_eras";
+
+/// `H(frozen)` of `zkas_state_root2`: BLAKE2b-256, personalization `zkas_frozen_eras`, over
+/// `count u32 LE` followed by each record as `era u32 LE || final_root 32 || freeze_block 32 ||
+/// freeze_blue_score u64 LE || size u64 LE`. The count prefix and the fixed record length make the
+/// encoding injective. The empty list hashes the 4-byte zero count.
+pub fn frozen_eras_hash(frozen: &[FrozenEra]) -> [u8; 32] {
+    let mut h = Params::new().hash_length(32).personal(FROZEN_ERAS_PERSONAL).to_state();
+    h.update(&(frozen.len() as u32).to_le_bytes());
+    for f in frozen {
+        h.update(&f.era.to_le_bytes());
+        h.update(&f.final_root);
+        h.update(&f.freeze_block);
+        h.update(&f.freeze_blue_score.to_le_bytes());
+        h.update(&f.size.to_le_bytes());
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(h.finalize().as_bytes());
+    out
+}
+
+/// Personalization of the NU-A state root. Distinct from v0 and v1, so no root of one version can
+/// equal a root of another.
+const STATE_ROOT_V2_PERSONAL: &[u8; 16] = b"zkas_state_root2";
+
+/// The shielded state root from NU-A on (15 A8.13):
+/// `BLAKE2b("zkas_state_root2", root_v1 || cumulative_fee_burn u128 LE || tree_era u32 LE || H(frozen))`.
+/// Selected by the DAA score of the block whose state it describes, like v1.
+pub fn shielded_state_root_v2(root_v1: &[u8; 32], nua: &NuaState) -> [u8; 32] {
+    let mut h = Params::new().hash_length(32).personal(STATE_ROOT_V2_PERSONAL).to_state();
+    h.update(root_v1);
+    h.update(&nua.cumulative_fee_burn.to_le_bytes());
+    h.update(&nua.tree_era.to_le_bytes());
+    h.update(&nua.frozen_hash());
+    let mut root = [0u8; 32];
+    root.copy_from_slice(h.finalize().as_bytes());
+    root
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn v2_binds_burn_era_and_every_frozen_field_and_differs_from_v1() {
+        let v1 = [0x51; 32];
+        let base = NuaState::default();
+        let r = shielded_state_root_v2(&v1, &base);
+        assert_ne!(r, v1, "v2 is a new digest, not v1");
+        assert_ne!(r, shielded_state_root_v2(&[0x52; 32], &base), "the v1 root must matter");
+        assert_ne!(r, shielded_state_root_v2(&v1, &NuaState { cumulative_fee_burn: 1, ..base.clone() }), "the burn must matter");
+        assert_ne!(r, shielded_state_root_v2(&v1, &NuaState { tree_era: 1, ..base.clone() }), "the era must matter");
+        let f = FrozenEra { era: 0, final_root: [1; 32], freeze_block: [2; 32], freeze_blue_score: 3, size: 4 };
+        let one = NuaState { frozen: vec![f], ..base.clone() };
+        let r1 = shielded_state_root_v2(&v1, &one);
+        assert_ne!(r, r1, "a frozen record must matter");
+        for g in [
+            FrozenEra { era: 1, ..f },
+            FrozenEra { final_root: [9; 32], ..f },
+            FrozenEra { freeze_block: [9; 32], ..f },
+            FrozenEra { freeze_blue_score: 9, ..f },
+            FrozenEra { size: 9, ..f },
+        ] {
+            assert_ne!(r1, shielded_state_root_v2(&v1, &NuaState { frozen: vec![g], ..base.clone() }), "{g:?}");
+        }
+        // Order and multiplicity are committed.
+        let g = FrozenEra { era: 1, final_root: [5; 32], freeze_block: [6; 32], freeze_blue_score: 7, size: 8 };
+        assert_ne!(frozen_eras_hash(&[f, g]), frozen_eras_hash(&[g, f]));
+        assert_ne!(frozen_eras_hash(&[f]), frozen_eras_hash(&[f, f]));
+    }
+
+    /// Wire pin: an independent implementation (Python `hashlib.blake2b(digest_size=32,
+    /// person=...)`) must reproduce these, so a field-order or personalization drift fails here.
+    #[test]
+    fn v2_matches_independent_reference_vectors() {
+        let empty = frozen_eras_hash(&[]);
+        assert_eq!(hex(&empty), "b1fcb54b5a33cf8a273129cd83eb456b4fb27ee8d1f5da2c4cd2a68aee774c5e");
+        let f = FrozenEra { era: 0, final_root: [0x11; 32], freeze_block: [0x22; 32], freeze_blue_score: 1_000, size: 4_293_918_720 };
+        let nua = NuaState { cumulative_fee_burn: 2_400_000, tree_era: 1, frozen: vec![f] };
+        assert_eq!(hex(&shielded_state_root_v2(&[0x33; 32], &nua)), "d20c7ab342bd37191f33f3844dc9de306f16e9abd6f2ffe82945fbaf2e8aebbb");
+    }
 
     const A: [u8; 32] = [0x11; 32];
     const N: [u8; 32] = [0x22; 32];
