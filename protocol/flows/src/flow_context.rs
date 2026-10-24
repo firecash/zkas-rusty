@@ -2,11 +2,13 @@ use crate::ban_policy::{AutoBanBudget, auto_ban_may_target, is_fork_reject_reaso
 use crate::serve_policy::ProofServeGate;
 use crate::flowcontext::{
     orphans::{OrphanBlocksPool, OrphanOutput},
+    dandelion::DandelionParams,
     process_queue::ProcessQueue,
+    relay::{MAX_INBOUND_PER_IP, MAX_INBOUND_PER_PREFIX, RelayPrivacy},
     transactions::TransactionsSpread,
 };
 use crate::user_agent_rule::{UserAgentRuleRejectReason, UserAgentRuleSet};
-use crate::{v7, v8, v10};
+use crate::{v7, v8, v10, v11};
 use async_trait::async_trait;
 use futures::future::join_all;
 use kaspa_addressmanager::AddressManager;
@@ -21,11 +23,7 @@ use kaspa_consensus_notify::{
     root::ConsensusNotificationRoot,
 };
 use kaspa_consensusmanager::{BlockProcessingBatch, ConsensusInstance, ConsensusManager, ConsensusProxy, ConsensusSessionOwned};
-use kaspa_core::{
-    debug, info,
-    kaspad_env::{name, version},
-    task::tick::TickService,
-};
+use kaspa_core::{debug, info, task::tick::TickService};
 use kaspa_core::{time::unix_now, warn};
 use kaspa_hashes::Hash;
 use kaspa_mining::mempool::tx::{Orphan, Priority};
@@ -62,7 +60,7 @@ use tokio_stream::{StreamExt, wrappers::UnboundedReceiverStream};
 use uuid::Uuid;
 
 /// The P2P protocol version.
-const PROTOCOL_VERSION: u32 = 10;
+const PROTOCOL_VERSION: u32 = 11;
 
 /// See `check_orphan_resolution_range`
 const BASELINE_ORPHAN_RESOLUTION_RANGE: u32 = 5;
@@ -305,6 +303,9 @@ pub struct FlowContextInner {
 
     // Mining rule engine
     mining_rule_engine: Arc<MiningRuleEngine>,
+
+    /// Transaction-origin privacy state: per-connection ids, Dandelion++, inv trickle (spec 06)
+    pub(crate) relay_privacy: RelayPrivacy,
 }
 
 #[derive(Clone)]
@@ -387,6 +388,7 @@ impl FlowContext {
         // The maximum amount of orphans allowed in the orphans pool. This number is an approximation
         // of how many orphans there can possibly be on average bounded by an upper bound.
         let max_orphans = (2u64.pow(orphan_resolution_range) as usize * config.ghostdag_k() as usize).min(MAX_ORPHANS_UPPER_BOUND);
+        let privacy = config.p2p_privacy.clone();
         Self {
             inner: Arc::new(FlowContextInner {
                 node_id: Uuid::new_v4().into(),
@@ -413,8 +415,23 @@ impl FlowContext {
                 max_orphans,
                 config,
                 mining_rule_engine,
+                relay_privacy: RelayPrivacy::new(
+                    &privacy,
+                    DandelionParams {
+                        min_peer_age: Duration::from_secs(privacy.dandelion_min_peer_age_secs),
+                        ..Default::default()
+                    },
+                ),
             }),
         }
+    }
+
+    pub(crate) fn from_inner(inner: Arc<FlowContextInner>) -> Self {
+        Self { inner }
+    }
+
+    pub(crate) fn inner_arc(&self) -> Arc<FlowContextInner> {
+        self.inner.clone()
     }
 
     pub fn block_invs_channel_size(&self) -> usize {
@@ -433,6 +450,7 @@ impl FlowContext {
         if let Some(logger) = self.block_event_logger.as_ref() {
             logger.start();
         }
+        self.spawn_relay_timer();
     }
 
     pub fn set_connection_manager(&self, connection_manager: Arc<ConnectionManager>) {
@@ -778,13 +796,15 @@ impl FlowContext {
                     tokio::spawn(async move {
                         mining_manager.revalidate_high_priority_transactions(&consensus_clone, tx).await;
                     });
+                    // Revalidation still drops own transactions that went stale. The origin-only
+                    // re-announce of what survived (to 8 peers every 30 s) was a beacon naming
+                    // the origin (spec 06 D-11): with Dandelion++ an own tx is re-stemmed to the
+                    // same own stem peer instead (`run_restems`); without it, the trickle
+                    // re-offers it only to peers that have not seen it.
                     while let Some(transactions) = rx.recv().await {
-                        let _ = context
-                            .broadcast_transactions(
-                                transactions,
-                                true, // We throttle high priority even when the network is not flooded since they will be rebroadcast if not accepted within reasonable time.
-                            )
-                            .await;
+                        if !context.relay_privacy.dandelion_enabled {
+                            context.trickle_transactions(transactions, false);
+                        }
                     }
                 }
                 context.mempool_scanning_is_done().await;
@@ -826,17 +846,8 @@ impl FlowContext {
         transaction: Transaction,
         orphan: Orphan,
     ) -> Result<(), ProtocolError> {
-        let transaction_insertion = self
-            .mining_manager()
-            .clone()
-            .validate_and_insert_transaction(consensus, transaction, Priority::High, orphan, RbfPolicy::Forbidden)
-            .await?;
-        self.broadcast_transactions(
-            transaction_insertion.accepted.iter().map(|x| x.id()),
-            false, // RPC transactions are considered high priority, so we don't want to throttle them
-        )
-        .await;
-        Ok(())
+        // Own transactions go through the Dandelion++ stem phase (spec 06 D-2); never an inv.
+        self.submit_own_transaction(consensus, transaction, orphan).await
     }
 
     /// Replaces the rpc-submitted transaction into the mempool and propagates it to peers.
@@ -851,6 +862,12 @@ impl FlowContext {
         consensus: &ConsensusProxy,
         transaction: Transaction,
     ) -> Result<Arc<Transaction>, ProtocolError> {
+        // A replacement skips the stem phase (RBF needs the mempool), but keeps the
+        // self-template embargo (spec 06 D-10) and the trickle.
+        self.mining_manager().set_template_embargo(
+            transaction.id(),
+            kaspa_core::time::unix_now() + crate::flowcontext::dandelion::embargo_delay(&mut rand::thread_rng()).as_millis() as u64,
+        );
         let transaction_insertion = self
             .mining_manager()
             .clone()
@@ -892,7 +909,8 @@ impl FlowContext {
     /// The broadcast itself may happen only during a subsequent call to this function since it is done at most
     /// after a predefined interval or when the queue length is larger than the Inv message capacity.
     pub async fn broadcast_transactions<I: IntoIterator<Item = TransactionId>>(&self, transaction_ids: I, should_throttle: bool) {
-        self.transactions_spread.write().await.broadcast_transactions(transaction_ids, should_throttle).await
+        // Per-peer Poisson trickle (spec 06 D-7) instead of the global 500 ms gate.
+        self.trickle_transactions(transaction_ids.into_iter().collect(), should_throttle);
     }
 }
 
@@ -950,9 +968,14 @@ impl FlowContext {
 
         // Build the local version message
         // Subnets are not currently supported
+        // A fresh id for every connection (spec 06 H-2): with one id per process, a peer holding
+        // two connections, or two observers comparing notes, could tell they reach the same node.
+        let connection_id = self.issue_connection_id();
         let mut self_version_message =
-            Version::new(local_address, self.node_id, network_name.clone(), None, advertised_protocol_version);
-        self_version_message.add_user_agent(name(), version(), &self.config.user_agent_comments);
+            Version::new(local_address, connection_id, network_name.clone(), None, advertised_protocol_version);
+        self_version_message.services = self.local_services();
+        // Uniform user agent `/kaspad:<major>.<minor>/` (H-5); comments only with --allow-uacomment.
+        self_version_message.add_user_agent_comments(&self.config.user_agent_comments);
         // TODO: disable_relay_tx from config/cmd
 
         // Perform the handshake
@@ -972,9 +995,23 @@ impl FlowContext {
         if self.hub.has_peer(router.key()) {
             return Err(ProtocolError::PeerAlreadyExists(router.key()));
         }
-        // And loopback connections...
-        if self.node_id == router.identity() {
+        // And loopback connections: the peer presents an id this node issued.
+        if self.is_own_connection_id(router.identity()) {
             return Err(ProtocolError::LoopbackConnection(router.key()));
+        }
+        // Per-connection ids no longer deduplicate two connections to one node by `(identity, ip)`,
+        // so dedupe outbound connections by address and cap inbound per IP (spec 06 H-2). Not for
+        // loopback/private sources: a LAN or a port forwarder puts many honest peers behind one.
+        if router.is_outbound() && self.hub.has_outbound_to(router.net_address()) {
+            return Err(ProtocolError::PeerAlreadyExists(router.key()));
+        }
+        if !router.is_outbound() && crate::ban_policy::auto_ban_may_target(router.net_address().ip()) {
+            let (same_ip, same_prefix) = self.hub.inbound_counts(router.net_address().ip());
+            if same_ip >= MAX_INBOUND_PER_IP || same_prefix >= MAX_INBOUND_PER_PREFIX {
+                return Err(ProtocolError::OtherOwned(format!(
+                    "inbound limit: {same_ip} connections from this IP, {same_prefix} from its prefix"
+                )));
+            }
         }
 
         if peer_version.network != network_name {
@@ -1019,13 +1056,15 @@ impl FlowContext {
         let (flows, applied_protocol_version) = if connect_only_new_versions {
             // Register all flows according to version
             match peer_protocol_version {
-                v if v >= PROTOCOL_VERSION => (v10::register(self.clone(), router.clone(), PROTOCOL_VERSION), PROTOCOL_VERSION),
+                v if v >= PROTOCOL_VERSION => (v11::register(self.clone(), router.clone(), PROTOCOL_VERSION), PROTOCOL_VERSION),
+                10 => (v10::register(self.clone(), router.clone(), 10), 10),
                 v => return Err(ProtocolError::VersionMismatch(PROTOCOL_VERSION, v)),
             }
         } else {
             // Register all flows according to version
             match peer_protocol_version {
-                v if v >= PROTOCOL_VERSION => (v10::register(self.clone(), router.clone(), PROTOCOL_VERSION), PROTOCOL_VERSION),
+                v if v >= PROTOCOL_VERSION => (v11::register(self.clone(), router.clone(), PROTOCOL_VERSION), PROTOCOL_VERSION),
+                10 => (v10::register(self.clone(), router.clone(), 10), 10),
                 9 => (v8::register(self.clone(), router.clone(), 9), 9),
                 8 => (v8::register(self.clone(), router.clone(), 8), 8),
                 7 => (v7::register(self.clone(), router.clone()), 7),
@@ -1036,6 +1075,7 @@ impl FlowContext {
         // Build and register the peer properties
         let peer_properties = Arc::new(PeerProperties {
             user_agent: peer_version.user_agent,
+            services: peer_version.services,
             advertised_protocol_version: peer_version.protocol_version,
             protocol_version: applied_protocol_version,
             disable_relay_tx: peer_version.disable_relay_tx,
@@ -1047,7 +1087,14 @@ impl FlowContext {
         // Send and receive the ready signal
         handshake.exchange_ready_messages().await?;
 
-        info!("Registering p2p flows for peer {} for protocol version {}", router, applied_protocol_version);
+        info!(
+            "Registering p2p flows for peer {} for protocol version {} over transport {}",
+            router,
+            applied_protocol_version,
+            router.transport().kind
+        );
+        #[cfg(feature = "spy-log")]
+        info!(target: "txsrc", "TXSRC peer {} {} {} {}", router.net_address(), router.identity(), router.is_outbound(), router.transport().kind);
 
         // Launch all flows. Note we launch only after the ready signal was exchanged
         for flow in flows {

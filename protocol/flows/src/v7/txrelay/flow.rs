@@ -124,6 +124,16 @@ impl RelayTransactionsFlow {
                 continue;
             }
 
+            #[cfg(feature = "spy-log")]
+            {
+                let t = crate::flowcontext::relay::spy_now_us();
+                for id in &inv {
+                    kaspa_core::info!(target: "txsrc", "TXSRC inv {} {} {} {}", id, self.router.net_address(), self.router.identity(), t);
+                }
+            }
+            // Never announce these back to this peer; fluff our stem copies; end own embargoes.
+            let inv = self.ctx.on_transactions_announced(&session, self.router.key(), inv).await;
+
             let requests = self.request_transactions(inv, throttling_state.should_throttle, &throttling_state.curr_snapshot).await?;
             self.receive_transactions(session, requests, throttling_state.should_throttle).await?;
         }

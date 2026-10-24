@@ -1,38 +1,23 @@
-use super::process_queue::ProcessQueue;
-use itertools::Itertools;
-use kaspa_consensus_core::tx::TransactionId;
-use kaspa_core::debug;
-use kaspa_p2p_lib::{
-    Hub, make_message,
-    pb::{InvTransactionsMessage, KaspadMessage, kaspad_message::Payload},
-};
+//! Scheduling of the mempool scanning task. Transaction announcement itself moved to the
+//! per-peer trickle (`trickle.rs`, spec 06 D-7); the 500 ms global gate is gone.
+
+use kaspa_p2p_lib::Hub;
 use std::time::{Duration, Instant};
 
 /// Interval between mempool scanning tasks (in seconds)
 const SCANNING_TASK_INTERVAL: u64 = 10;
 const REBROADCAST_FREQUENCY: u64 = 3;
-const BROADCAST_INTERVAL: Duration = Duration::from_millis(500);
 pub(crate) const MAX_INV_PER_TX_INV_MSG: usize = 131_072;
 
 pub struct TransactionsSpread {
-    hub: Hub,
     last_scanning_time: Instant,
     scanning_task_running: bool,
     scanning_job_count: u64,
-    transaction_ids: ProcessQueue<TransactionId>,
-    last_broadcast_time: Instant,
 }
 
 impl TransactionsSpread {
-    pub fn new(hub: Hub) -> Self {
-        Self {
-            hub,
-            last_scanning_time: Instant::now(),
-            scanning_task_running: false,
-            scanning_job_count: 0,
-            transaction_ids: ProcessQueue::new(),
-            last_broadcast_time: Instant::now(),
-        }
+    pub fn new(_hub: Hub) -> Self {
+        Self { last_scanning_time: Instant::now(), scanning_task_running: false, scanning_job_count: 0 }
     }
 
     /// Returns true if the time has come for running the task of scanning mempool transactions
@@ -65,40 +50,5 @@ impl TransactionsSpread {
     pub fn mempool_scanning_is_done(&mut self) {
         assert!(self.scanning_task_running, "no stop without a matching start");
         self.scanning_task_running = false;
-    }
-
-    /// Add the given transactions IDs to a set of IDs to broadcast. The IDs will be broadcasted to all peers
-    /// within transaction Inv messages.
-    ///
-    /// The broadcast itself may happen only during a subsequent call to this function since it is done at most
-    /// every `BROADCAST_INTERVAL` milliseconds or when the queue length is larger than the Inv message
-    /// capacity.
-    ///
-    /// _GO-KASPAD: EnqueueTransactionIDsForPropagation_
-    pub async fn broadcast_transactions<I: IntoIterator<Item = TransactionId>>(&mut self, transaction_ids: I, should_throttle: bool) {
-        self.transaction_ids.enqueue_chunk(transaction_ids);
-
-        let now = Instant::now();
-        if now < self.last_broadcast_time + BROADCAST_INTERVAL && self.transaction_ids.len() < MAX_INV_PER_TX_INV_MSG {
-            return;
-        }
-
-        while !self.transaction_ids.is_empty() {
-            let ids = self.transaction_ids.dequeue_chunk(MAX_INV_PER_TX_INV_MSG).map(|x| x.into()).collect_vec();
-            debug!("Transaction propagation: broadcasting {} transactions", ids.len());
-            let msg = make_message!(Payload::InvTransactions, InvTransactionsMessage { ids });
-            self.broadcast(msg, should_throttle).await;
-        }
-
-        self.last_broadcast_time = Instant::now();
-    }
-
-    async fn broadcast(&self, msg: KaspadMessage, should_throttle: bool) {
-        if should_throttle {
-            // TODO: Figure out a better number
-            self.hub.broadcast_to_some_peers(msg, 8).await
-        } else {
-            self.hub.broadcast(msg, None).await
-        }
     }
 }

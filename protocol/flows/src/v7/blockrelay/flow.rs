@@ -225,6 +225,16 @@ impl HandleRelayInvsFlow {
             // block. Recorded here because nothing downstream remembers the
             // source — consensus is handed a block, not a sender.
             self.ctx.credit_relay(self.router.key());
+            // Devnet spy nodes only (feature `spy-log`, never in a release build, spec 06 F-4):
+            // block arrival time and its transactions, for the inclusion-latency measurement.
+            #[cfg(feature = "spy-log")]
+            kaspa_core::info!(
+                target: "txsrc",
+                "TXSRC block {} {} {}",
+                block.hash(),
+                crate::flowcontext::relay::spy_now_us(),
+                block.transactions.iter().skip(1).map(|t| t.id().to_string()).collect::<Vec<_>>().join(",")
+            );
             // Per-block relay-source logging removed for privacy: it let an off-node
             // tool join block-hash+peer-IP against ZKMM tags to deanonymize miners
             // (IP <-> Kaspa payout). Aggregate per-peer relay credit above is retained.

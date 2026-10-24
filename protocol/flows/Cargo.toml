@@ -42,12 +42,18 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal"] }
 tokio-stream = { workspace = true, features = ["net"] }
 uuid = { workspace = true, features = ["v4", "fast-rng"] }
 chrono.workspace = true
+hex.workspace = true
+secp256k1.workspace = true
+sha2.workspace = true
 
 [features]
 # Lowers `SMT_CHUNK_SIZE` and `SMT_FLOW_CONTROL_WINDOW` to tiny values so
 # integration tests can exercise the chunked / flow-controlled SMT IBD path
 # without generating tens of thousands of active lanes.
 test-smt-small-chunks = []
+# Devnet spy nodes for the first-spy experiment (spec 06 §8): log the first inv / stem per
+# (txid, peer). Never enabled in a release build (spec 06 F-4).
+spy-log = []
 
 [lints]
 workspace = true

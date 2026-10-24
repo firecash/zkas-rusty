@@ -15,10 +15,12 @@ impl<T: Copy + PartialEq + Eq + std::hash::Hash> ProcessQueue<T> {
         Self { deque: VecDeque::with_capacity(capacity), set: HashSet::with_capacity(capacity) }
     }
 
+    #[cfg(test)] // only the (removed) global inv gate used it outside tests
     pub fn len(&self) -> usize {
         self.deque.len()
     }
 
+    #[cfg(test)] // only the (removed) global inv gate used it outside tests
     pub fn is_empty(&self) -> bool {
         self.deque.is_empty()
     }
@@ -44,6 +46,7 @@ impl<T: Copy + PartialEq + Eq + std::hash::Hash> ProcessQueue<T> {
         }
     }
 
+    #[cfg(test)] // only the (removed) global inv gate used it outside tests
     pub fn dequeue_chunk(&mut self, max_chunk_size: usize) -> impl ExactSizeIterator<Item = T> + '_ {
         self.deque.drain(0..max_chunk_size.min(self.deque.len())).inspect(|x| assert!(self.set.remove(x)))
     }
