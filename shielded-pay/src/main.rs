@@ -586,7 +586,14 @@ async fn balance(rpc_server: String, seed: [u8; 32]) {
 async fn refuse_after_security_fork(client: &GrpcClient) {
     let dag = client.get_block_dag_info().await.unwrap_or_else(|e| fatal(format!("get_block_dag_info failed: {e}")));
     let params = kaspa_consensus_core::config::params::Params::from(dag.network);
-    if params.security_fork_activation.is_active(dag.virtual_daa_score.saturating_add(600)) {
+    // `ZKAS_SECURITY_FORK_DAA` overrides the activation for a test network started with an
+    // override-params file (the same convention as zkas-walletd); `never` = not scheduled.
+    let fork = match std::env::var("ZKAS_SECURITY_FORK_DAA").ok().as_deref() {
+        Some("never") => kaspa_consensus_core::config::params::ForkActivation::never(),
+        Some(v) => v.parse::<u64>().map(kaspa_consensus_core::config::params::ForkActivation::new).unwrap_or(params.security_fork_activation),
+        None => params.security_fork_activation,
+    };
+    if fork.is_active(dag.virtual_daa_score.saturating_add(600)) {
         fatal("shielded-pay builds the pre-upgrade spend format, which the network no longer accepts; send with zkas-walletd".into());
     }
 }
