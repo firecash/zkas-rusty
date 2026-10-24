@@ -102,6 +102,9 @@ pub struct CoinbaseManager {
     miner_accrual_payout_interval: u64,
     /// DAA score from which miner rewards accrue in one carried slot (the security fork).
     miner_accrual_activation: ForkActivation,
+    /// NU-A: from this DAA score the coinbase `extra_data` is the fixed 5-byte form (spec 06 F-1),
+    /// whatever extra data the requester passed. Never by default; see [`Self::with_nu_a_activation`].
+    nu_a_activation: ForkActivation,
 
     /// Precomputed subsidy by month tables (for before and after the Crescendo hardfork)
     subsidy_by_month_table_before: SubsidyByMonthTable,
@@ -171,9 +174,28 @@ impl CoinbaseManager {
             miner_accrual_activation,
             miner_accrual_payout_interval: miner_accrual_payout_interval.max(1),
             dev_fee_end_activation,
+            nu_a_activation: ForkActivation::never(),
             subsidy_by_month_table_before,
             subsidy_by_month_table_after,
             crescendo_activation_daa_score: bps_history.activation().daa_score(),
+        }
+    }
+
+    /// Arm the NU-A fixed coinbase `extra_data` at `activation`.
+    pub fn with_nu_a_activation(mut self, activation: ForkActivation) -> Self {
+        self.nu_a_activation = activation;
+        self
+    }
+
+    /// The extra data a coinbase at `daa_score` carries: the requester's before NU-A, the fixed
+    /// 5-byte form from it. Applied where the payload is built ([`Self::expected_coinbase_transaction`])
+    /// and where a cached template's payload is re-pointed ([`Self::modify_coinbase_payload`]), so a
+    /// node never hands out a template that NU-A nodes reject.
+    fn coinbase_extra_data<'a>(&self, daa_score: u64, requested: &'a [u8]) -> std::borrow::Cow<'a, [u8]> {
+        if self.nu_a_activation.is_active(daa_score) {
+            std::borrow::Cow::Owned(kaspa_consensus_core::config::params::nu_a_coinbase_extra_data().to_vec())
+        } else {
+            std::borrow::Cow::Borrowed(requested)
         }
     }
 
@@ -306,11 +328,12 @@ impl CoinbaseManager {
 
         // Build the current block's payload
         let subsidy = self.calc_block_subsidy(daa_score);
+        let extra_data = self.coinbase_extra_data(daa_score, miner_data.extra_data.as_ref());
         let payload = self.serialize_coinbase_payload(&CoinbaseData {
             blue_score: ghostdag_data.blue_score,
             subsidy,
             shielded_commitment,
-            miner_data,
+            miner_data: MinerData { script_public_key: miner_data.script_public_key.clone(), extra_data: extra_data.as_ref() },
         })?;
 
         let tx_version =
@@ -375,7 +398,15 @@ impl CoinbaseManager {
         Ok(payload)
     }
 
-    pub fn modify_coinbase_payload<T: AsRef<[u8]>>(&self, mut payload: Vec<u8>, miner_data: &MinerData<T>) -> CoinbaseResult<Vec<u8>> {
+    /// `daa_score` is the DAA score of the template whose payload is modified: from NU-A the extra
+    /// data stays the fixed form whatever `miner_data` asks for.
+    pub fn modify_coinbase_payload<T: AsRef<[u8]>>(
+        &self,
+        mut payload: Vec<u8>,
+        miner_data: &MinerData<T>,
+        daa_score: u64,
+    ) -> CoinbaseResult<Vec<u8>> {
+        let extra_data = self.coinbase_extra_data(daa_score, miner_data.extra_data.as_ref());
         let script_pub_key_len = miner_data.script_public_key.script().len();
         if script_pub_key_len > self.coinbase_payload_script_public_key_max_len as usize {
             return Err(CoinbaseError::PayloadScriptPublicKeyLenAboveMax(
@@ -392,7 +423,7 @@ impl CoinbaseManager {
             miner_data.script_public_key.version().to_le_bytes().iter().copied() // Script public key version (u16)
                 .chain((script_pub_key_len as u8).to_le_bytes().iter().copied()) // Script public key length  (u8)
                 .chain(miner_data.script_public_key.script().iter().copied())    // Script public key
-                .chain(miner_data.extra_data.as_ref().iter().copied()), // Extra data
+                .chain(extra_data.iter().copied()), // Extra data
         );
 
         Ok(payload)
@@ -847,7 +878,7 @@ mod tests {
         };
 
         let mut payload = cbm.serialize_coinbase_payload(&data).unwrap();
-        payload = cbm.modify_coinbase_payload(payload, &data2.miner_data).unwrap(); // Update the payload with the modified miner data
+        payload = cbm.modify_coinbase_payload(payload, &data2.miner_data, 0).unwrap(); // Update the payload with the modified miner data
         let deserialized_data = cbm.deserialize_coinbase_payload(&payload).unwrap();
 
         assert_eq!(data2, deserialized_data);

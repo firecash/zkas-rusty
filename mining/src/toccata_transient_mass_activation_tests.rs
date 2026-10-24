@@ -215,7 +215,7 @@ impl ConsensusApi for MassPolicyTestConsensus {
         VirtualStateApproxId::new(self.get_virtual_daa_score(), 0.into(), ZERO_HASH)
     }
 
-    fn modify_coinbase_payload(&self, payload: Vec<u8>, _miner_data: &MinerData) -> CoinbaseResult<Vec<u8>> {
+    fn modify_coinbase_payload(&self, payload: Vec<u8>, _miner_data: &MinerData, _daa_score: u64) -> CoinbaseResult<Vec<u8>> {
         Ok(payload)
     }
 

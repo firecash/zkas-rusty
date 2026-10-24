@@ -20,7 +20,44 @@ impl BlockBodyProcessor {
     pub fn validate_body_in_context(self: &Arc<Self>, block: &Block) -> BlockProcessResult<()> {
         self.check_parent_bodies_exist(block)?;
         self.check_coinbase_blue_score_and_subsidy(block)?;
-        self.check_block_transactions_in_context(block)
+        self.check_block_transactions_in_context(block)?;
+        self.check_shielded_proofs(block)
+    }
+
+    /// NU-A (spec 08 R1.5): from the activation, judged at the block's own DAA score, a block that
+    /// carries a shielded transaction whose bundle fails verification is invalid.
+    ///
+    /// Before NU-A the proof was checked only in the virtual processor and a failure merely kept the
+    /// transaction from being accepted (`filter_map(.ok())` in utxo_validation), so a miner could fill
+    /// its block with garbage-proof bundles that every node verified and every archival node stored,
+    /// for free: nothing was accepted, so no fee was paid. Bundle validity is a pure function of the
+    /// transaction bytes, the network domain and the bundle format, which the carrying block's DAA
+    /// score fixes, so making it block-fatal touches no contextual rule (anchor finality and
+    /// nullifier conflicts stay drops).
+    ///
+    /// Successes land in the validator's verdict cache, so the virtual processor's check of the same
+    /// transaction is a cache hit. Verified in parallel on the body processor's pool; the first
+    /// failing transaction in block order is reported.
+    fn check_shielded_proofs(self: &Arc<Self>, block: &Block) -> BlockProcessResult<()> {
+        if !self.nu_a_activation.is_active(block.header.daa_score) {
+            return Ok(());
+        }
+        use rayon::prelude::*;
+        let daa = block.header.daa_score;
+        let shielded: Vec<&kaspa_consensus_core::tx::Transaction> =
+            block.transactions[1..].iter().filter(|tx| tx.is_shielded()).collect();
+        if shielded.is_empty() {
+            return Ok(());
+        }
+        let verdicts: Vec<Result<(), _>> = self
+            .thread_pool
+            .install(|| shielded.par_iter().map(|tx| self.transaction_validator.preverify_shielded_bundle(tx, daa)).collect());
+        for (tx, verdict) in shielded.iter().zip(verdicts) {
+            if let Err(e) = verdict {
+                return Err(RuleError::InvalidShieldedProofInBlock(tx.id(), e));
+            }
+        }
+        Ok(())
     }
 
     pub fn validate_trusted_body_in_context(self: &Arc<Self>, block: &Block) -> BlockProcessResult<()> {
@@ -98,6 +135,17 @@ impl BlockBodyProcessor {
                         block.transactions[0].outputs.len(),
                         self.pre_fork_coinbase_outputs_limit,
                     ));
+                }
+
+                // NU-A (spec 06 F-1): the coinbase extra data is the fixed 5-byte form, so it no longer
+                // carries a node version or a pool tag. The genesis coinbase is exempt (it is fixed).
+                if self.nu_a_activation.is_active(block.header.daa_score) && block.hash() != self.genesis.hash {
+                    let extra = data.miner_data.extra_data;
+                    if extra.len() != kaspa_consensus_core::config::params::NU_A_COINBASE_EXTRA_DATA_LEN
+                        || extra[0] != kaspa_consensus_core::config::params::NU_A_COINBASE_EXTRA_DATA_FORMAT
+                    {
+                        return Err(RuleError::BadCoinbaseExtraData(extra.len(), extra.first().copied()));
+                    }
                 }
 
                 // Security fork: our own coinbase may not commit to another block for merge mining,

@@ -71,6 +71,9 @@ pub struct BlockBodyProcessor {
     pub(super) pre_fork_coinbase_outputs_limit: u64,
     /// See `Params::coinbase_commitment_ban_activation`.
     pub(super) coinbase_commitment_ban_activation: kaspa_consensus_core::config::params::ForkActivation,
+    /// NU-A (`Params::nu_a_activation`): block-fatal invalid proofs, the per-block shielded action
+    /// cap and the fixed coinbase `extra_data`, each judged at the block's own DAA score.
+    pub(super) nu_a_activation: kaspa_consensus_core::config::params::ForkActivation,
 
     // Stores
     pub(super) statuses_store: Arc<RwLock<DbStatusesStore>>,
@@ -128,6 +131,7 @@ impl BlockBodyProcessor {
             security_fork_activation: params.security_fork_activation,
             pre_fork_coinbase_outputs_limit: params.ghostdag_k() as u64 + 2,
             coinbase_commitment_ban_activation: params.coinbase_commitment_ban_activation(),
+            nu_a_activation: params.nu_a_activation,
 
             statuses_store: storage.statuses_store.clone(),
             _ghostdag_store: storage.ghostdag_store.clone(),

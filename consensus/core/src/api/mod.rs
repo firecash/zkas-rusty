@@ -409,7 +409,8 @@ pub trait ConsensusApi: Send + Sync {
         unimplemented!()
     }
 
-    fn modify_coinbase_payload(&self, payload: Vec<u8>, miner_data: &MinerData) -> CoinbaseResult<Vec<u8>> {
+    /// `daa_score` is the DAA score of the template the payload belongs to (NU-A fixes the extra data).
+    fn modify_coinbase_payload(&self, payload: Vec<u8>, miner_data: &MinerData, daa_score: u64) -> CoinbaseResult<Vec<u8>> {
         unimplemented!()
     }
 

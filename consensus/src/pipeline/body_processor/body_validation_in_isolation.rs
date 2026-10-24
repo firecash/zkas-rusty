@@ -19,6 +19,7 @@ impl BlockBodyProcessor {
         Self::check_hash_merkle_root(block)?;
         Self::check_only_one_coinbase(block)?;
         self.check_transactions_in_isolation(block)?;
+        self.check_shielded_action_cap(block)?;
         let mass = self.check_block_mass(block)?;
         self.check_duplicate_transactions(block)?;
         self.check_block_double_spends(block)?;
@@ -59,6 +60,30 @@ impl BlockBodyProcessor {
         for tx in block.transactions.iter() {
             if let Err(e) = self.transaction_validator.validate_tx_in_isolation(tx) {
                 return Err(RuleError::TxInIsolationValidationFailed(tx.id(), e));
+            }
+        }
+        Ok(())
+    }
+
+    /// NU-A (spec 08 R4.1): from the activation, judged at the block's own DAA score, the block's
+    /// non-coinbase shielded transactions may carry at most `MAX_SHIELDED_ACTIONS_PER_BLOCK` actions
+    /// together (one action = one note-tree leaf + one nullifier). Coinbase notes are not counted:
+    /// they are bounded by the mergeset size. 78 is today's byte-implied maximum, so this refuses no
+    /// block that is valid today; it keeps state growth an explicit decision if bytes per action
+    /// ever shrink. Runs after the isolation checks, which already refused any bundle whose header
+    /// does not decode.
+    fn check_shielded_action_cap(self: &Arc<Self>, block: &Block) -> BlockProcessResult<()> {
+        if !self.nu_a_activation.is_active(block.header.daa_score) {
+            return Ok(());
+        }
+        let limit = kaspa_consensus_core::config::params::MAX_SHIELDED_ACTIONS_PER_BLOCK;
+        let mut total = 0usize;
+        for tx in block.transactions[1..].iter().filter(|tx| tx.is_shielded()) {
+            // `None` cannot reach here (isolation refused the transaction); count it as over the cap
+            // rather than as zero so a future change to that order cannot open a hole.
+            total = total.saturating_add(kaspa_shielded_core::bundle::action_count_from_bytes(&tx.payload).unwrap_or(usize::MAX));
+            if total > limit {
+                return Err(RuleError::TooManyShieldedActions(total, limit));
             }
         }
         Ok(())

@@ -98,7 +98,8 @@ impl BlockTemplateBuilder {
 
         // The first transaction is always the coinbase transaction
         let coinbase_tx = &mut block_template.block.transactions[COINBASE_TRANSACTION_INDEX];
-        let new_payload = consensus.modify_coinbase_payload(coinbase_tx.payload.clone(), new_miner_data)?;
+        let new_payload =
+            consensus.modify_coinbase_payload(coinbase_tx.payload.clone(), new_miner_data, block_template_to_modify.block.header.daa_score)?;
         coinbase_tx.payload = new_payload;
         if block_template.coinbase_has_red_reward {
             // The red-blocks-reward output pays the template's miner. Upstream Kaspa assumes it is
