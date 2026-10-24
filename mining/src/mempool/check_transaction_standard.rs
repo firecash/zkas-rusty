@@ -70,6 +70,19 @@ impl Mempool {
     ) -> NonStandardResult<()> {
         let transaction_id = transaction.id();
 
+        // SF-L relay policy (spec 01 L-R2). Before SF-L, a shielded transaction with a non-zero
+        // lock time is one that SF-L nodes and older nodes will judge differently once SF-L
+        // activates, so it is neither relayed nor templated: this is what keeps recent-but-unforked
+        // miners from building blocks the fork rejects. From SF-L on, a DAA-type lock time is
+        // standard (consensus enforces finality) and a time-type one is invalid. Every ordinary
+        // wallet send uses 0 (L-R3).
+        if transaction.tx.is_shielded() && transaction.tx.lock_time != 0 {
+            let sfl = self.shielded_locktime_activation.is_active(virtual_daa_score);
+            if !sfl || transaction.tx.lock_time >= kaspa_consensus_core::constants::LOCK_TIME_THRESHOLD {
+                return Err(NonStandardError::RejectShieldedLockTime(transaction_id, transaction.tx.lock_time));
+            }
+        }
+
         // Until shortly before Toccata activates, keep the legacy per-tx standard mass cap on the
         // non-contextual dimensions so updated nodes don't relay transactions that peers still reject.
         if let Some(cap) = self.standard_transaction_mass_cap(transaction, virtual_daa_score) {
@@ -696,5 +709,41 @@ mod tests {
         );
         // Within the window the storage cap is lifted; the well-funded, standard tx is accepted.
         assert_eq!(mempool.check_transaction_standard_in_context(&high_storage, Priority::High, in_window), Ok(()));
+    }
+
+    /// SF-L relay policy L-R2: before SF-L every shielded tx with a non-zero lock time is
+    /// non-standard; from SF-L a DAA-type lock time is standard and a time-type one is not. Lock
+    /// time 0 and transparent transactions are untouched.
+    #[test]
+    fn shielded_lock_time_is_non_standard_until_sf_l() {
+        use kaspa_consensus_core::config::params::ForkActivation;
+        use kaspa_consensus_core::tx::{TX_VERSION_SHIELDED, Transaction};
+        let params: Params = NetworkType::Mainnet.into();
+        let config =
+            Config::build_default(params.target_time_per_block(), false, params.mempool_block_mass_limits(), params.block_lane_limits);
+        let mut mempool = Mempool::new(Arc::new(config), params.toccata_activation, Arc::new(MiningCounters::default()));
+        let sfl = 1_000u64;
+        mempool.shielded_locktime_activation = ForkActivation::new(sfl);
+        let shielded = |lock_time: u64| {
+            let tx = Transaction::new(TX_VERSION_SHIELDED, vec![], vec![], lock_time, SUBNETWORK_ID_NATIVE, 0, vec![]);
+            let mut mtx = MutableTransaction::from_tx(tx);
+            mtx.calculated_non_contextual_masses = Some(NonContextualMasses::new(1, 1));
+            mtx
+        };
+        let lt = |mtx: &MutableTransaction, daa| mempool.check_transaction_standard_in_isolation(mtx, daa);
+        let reject = |mtx: &MutableTransaction| Err(NonStandardError::RejectShieldedLockTime(mtx.id(), mtx.tx.lock_time));
+        // Before SF-L: any non-zero value is refused.
+        for v in [1u64, 500, 600_000_000_000] {
+            let m = shielded(v);
+            assert_eq!(lt(&m, sfl - 1), reject(&m), "lock {v} before SF-L");
+        }
+        // After: DAA-type passes this check, time-type does not.
+        let m = shielded(500);
+        assert_ne!(lt(&m, sfl), reject(&m), "a DAA lock time is standard from SF-L");
+        let m = shielded(600_000_000_000);
+        assert_eq!(lt(&m, sfl), reject(&m), "a time lock stays non-standard");
+        // Lock time 0 is never refused by this rule, before or after.
+        let m = shielded(0);
+        assert_ne!(lt(&m, 0), reject(&m));
     }
 }

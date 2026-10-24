@@ -94,6 +94,14 @@ impl MiningManager {
         Self { config, block_template_cache, mempool, counters }
     }
 
+    /// Arm the SF-L relay policy (spec 01 L-R2) at `activation`. Ships in the node release that
+    /// precedes SF-L by at least 28 days: with `never` it already refuses every shielded
+    /// transaction whose `lock_time` is non-zero.
+    pub fn with_shielded_locktime_activation(self, activation: ForkActivation) -> Self {
+        self.mempool.write().shielded_locktime_activation = activation;
+        self
+    }
+
     pub fn get_block_template(&self, consensus: &dyn ConsensusApi, miner_data: &MinerData) -> MiningManagerResult<BlockTemplate> {
         let virtual_state_approx_id = consensus.get_virtual_state_approx_id();
         let mut cache_lock = self.block_template_cache.lock(virtual_state_approx_id);

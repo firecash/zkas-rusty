@@ -48,6 +48,7 @@ impl TransactionValidator {
         lock_time_arg: LockTimeArg,
         block_daa_score: u64,
     ) -> TxResult<()> {
+        self.check_shielded_lock_time(tx, block_daa_score)?;
         self.check_tx_is_finalized(tx, lock_time_arg)?;
         self.check_transaction_version(tx, block_daa_score)?;
         self.check_shielded_format_in_header_context(tx, block_daa_score)?;
@@ -57,13 +58,57 @@ impl TransactionValidator {
     /// The shielded payload must decode in the format of the carrying block's DAA score: before the
     /// security fork exactly as every node always parsed it (flag bit 3 carries no field), from it
     /// with the anchor-block field. See `ShieldedBundle::from_bytes_at`.
+    ///
+    /// NU-A (spec 08 R2.2): from the activation the decoded bundle's value balance must also reach
+    /// the burned floor `600,000 * max(2, n)`. Like the format, the floor is a pure function of the
+    /// transaction bytes and the carrying block's DAA score, so a block carrying an under-paying
+    /// transaction is invalid (never a drop), and the mempool, which runs this at the virtual's DAA
+    /// score, refuses it before any proof is verified.
     fn check_shielded_format_in_header_context(&self, tx: &Transaction, block_daa_score: u64) -> TxResult<()> {
         if !tx.is_shielded() {
             return Ok(());
         }
-        kaspa_shielded_core::bundle::ShieldedBundle::from_bytes_at(&tx.payload, self.security_fork_activation.is_active(block_daa_score))
-            .map(|_| ())
-            .map_err(|_| TxRuleError::InvalidShieldedTransaction("malformed Orchard bundle in payload"))
+        let bundle =
+            kaspa_shielded_core::bundle::ShieldedBundle::from_bytes_at(&tx.payload, self.security_fork_activation.is_active(block_daa_score))
+                .map_err(|_| TxRuleError::InvalidShieldedTransaction("malformed Orchard bundle in payload"))?;
+        if self.nu_a_activation.is_active(block_daa_score) {
+            let n = bundle.actions.len();
+            let floor = kaspa_consensus_core::config::params::shielded_fee_floor(n);
+            // A negative value balance is refused in UTXO context as well; here it simply cannot
+            // reach the floor.
+            if bundle.value_balance < 0 || (bundle.value_balance as u64) < floor {
+                return Err(TxRuleError::ShieldedFeeBelowFloor(bundle.value_balance.max(0) as u64, floor, n));
+            }
+        }
+        Ok(())
+    }
+
+    /// SF-L (spec 01 §3.1 L-R1). From the activation, judged at the DAA score of the block that
+    /// carries the transaction (the mempool passes the virtual's), a shielded transaction's
+    /// `lock_time` means what it says:
+    /// - (i) a time-type value (`>= LOCK_TIME_THRESHOLD`) is invalid: the past median time is a
+    ///   second, miner-influenced clock computed lazily per block, and contracts convert wall time
+    ///   to DAA at about 1 DAA/s;
+    /// - (ii) a non-zero DAA-type value must be strictly below the carrying block's DAA score;
+    /// - (iii) the input-sequence escape of [`Self::check_tx_is_finalized`] does not apply: a
+    ///   shielded transaction has no inputs, so that loop is vacuous, which is exactly why every
+    ///   value passed before the fork.
+    ///
+    /// Soundness at the carrying block: a block's DAA score is its selected parent's plus its
+    /// DAA-window mergeset count, so a miner cannot give a block a score its past does not contain,
+    /// and the chain block that later accepts the transaction has a strictly larger score. The rule
+    /// only narrows the valid set, so it is a soft fork.
+    fn check_shielded_lock_time(&self, tx: &Transaction, block_daa_score: u64) -> TxResult<()> {
+        if !tx.is_shielded() || tx.lock_time == 0 || !self.shielded_locktime_activation.is_active(block_daa_score) {
+            return Ok(());
+        }
+        if tx.lock_time >= LOCK_TIME_THRESHOLD {
+            return Err(TxRuleError::ShieldedTimeLock(tx.lock_time));
+        }
+        if tx.lock_time >= block_daa_score {
+            return Err(TxRuleError::ShieldedNotFinalized(tx.lock_time, block_daa_score));
+        }
+        Ok(())
     }
 
     pub(crate) fn get_lock_time_type(tx: &Transaction) -> LockTimeType {

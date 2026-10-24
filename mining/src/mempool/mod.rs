@@ -51,6 +51,8 @@ pub(crate) struct Mempool {
     config: Arc<Config>,
     // TODO(post-toccata): remove this field, will be unused after post-toccata cleanups
     toccata_activation: ForkActivation,
+    /// SF-L (`Params::shielded_locktime_activation`): decides the L-R2 relay policy. Never by default.
+    pub(crate) shielded_locktime_activation: ForkActivation,
     transaction_pool: TransactionsPool,
     orphan_pool: OrphanPool,
     accepted_transactions: AcceptedTransactions,
@@ -62,7 +64,15 @@ impl Mempool {
         let transaction_pool = TransactionsPool::new(config.clone());
         let orphan_pool = OrphanPool::new(config.clone());
         let accepted_transactions = AcceptedTransactions::new(config.clone());
-        Self { config, toccata_activation, transaction_pool, orphan_pool, accepted_transactions, counters }
+        Self {
+            config,
+            toccata_activation,
+            shielded_locktime_activation: ForkActivation::never(),
+            transaction_pool,
+            orphan_pool,
+            accepted_transactions,
+            counters,
+        }
     }
 
     pub(crate) fn get_transaction(&self, transaction_id: &TransactionId, query: TransactionQuery) -> Option<MutableTransaction> {

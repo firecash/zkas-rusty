@@ -143,7 +143,8 @@ impl ConsensusServices {
             },
             params.miner_accrual_payout_interval,
             params.dev_fee_end_activation,
-        );
+        )
+        .with_nu_a_activation(params.nu_a_activation);
 
         let mass_calculator =
             MassCalculator::new(params.mass_per_tx_byte, params.mass_per_script_pub_key_byte, params.storage_mass_parameter);
@@ -162,7 +163,8 @@ impl ConsensusServices {
             params.mass_per_sig_op,
             params.genesis.hash.as_bytes(),
         )
-        .with_security_fork_activation(params.security_fork_activation);
+        .with_security_fork_activation(params.security_fork_activation)
+        .with_sf_l_nu_a(params.shielded_locktime_activation, params.nu_a_activation);
 
         let pruning_point_manager = PruningPointManager::new(
             params.pruning_depth(),

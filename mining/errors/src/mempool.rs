@@ -123,6 +123,12 @@ pub type RuleResult<T> = std::result::Result<T, RuleError>;
 
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
 pub enum NonStandardError {
+    /// SF-L relay policy (spec 01 L-R2): before SF-L activates a shielded transaction with a
+    /// non-zero `lock_time` is not relayed or mined (old and new nodes would judge it differently),
+    /// and after it a time-type `lock_time` is invalid anyway.
+    #[error("shielded transaction lock time {1} is non-standard (SF-L not active, or not a DAA score)")]
+    RejectShieldedLockTime(TransactionId, u64),
+
     #[error("transaction version {1} is not in the valid range of {2}-{3}")]
     RejectVersion(TransactionId, u16, u16, u16),
 
@@ -165,6 +171,7 @@ pub enum NonStandardError {
 impl NonStandardError {
     pub fn transaction_id(&self) -> &TransactionId {
         match self {
+            NonStandardError::RejectShieldedLockTime(id, _) => id,
             NonStandardError::RejectVersion(id, _, _, _) => id,
             NonStandardError::RejectComputeMass(id, _, _) => id,
             NonStandardError::RejectTransientMass(id, _, _) => id,
