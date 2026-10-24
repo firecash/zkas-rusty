@@ -320,6 +320,18 @@ pub struct OverrideParams {
     /// the score it crosses.
     pub security_fork_activation: Option<ForkActivation>,
 
+    /// See [`Params::shielded_locktime_activation`] (SF-L). Overridable so a private test network can
+    /// choose the score it crosses; every built-in network carries `never`.
+    pub shielded_locktime_activation: Option<ForkActivation>,
+
+    /// See [`Params::nu_a_activation`] (NU-A). Overridable for the same reason; `never` on every
+    /// built-in network.
+    pub nu_a_activation: Option<ForkActivation>,
+
+    /// See [`Params::tree_rollover_threshold`]. A devnet sets a small value to exercise the
+    /// tree-era rollover; mainnet refuses overrides.
+    pub tree_rollover_threshold: Option<u64>,
+
     /// See [`Params::miner_accrual_payout_interval`].
     pub miner_accrual_payout_interval: Option<u64>,
 
@@ -365,6 +377,9 @@ impl From<Params> for OverrideParams {
             toccata_activation: Some(p.toccata_activation),
             merged_mining_activation: Some(p.merged_mining_activation),
             security_fork_activation: Some(p.security_fork_activation),
+            shielded_locktime_activation: Some(p.shielded_locktime_activation),
+            nu_a_activation: Some(p.nu_a_activation),
+            tree_rollover_threshold: Some(p.tree_rollover_threshold),
             miner_accrual_payout_interval: Some(p.miner_accrual_payout_interval),
             dev_fee_end_activation: Some(p.dev_fee_end_activation),
             shielded_coinbase: Some(p.shielded_coinbase),
@@ -537,6 +552,33 @@ pub struct Params {
     /// Mainnet: [`ZKAS_SECURITY_FORK_DAA`].
     pub security_fork_activation: ForkActivation,
 
+    /// SF-L soft fork (spec 01 §3.1, 15 Part C train 2). From this DAA score, judged at the DAA score
+    /// of the block that CARRIES the transaction, a shielded transaction's `lock_time` is enforced:
+    /// a time-type value (`>= LOCK_TIME_THRESHOLD`) is invalid, and a non-zero DAA-type value must be
+    /// below the carrying block's DAA score. Before it the field is signed and inert (shielded
+    /// transactions have no inputs, so the input-sequence escape made every value final).
+    /// `never` on every built-in network until the owner schedules it.
+    pub shielded_locktime_activation: ForkActivation,
+
+    /// NU-A hard fork (15 Part C train 3; spec 08 R1.5, R2, R4; spec 06 F-1), all at one DAA score:
+    /// - burned fee floor: a shielded tx carried by a block at or past this score must pay
+    ///   `value_balance >= shielded_fee_floor(n)`; the floor is burned and only the remainder (the tip)
+    ///   is paid to miners;
+    /// - a shielded tx whose bundle fails verification makes its carrying block invalid (today it is
+    ///   dropped, a free CPU-DoS);
+    /// - at most [`MAX_SHIELDED_ACTIONS_PER_BLOCK`] non-coinbase shielded actions per block;
+    /// - the coinbase `extra_data` is exactly [`NU_A_COINBASE_EXTRA_DATA_LEN`] bytes, format byte 0x01;
+    /// - state root v2 (`zkas_state_root2`) commits the cumulative burned floor, the tree era and the
+    ///   frozen-era list, and the tree-era rollover at [`Self::tree_rollover_threshold`] is armed.
+    /// `never` on every built-in network until the owner schedules it.
+    pub nu_a_activation: ForkActivation,
+
+    /// NU-A (spec 08 R4.2): leaf count of the current tree era at which the next chain block starts a
+    /// new era (empty tree, era + 1) after freezing the old era's final root. Mainnet
+    /// [`MAINNET_TREE_ROLLOVER_THRESHOLD`] (2^32 - 2^20, so `TreeFull` stays unreachable: one chain
+    /// block appends at most 14,222 leaves). Only consulted from `nu_a_activation`.
+    pub tree_rollover_threshold: u64,
+
     /// ZKas launch difficulty schedule — number of blocks (blue-score units) at the
     /// start of the chain during which difficulty is **pinned** to the genesis target
     /// (super-easy) so the chain can be bootstrap-mined on CPU. `0` (together with
@@ -585,6 +627,21 @@ pub struct Params {
 }
 
 impl Params {
+    /// Consistency of the SF-L / NU-A parameters (refused at kaspad startup):
+    /// - NU-A at or after the security fork (state root v2 is built over v1);
+    /// - a rollover threshold of at least 1 and at most `2^32 - 2^16` leaves, so the block after the
+    ///   threshold always fits in the era's 2^32-leaf tree.
+    pub fn check_sf_l_nu_a(&self) -> Result<(), String> {
+        let (nua, sf) = (self.nu_a_activation, self.security_fork_activation);
+        if nua.daa_score() != ForkActivation::never().daa_score() && nua.daa_score() < sf.daa_score() {
+            return Err(format!("nu_a_activation ({}) must not precede security_fork_activation ({})", nua.daa_score(), sf.daa_score()));
+        }
+        if self.tree_rollover_threshold == 0 || self.tree_rollover_threshold > (1u64 << 32) - (1u64 << 16) {
+            return Err(format!("tree_rollover_threshold ({}) must be in 1..=2^32-2^16", self.tree_rollover_threshold));
+        }
+        Ok(())
+    }
+
     /// Blue score at and below which difficulty is pinned to the (super-easy) genesis
     /// target during the low-difficulty start. See [`Self::difficulty_ramp_end_blue_score`].
     #[inline]
@@ -873,6 +930,9 @@ impl Params {
             dev_fee_end_activation: overrides.dev_fee_end_activation.unwrap_or(self.dev_fee_end_activation),
             merged_mining_activation: overrides.merged_mining_activation.unwrap_or(self.merged_mining_activation),
             security_fork_activation: overrides.security_fork_activation.unwrap_or(self.security_fork_activation),
+            shielded_locktime_activation: overrides.shielded_locktime_activation.unwrap_or(self.shielded_locktime_activation),
+            nu_a_activation: overrides.nu_a_activation.unwrap_or(self.nu_a_activation),
+            tree_rollover_threshold: overrides.tree_rollover_threshold.unwrap_or(self.tree_rollover_threshold),
 
             // Consensus-critical launch schedule; not exposed as a CLI override.
             low_difficulty_start_blocks: self.low_difficulty_start_blocks,
@@ -949,6 +1009,48 @@ pub const ZKAS_DEV_FEE_PERMILLE: u64 = 50;
 /// the 8,700,500 of 23767efa and the 7,000,500 of 1e684932 (neither tagged or released): a node built
 /// from either splits here.
 pub const ZKAS_SECURITY_FORK_DAA: u64 = 6_983_500;
+
+/// NU-A (spec 08 R2.1): burned fee floor per action, in sompi (0.006 ZKAS). The largest round value
+/// every deployed wallet already pays: the SDK's `chunk_fee(n) = max(3,000,000, 200 * (2,965 + 3,156 n))`
+/// is above `600,000 * max(2, n)` for every n (minimum margin 7.2% at n = 38).
+pub const SHIELDED_FEE_FLOOR_PER_ACTION: u64 = 600_000;
+
+/// NU-A (spec 08 R2.1): the burned fee floor of a shielded transaction with `actions` actions,
+/// `600,000 * max(2, n)` sompi.
+pub const fn shielded_fee_floor(actions: usize) -> u64 {
+    let n = if actions < 2 { 2 } else { actions as u64 };
+    SHIELDED_FEE_FLOOR_PER_ACTION.saturating_mul(n)
+}
+
+/// NU-A (spec 08 R4.1): most non-coinbase shielded actions one block may carry. Exactly today's
+/// byte-implied maximum (one tx: (250,000 - 2,963) / 3,156 = 78), so a no-op for every block a
+/// node accepts today; it stops a later byte change from silently raising state growth.
+pub const MAX_SHIELDED_ACTIONS_PER_BLOCK: usize = 78;
+
+/// NU-A (spec 08 R4.2.2): mainnet tree-era rollover threshold, 2^32 - 2^20 leaves.
+pub const MAINNET_TREE_ROLLOVER_THRESHOLD: u64 = (1u64 << 32) - (1u64 << 20);
+
+/// NU-A (spec 06 F-1): length of the fixed coinbase `extra_data`: one format byte
+/// ([`NU_A_COINBASE_EXTRA_DATA_FORMAT`]) and a little-endian u32 readiness bitmask.
+pub const NU_A_COINBASE_EXTRA_DATA_LEN: usize = 5;
+
+/// NU-A (spec 06 F-1): format byte of the fixed coinbase `extra_data`.
+pub const NU_A_COINBASE_EXTRA_DATA_FORMAT: u8 = 0x01;
+
+/// Readiness bit 0 of the fixed coinbase `extra_data`: the producing node implements SF-L.
+pub const COINBASE_READINESS_SF_L: u32 = 1 << 0;
+/// Readiness bit 1 of the fixed coinbase `extra_data`: the producing node implements NU-A.
+pub const COINBASE_READINESS_NU_A: u32 = 1 << 1;
+/// The readiness bitmask this software writes: every upgrade it implements. Consensus checks only
+/// the length and the format byte, so later upgrades can define further bits.
+pub const COINBASE_READINESS: u32 = COINBASE_READINESS_SF_L | COINBASE_READINESS_NU_A;
+
+/// NU-A (spec 06 F-1): the fixed coinbase `extra_data` this software writes:
+/// `[NU_A_COINBASE_EXTRA_DATA_FORMAT] ++ COINBASE_READINESS (u32 LE)`.
+pub const fn nu_a_coinbase_extra_data() -> [u8; NU_A_COINBASE_EXTRA_DATA_LEN] {
+    let r = COINBASE_READINESS.to_le_bytes();
+    [NU_A_COINBASE_EXTRA_DATA_FORMAT, r[0], r[1], r[2], r[3]]
+}
 
 /// Mainnet DAA score from which the dev fee is zero: the security fork itself, one activation.
 /// The first block at or past it pays the carried dev balance as one final note; afterwards no dev
@@ -1096,6 +1198,10 @@ pub const MAINNET_PARAMS: Params = Params {
     // intended, correct value. This is historical context, not a planned change.)
     merged_mining_activation: ForkActivation::always(),
     security_fork_activation: ForkActivation::new(ZKAS_SECURITY_FORK_DAA),
+    // SF-L and NU-A are dormant until the owner schedules them (19-sfl-nua-impl.md §6).
+    shielded_locktime_activation: ForkActivation::never(),
+    nu_a_activation: ForkActivation::never(),
+    tree_rollover_threshold: MAINNET_TREE_ROLLOVER_THRESHOLD,
 
     // ZKas launch difficulty: the low-difficulty bootstrap schedule is DISABLED on mainnet
     // (both 0), so the chain launches under pure upstream KIP-0004 DAA from genesis — the
@@ -1193,6 +1299,10 @@ pub const TESTNET_PARAMS: Params = Params {
     // On testnet, merged mining is available from genesis for testing.
     merged_mining_activation: ForkActivation::always(),
     security_fork_activation: ForkActivation::always(),
+    // SF-L and NU-A are dormant until the owner schedules them (19-sfl-nua-impl.md §6).
+    shielded_locktime_activation: ForkActivation::never(),
+    nu_a_activation: ForkActivation::never(),
+    tree_rollover_threshold: MAINNET_TREE_ROLLOVER_THRESHOLD,
 
     // Launch difficulty schedule disabled on testnet.
     low_difficulty_start_blocks: 0,
@@ -1260,6 +1370,10 @@ pub const SIMNET_PARAMS: Params = Params {
     dev_fee_end_activation: ForkActivation::never(),
     merged_mining_activation: ForkActivation::always(),
     security_fork_activation: ForkActivation::always(),
+    // SF-L and NU-A are dormant until the owner schedules them (19-sfl-nua-impl.md §6).
+    shielded_locktime_activation: ForkActivation::never(),
+    nu_a_activation: ForkActivation::never(),
+    tree_rollover_threshold: MAINNET_TREE_ROLLOVER_THRESHOLD,
 
     // Launch difficulty schedule disabled on simnet.
     low_difficulty_start_blocks: 0,
@@ -1339,6 +1453,10 @@ pub const DEVNET_PARAMS: Params = Params {
     dev_fee_end_activation: ForkActivation::never(),
     merged_mining_activation: ForkActivation::always(),
     security_fork_activation: ForkActivation::new(1_500),
+    // SF-L and NU-A are dormant until the owner schedules them (19-sfl-nua-impl.md §6).
+    shielded_locktime_activation: ForkActivation::never(),
+    nu_a_activation: ForkActivation::never(),
+    tree_rollover_threshold: MAINNET_TREE_ROLLOVER_THRESHOLD,
 
     // Pin difficulty to the (easy) genesis target for the first 50k blocks so the
     // short devnet demo chain stays CPU-mineable throughout (mirrors mainnet's launch
@@ -1391,6 +1509,42 @@ mod tests {
             let secs = p.miner_accrual_payout_interval * p.target_time_per_block() / 1000;
             assert_eq!(secs, 100, "{:?}", p.net);
         }
+    }
+
+    #[test]
+    fn sf_l_nu_a_are_dormant_everywhere_and_overridable() {
+        for p in [MAINNET_PARAMS, TESTNET_PARAMS, SIMNET_PARAMS, DEVNET_PARAMS] {
+            assert_eq!(p.shielded_locktime_activation, ForkActivation::never(), "{:?}", p.net);
+            assert_eq!(p.nu_a_activation, ForkActivation::never(), "{:?}", p.net);
+            assert_eq!(p.tree_rollover_threshold, MAINNET_TREE_ROLLOVER_THRESHOLD);
+            p.check_sf_l_nu_a().unwrap();
+        }
+        let o: OverrideParams = serde_json::from_str(
+            r#"{"security_fork_activation":300,"shielded_locktime_activation":700,"nu_a_activation":1300,"tree_rollover_threshold":1400}"#,
+        )
+        .unwrap();
+        let p = DEVNET_PARAMS.override_params(o);
+        assert!(!p.shielded_locktime_activation.is_active(699) && p.shielded_locktime_activation.is_active(700));
+        assert!(!p.nu_a_activation.is_active(1299) && p.nu_a_activation.is_active(1300));
+        assert_eq!(p.tree_rollover_threshold, 1400);
+        p.check_sf_l_nu_a().unwrap();
+        let mut bad = p.clone();
+        bad.nu_a_activation = ForkActivation::new(200);
+        assert!(bad.check_sf_l_nu_a().is_err(), "NU-A before the security fork is refused");
+        let mut bad = p.clone();
+        bad.tree_rollover_threshold = 0;
+        assert!(bad.check_sf_l_nu_a().is_err());
+        // The floor and the fixed extra data.
+        assert_eq!(shielded_fee_floor(0), 1_200_000);
+        assert_eq!(shielded_fee_floor(1), 1_200_000);
+        assert_eq!(shielded_fee_floor(2), 1_200_000);
+        assert_eq!(shielded_fee_floor(38), 22_800_000);
+        // Every deployed SDK fee clears the floor (08 R2.1): chunk_fee(n) = max(3,000,000, 200 * (2,965 + 3,156 n)).
+        for n in 1..=78u64 {
+            let sdk = 3_000_000u64.max(200 * (2_965 + 3_156 * n.max(2)));
+            assert!(sdk >= shielded_fee_floor(n as usize), "n={n}");
+        }
+        assert_eq!(nu_a_coinbase_extra_data(), [0x01, 0x03, 0, 0, 0]);
     }
 
     #[test]

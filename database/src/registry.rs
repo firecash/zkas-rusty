@@ -166,6 +166,10 @@ pub enum DatabaseStorePrefixes {
     /// Written in the same batch as every change to that set, so after a crash the set says where it
     /// stands and startup can move it to the virtual sink from the per-block diffs.
     ShieldedNullifierCursor = 99,
+    /// NU-A per-chain-block state (`kaspa_shielded_core::commitment::NuaState`: cumulative burned fee
+    /// floor, tree era, frozen eras), committed by `zkas_state_root2`. Absent = the default, which is
+    /// every pre-NU-A block's value. 100 is taken by the N1 nullifier-count store.
+    ShieldedNuaState = 101,
 
     // ---- Separator ----
     /// Reserved as a separator

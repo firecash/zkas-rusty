@@ -105,6 +105,22 @@ pub enum RuleError {
     #[error("coinbase payload carries a merge-mining commitment, which a ZKas block may not")]
     CoinbaseCarriesMergeMiningCommitment,
 
+    /// NU-A (spec 06 F-1): the coinbase `extra_data` must be exactly the fixed 5-byte form
+    /// (format byte 0x01 and a u32 readiness bitmask), so no pool or node tag fingerprints a block.
+    #[error("coinbase extra data is {0} bytes with format byte {1:?}; NU-A requires exactly 5 bytes with format 0x01")]
+    BadCoinbaseExtraData(usize, Option<u8>),
+
+    /// NU-A (spec 08 R4.1): the block's non-coinbase shielded transactions carry more actions
+    /// (note-tree leaves and nullifiers) than one block may add.
+    #[error("block carries {0} non-coinbase shielded actions, above the limit of {1}")]
+    TooManyShieldedActions(usize, usize),
+
+    /// NU-A (spec 08 R1.5): a shielded transaction in the block fails bundle verification (proof,
+    /// binding or spend-authorization signature, or encoding). Before NU-A such a transaction was
+    /// silently dropped, which let a miner make every node verify garbage at no cost.
+    #[error("shielded transaction {0} in the block fails verification: {1}")]
+    InvalidShieldedProofInBlock(TransactionId, TxRuleError),
+
     /// Before the security fork the coinbase output limit is k + 2 (kept so pre-fork validity is
     /// unchanged); from it, k + 3.
     #[error("coinbase has {0} outputs, above the pre-fork limit of {1}")]

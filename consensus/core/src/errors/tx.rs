@@ -47,6 +47,22 @@ pub enum TxRuleError {
     #[error("transaction input #{0} is not finalized")]
     NotFinalized(usize),
 
+    /// SF-L (spec 01 L-R1 (i)): from the activation a shielded transaction may not carry a
+    /// time-type `lock_time` (`>= LOCK_TIME_THRESHOLD`); only DAA-type locks are defined.
+    #[error("shielded transaction lock time {0} is a timestamp; only DAA-score lock times are valid for shielded transactions")]
+    ShieldedTimeLock(u64),
+
+    /// SF-L (spec 01 L-R1 (ii)): a shielded transaction's DAA-type `lock_time` must be below the
+    /// DAA score of the block that carries it. Shielded transactions have no inputs, so the
+    /// input-sequence escape of transparent transactions does not apply.
+    #[error("shielded transaction is not final: lock time {0} is not below DAA score {1}")]
+    ShieldedNotFinalized(u64, u64),
+
+    /// NU-A (spec 08 R2.2): the bundle's value balance (its fee) is below the burned floor
+    /// `600,000 * max(2, actions)`.
+    #[error("shielded fee {0} is below the burned floor {1} for {2} actions")]
+    ShieldedFeeBelowFloor(u64, u64, usize),
+
     #[error("coinbase transaction has {0} inputs while none are expected")]
     CoinbaseHasInputs(usize),
 

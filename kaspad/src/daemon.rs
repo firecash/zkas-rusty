@@ -331,6 +331,13 @@ pub fn create_core_with_runtime(runtime: &Runtime, args: &Args, fd_total_budget:
         );
         exit(1);
     }
+    // NU-A's state root v2 is built over the security fork's v1 (anchor window, miner slot), so NU-A
+    // can only activate at or after the security fork; and the rollover threshold must leave
+    // `TreeFull` unreachable (one chain block appends at most ~14,222 leaves on mainnet's shape).
+    if let Err(e) = params.check_sf_l_nu_a() {
+        println!("Invalid params: {e}");
+        exit(1);
+    }
     // After a reorg the reachability reindex root switches to the winning chain only once that chain
     // is `DEFAULT_REINDEX_SLACK` taller. With a pruning depth below finality + that slack (possible
     // only through an override file), pruning can delete a losing branch that still holds the reindex
@@ -826,7 +833,8 @@ Do you confirm? (y/n)";
         config.ram_scale,
         config.block_template_cache_lifetime,
         mining_counters.clone(),
-    )));
+    )
+    .with_shielded_locktime_activation(config.shielded_locktime_activation)));
     let mining_monitor =
         Arc::new(MiningMonitor::new(mining_manager.clone(), mining_counters, tx_script_cache_counters.clone(), tick_service.clone()));
 
