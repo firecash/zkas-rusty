@@ -143,6 +143,11 @@ enum Cmd {
         /// Anchor maturity depth in blocks (must match consensus shielded_anchor_depth).
         #[arg(long, default_value_t = DEFAULT_ANCHOR_DEPTH)]
         anchor_depth: u64,
+        /// Pick input notes in random order instead of largest first. The scan stops at the
+        /// matured prefix, so it cannot see spends from the last ~anchor_depth blocks; repeated
+        /// sends (test networks, load generators) would otherwise pick the same note again.
+        #[arg(long, default_value_t = false)]
+        random_note: bool,
     },
     /// Sign a message with a wallet seed, proving control of the wallet's shielded
     /// address WITHOUT spending. Offline (no node needed). The signature discloses
@@ -602,7 +607,7 @@ async fn refuse_after_security_fork(client: &GrpcClient) {
     }
 }
 
-async fn send(rpc_server: String, owner_seed: [u8; 32], to: String, amount: u64, fee: u64, anchor_depth: u64) {
+async fn send(rpc_server: String, owner_seed: [u8; 32], to: String, amount: u64, fee: u64, anchor_depth: u64, random_note: bool) {
     let client = connect(&rpc_server).await;
     refuse_after_security_fork(&client).await;
 
@@ -634,7 +639,12 @@ async fn send(rpc_server: String, owner_seed: [u8; 32], to: String, amount: u64,
         n
     };
     let mut candidates: Vec<_> = db.notes().to_vec();
-    candidates.sort_by(|a, b| b.value().cmp(&a.value())); // descending
+    if random_note {
+        use rand::seq::SliceRandom;
+        candidates.shuffle(&mut rand::thread_rng());
+    } else {
+        candidates.sort_by(|a, b| b.value().cmp(&a.value())); // descending
+    }
     let mut inputs = Vec::new();
     let mut selected = 0u64;
     for n in &candidates {
@@ -780,8 +790,8 @@ async fn main() {
         Cmd::Balance { rpc_server, seed_hex, seed_byte } => {
             balance(rpc_server, resolve_seed(seed_hex, seed_byte)).await;
         }
-        Cmd::Send { rpc_server, owner_seed_hex, owner_seed_byte, to, amount, fee, anchor_depth } => {
-            send(rpc_server, resolve_seed(owner_seed_hex, owner_seed_byte), to, amount, fee, anchor_depth).await;
+        Cmd::Send { rpc_server, owner_seed_hex, owner_seed_byte, to, amount, fee, anchor_depth, random_note } => {
+            send(rpc_server, resolve_seed(owner_seed_hex, owner_seed_byte), to, amount, fee, anchor_depth, random_note).await;
         }
         Cmd::Sign { seed_hex, seed_byte, seed_stdin, network, message } => {
             sign(resolve_sign_seed(seed_hex, seed_byte, seed_stdin), network, message);
