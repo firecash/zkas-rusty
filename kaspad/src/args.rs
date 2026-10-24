@@ -94,6 +94,24 @@ pub struct Args {
     pub prealloc_amount: u64,
 
     pub disable_upnp: bool,
+    /// UPnP is off by default (spec 06 H-6): mapping a port announces this node's address.
+    pub enable_upnp: bool,
+    /// Accept `--uacomment` (spec 06 H-5: comments make a node unique on the network).
+    pub allow_uacomment: bool,
+    /// Plaintext p2p only, no ZKT2 (rollback flag, spec 06 §6).
+    pub p2p_v1_only: bool,
+    /// ZKT2 only: refuse plaintext peers in both directions (rollout phase R3).
+    pub p2p_v2_only: bool,
+    /// No Dandelion++ stem phase: own transactions are trickled (rollback flag, spec 06 §6).
+    pub no_dandelion: bool,
+    /// Minimum connection age (seconds) of a Dandelion++ stem peer; default 3600 (devnets only).
+    pub dandelion_min_peer_age: Option<u64>,
+    /// Local IP for outbound p2p sockets.
+    pub p2p_outbound_bind: Option<String>,
+    /// File holding a 32-byte hex BIP 340 secret key for pinned-key authentication (T-8).
+    pub p2p_auth_key: Option<String>,
+    /// `<host:port>=<x-only pubkey hex>`: authenticate this peer by its pinned key (T-8).
+    pub peer_pin: Vec<String>,
     #[serde(rename = "nodnsseed")]
     pub disable_dns_seeding: bool,
     #[serde(rename = "nogrpc")]
@@ -167,6 +185,15 @@ impl Default for Args {
             prealloc_amount: 10_000_000_000,
 
             disable_upnp: false,
+            enable_upnp: false,
+            allow_uacomment: false,
+            p2p_v1_only: false,
+            p2p_v2_only: false,
+            no_dandelion: false,
+            dandelion_min_peer_age: None,
+            p2p_outbound_bind: None,
+            p2p_auth_key: None,
+            peer_pin: vec![],
             disable_dns_seeding: false,
             disable_grpc: false,
             ram_scale: 1.0,
@@ -185,7 +212,9 @@ impl Default for Args {
 impl Args {
     pub fn apply_to_config(&self, config: &mut Config) {
         config.utxoindex = self.utxoindex;
-        config.disable_upnp = self.disable_upnp;
+        // UPnP is opt-in (spec 06 H-6); --disable-upnp is still accepted and wins.
+        config.disable_upnp = self.disable_upnp || !self.enable_upnp;
+        config.p2p_privacy = self.p2p_privacy_config();
         config.unsafe_rpc = self.unsafe_rpc;
         config.enable_banning = self.enable_banning;
         config.enable_unsynced_mining = self.enable_unsynced_mining;
@@ -206,6 +235,24 @@ impl Args {
         if let Some(num_prealloc_utxos) = self.num_prealloc_utxos {
             config.initial_utxo_set = Arc::new(self.generate_prealloc_utxos(num_prealloc_utxos));
         }
+    }
+
+    /// The p2p v11 privacy settings these arguments select. Inputs were validated by `parse`.
+    pub fn p2p_privacy_config(&self) -> kaspa_consensus_core::config::P2pPrivacyConfig {
+        let mut c = kaspa_consensus_core::config::P2pPrivacyConfig::default();
+        c.transport_v2 = !self.p2p_v1_only;
+        if self.p2p_v2_only {
+            c.allow_v1_inbound = false;
+            c.allow_v1_outbound = false;
+        }
+        c.dandelion = !self.no_dandelion;
+        if let Some(age) = self.dandelion_min_peer_age {
+            c.dandelion_min_peer_age_secs = age;
+        }
+        c.outbound_bind_ip = self.p2p_outbound_bind.as_ref().and_then(|s| s.parse().ok());
+        c.auth_secret_key = self.p2p_auth_key.as_ref().and_then(|path| read_auth_key(path).ok());
+        c.peer_pins = self.peer_pin.iter().filter_map(|p| parse_peer_pin(p).ok()).collect();
+        c
     }
 
     #[cfg(feature = "devnet-prealloc")]
@@ -479,7 +526,42 @@ Setting to 0 prevents the preallocation and sets the maximum to {}, leading to 0
                 .value_parser(clap::value_parser!(u64))
                 .help("Interval in seconds for performance metrics collection."),
         )
-        .arg(arg!(--"disable-upnp" "Disable upnp").env("KASPAD_DISABLE_UPNP"))
+        .arg(arg!(--"disable-upnp" "Disable upnp (it is off by default; see --enable-upnp)").env("KASPAD_DISABLE_UPNP"))
+        .arg(arg!(--"enable-upnp" "Map the p2p port with UPnP. Off by default: the mapping announces this node's address").env("KASPAD_ENABLE_UPNP"))
+        .arg(arg!(--"allow-uacomment" "Accept --uacomment. Your node becomes unique on the network").env("KASPAD_ALLOW_UACOMMENT"))
+        .arg(arg!(--"p2p-v1-only" "Rollback: speak only the plaintext p2p transport (no ZKT2 encryption)").env("KASPAD_P2P_V1_ONLY"))
+        .arg(arg!(--"p2p-v2-only" "Speak only the ZKT2 encrypted transport; refuse plaintext peers").env("KASPAD_P2P_V2_ONLY"))
+        .arg(arg!(--"no-dandelion" "Rollback: no Dandelion++ stem phase; own transactions are announced by trickle").env("KASPAD_NO_DANDELION"))
+        .arg(
+            Arg::new("dandelion-min-peer-age")
+                .long("dandelion-min-peer-age")
+                .require_equals(true)
+                .value_parser(clap::value_parser!(u64))
+                .hide(true)
+                .help("Minimum connection age in seconds of a Dandelion++ stem peer (default 3600; for test networks)"),
+        )
+        .arg(
+            Arg::new("p2p-outbound-bind")
+                .long("p2p-outbound-bind")
+                .require_equals(true)
+                .value_name("IP")
+                .help("Local IP address to bind outbound p2p connections to"),
+        )
+        .arg(
+            Arg::new("p2p-auth-key")
+                .long("p2p-auth-key")
+                .require_equals(true)
+                .value_name("FILE")
+                .help("File with a 32-byte hex secret key; peers that pin its BIP 340 public key can authenticate this node. The key is never shown to a peer that does not already know it"),
+        )
+        .arg(
+            Arg::new("peer-pin")
+                .long("peer-pin")
+                .action(ArgAction::Append)
+                .require_equals(true)
+                .value_name("HOST:PORT=PUBKEY")
+                .help("Authenticate the peer at HOST:PORT by its pinned 32-byte x-only BIP 340 public key (hex); disconnect and warn if it cannot prove it"),
+        )
         .arg(arg!(--"nodnsseed" "Disable DNS seeding for peers").env("KASPAD_NODNSSEED"))
         .arg(arg!(--"nogrpc" "Disable gRPC server").env("KASPAD_NOGRPC"))
         .arg(
@@ -640,6 +722,15 @@ impl Args {
             // Note: currently used programmatically by benchmarks and not exposed to CLI users
             block_template_cache_lifetime: defaults.block_template_cache_lifetime,
             disable_upnp: arg_match_unwrap_or::<bool>(&m, "disable-upnp", defaults.disable_upnp),
+            enable_upnp: arg_match_unwrap_or::<bool>(&m, "enable-upnp", defaults.enable_upnp),
+            allow_uacomment: arg_match_unwrap_or::<bool>(&m, "allow-uacomment", defaults.allow_uacomment),
+            p2p_v1_only: arg_match_unwrap_or::<bool>(&m, "p2p-v1-only", defaults.p2p_v1_only),
+            p2p_v2_only: arg_match_unwrap_or::<bool>(&m, "p2p-v2-only", defaults.p2p_v2_only),
+            no_dandelion: arg_match_unwrap_or::<bool>(&m, "no-dandelion", defaults.no_dandelion),
+            dandelion_min_peer_age: m.get_one::<u64>("dandelion-min-peer-age").cloned().or(defaults.dandelion_min_peer_age),
+            p2p_outbound_bind: m.get_one::<String>("p2p-outbound-bind").cloned().or(defaults.p2p_outbound_bind),
+            p2p_auth_key: m.get_one::<String>("p2p-auth-key").cloned().or(defaults.p2p_auth_key),
+            peer_pin: arg_match_many_unwrap_or::<String>(&m, "peer-pin", defaults.peer_pin),
             disable_dns_seeding: arg_match_unwrap_or::<bool>(&m, "nodnsseed", defaults.disable_dns_seeding),
             disable_grpc: arg_match_unwrap_or::<bool>(&m, "nogrpc", defaults.disable_grpc),
             wallet_api: m.get_one::<String>("wallet-api").cloned().or(defaults.wallet_api),
@@ -665,6 +756,7 @@ impl Args {
         }
 
         validate_ua_rules(&args.ua_rule)?;
+        validate_p2p_privacy(&args)?;
 
         Ok(args)
     }
@@ -681,6 +773,44 @@ fn arg_match_many_unwrap_or<T: Clone + Send + Sync + 'static>(m: &clap::ArgMatch
         Some(val_ref) => val_ref.cloned().collect(),
         None => default,
     }
+}
+
+fn read_auth_key(path: &str) -> Result<[u8; 32], String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("cannot read --p2p-auth-key file {path}: {e}"))?;
+    let mut key = [0u8; 32];
+    hex::decode_to_slice(text.trim(), &mut key).map_err(|e| format!("--p2p-auth-key file {path} must hold 64 hex characters: {e}"))?;
+    secp256k1::SecretKey::from_slice(&key).map_err(|e| format!("--p2p-auth-key file {path}: {e}"))?;
+    Ok(key)
+}
+
+fn parse_peer_pin(pin: &str) -> Result<(String, [u8; 32]), String> {
+    let (target, key_hex) = pin.rsplit_once('=').ok_or_else(|| format!("--peer-pin `{pin}` must be HOST:PORT=PUBKEY"))?;
+    let mut key = [0u8; 32];
+    hex::decode_to_slice(key_hex.trim(), &mut key).map_err(|e| format!("--peer-pin `{pin}`: the key must be 64 hex characters: {e}"))?;
+    secp256k1::XOnlyPublicKey::from_slice(&key).map_err(|e| format!("--peer-pin `{pin}`: {e}"))?;
+    Ok((target.to_string(), key))
+}
+
+fn validate_p2p_privacy(args: &Args) -> Result<(), clap::Error> {
+    let invalid = |msg: String| clap::Error::raw(clap::error::ErrorKind::ValueValidation, msg + "\n");
+    if !args.user_agent_comments.is_empty() && !args.allow_uacomment {
+        return Err(invalid(
+            "--uacomment makes your node unique on the network (every other node sends /kaspad:<major>.<minor>/); pass --allow-uacomment to use it anyway".into(),
+        ));
+    }
+    if args.p2p_v1_only && args.p2p_v2_only {
+        return Err(invalid("--p2p-v1-only and --p2p-v2-only contradict each other".into()));
+    }
+    if let Some(ip) = &args.p2p_outbound_bind {
+        ip.parse::<std::net::IpAddr>().map_err(|e| invalid(format!("--p2p-outbound-bind `{ip}`: {e}")))?;
+    }
+    if let Some(path) = &args.p2p_auth_key {
+        read_auth_key(path).map_err(invalid)?;
+    }
+    for pin in &args.peer_pin {
+        parse_peer_pin(pin).map_err(invalid)?;
+    }
+    Ok(())
 }
 
 fn validate_ua_rules(rules: &[String]) -> Result<(), clap::Error> {

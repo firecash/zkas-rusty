@@ -91,6 +91,47 @@ pub struct Config {
 
     /// The number of days to keep data for
     pub retention_period_days: Option<f64>,
+
+    /// p2p protocol v11 privacy settings (spec 06): transport, Dandelion++, pinned peers.
+    /// Not consensus-sensitive.
+    pub p2p_privacy: P2pPrivacyConfig,
+}
+
+/// p2p protocol v11 privacy settings (spec 06). Defaults are rollout phase R1: ZKT2 first with
+/// plaintext accepted and used as fallback, Dandelion++ on.
+#[derive(Clone, Debug)]
+pub struct P2pPrivacyConfig {
+    /// Speak the ZKT2 encrypted transport (`--p2p-v1-only` turns it off).
+    pub transport_v2: bool,
+    /// Accept plaintext inbound connections (R1, R2).
+    pub allow_v1_inbound: bool,
+    /// Fall back to plaintext when a dialled peer is a v10 node (R1).
+    pub allow_v1_outbound: bool,
+    /// Dandelion++ stem phase for transactions (`--no-dandelion` turns it off).
+    pub dandelion: bool,
+    /// Minimum connection age of a stem peer (spec: 1 h; a devnet may shorten it).
+    pub dandelion_min_peer_age_secs: u64,
+    /// Local IP to bind outbound p2p sockets to.
+    pub outbound_bind_ip: Option<std::net::IpAddr>,
+    /// Long-term BIP 340 secret key for pinned-key authentication (`--p2p-auth-key`).
+    pub auth_secret_key: Option<[u8; 32]>,
+    /// Peers whose BIP 340 x-only key we pin (`--peer-pin=<host:port>=<hex>`).
+    pub peer_pins: Vec<(String, [u8; 32])>,
+}
+
+impl Default for P2pPrivacyConfig {
+    fn default() -> Self {
+        Self {
+            transport_v2: true,
+            allow_v1_inbound: true,
+            allow_v1_outbound: true,
+            dandelion: true,
+            dandelion_min_peer_age_secs: 3600,
+            outbound_bind_ip: None,
+            auth_secret_key: None,
+            peer_pins: Vec::new(),
+        }
+    }
 }
 
 impl Config {
@@ -149,6 +190,7 @@ impl Config {
             disable_upnp: false,
             ram_scale: 1.0,
             retention_period_days: None,
+            p2p_privacy: Default::default(),
         }
     }
 

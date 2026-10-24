@@ -28,6 +28,8 @@ kaspa-consensusmanager.workspace = true
 kaspa-core.workspace = true
 kaspa-database.workspace = true
 faster-hex.workspace = true
+hex.workspace = true
+secp256k1.workspace = true
 kaspa-grpc-server.workspace = true
 kaspa-hashes.workspace = true
 kaspa-shielded-core.workspace = true
@@ -84,6 +86,8 @@ wallet-api = ["dep:zkas-walletd"]
 heap = ["dhat", "kaspa-alloc/heap"]
 devnet-prealloc = ["kaspa-consensus/devnet-prealloc"]
 semaphore-trace = ["kaspa-utils/semaphore-trace"]
+# Devnet spy node for the first-spy experiment (spec 06 §8). Never in a release build.
+spy-log = ["kaspa-p2p-flows/spy-log"]
 
 [lints]
 workspace = true
