@@ -1933,6 +1933,180 @@ mod tests {
         );
     }
 
+    // ---- Dandelion++ stempool and self-template embargo (spec 06 D-6, D-8, D-9, D-10) ----
+
+    fn uncached_mining_manager() -> MiningManager {
+        MiningManager::new(
+            TARGET_TIME_PER_BLOCK,
+            false,
+            BlockMassLimits::with_shared_limit(MAX_BLOCK_MASS),
+            ForkActivation::never(),
+            BLOCK_LANE_LIMITS,
+            Some(0),
+            Arc::new(MiningCounters::default()),
+        )
+    }
+
+    fn template_ids(mining_manager: &MiningManager, consensus: &ConsensusMock) -> Vec<TransactionId> {
+        // The template cache keys on milliseconds; step past it so every call builds afresh.
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        let template = mining_manager.get_block_template(consensus, &get_miner_data(Prefix::Testnet)).expect("template");
+        template.block.transactions.iter().skip(1).map(|t| t.id()).collect()
+    }
+
+    #[test]
+    fn test_stem_transaction_is_invisible_until_fluffed() {
+        use crate::stempool::StemAdmission;
+        let consensus = Arc::new(ConsensusMock::new());
+        let mm = uncached_mining_manager();
+        let tx = shielded_mutable_tx(&[shielded_nf(1)], 200_000).tx.as_ref().clone();
+        let id = tx.id();
+        assert!(matches!(mm.validate_stem_transaction(consensus.as_ref(), tx.clone(), false, false), Ok(StemAdmission::Inserted)));
+        assert!(mm.stem_contains(&id));
+        // Not served by getdata / RPC (both read the mempool), not counted, not templated (D-8).
+        assert!(mm.get_transaction(&id, TransactionQuery::All).is_none());
+        assert_eq!(mm.transaction_count(TransactionQuery::All), 0);
+        assert!(!mm.unknown_transactions(vec![id]).is_empty(), "an inv for it is still unknown to the mempool path");
+        assert!(!template_ids(&mm, &consensus).contains(&id));
+        // Offering it again is a loop (D-3).
+        assert!(matches!(
+            mm.validate_stem_transaction(consensus.as_ref(), tx.clone(), false, false),
+            Ok(StemAdmission::Known { in_stempool: true })
+        ));
+        // Fluff moves it to the mempool, where templates see it (D-6).
+        let accepted = mm.fluff_stem_transaction(consensus.as_ref(), id, None).unwrap();
+        assert_eq!(accepted.iter().map(|t| t.id()).collect_vec(), vec![id]);
+        assert!(!mm.stem_contains(&id));
+        assert!(template_ids(&mm, &consensus).contains(&id));
+        assert!(matches!(
+            mm.validate_stem_transaction(consensus.as_ref(), tx, false, false),
+            Ok(StemAdmission::Known { in_stempool: false })
+        ));
+    }
+
+    #[test]
+    fn test_stem_conflict_with_the_mempool_is_reported_not_dropped() {
+        use crate::stempool::StemAdmission;
+        let consensus = Arc::new(ConsensusMock::new());
+        let mm = uncached_mining_manager();
+        let tx_a = shielded_mutable_tx(&[shielded_nf(7)], 200_000);
+        let a = tx_a.id();
+        mm.validate_and_insert_mutable_transaction(consensus.as_ref(), tx_a, Priority::Low, Orphan::Allowed, RbfPolicy::Allowed).unwrap();
+        let tx_b = shielded_mutable_tx(&[shielded_nf(9), shielded_nf(7)], 300_000).tx.as_ref().clone();
+        let b = tx_b.id();
+        match mm.validate_stem_transaction(consensus.as_ref(), tx_b, false, false) {
+            Ok(StemAdmission::MempoolConflict { nullifier, resident, transaction }) => {
+                assert_eq!(nullifier, shielded_nf(7));
+                assert_eq!(resident, a);
+                assert_eq!(transaction.id(), b);
+            }
+            other => panic!("expected a conflict notice, got {other:?}"),
+        }
+        assert!(!mm.stem_contains(&b), "the conflicting stem tx is not held");
+    }
+
+    #[test]
+    fn test_conflict_is_only_reported_for_a_valid_proof() {
+        // 16 F12: a garbage-proof double spend must not trigger a notice; it is an invalid tx.
+        let consensus = Arc::new(ConsensusMock::new());
+        let mm = uncached_mining_manager();
+        let tx_a = shielded_mutable_tx(&[shielded_nf(7)], 200_000);
+        mm.validate_and_insert_mutable_transaction(consensus.as_ref(), tx_a, Priority::Low, Orphan::Allowed, RbfPolicy::Allowed).unwrap();
+        let tx_b = shielded_mutable_tx(&[shielded_nf(7)], 300_000).tx.as_ref().clone();
+        consensus.set_status(tx_b.id(), Err(TxRuleError::InvalidShieldedProof("simulated".into())));
+        let res = mm.validate_stem_transaction(consensus.as_ref(), tx_b, false, false);
+        assert!(
+            matches!(res, Err(MiningManagerError::MempoolError(RuleError::RejectTxRule(TxRuleError::InvalidShieldedProof(_))))),
+            "got {res:?}"
+        );
+    }
+
+    #[test]
+    fn test_first_stem_wins_a_stem_conflict_and_mempool_txs_evict_stem_entries() {
+        use crate::stempool::StemAdmission;
+        let consensus = Arc::new(ConsensusMock::new());
+        let mm = uncached_mining_manager();
+        let s1 = shielded_mutable_tx(&[shielded_nf(3)], 200_000).tx.as_ref().clone();
+        let s2 = shielded_mutable_tx(&[shielded_nf(3)], 250_000).tx.as_ref().clone();
+        assert!(matches!(mm.validate_stem_transaction(consensus.as_ref(), s1.clone(), false, false), Ok(StemAdmission::Inserted)));
+        assert!(matches!(mm.validate_stem_transaction(consensus.as_ref(), s2, false, false), Ok(StemAdmission::StemConflict)));
+        // A mempool transaction spending the same note evicts the stem entry (D-9).
+        let m = shielded_mutable_tx(&[shielded_nf(3)], 400_000);
+        mm.validate_and_insert_mutable_transaction(consensus.as_ref(), m, Priority::Low, Orphan::Allowed, RbfPolicy::Allowed).unwrap();
+        assert!(!mm.stem_contains(&s1.id()));
+    }
+
+    #[test]
+    fn test_block_inclusion_removes_stem_entries() {
+        use crate::stempool::StemAdmission;
+        let consensus = Arc::new(ConsensusMock::new());
+        let mm = uncached_mining_manager();
+        let s = shielded_mutable_tx(&[shielded_nf(4)], 200_000).tx.as_ref().clone();
+        let other = shielded_mutable_tx(&[shielded_nf(5)], 200_000).tx.as_ref().clone();
+        let spender = shielded_mutable_tx(&[shielded_nf(5)], 999_000).tx.as_ref().clone();
+        for t in [&s, &other] {
+            assert!(matches!(mm.validate_stem_transaction(consensus.as_ref(), (*t).clone(), false, false), Ok(StemAdmission::Inserted)));
+        }
+        // The block carries `s` itself and a different spend of `other`'s note (D-6).
+        let block = build_block_transactions([&s, &spender].into_iter());
+        mm.handle_new_block_transactions(consensus.as_ref(), 2, &block).unwrap();
+        assert_eq!(mm.stem_len(), 0);
+    }
+
+    #[test]
+    fn test_dry_run_validates_without_inserting() {
+        use crate::stempool::StemAdmission;
+        let consensus = Arc::new(ConsensusMock::new());
+        let mm = uncached_mining_manager();
+        let s = shielded_mutable_tx(&[shielded_nf(6)], 200_000).tx.as_ref().clone();
+        assert!(matches!(mm.validate_stem_transaction(consensus.as_ref(), s.clone(), false, true), Ok(StemAdmission::Inserted)));
+        assert!(!mm.stem_contains(&s.id()));
+    }
+
+    #[test]
+    fn test_self_template_embargo_holds_an_own_tx_out_of_templates() {
+        let consensus = Arc::new(ConsensusMock::new());
+        let mm = uncached_mining_manager();
+        // Own tx with an embargo an hour away: in the mempool, not in our own templates (D-10).
+        let own = shielded_mutable_tx(&[shielded_nf(11)], 200_000);
+        let id = own.id();
+        mm.set_template_embargo(id, kaspa_core::time::unix_now() + 3_600_000);
+        mm.validate_and_insert_mutable_transaction(consensus.as_ref(), own, Priority::High, Orphan::Forbidden, RbfPolicy::Forbidden).unwrap();
+        assert!(mm.get_transaction(&id, TransactionQuery::TransactionsOnly).is_some());
+        assert!(!template_ids(&mm, &consensus).contains(&id), "embargoed own tx must not be self-templated");
+        // A relayed tx is unaffected.
+        let relayed = shielded_mutable_tx(&[shielded_nf(12)], 200_000);
+        let rid = relayed.id();
+        mm.validate_and_insert_mutable_transaction(consensus.as_ref(), relayed, Priority::Low, Orphan::Allowed, RbfPolicy::Allowed).unwrap();
+        assert!(template_ids(&mm, &consensus).contains(&rid));
+        // A peer announced the own tx: the embargo ends.
+        mm.release_template_embargoes_for(&[id]);
+        assert!(template_ids(&mm, &consensus).contains(&id));
+
+        // And an embargo whose time passed ends at the next template.
+        let own2 = shielded_mutable_tx(&[shielded_nf(13)], 200_000);
+        let id2 = own2.id();
+        mm.set_template_embargo(id2, kaspa_core::time::unix_now() + 50);
+        mm.validate_and_insert_mutable_transaction(consensus.as_ref(), own2, Priority::High, Orphan::Forbidden, RbfPolicy::Forbidden).unwrap();
+        assert!(!template_ids(&mm, &consensus).contains(&id2));
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        assert!(template_ids(&mm, &consensus).contains(&id2));
+    }
+
+    #[test]
+    fn test_removing_an_embargoed_tx_leaves_no_trace() {
+        let consensus = Arc::new(ConsensusMock::new());
+        let mm = uncached_mining_manager();
+        let own = shielded_mutable_tx(&[shielded_nf(14)], 200_000);
+        let id = own.id();
+        mm.set_template_embargo(id, kaspa_core::time::unix_now() + 3_600_000);
+        mm.validate_and_insert_mutable_transaction(consensus.as_ref(), own.clone(), Priority::High, Orphan::Forbidden, RbfPolicy::Forbidden)
+            .unwrap();
+        let block = build_block_transactions(std::iter::once(own.tx.as_ref()));
+        mm.handle_new_block_transactions(consensus.as_ref(), 2, &block).unwrap();
+        assert_eq!(mm.template_embargo_count(), 0);
+    }
+
     #[allow(dead_code)]
     fn all_priority_orphan_combinations() -> impl Iterator<Item = (Priority, Orphan)> {
         [Priority::Low, Priority::High]

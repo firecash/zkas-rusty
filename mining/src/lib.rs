@@ -14,6 +14,7 @@ mod manager_tests;
 pub mod mempool;
 pub mod model;
 pub mod monitor;
+pub mod stempool;
 #[cfg(test)]
 mod toccata_transient_mass_activation_tests;
 

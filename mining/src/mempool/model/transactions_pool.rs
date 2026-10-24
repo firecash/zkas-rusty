@@ -20,7 +20,7 @@ use kaspa_consensus_core::{
 };
 use kaspa_core::{debug, time::unix_now, trace};
 use std::{
-    collections::{hash_map::Keys, hash_set::Iter},
+    collections::{HashMap, hash_map::Keys, hash_set::Iter},
     iter::once,
     sync::Arc,
 };
@@ -78,6 +78,13 @@ pub(crate) struct TransactionsPool {
 
     /// Store of UTXOs
     utxo_set: MempoolUtxoSet,
+
+    /// Self-template embargo (spec 06 D-10): transactions this node originated, kept out of the
+    /// ready frontier -- and so out of this node's own block templates -- until a peer announced
+    /// them back or the time (unix ms) passed. Without it a mining node templates its own RPC
+    /// transaction within one template refresh, before any peer has seen it, and the first block
+    /// containing it names the origin.
+    template_embargo: HashMap<TransactionId, u64>,
 }
 
 impl TransactionsPool {
@@ -93,6 +100,7 @@ impl TransactionsPool {
             last_expire_scan_time: unix_now(),
             utxo_set: MempoolUtxoSet::new(),
             estimated_size: 0,
+            template_embargo: HashMap::new(),
         }
     }
 
@@ -123,7 +131,7 @@ impl TransactionsPool {
         // here yet since, by definition, they would have been orphans.
         let parents = self.get_parent_transaction_ids_in_pool(&transaction.mtx);
         self.parent_transactions.insert(id, parents.clone());
-        if parents.is_empty() {
+        if parents.is_empty() && !self.is_template_embargoed(&id) {
             let cofactors = self.config.mempool_mass_cofactors.get(transaction.added_at_daa_score);
             self.ready_transactions.insert(FeerateTransactionKey::from_tx(&transaction, &cofactors));
         }
@@ -153,7 +161,7 @@ impl TransactionsPool {
             for chain in chains.iter() {
                 if let Some(parents) = self.parent_transactions.get_mut(chain) {
                     parents.remove(transaction_id);
-                    if parents.is_empty() {
+                    if parents.is_empty() && !self.template_embargo.contains_key(chain) {
                         let tx = self.all_transactions.get(chain).unwrap();
                         let cofactors = self.config.mempool_mass_cofactors.get(tx.added_at_daa_score);
                         self.ready_transactions.insert(FeerateTransactionKey::from_tx(tx, &cofactors));
@@ -163,6 +171,7 @@ impl TransactionsPool {
         }
         self.parent_transactions.remove(transaction_id);
         self.chained_transactions.remove(transaction_id);
+        self.template_embargo.remove(transaction_id);
 
         // Remove the transaction itself
         let removed_tx = self.all_transactions.remove(transaction_id).ok_or(RuleError::RejectMissingTransaction(*transaction_id))?;
@@ -197,6 +206,49 @@ impl TransactionsPool {
         } else {
             false
         }
+    }
+
+    fn is_template_embargoed(&self, id: &TransactionId) -> bool {
+        self.template_embargo.get(id).is_some_and(|until| *until > unix_now())
+    }
+
+    /// Registers a self-template embargo for `id` until `until_ms` (unix ms). Call BEFORE the
+    /// transaction is inserted; an entry for a transaction that never arrives is dropped by the
+    /// next [`Self::release_template_embargoes`] after its time.
+    pub(crate) fn set_template_embargo(&mut self, id: TransactionId, until_ms: u64) {
+        self.template_embargo.insert(id, until_ms);
+    }
+
+    pub(crate) fn template_embargo_count(&self) -> usize {
+        self.template_embargo.len()
+    }
+
+    /// Ends the embargo of every entry whose time passed, and of the listed ids (a peer announced
+    /// them, so they are public). A released transaction with no parent in the pool enters the
+    /// ready frontier. Returns how many entered.
+    pub(crate) fn release_template_embargoes(&mut self, now_ms: u64, announced: &[TransactionId]) -> usize {
+        if self.template_embargo.is_empty() {
+            return 0;
+        }
+        let mut released: Vec<TransactionId> =
+            self.template_embargo.iter().filter(|(_, until)| **until <= now_ms).map(|(id, _)| *id).collect();
+        released.extend(announced.iter().filter(|id| self.template_embargo.contains_key(id)));
+        let mut entered = 0;
+        for id in released {
+            if self.template_embargo.remove(&id).is_none() {
+                continue;
+            }
+            let ready = self.parent_transactions.get(&id).is_none_or(|p| p.is_empty());
+            if let Some(tx) = self.all_transactions.get(&id)
+                && ready
+            {
+                let cofactors = self.config.mempool_mass_cofactors.get(tx.added_at_daa_score);
+                if self.ready_transactions.insert(FeerateTransactionKey::from_tx(tx, &cofactors)) {
+                    entered += 1;
+                }
+            }
+        }
+        entered
     }
 
     pub(crate) fn ready_transaction_count(&self) -> usize {

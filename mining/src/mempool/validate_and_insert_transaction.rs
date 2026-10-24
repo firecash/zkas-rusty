@@ -130,7 +130,7 @@ impl Mempool {
     }
 
     /// Validates that the transaction wasn't already accepted into the DAG
-    fn validate_transaction_unacceptance(&self, transaction_id: TransactionId) -> RuleResult<()> {
+    pub(crate) fn validate_transaction_unacceptance(&self, transaction_id: TransactionId) -> RuleResult<()> {
         // Reject if the transaction is registered as an accepted transaction
         match self.accepted_transactions.has(&transaction_id) {
             true => Err(RuleError::RejectAlreadyAccepted(transaction_id)),
@@ -138,7 +138,7 @@ impl Mempool {
         }
     }
 
-    fn validate_transaction_not_duplicate(&self, transaction_id: TransactionId) -> RuleResult<()> {
+    pub(crate) fn validate_transaction_not_duplicate(&self, transaction_id: TransactionId) -> RuleResult<()> {
         if self.transaction_pool.has(&transaction_id) {
             return Err(RuleError::RejectDuplicate(transaction_id));
         }
@@ -146,14 +146,14 @@ impl Mempool {
         Ok(())
     }
 
-    fn validate_transaction_std_in_isolation(&self, transaction: &MutableTransaction, virtual_daa_score: u64) -> RuleResult<()> {
+    pub(crate) fn validate_transaction_std_in_isolation(&self, transaction: &MutableTransaction, virtual_daa_score: u64) -> RuleResult<()> {
         if !self.config.accept_non_standard {
             self.check_transaction_standard_in_isolation(transaction, virtual_daa_score)?;
         }
         Ok(())
     }
 
-    fn validate_transaction_std_in_context(
+    pub(crate) fn validate_transaction_std_in_context(
         &self,
         transaction: &MutableTransaction,
         priority: Priority,

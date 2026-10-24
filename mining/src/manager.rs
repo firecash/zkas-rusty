@@ -40,7 +40,9 @@ use kaspa_mining_errors::{
     manager::MiningManagerError,
     mempool::{RuleError, RuleResult},
 };
-use parking_lot::RwLock;
+use crate::stempool::{StemAdmission, Stempool};
+use kaspa_core::time::unix_now;
+use parking_lot::{Mutex, RwLock};
 use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -49,6 +51,8 @@ pub struct MiningManager {
     block_template_cache: BlockTemplateCache,
     mempool: RwLock<Mempool>,
     counters: Arc<MiningCounters>,
+    /// Dandelion++ stem-phase transactions; never read by templates, getdata or RPC (spec 06 D-8).
+    stempool: Mutex<Stempool>,
 }
 
 impl MiningManager {
@@ -91,10 +95,11 @@ impl MiningManager {
         let config = Arc::new(config);
         let mempool = RwLock::new(Mempool::new(config.clone(), toccata_activation, counters.clone()));
         let block_template_cache = BlockTemplateCache::new(cache_lifetime);
-        Self { config, block_template_cache, mempool, counters }
+        Self { config, block_template_cache, mempool, counters, stempool: Default::default() }
     }
 
     pub fn get_block_template(&self, consensus: &dyn ConsensusApi, miner_data: &MinerData) -> MiningManagerResult<BlockTemplate> {
+        self.release_due_template_embargoes();
         let virtual_state_approx_id = consensus.get_virtual_state_approx_id();
         let mut cache_lock = self.block_template_cache.lock(virtual_state_approx_id);
         let immutable_template = cache_lock.get_immutable_cached_template();
@@ -344,6 +349,7 @@ impl MiningManager {
                 accepted_transactions.push(accepted_transaction);
                 accepted_transactions.extend(self.validate_and_insert_unorphaned_transactions(consensus, unorphaned_transactions));
                 self.counters.increase_tx_counts(1, priority);
+                self.remove_stem_superseded_by(accepted_transactions.iter().map(|t| t.as_ref()));
 
                 Ok(TransactionInsertion::new(removed, accepted_transactions))
             }
@@ -542,6 +548,8 @@ impl MiningManager {
 
         insert_results
             .extend(self.validate_and_insert_unorphaned_transactions(consensus, unorphaned_transactions).into_iter().map(Ok));
+        // A mempool transaction spending a nullifier a stem entry owns evicts the stem entry (D-9).
+        self.remove_stem_superseded_by(insert_results.iter().filter_map(|r| r.as_ref().ok()).map(|t| t.as_ref()));
         insert_results
     }
 
@@ -631,6 +639,10 @@ impl MiningManager {
         // TODO: avoid returning a result from this function (and the underlying function). Any possible error is a
         // problem of the internal implementation and unrelated to the caller
 
+        // A stem transaction seen in a block is done, and so is any stem entry the block's
+        // transactions double-spend (spec 06 D-6, D-9).
+        self.remove_stem_superseded_by(block_transactions.iter());
+
         // write lock on mempool
         let unorphaned_transactions = self.mempool.write().handle_new_block_transactions(block_daa_score, block_transactions)?;
 
@@ -638,6 +650,158 @@ impl MiningManager {
         let accepted_transactions = self.validate_and_insert_unorphaned_transactions(consensus, unorphaned_transactions);
 
         Ok(accepted_transactions)
+    }
+
+    fn remove_stem_superseded_by<'a>(&self, transactions: impl Iterator<Item = &'a Transaction>) {
+        let mut stempool = self.stempool.lock();
+        if stempool.is_empty() {
+            return;
+        }
+        for tx in transactions {
+            for id in stempool.remove_superseded_by(tx) {
+                debug!("Stempool: dropped {id}, superseded by {}", tx.id());
+            }
+        }
+    }
+
+    /// Registers a self-template embargo (spec 06 D-10) for a transaction about to be inserted.
+    pub fn set_template_embargo(&self, id: TransactionId, until_ms: u64) {
+        self.mempool.write().set_template_embargo(id, until_ms);
+    }
+
+    /// Ends the self-template embargo of `ids` because a peer announced them.
+    pub fn release_template_embargoes_for(&self, ids: &[TransactionId]) {
+        if self.mempool.read().template_embargo_count() == 0 {
+            return;
+        }
+        self.mempool.write().release_template_embargoes(unix_now(), ids);
+    }
+
+    fn release_due_template_embargoes(&self) {
+        if self.mempool.read().template_embargo_count() == 0 {
+            return;
+        }
+        self.mempool.write().release_template_embargoes(unix_now(), &[]);
+    }
+
+    /// Validates `transaction` for the Dandelion++ stem phase and, if it passes, holds it in the
+    /// stempool (spec 06 §3.3.3: the same checks as relay, Halo 2 included, run before forwarding).
+    ///
+    /// The order matters for 16 F12: a nullifier conflict with the mempool is noted before, but
+    /// acted on only after, the proof verified, so a conflict notice is only ever sent for a
+    /// proof-valid transaction. `dry_run` validates without inserting (used for a received
+    /// `ShieldedConflict`, whose `tx_b` must never enter any pool here).
+    pub fn validate_stem_transaction(
+        &self,
+        consensus: &dyn ConsensusApi,
+        transaction: Transaction,
+        own: bool,
+        dry_run: bool,
+    ) -> MiningManagerResult<StemAdmission> {
+        let id = transaction.id();
+        if self.stempool.lock().contains(&id) {
+            return Ok(StemAdmission::Known { in_stempool: true });
+        }
+        if self.mempool.read().has_transaction(&id, TransactionQuery::All) {
+            return Ok(StemAdmission::Known { in_stempool: false });
+        }
+        let (mut mtx, _early_conflict) = match self.mempool.read().pre_validate_stem_transaction(consensus, MutableTransaction::from_tx(transaction)) {
+            Ok(x) => x,
+            Err(RuleError::RejectDuplicate(_)) | Err(RuleError::RejectAlreadyAccepted(_)) => {
+                return Ok(StemAdmission::Known { in_stempool: false });
+            }
+            Err(err) => return Err(err.into()),
+        };
+        // no lock on mempool: consensus validation, the shielded proof included
+        let args = TransactionValidationArgs::new(None);
+        if let Err(err) = validate_mempool_transaction(consensus, &mut mtx, &args) {
+            return Err(err.into());
+        }
+        let virtual_daa_score = consensus.get_virtual_daa_score();
+        {
+            let mempool = self.mempool.read();
+            if let Some((nullifier_hex, resident)) = mempool.nullifier_conflict(&mtx) {
+                let mut nullifier = [0u8; 32];
+                let _ = hex::decode_to_slice(nullifier_hex.as_bytes(), &mut nullifier);
+                return Ok(StemAdmission::MempoolConflict { nullifier, resident, transaction: mtx.tx.clone() });
+            }
+            match mempool.validate_stem_in_context(&mtx, virtual_daa_score) {
+                Ok(()) => {}
+                Err(RuleError::RejectDuplicate(_)) | Err(RuleError::RejectAlreadyAccepted(_)) => {
+                    return Ok(StemAdmission::Known { in_stempool: false });
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
+        let mut stempool = self.stempool.lock();
+        if stempool.contains(&id) {
+            return Ok(StemAdmission::Known { in_stempool: true });
+        }
+        if stempool.nullifier_conflict(&mtx.tx).is_some() {
+            return Ok(StemAdmission::StemConflict);
+        }
+        if dry_run {
+            return Ok(StemAdmission::Inserted);
+        }
+        if stempool.is_full_for(&mtx) {
+            return Ok(StemAdmission::Full(Box::new(mtx)));
+        }
+        stempool.insert(mtx, own);
+        Ok(StemAdmission::Inserted)
+    }
+
+    /// Moves a stem transaction into the mempool (spec 06 D-6). Re-runs full validation: the
+    /// anchor or a nullifier may have gone stale during the stem phase; the proof verdict is
+    /// answered from consensus' shielded verify cache. Returns the accepted transactions.
+    pub fn fluff_stem_transaction(
+        &self,
+        consensus: &dyn ConsensusApi,
+        id: TransactionId,
+        template_embargo_until: Option<u64>,
+    ) -> MiningManagerResult<Vec<Arc<Transaction>>> {
+        let Some(entry) = self.stempool.lock().remove(&id) else { return Ok(vec![]) };
+        let priority = if entry.own { Priority::High } else { Priority::Low };
+        self.insert_fluffed(consensus, entry.mtx.tx.as_ref().clone(), priority, template_embargo_until)
+    }
+
+    /// Inserts a transaction that skips (or left) the stem phase, with an optional self-template
+    /// embargo for own transactions.
+    pub fn insert_fluffed(
+        &self,
+        consensus: &dyn ConsensusApi,
+        transaction: Transaction,
+        priority: Priority,
+        template_embargo_until: Option<u64>,
+    ) -> MiningManagerResult<Vec<Arc<Transaction>>> {
+        if let Some(until) = template_embargo_until {
+            self.set_template_embargo(transaction.id(), until);
+        }
+        let orphan = if priority == Priority::High { Orphan::Forbidden } else { Orphan::Allowed };
+        match self.validate_and_insert_transaction(consensus, transaction, priority, orphan, RbfPolicy::Forbidden) {
+            Ok(insertion) => Ok(insertion.accepted),
+            Err(MiningManagerError::MempoolError(RuleError::RejectDuplicate(_))) => Ok(vec![]),
+            Err(err) => Err(err),
+        }
+    }
+
+    pub fn stem_transaction(&self, id: &TransactionId) -> Option<Arc<Transaction>> {
+        self.stempool.lock().get(id).map(|e| e.mtx.tx.clone())
+    }
+
+    pub fn stem_contains(&self, id: &TransactionId) -> bool {
+        self.stempool.lock().contains(id)
+    }
+
+    pub fn stem_ids(&self) -> Vec<TransactionId> {
+        self.stempool.lock().ids()
+    }
+
+    pub fn stem_len(&self) -> usize {
+        self.stempool.lock().len()
+    }
+
+    pub fn remove_stem_transaction(&self, id: &TransactionId) -> bool {
+        self.stempool.lock().remove(id).is_some()
     }
 
     pub fn expire_low_priority_transactions(&self, consensus: &dyn ConsensusApi) {
@@ -874,6 +1038,11 @@ impl MiningManager {
     }
 
     #[cfg(test)]
+    pub(crate) fn template_embargo_count(&self) -> usize {
+        self.mempool.read().template_embargo_count()
+    }
+
+    #[cfg(test)]
     pub(crate) fn get_estimated_size(&self) -> usize {
         self.mempool.read().get_estimated_size()
     }
@@ -1029,6 +1198,66 @@ impl MiningManagerProxy {
     /// nor accepted.
     pub async fn unknown_transactions(self, transactions: Vec<TransactionId>) -> Vec<TransactionId> {
         spawn_blocking(move || self.inner.unknown_transactions(transactions)).await.unwrap()
+    }
+
+    /// See [`MiningManager::validate_stem_transaction`].
+    pub async fn validate_stem_transaction(
+        self,
+        consensus: &ConsensusProxy,
+        transaction: Transaction,
+        own: bool,
+        dry_run: bool,
+    ) -> MiningManagerResult<StemAdmission> {
+        consensus.clone().spawn_blocking(move |c| self.inner.validate_stem_transaction(c, transaction, own, dry_run)).await
+    }
+
+    /// See [`MiningManager::fluff_stem_transaction`].
+    pub async fn fluff_stem_transaction(
+        self,
+        consensus: &ConsensusProxy,
+        id: TransactionId,
+        template_embargo_until: Option<u64>,
+    ) -> MiningManagerResult<Vec<Arc<Transaction>>> {
+        consensus.clone().spawn_blocking(move |c| self.inner.fluff_stem_transaction(c, id, template_embargo_until)).await
+    }
+
+    /// See [`MiningManager::insert_fluffed`].
+    pub async fn insert_fluffed(
+        self,
+        consensus: &ConsensusProxy,
+        transaction: Transaction,
+        priority: Priority,
+        template_embargo_until: Option<u64>,
+    ) -> MiningManagerResult<Vec<Arc<Transaction>>> {
+        consensus.clone().spawn_blocking(move |c| self.inner.insert_fluffed(c, transaction, priority, template_embargo_until)).await
+    }
+
+    pub fn stem_transaction(&self, id: &TransactionId) -> Option<Arc<Transaction>> {
+        self.inner.stem_transaction(id)
+    }
+
+    pub fn stem_contains(&self, id: &TransactionId) -> bool {
+        self.inner.stem_contains(id)
+    }
+
+    pub fn stem_ids(&self) -> Vec<TransactionId> {
+        self.inner.stem_ids()
+    }
+
+    pub fn stem_len(&self) -> usize {
+        self.inner.stem_len()
+    }
+
+    pub fn remove_stem_transaction(&self, id: &TransactionId) -> bool {
+        self.inner.remove_stem_transaction(id)
+    }
+
+    pub fn set_template_embargo(&self, id: TransactionId, until_ms: u64) {
+        self.inner.set_template_embargo(id, until_ms)
+    }
+
+    pub async fn release_template_embargoes_for(self, ids: Vec<TransactionId>) {
+        spawn_blocking(move || self.inner.release_template_embargoes_for(&ids)).await.unwrap()
     }
 
     pub fn snapshot(&self) -> MempoolCountersSnapshot {

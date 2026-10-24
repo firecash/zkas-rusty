@@ -119,6 +119,55 @@ impl Mempool {
         count
     }
 
+    pub(crate) fn set_template_embargo(&mut self, id: TransactionId, until_ms: u64) {
+        self.transaction_pool.set_template_embargo(id, until_ms)
+    }
+
+    pub(crate) fn template_embargo_count(&self) -> usize {
+        self.transaction_pool.template_embargo_count()
+    }
+
+    pub(crate) fn release_template_embargoes(&mut self, now_ms: u64, announced: &[TransactionId]) -> usize {
+        self.transaction_pool.release_template_embargoes(now_ms, announced)
+    }
+
+    /// Pre-validation for a Dandelion++ stem transaction: like `pre_validate_and_populate_transaction`
+    /// but a nullifier conflict with the mempool is returned instead of failing, because the stem
+    /// path must verify the proof before it may announce the conflict (spec 06 D-9).
+    pub(crate) fn pre_validate_stem_transaction(
+        &self,
+        consensus: &dyn kaspa_consensus_core::api::ConsensusApi,
+        mut transaction: MutableTransaction,
+    ) -> errors::RuleResult<(MutableTransaction, Option<(String, TransactionId)>)> {
+        let transaction_id = transaction.id();
+        self.validate_transaction_unacceptance(transaction_id)?;
+        self.validate_transaction_not_duplicate(transaction_id)?;
+        transaction.calculated_non_contextual_masses = Some(consensus.calculate_transaction_non_contextual_masses(&transaction.tx)?);
+        let virtual_daa_score = consensus.get_virtual_daa_score();
+        self.validate_transaction_limits_in_isolation(&transaction, virtual_daa_score)?;
+        self.validate_transaction_std_in_isolation(&transaction, virtual_daa_score)?;
+        let conflict = self.nullifier_conflict(&transaction);
+        self.transaction_pool.check_double_spends(&transaction)?;
+        self.populate_mempool_entries(&mut transaction)?;
+        Ok((transaction, conflict))
+    }
+
+    /// The first mempool nullifier conflict of `transaction`: (nullifier hex, resident tx id).
+    pub(crate) fn nullifier_conflict(&self, transaction: &MutableTransaction) -> Option<(String, TransactionId)> {
+        match self.transaction_pool.check_nullifier_double_spends(transaction) {
+            Err(errors::RuleError::RejectDoubleSpendNullifierInMempool(nf, owner)) => Some((nf, owner)),
+            _ => None,
+        }
+    }
+
+    /// The in-context checks `post_validate_and_insert_transaction` runs, without inserting.
+    pub(crate) fn validate_stem_in_context(&self, transaction: &MutableTransaction, virtual_daa_score: u64) -> errors::RuleResult<()> {
+        self.validate_transaction_unacceptance(transaction.id())?;
+        self.validate_transaction_not_duplicate(transaction.id())?;
+        self.validate_transaction_limits_in_context(transaction, virtual_daa_score)?;
+        self.validate_transaction_std_in_context(transaction, Priority::Low, virtual_daa_score)
+    }
+
     pub(crate) fn ready_transaction_count(&self) -> usize {
         self.transaction_pool.ready_transaction_count()
     }
