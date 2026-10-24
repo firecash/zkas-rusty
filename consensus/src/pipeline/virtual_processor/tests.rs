@@ -3968,3 +3968,348 @@ async fn combined_reimport_is_idempotent() {
     node.shutdown(wait);
 }
 
+
+// ---------------------------------------------------------------------------------------------
+// SF-L and NU-A (19-sfl-nua-impl.md). Every test runs real Halo 2 proofs through mined blocks, on
+// the post-security-fork format (mainnet's), with the activations set per test.
+// ---------------------------------------------------------------------------------------------
+
+/// A post-security-fork chain with one spendable coinbase note (block 1, single-leaf tree), mature.
+struct SfNuaChain {
+    ctx: TestContext,
+    net: [u8; 32],
+    miner_seed: [u8; 32],
+    block1: Block,
+}
+
+impl SfNuaChain {
+    async fn new(sf_l: ForkActivation, nu_a: ForkActivation, edit: impl Fn(&mut Params)) -> Self {
+        let mut params = MAINNET_PARAMS.clone();
+        params.shielded_coinbase = true;
+        params.dev_fee_recipient = None;
+        params.security_fork_activation = ForkActivation::always();
+        params.miner_accrual_payout_interval = 1;
+        params.shielded_locktime_activation = sf_l;
+        params.nu_a_activation = nu_a;
+        let config = ConfigBuilder::new(params)
+            .edit_consensus_params(|p| {
+                p.genesis.bits = 0x207fffff;
+                p.blockrate.finality_depth = 50;
+                p.blockrate.shielded_anchor_depth = 5;
+                edit(p);
+            })
+            .build();
+        let net = config.genesis.hash.as_bytes();
+        let mut ctx = TestContext::new(TestConsensus::new(&config));
+        let miner_seed = [7u8; 32];
+        let miner_addr = kaspa_shielded_core::wallet::address_bytes_from_seed(miner_seed).expect("orchard address");
+        ctx.miner_data = MinerData::new(ScriptPublicKey::new(0, ScriptVec::from_slice(&miner_addr)), vec![]);
+        let mut block1 = None;
+        for _ in 0..2 {
+            let b = ctx.mine_real_pow_block();
+            ctx.consensus.validate_and_insert_block(b.clone()).virtual_state_task.await.unwrap();
+            block1 = Some(b);
+        }
+        let mut chain = Self { ctx, net, miner_seed, block1: block1.unwrap() };
+        chain.mine_empty(6).await;
+        chain
+    }
+
+    async fn mine_empty(&mut self, n: usize) -> Vec<Hash> {
+        let mut out = Vec::new();
+        for _ in 0..n {
+            let b = self.ctx.mine_real_pow_block();
+            out.push(b.header.hash);
+            self.ctx.consensus.validate_and_insert_block(b).virtual_state_task.await.unwrap();
+        }
+        out
+    }
+
+    /// A real spend of block 1's note with the given lock time and fee, naming block 1.
+    fn spend(&self, lock_time: u64, fee: u64, recipient_tag: u8) -> Transaction {
+        use kaspa_consensus_core::subnets::SUBNETWORK_ID_NATIVE;
+        use kaspa_consensus_core::tx::TX_VERSION_SHIELDED;
+        let cb = &self.block1.transactions[0];
+        let (cb_txid, note_value) = (cb.id(), cb.outputs[0].value);
+        let recipient = kaspa_shielded_core::wallet::address_bytes_from_seed([recipient_tag; 32]).unwrap();
+        // lock_time is set before the sighash context is taken: it is signed.
+        let mut tx = Transaction::new(TX_VERSION_SHIELDED, vec![], vec![], lock_time, SUBNETWORK_ID_NATIVE, 0, vec![]);
+        let tx_ctx = tx.shielded_sighash_context();
+        tx.payload = kaspa_shielded_core::wallet::build::build_singleleaf_coinbase_spend_anchored(
+            self.miner_seed,
+            cb_txid.as_bytes(),
+            0,
+            note_value,
+            recipient,
+            note_value - fee,
+            &self.net,
+            &tx_ctx,
+            Some(self.block1.header.hash.as_bytes()),
+        )
+        .expect("wallet builds a real spend bundle");
+        tx.finalize();
+        tx
+    }
+
+    fn virtual_daa(&self) -> u64 {
+        self.ctx.consensus.get_virtual_daa_score()
+    }
+
+    /// Mine `txs` in a block (injected behind the template validator, so a tx the template would
+    /// refuse still reaches consensus) and one child; true if every tx was applied.
+    async fn mine_and_check_applied(&mut self, txs: Vec<Transaction>) -> (bool, Hash, Hash) {
+        let ids: Vec<_> = txs.iter().map(|t| t.id()).collect();
+        let b = self.ctx.mine_real_pow_block_injecting(txs);
+        let carrier = b.header.hash;
+        self.ctx.consensus.validate_and_insert_block(b).virtual_state_task.await.expect("carrying block is valid");
+        let child = self.ctx.mine_real_pow_block();
+        let child_hash = child.header.hash;
+        self.ctx.consensus.validate_and_insert_block(child).virtual_state_task.await.unwrap();
+        let applied = self.ctx.consensus.get_shielded_chain_block_data(child_hash).unwrap();
+        (ids.iter().all(|id| applied.accepted_txids.contains(id)), carrier, child_hash)
+    }
+
+    async fn insert_injected(&mut self, txs: Vec<Transaction>) -> Result<BlockStatus, crate::errors::RuleError> {
+        let b = self.ctx.mine_real_pow_block_injecting(txs);
+        self.ctx.consensus.validate_and_insert_block(b).virtual_state_task.await
+    }
+}
+
+const FLOOR2: u64 = 1_200_000; // shielded_fee_floor(2): a single-leaf spend has 2 actions (Orchard pads)
+
+/// SF-L (spec 01 L-1, L-2, L-4): from the activation a shielded tx's DAA lock time is enforced at the
+/// carrying block (DAA = L invalid, L+1 valid) and a time-type lock is invalid; before it (today) the
+/// field is inert and a non-final tx is applied.
+#[tokio::test]
+async fn sf_l_enforces_shielded_lock_time_at_the_carrying_block() {
+    use crate::errors::RuleError;
+    use kaspa_consensus_core::errors::tx::TxRuleError;
+
+    // Today's rules: the lock time is ignored, the non-final spend is applied.
+    let mut old = SfNuaChain::new(ForkActivation::never(), ForkActivation::never(), |_| {}).await;
+    let far = old.virtual_daa() + 1_000;
+    let (applied, _, _) = old.mine_and_check_applied(vec![old.spend(far, 2_000, 9)]).await;
+    assert!(applied, "before SF-L a far-future lock time is inert (the vacuous input loop)");
+
+    let mut c = SfNuaChain::new(ForkActivation::always(), ForkActivation::never(), |_| {}).await;
+    // The next block's DAA score is the virtual's; lock it at exactly that score: not final.
+    let next_daa = c.virtual_daa();
+    let l = next_daa;
+    let r = c.insert_injected(vec![c.spend(l, 2_000, 9)]).await;
+    assert!(
+        matches!(r, Err(RuleError::TxInContextFailed(_, TxRuleError::ShieldedNotFinalized(lt, daa))) if lt == l && daa == next_daa),
+        "lock time == carrying block DAA is not final: {r:?}"
+    );
+    let r = c.insert_injected(vec![c.spend(600_000_000_000, 2_000, 9)]).await;
+    assert!(matches!(r, Err(RuleError::TxInContextFailed(_, TxRuleError::ShieldedTimeLock(_)))), "time-type lock is invalid: {r:?}");
+    // One below the next block's DAA score: final, applied.
+    let l = c.virtual_daa() - 1;
+    let (applied, _, _) = c.mine_and_check_applied(vec![c.spend(l, 2_000, 9)]).await;
+    assert!(applied, "lock time below the carrying block's DAA score is final and applied");
+}
+
+/// NU-A R2: below-floor fee invalidates the carrying block; at the floor plus a tip the tx applies,
+/// the floor is burned (committed in zkas_state_root2), and the merging coinbase re-mints only the tip.
+#[tokio::test]
+async fn nu_a_fee_floor_is_burned_and_only_the_tip_is_paid() {
+    use crate::errors::RuleError;
+    use kaspa_consensus_core::errors::tx::TxRuleError;
+    let mut c = SfNuaChain::new(ForkActivation::never(), ForkActivation::always(), |_| {}).await;
+    let r = c.insert_injected(vec![c.spend(0, FLOOR2 - 1, 9)]).await;
+    assert!(
+        matches!(r, Err(RuleError::TxInContextFailed(_, TxRuleError::ShieldedFeeBelowFloor(f, floor, 2))) if f == FLOOR2 - 1 && floor == FLOOR2),
+        "a fee one sompi below the floor invalidates the block: {r:?}"
+    );
+    // Reference: the reward of an empty block (same subsidy month).
+    let empty = c.mine_empty(2).await;
+    let reward_of_empty: u64 = c.ctx.consensus.get_block(empty[1]).unwrap().transactions[0].outputs.iter().map(|o| o.value).sum();
+    let tip = 4_321;
+    let (applied, _carrier, child) = c.mine_and_check_applied(vec![c.spend(0, FLOOR2 + tip, 9)]).await;
+    assert!(applied, "a fee at the floor plus a tip is applied");
+    let child_reward: u64 = c.ctx.consensus.get_block(child).unwrap().transactions[0].outputs.iter().map(|o| o.value).sum();
+    assert_eq!(child_reward, reward_of_empty + tip, "the merging coinbase pays subsidy + tip, never the burned floor");
+    let vp = c.ctx.consensus.virtual_processor();
+    let mgr = vp.shielded_state_manager_ref();
+    let nua = mgr.nua_at(child).unwrap();
+    assert_eq!(nua.cumulative_fee_burn, FLOOR2 as u128, "the floor is in the committed burn total");
+    let v1 = mgr.state_root_v1_at(child, false).unwrap();
+    assert_eq!(vp.shielded_state_root_at(child).unwrap(), kaspa_shielded_core::commitment::shielded_state_root_v2(&v1, &nua));
+    assert_ne!(vp.shielded_state_root_at(child).unwrap(), v1, "after NU-A the committed root is v2");
+    // The next block commits that root and validates (pool delta = subsidy - burn holds).
+    c.mine_empty(2).await;
+}
+
+/// NU-A R1.5 (spec 08 T5): a block carrying a bundle with an invalid proof is invalid after NU-A;
+/// before it the block stays valid and the transaction is silently dropped (today's free CPU-DoS).
+#[tokio::test]
+async fn nu_a_invalid_proof_is_block_fatal_and_dropped_before() {
+    use crate::errors::RuleError;
+    let corrupt = |tx: &Transaction| {
+        let mut b = kaspa_shielded_core::bundle::ShieldedBundle::from_bytes_at(&tx.payload, true).unwrap();
+        let i = b.proof.len() / 2;
+        b.proof[i] ^= 0x01;
+        let mut t = tx.clone();
+        t.payload = b.to_bytes();
+        assert_eq!(kaspa_shielded_core::bundle::ShieldedBundle::from_bytes_at(&t.payload, true).unwrap().proof.len(), b.proof.len());
+        t.finalize();
+        t
+    };
+    let mut old = SfNuaChain::new(ForkActivation::never(), ForkActivation::never(), |_| {}).await;
+    let bad = corrupt(&old.spend(0, FLOOR2 + 1, 9));
+    let bad_id = bad.id();
+    // Before NU-A the block is NOT rejected: it is stored (every node pays for its verification,
+    // the free CPU-DoS R1.5 closes). As a chain candidate it fails the chain-qualification check on
+    // its own transactions and is disqualified from the selected chain; a block merging it later
+    // drops the transaction (`filter_map(.ok())`). The naive expectation "the carrying block stays
+    // UTXO-valid" was wrong: the code is stricter for the carrier itself, but still not fatal.
+    let status = old.insert_injected(vec![bad]).await.expect("before NU-A the block is accepted into the DAG, not rejected");
+    assert_eq!(status, BlockStatus::StatusDisqualifiedFromChain, "stored, but never a chain block");
+    let more = old.mine_empty(3).await;
+    for h in &more {
+        assert_eq!(old.ctx.consensus.block_status(*h), BlockStatus::StatusUTXOValid, "the chain continues past it");
+        assert!(!old.ctx.consensus.get_shielded_chain_block_data(*h).unwrap().accepted_txids.contains(&bad_id), "the tx is never applied");
+    }
+
+    let mut c = SfNuaChain::new(ForkActivation::never(), ForkActivation::always(), |_| {}).await;
+    let bad = corrupt(&c.spend(0, FLOOR2 + 1, 9));
+    let bad_id = bad.id();
+    let r = c.insert_injected(vec![bad]).await;
+    assert!(matches!(r, Err(RuleError::InvalidShieldedProofInBlock(id, _)) if id == bad_id), "after NU-A the block is invalid: {r:?}");
+    // The honest version of the same spend is fine.
+    let (applied, _, _) = c.mine_and_check_applied(vec![c.spend(0, FLOOR2 + 1, 9)]).await;
+    assert!(applied);
+}
+
+/// NU-A R4.1: more than 78 non-coinbase shielded actions in one block is invalid; 78 is not refused
+/// by the cap (that block fails a later rule here, mass, which is what proves the cap let it pass).
+#[tokio::test]
+async fn nu_a_caps_non_coinbase_shielded_actions_per_block() {
+    use crate::errors::RuleError;
+    let mut c = SfNuaChain::new(ForkActivation::never(), ForkActivation::always(), |_| {}).await;
+    let base = c.spend(0, FLOOR2 + 1, 9);
+    // Same bundle, distinct txids (lock time is inert without SF-L); 2 actions each.
+    let copies = |n: u64| {
+        (0..n)
+            .map(|i| {
+                let mut t = base.clone();
+                t.lock_time = i;
+                t.finalize();
+                t
+            })
+            .collect::<Vec<_>>()
+    };
+    let r = c.insert_injected(copies(40)).await;
+    assert!(matches!(r, Err(RuleError::TooManyShieldedActions(80, 78))), "80 actions are over the cap: {r:?}");
+    let r = c.insert_injected(copies(39)).await;
+    assert!(!matches!(r, Err(RuleError::TooManyShieldedActions(..))), "78 actions pass the cap: {r:?}");
+    // Before NU-A the cap does not exist (the same block fails only later rules).
+    let mut old = SfNuaChain::new(ForkActivation::never(), ForkActivation::never(), |_| {}).await;
+    let base_old = old.spend(0, FLOOR2 + 1, 9);
+    let many: Vec<_> = (0..40u64)
+        .map(|i| {
+            let mut t = base_old.clone();
+            t.lock_time = i;
+            t.finalize();
+            t
+        })
+        .collect();
+    let r = old.insert_injected(many).await;
+    assert!(!matches!(r, Err(RuleError::TooManyShieldedActions(..))), "no cap before NU-A: {r:?}");
+}
+
+/// NU-A F-1: the template carries the fixed 5-byte extra data whatever the miner asked for, and a
+/// block with any other extra data is invalid.
+#[tokio::test]
+async fn nu_a_fixes_the_coinbase_extra_data() {
+    use crate::errors::RuleError;
+    let mut c = SfNuaChain::new(ForkActivation::never(), ForkActivation::always(), |_| {}).await;
+    let fixed = kaspa_consensus_core::config::params::nu_a_coinbase_extra_data();
+    c.ctx.miner_data.extra_data = b"/pool-tag".to_vec();
+    let b = c.ctx.mine_real_pow_block();
+    assert!(b.transactions[0].payload.ends_with(&fixed), "the template ignores the requested tag after NU-A");
+    c.ctx.consensus.validate_and_insert_block(b).virtual_state_task.await.expect("fixed form is valid");
+    let tampered = c.ctx.mine_real_pow_block_tampering_coinbase(|cb| {
+        let n = cb.payload.len();
+        cb.payload.truncate(n - fixed.len());
+        cb.payload.extend_from_slice(b"/pool-tag");
+    });
+    let r = c.ctx.consensus.validate_and_insert_block(tampered).virtual_state_task.await;
+    assert!(matches!(r, Err(RuleError::BadCoinbaseExtraData(9, Some(b'/')))), "{r:?}");
+    // Before NU-A the requested tag is kept.
+    let mut old = SfNuaChain::new(ForkActivation::never(), ForkActivation::never(), |_| {}).await;
+    old.ctx.miner_data.extra_data = b"/pool-tag".to_vec();
+    let b = old.ctx.mine_real_pow_block();
+    assert!(b.transactions[0].payload.ends_with(b"/pool-tag"));
+}
+
+/// NU-A R4.2 (spec 08 T10, in-process): the tree rolls over at the threshold; a note of a frozen era
+/// is spendable against the era's final root long after `max_shielded_anchor_age`, while the same
+/// stale anchor is dropped without NU-A; a root of the era that is not its final root expires as
+/// usual; the double spend of a frozen note is refused by the one global nullifier set; and a
+/// pruning-point export binds the NU-A state through zkas_state_root2.
+#[tokio::test]
+async fn nu_a_tree_era_rollover_and_frozen_anchor_exemption() {
+    let small_window = |p: &mut Params| {
+        p.blockrate.max_shielded_anchor_age = 8;
+    };
+    // Threshold 1: block 1's single-leaf tree is era 0, frozen by block 2 with block 1's root.
+    let mut c = SfNuaChain::new(ForkActivation::never(), ForkActivation::always(), |p| {
+        small_window(p);
+        p.tree_rollover_threshold = 1;
+    })
+    .await;
+    let tips = c.mine_empty(12).await;
+    let tip = *tips.last().unwrap();
+    {
+        let mgr = c.ctx.consensus.virtual_processor().shielded_state_manager_ref();
+        let nua = mgr.nua_at(tip).unwrap();
+        assert!(nua.tree_era >= 18, "every block rolled over: era {}", nua.tree_era);
+        let f0 = nua.frozen[0];
+        assert_eq!((f0.era, f0.size, f0.freeze_block), (0, 1, c.block1.header.hash.as_bytes()));
+        assert_eq!(f0.final_root, c.ctx.consensus.virtual_processor().shielded_anchor_at(c.block1.header.hash).unwrap());
+        assert_eq!(nua.frozen.len() as u32, nua.tree_era);
+    }
+    // Age of block 1's anchor is now ~19 > 8: only the frozen exemption can apply it.
+    let (applied, _, _) = c.mine_and_check_applied(vec![c.spend(0, FLOOR2 + 7, 9)]).await;
+    assert!(applied, "a frozen-era note is spendable after the maximum anchor age");
+    // A second spend of the same note (different output, so a different tx): one nullifier set.
+    let (applied, _, _) = c.mine_and_check_applied(vec![c.spend(0, FLOOR2 + 8, 10)]).await;
+    assert!(!applied, "the frozen note cannot be spent twice");
+
+    // The pruning-point export carries the NU-A state and binds to the committed v2 root.
+    {
+        let vp = c.ctx.consensus.virtual_processor();
+        let pp = tip;
+        let committed = vp.shielded_state_root_at(pp).unwrap();
+        let wire = vp.export_pruning_point_shielded(pp).unwrap().expect("pp exports");
+        let md = crate::processes::shielded::PruningPointShieldedMetadata::from_wire_bytes(&wire.data).unwrap();
+        assert!(!md.nua.frozen.is_empty());
+        vp.verify_import_binding_versioned(pp, &md, committed).expect("honest export binds to the v2 root");
+        let mut t = md.clone();
+        t.nua.cumulative_fee_burn += 1;
+        assert!(vp.verify_import_binding_versioned(pp, &t, committed).is_err(), "a different burn total is refused");
+        let mut t = md.clone();
+        t.nua.frozen[0].final_root = [0xEE; 32];
+        assert!(vp.verify_import_binding_versioned(pp, &t, committed).is_err(), "a forged frozen root is refused");
+        let mut t = md.clone();
+        t.nua.frozen.pop();
+        assert!(vp.verify_import_binding_versioned(pp, &t, committed).is_err(), "an omitted frozen era is refused");
+    }
+
+    // Control without NU-A: the same stale anchor is dropped (max age).
+    let mut old = SfNuaChain::new(ForkActivation::never(), ForkActivation::never(), small_window).await;
+    old.mine_empty(12).await;
+    let (applied, _, _) = old.mine_and_check_applied(vec![old.spend(0, FLOOR2 + 7, 9)]).await;
+    assert!(!applied, "without the exemption an anchor older than the maximum age is dropped");
+
+    // Threshold 2: era 0 = blocks 1..2, frozen with block 2's root; block 1's root is NOT final, so a
+    // spend anchored there expires as usual.
+    let mut c2 = SfNuaChain::new(ForkActivation::never(), ForkActivation::always(), |p| {
+        small_window(p);
+        p.tree_rollover_threshold = 2;
+    })
+    .await;
+    c2.mine_empty(12).await;
+    let (applied, _, _) = c2.mine_and_check_applied(vec![c2.spend(0, FLOOR2 + 7, 9)]).await;
+    assert!(!applied, "a non-final root of a frozen era is not exempt");
+}
