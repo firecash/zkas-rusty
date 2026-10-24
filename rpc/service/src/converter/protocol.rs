@@ -26,6 +26,8 @@ impl ProtocolConverter {
             advertised_protocol_version: properties.advertised_protocol_version,
             time_connected: peer.time_connected(),
             blocks_relayed: self.flow_context.relay_credit(&peer.key()),
+            transport: peer.transport().kind.to_string(),
+            session_id: peer.transport().session_id.map(hex::encode).unwrap_or_default(),
         }
     }
 

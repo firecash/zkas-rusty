@@ -419,6 +419,11 @@ message GetConnectedPeerInfoMessage {
   // Blocks this peer was the first to relay to us, since this node started.
   // Gossip is a race, so this is "who supplies us first", not "who mined it".
   uint64 blocksRelayed = 12;
+
+  // "v1" (plaintext) or "v2" (ZKT2 encrypted transport)
+  string transport = 13;
+  // Hex BIP 324 session id of a v2 connection; compare it out of band with the peer's operator
+  string sessionId = 14;
 }
 
 // AddPeerRequestMessage adds a peer to kaspad's outgoing connection list.

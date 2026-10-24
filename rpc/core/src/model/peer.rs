@@ -28,4 +28,10 @@ pub struct RpcPeerInfo {
     /// keeps us supplied with blocks first — not who produced them. On a shielded
     /// chain the producer is deliberately unidentifiable.
     pub blocks_relayed: u64,
+
+    /// `v1` (plaintext) or `v2` (ZKT2 encrypted transport, spec 06 §3.1)
+    pub transport: String,
+    /// Hex BIP 324 session id of a `v2` connection, empty for `v1`. Two operators who read the
+    /// same id on both ends know no man in the middle split the connection (spec 06 T-7).
+    pub session_id: String,
 }

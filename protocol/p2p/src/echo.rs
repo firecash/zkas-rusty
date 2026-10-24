@@ -201,4 +201,56 @@ mod tests {
         drop(adaptor2);
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
+
+    async fn connect_pair(port: u16, server: crate::TransportConfig, client: crate::TransportConfig) -> (crate::TransportInfo, crate::TransportInfo) {
+        let server_addr = NetAddress::from_str(&format!("127.0.0.1:{port}")).unwrap();
+        let a_server =
+            Adaptor::bidirectional_with_transport(server_addr, Hub::new(), Arc::new(EchoFlowInitializer::new()), Default::default(), server)
+                .unwrap();
+        let a_client = Adaptor::client_only_with_transport(Hub::new(), Arc::new(EchoFlowInitializer::new()), Default::default(), client);
+        let key = a_client
+            .connect_peer_with_retries(format!("127.0.0.1:{port}"), 16, Duration::from_millis(250))
+            .await
+            .expect("peer connection failed");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let c = a_client.active_peers();
+        let s = a_server.active_peers();
+        assert_eq!(c.len(), 1, "handshake failed -- outbound peer is missing");
+        assert_eq!(s.len(), 1, "handshake failed -- inbound peer is missing");
+        let out = (c[0].transport(), s[0].transport());
+        a_client.terminate(key).await;
+        a_client.close().await;
+        a_server.close().await;
+        out
+    }
+
+    /// ZKT2 on both ends: the h2/gRPC handshake and flows run unchanged on top, and both ends see
+    /// the same session id (spec 06 T-7).
+    #[tokio::test]
+    async fn zkt2_carries_the_p2p_handshake() {
+        let cfg = crate::TransportConfig::zkt2_opportunistic("zkas-devnet".into());
+        let (c, s) = connect_pair(50061, cfg.clone(), cfg).await;
+        assert_eq!(c.kind, crate::TransportKind::V2);
+        assert_eq!(s.kind, crate::TransportKind::V2);
+        assert!(c.session_id.is_some());
+        assert_eq!(c.session_id, s.session_id);
+    }
+
+    /// A v11 node dialling a v10 (plaintext-only) node falls back to plaintext (T-6).
+    #[tokio::test]
+    async fn zkt2_client_falls_back_to_a_plaintext_server() {
+        let (c, s) =
+            connect_pair(50062, crate::TransportConfig::plaintext(), crate::TransportConfig::zkt2_opportunistic("zkas-devnet".into())).await;
+        assert_eq!(c.kind, crate::TransportKind::V1);
+        assert_eq!(s.kind, crate::TransportKind::V1);
+    }
+
+    /// A v10 node dialling a v11 node is served in plaintext (T-5 sniff).
+    #[tokio::test]
+    async fn plaintext_client_is_served_by_a_zkt2_server() {
+        let (c, s) =
+            connect_pair(50063, crate::TransportConfig::zkt2_opportunistic("zkas-devnet".into()), crate::TransportConfig::plaintext()).await;
+        assert_eq!(c.kind, crate::TransportKind::V1);
+        assert_eq!(s.kind, crate::TransportKind::V1);
+    }
 }

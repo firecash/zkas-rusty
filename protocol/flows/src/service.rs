@@ -6,7 +6,7 @@ use kaspa_core::{
     task::service::{AsyncService, AsyncServiceFuture},
     trace,
 };
-use kaspa_p2p_lib::Adaptor;
+use kaspa_p2p_lib::{Adaptor, TransportConfig};
 use kaspa_utils::triggers::SingleTrigger;
 use kaspa_utils_tower::counters::TowerConnectionCounters;
 
@@ -65,11 +65,28 @@ impl AsyncService for P2pService {
         // Prepare a shutdown signal receiver
         let shutdown_signal = self.shutdown.listener.clone();
 
-        let p2p_adaptor = if self.inbound_limit == 0 {
-            Adaptor::client_only(self.flow_context.hub().clone(), self.flow_context.clone(), self.counters.clone())
+        let privacy = &self.flow_context.config.p2p_privacy;
+        let transport = if privacy.transport_v2 {
+            TransportConfig {
+                allow_v1_inbound: privacy.allow_v1_inbound,
+                allow_v1_outbound: privacy.allow_v1_outbound,
+                outbound_bind_ip: privacy.outbound_bind_ip,
+                ..TransportConfig::zkt2_opportunistic(self.flow_context.config.network_name())
+            }
         } else {
-            Adaptor::bidirectional(self.listen, self.flow_context.hub().clone(), self.flow_context.clone(), self.counters.clone())
-                .unwrap()
+            TransportConfig { outbound_bind_ip: privacy.outbound_bind_ip, ..TransportConfig::plaintext() }
+        };
+        let p2p_adaptor = if self.inbound_limit == 0 {
+            Adaptor::client_only_with_transport(self.flow_context.hub().clone(), self.flow_context.clone(), self.counters.clone(), transport)
+        } else {
+            Adaptor::bidirectional_with_transport(
+                self.listen,
+                self.flow_context.hub().clone(),
+                self.flow_context.clone(),
+                self.counters.clone(),
+                transport,
+            )
+            .unwrap()
         };
         let connection_manager = ConnectionManager::new(
             p2p_adaptor.clone(),

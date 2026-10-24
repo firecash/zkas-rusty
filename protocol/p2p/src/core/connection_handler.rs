@@ -1,6 +1,10 @@
 use crate::common::ProtocolError;
 use crate::core::hub::HubEvent;
 use crate::core::router::outgoing_pipe;
+use crate::core::transport::{
+    MAX_PENDING_TRANSPORT_HANDSHAKES, P2pConn, P2pConnectInfo, RESPONDER_HANDSHAKE_TIMEOUT, TransportConfig, TransportInfo,
+    TransportMarks, accept as transport_accept, dial as transport_dial,
+};
 use crate::pb::{
     KaspadMessage, p2p_client::P2pClient as ProtoP2pClient, p2p_server::P2p as ProtoP2p, p2p_server::P2pServer as ProtoP2pServer,
 };
@@ -14,7 +18,7 @@ use kaspa_utils_tower::{
 };
 use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::net::{IpAddr, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -118,6 +122,8 @@ pub struct ConnectionHandler {
     initializer: Arc<dyn ConnectionInitializer>,
     counters: Arc<TowerConnectionCounters>,
     pending_inbound_handshakes: Arc<Mutex<PendingInboundHandshakes>>,
+    transport: Arc<TransportConfig>,
+    transport_marks: Arc<Mutex<TransportMarks>>,
 }
 
 impl ConnectionHandler {
@@ -125,8 +131,16 @@ impl ConnectionHandler {
         hub_sender: MpscSender<HubEvent>,
         initializer: Arc<dyn ConnectionInitializer>,
         counters: Arc<TowerConnectionCounters>,
+        transport: TransportConfig,
     ) -> Self {
-        Self { hub_sender, initializer, counters, pending_inbound_handshakes: Default::default() }
+        Self {
+            hub_sender,
+            initializer,
+            counters,
+            pending_inbound_handshakes: Default::default(),
+            transport: Arc::new(transport),
+            transport_marks: Default::default(),
+        }
     }
 
     /// Launches a P2P server listener loop
@@ -137,6 +151,48 @@ impl ConnectionHandler {
 
         let bytes_tx = self.counters.bytes_tx.clone();
         let bytes_rx = self.counters.bytes_rx.clone();
+
+        // Bind synchronously so a taken port is reported to the caller, then hand tonic a stream of
+        // connections whose transport (plaintext or ZKT2) was settled first.
+        let std_listener = std::net::TcpListener::bind(SocketAddr::from(serve_address))?;
+        std_listener.set_nonblocking(true)?;
+        let listener = tokio::net::TcpListener::from_std(std_listener)?;
+        let transport = self.transport.clone();
+        let (conn_sender, conn_receiver) = tokio::sync::mpsc::channel::<Result<P2pConn, std::io::Error>>(MAX_PENDING_TRANSPORT_HANDSHAKES);
+        let handshake_slots = Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_TRANSPORT_HANDSHAKES));
+        tokio::spawn(async move {
+            loop {
+                let (tcp, remote) = match listener.accept().await {
+                    Ok(x) => x,
+                    Err(err) => {
+                        debug!("P2P, accept error: {err}");
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        continue;
+                    }
+                };
+                if conn_sender.is_closed() {
+                    break;
+                }
+                let Ok(slot) = handshake_slots.clone().try_acquire_owned() else {
+                    debug!("P2P, too many pending transport handshakes, dropping {remote}");
+                    continue;
+                };
+                let transport = transport.clone();
+                let conn_sender = conn_sender.clone();
+                tokio::spawn(async move {
+                    let _slot = slot;
+                    match tokio::time::timeout(RESPONDER_HANDSHAKE_TIMEOUT, transport_accept(tcp, &transport)).await {
+                        Ok(Ok(Some(conn))) => {
+                            let _ = conn_sender.send(Ok(conn)).await;
+                        }
+                        Ok(Ok(None)) => debug!("P2P, refused plaintext connection from {remote} (v1 inbound disabled)"),
+                        Ok(Err(err)) => debug!("P2P, transport handshake with {remote} failed: {err}"),
+                        Err(_) => debug!("P2P, transport handshake with {remote} timed out"),
+                    }
+                });
+            }
+        });
+        let incoming = tokio_stream::wrappers::ReceiverStream::new(conn_receiver);
 
         tokio::spawn(async move {
             let proto_server = ProtoP2pServer::new(connection_handler)
@@ -149,7 +205,7 @@ impl ConnectionHandler {
                 .layer(MapRequestBodyLayer::new(move |body| tonic::body::Body::new(CountBytesBody::new(body, bytes_rx.clone()))))
                 .layer(MapResponseBodyLayer::new(move |body| tonic::body::Body::new(CountBytesBody::new(body, bytes_tx.clone()))))
                 .add_service(proto_server)
-                .serve_with_shutdown(serve_address.into(), termination_receiver.map(drop))
+                .serve_with_incoming_shutdown(incoming, termination_receiver.map(drop))
                 .await;
 
             match serve_result {
@@ -167,11 +223,22 @@ impl ConnectionHandler {
         };
         let peer_address = format!("http://{}", peer_address); // Add scheme prefix as required by Tonic
 
+        // Settle the transport first (TCP, then ZKT2 or the plaintext fallback), then give tonic
+        // the ready stream through a one-shot connector. Doing the handshake here rather than in
+        // the connector keeps its errors typed and the fallback decision in one place.
+        let conn = transport_dial(socket_address, &self.transport, &self.transport_marks).await?;
+        let transport_info = conn.transport();
+        let slot = Arc::new(Mutex::new(Some(conn)));
+        let connector = tower::service_fn(move |_uri: tonic::transport::Uri| {
+            let conn = slot.lock().take();
+            async move {
+                conn.map(hyper_util::rt::TokioIo::new)
+                    .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotConnected, "p2p connections are not re-dialled"))
+            }
+        });
         let channel = tonic::transport::Endpoint::new(peer_address)?
             .timeout(Duration::from_millis(Self::communication_timeout()))
-            .connect_timeout(Duration::from_millis(Self::connect_timeout()))
-            .tcp_keepalive(Some(Duration::from_millis(Self::keep_alive())))
-            .connect()
+            .connect_with_connector(connector)
             .await?;
 
         let channel = ServiceBuilder::new()
@@ -191,7 +258,8 @@ impl ConnectionHandler {
         let (outgoing_route, outgoing_stream) = outgoing_pipe(Self::outgoing_network_channel_size());
         let incoming_stream = client.message_stream(outgoing_stream).await?.into_inner();
 
-        let router = Router::new(socket_address, true, self.hub_sender.clone(), incoming_stream, outgoing_route).await;
+        let router =
+            Router::new(socket_address, true, transport_info, self.hub_sender.clone(), incoming_stream, outgoing_route).await;
 
         // For outbound peers, we perform the initialization as part of the connect logic
         match self.initializer.initialize_connection(router.clone()).await {
@@ -255,13 +323,6 @@ impl ConnectionHandler {
         10_000
     }
 
-    fn keep_alive() -> u64 {
-        10_000
-    }
-
-    fn connect_timeout() -> u64 {
-        1_000
-    }
 }
 
 #[tonic::async_trait]
@@ -273,8 +334,17 @@ impl ProtoP2p for ConnectionHandler {
         &self,
         request: Request<Streaming<KaspadMessage>>,
     ) -> Result<Response<Self::MessageStreamStream>, TonicStatus> {
-        let Some(remote_address) = request.remote_addr() else {
-            return Err(TonicStatus::new(tonic::Code::InvalidArgument, "Incoming connection opening request has no remote address"));
+        let (remote_address, transport_info) = match request.extensions().get::<P2pConnectInfo>() {
+            Some(info) => (info.remote, info.transport),
+            None => match request.remote_addr() {
+                Some(addr) => (addr, TransportInfo::v1()),
+                None => {
+                    return Err(TonicStatus::new(
+                        tonic::Code::InvalidArgument,
+                        "Incoming connection opening request has no remote address",
+                    ));
+                }
+            },
         };
 
         // Bound pending handshakes globally and per source IP before allocating the router and its channels.
@@ -287,7 +357,7 @@ impl ProtoP2p for ConnectionHandler {
         let incoming_stream = request.into_inner();
 
         // Build the router object
-        let router = Router::new(remote_address, false, self.hub_sender.clone(), incoming_stream, outgoing_route).await;
+        let router = Router::new(remote_address, false, transport_info, self.hub_sender.clone(), incoming_stream, outgoing_route).await;
 
         let initializer = self.initializer.clone();
         let hub_sender = self.hub_sender.clone();

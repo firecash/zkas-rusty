@@ -1,6 +1,7 @@
 use crate::ConnectionError;
 use crate::common::ProtocolError;
 use crate::core::hub::Hub;
+use crate::core::transport::TransportConfig;
 use crate::{Router, core::connection_handler::ConnectionHandler};
 use kaspa_utils::networking::NetAddress;
 use kaspa_utils_tower::counters::TowerConnectionCounters;
@@ -47,8 +48,18 @@ impl Adaptor {
 
     /// Creates a P2P adaptor with only client-side support. Typical Kaspa nodes should use `Adaptor::bidirectional`
     pub fn client_only(hub: Hub, initializer: Arc<dyn ConnectionInitializer>, counters: Arc<TowerConnectionCounters>) -> Arc<Self> {
+        Self::client_only_with_transport(hub, initializer, counters, TransportConfig::plaintext())
+    }
+
+    /// `client_only` with an explicit transport (plaintext, or ZKT2 with fallback)
+    pub fn client_only_with_transport(
+        hub: Hub,
+        initializer: Arc<dyn ConnectionInitializer>,
+        counters: Arc<TowerConnectionCounters>,
+        transport: TransportConfig,
+    ) -> Arc<Self> {
         let (hub_sender, hub_receiver) = mpsc_channel(Self::hub_channel_size());
-        let connection_handler = ConnectionHandler::new(hub_sender, initializer, counters);
+        let connection_handler = ConnectionHandler::new(hub_sender, initializer, counters, transport);
         let adaptor = Arc::new(Adaptor::new(None, connection_handler, hub));
         adaptor.hub.clone().start_event_loop(hub_receiver);
         adaptor
@@ -61,8 +72,19 @@ impl Adaptor {
         initializer: Arc<dyn ConnectionInitializer>,
         counters: Arc<TowerConnectionCounters>,
     ) -> Result<Arc<Self>, ConnectionError> {
+        Self::bidirectional_with_transport(serve_address, hub, initializer, counters, TransportConfig::plaintext())
+    }
+
+    /// `bidirectional` with an explicit transport (plaintext, or ZKT2 with fallback)
+    pub fn bidirectional_with_transport(
+        serve_address: NetAddress,
+        hub: Hub,
+        initializer: Arc<dyn ConnectionInitializer>,
+        counters: Arc<TowerConnectionCounters>,
+        transport: TransportConfig,
+    ) -> Result<Arc<Self>, ConnectionError> {
         let (hub_sender, hub_receiver) = mpsc_channel(Self::hub_channel_size());
-        let connection_handler = ConnectionHandler::new(hub_sender, initializer, counters);
+        let connection_handler = ConnectionHandler::new(hub_sender, initializer, counters, transport);
         let server_termination = connection_handler.serve(serve_address)?;
         let adaptor = Arc::new(Adaptor::new(Some(server_termination), connection_handler, hub));
         adaptor.hub.clone().start_event_loop(hub_receiver);

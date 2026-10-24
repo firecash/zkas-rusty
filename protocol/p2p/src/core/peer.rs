@@ -1,11 +1,13 @@
 use kaspa_consensus_core::subnets::SubnetworkId;
 use kaspa_utils::networking::{IpAddress, PeerId};
+use crate::core::transport::TransportInfo;
 use std::{fmt::Display, net::SocketAddr, sync::Arc, time::Instant};
 
 #[derive(Debug, Clone, Default)]
 pub struct PeerProperties {
     pub user_agent: String,
-    // TODO: add services
+    /// `Version.services` as the peer advertised it (spec 06 H-4)
+    pub services: u64,
     pub advertised_protocol_version: u32,
     pub protocol_version: u32,
     pub disable_relay_tx: bool,
@@ -21,6 +23,7 @@ pub struct Peer {
     connection_started: Instant,
     properties: Arc<PeerProperties>,
     last_ping_duration: u64,
+    transport: TransportInfo,
 }
 
 impl Peer {
@@ -31,8 +34,14 @@ impl Peer {
         connection_started: Instant,
         properties: Arc<PeerProperties>,
         last_ping_duration: u64,
+        transport: TransportInfo,
     ) -> Self {
-        Self { identity, net_address, is_outbound, connection_started, properties, last_ping_duration }
+        Self { identity, net_address, is_outbound, connection_started, properties, last_ping_duration, transport }
+    }
+
+    /// Plaintext or ZKT2, and the ZKT2 session id (spec 06 T-7)
+    pub fn transport(&self) -> TransportInfo {
+        self.transport
     }
 
     /// Internal identity of this peer

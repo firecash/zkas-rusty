@@ -20,6 +20,8 @@ from!(item: &kaspa_rpc_core::RpcPeerInfo, protowire::GetConnectedPeerInfoMessage
         time_connected: item.time_connected as i64,
         is_ibd_peer: item.is_ibd_peer,
         blocks_relayed: item.blocks_relayed,
+        transport: item.transport.clone(),
+        session_id: item.session_id.clone(),
     }
 });
 
@@ -42,6 +44,8 @@ try_from!(item: &protowire::GetConnectedPeerInfoMessage, kaspa_rpc_core::RpcPeer
         time_connected: item.time_connected as u64,
         is_ibd_peer: item.is_ibd_peer,
         blocks_relayed: item.blocks_relayed,
+        transport: item.transport.clone(),
+        session_id: item.session_id.clone(),
     }
 });
 

@@ -16,4 +16,5 @@ pub use crate::core::hub::Hub;
 pub use crate::core::payload_type::KaspadMessagePayloadType;
 pub use crate::core::peer::{Peer, PeerKey, PeerProperties};
 pub use crate::core::router::{BLANK_ROUTE_ID, IncomingRoute, Router, SharedIncomingRoute};
+pub use crate::core::transport::{TransportConfig, TransportInfo, TransportKind};
 pub use handshake::KaspadHandshake;

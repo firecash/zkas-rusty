@@ -10,6 +10,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+hex.workspace = true
 kaspa-addresses.workspace = true
 kaspa-consensus-core.workspace = true
 kaspa-consensus-notify.workspace = true

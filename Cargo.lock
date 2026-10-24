@@ -4082,6 +4082,7 @@ dependencies = [
  "bincode",
  "chrono",
  "futures",
+ "hex",
  "indexmap 2.14.0",
  "itertools 0.13.0",
  "kaspa-addressmanager",
@@ -4104,7 +4105,9 @@ dependencies = [
  "parking_lot",
  "rand 0.8.6",
  "regex",
+ "secp256k1",
  "semver",
+ "sha2",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
@@ -4120,6 +4123,7 @@ dependencies = [
  "futures",
  "h2",
  "hex",
+ "hyper-util",
  "itertools 0.13.0",
  "kaspa-consensus-core",
  "kaspa-core",
@@ -4128,18 +4132,21 @@ dependencies = [
  "kaspa-mining-errors",
  "kaspa-utils",
  "kaspa-utils-tower",
+ "kaspa-zkt2",
  "log",
  "parking_lot",
  "prost",
  "rand 0.8.6",
  "seqlock",
  "serde",
+ "socket2 0.6.3",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+ "tower",
  "uuid",
 ]
 
@@ -4262,6 +4269,7 @@ name = "kaspa-rpc-service"
 version = "2.0.1"
 dependencies = [
  "async-trait",
+ "hex",
  "kaspa-addresses",
  "kaspa-consensus-core",
  "kaspa-consensus-notify",
@@ -5032,6 +5040,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "kaspa-zkt2"
+version = "2.0.1"
+dependencies = [
+ "blake2b_simd",
+ "chacha20 0.9.1",
+ "chacha20poly1305",
+ "hex",
+ "hmac",
+ "rand 0.8.6",
+ "secp256k1",
+ "sha2",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "kaspad"
 version = "2.0.1"
 dependencies = [
@@ -5045,6 +5069,7 @@ dependencies = [
  "dirs",
  "faster-hex 0.9.0",
  "futures-util",
+ "hex",
  "itertools 0.13.0",
  "kaspa-addresses",
  "kaspa-addressmanager",
@@ -5080,6 +5105,7 @@ dependencies = [
  "rand 0.8.6",
  "rayon",
  "rocksdb",
+ "secp256k1",
  "serde",
  "serde_json",
  "serde_with",

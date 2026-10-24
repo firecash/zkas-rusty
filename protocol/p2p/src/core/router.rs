@@ -21,6 +21,7 @@ use tokio::sync::oneshot::{Sender as OneshotSender, channel as oneshot_channel};
 use tonic::Streaming;
 
 use super::peer::{PeerKey, PeerProperties};
+use super::transport::TransportInfo;
 
 pub struct IncomingRoute {
     rx: MpscReceiver<KaspadMessage>,
@@ -247,6 +248,9 @@ pub struct Router {
     /// Indicates whether this connection is an outbound connection
     is_outbound: bool,
 
+    /// Plaintext or ZKT2, and the ZKT2 session id
+    transport: TransportInfo,
+
     /// Time of creation of this object and the connection it holds
     connection_started: Instant,
 
@@ -286,6 +290,7 @@ impl From<&Router> for Peer {
             router.connection_started,
             router.properties(),
             router.last_ping_duration(),
+            router.transport,
         )
     }
 }
@@ -300,6 +305,7 @@ impl Router {
     pub(crate) async fn new(
         net_address: SocketAddr,
         is_outbound: bool,
+        transport: TransportInfo,
         hub_sender: MpscSender<HubEvent>,
         mut incoming_stream: Streaming<KaspadMessage>,
         outgoing_route: OutgoingRoute,
@@ -311,6 +317,7 @@ impl Router {
             identity: Default::default(),
             net_address,
             is_outbound,
+            transport,
             connection_started: Instant::now(),
             routing_map_by_type: RwLock::new(HashMap::new()),
             routing_map_by_id: RwLock::new(HashMap::new()),
@@ -405,6 +412,11 @@ impl Router {
     /// Indicates whether this connection is an outbound connection
     pub fn is_outbound(&self) -> bool {
         self.is_outbound
+    }
+
+    /// The transport this connection runs on (plaintext or ZKT2) and its session id
+    pub fn transport(&self) -> TransportInfo {
+        self.transport
     }
 
     pub(crate) fn is_closed(&self) -> bool {

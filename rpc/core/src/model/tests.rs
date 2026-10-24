@@ -496,6 +496,8 @@ mod mockery {
                 time_connected: mock(),
                 is_ibd_peer: mock(),
                 blocks_relayed: mock(),
+                transport: "v2".to_string(),
+                session_id: "00".repeat(32),
             }
         }
     }
