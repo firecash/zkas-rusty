@@ -500,7 +500,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_flipped_ciphertext_byte_kills_the_stream() {
-        let (a, mut b) = duplex(1 << 20);
+        let (a, b) = duplex(1 << 20);
         // A man in the middle relaying with one byte flipped after the handshake.
         let (mitm_i, mut mitm_o) = duplex(1 << 20);
         let c = cfg();
