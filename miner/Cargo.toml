@@ -38,3 +38,7 @@ log.workspace = true
 num_cpus.workspace = true
 rand.workspace = true
 tokio = { workspace = true, features = ["rt", "macros", "rt-multi-thread", "time", "sync"] }
+
+[dev-dependencies]
+# `examples/nua_devnet.rs` (SF-L / NU-A devnet driver): real spend building and era tracking.
+kaspa-shielded-core = { workspace = true, features = ["circuit"] }
