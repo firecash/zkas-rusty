@@ -2034,7 +2034,9 @@ mod tests {
         // What an empty trailing slot costs on the wire, so each older layout can be cut exactly.
         let slot_len = bincode::serialized_size(&kaspa_consensus_core::coinbase::MinerAccrual::default()).unwrap() as usize;
         let prefix_len = bincode::serialized_size(&kaspa_shielded_core::anchor_window::AnchorLog::default()).unwrap() as usize;
-        let slot_len = slot_len + prefix_len; // the trailing anchor-log prefix rides after the slot
+        // NU-A appended `nua` after the anchor-log prefix: every older layout is also missing it.
+        let nua_len = bincode::serialized_size(&NuaState::default()).unwrap() as usize;
+        let slot_len = slot_len + prefix_len + nua_len; // the trailing anchor-log prefix and NU-A state ride after the slot
 
         // Round-trip through the current layout.
         let bytes = md.to_wire_bytes();
@@ -2044,6 +2046,24 @@ mod tests {
         assert_eq!(back.in_window_anchors, md.in_window_anchors);
         assert_eq!(back.in_window_anchor_source_scores, md.in_window_anchor_source_scores);
         assert_eq!(back.miner_accrual, md.miner_accrual, "the carried miner slot survives the wire");
+
+        // NU-A state survives the wire when it is not the default.
+        let md_nua = PruningPointShieldedMetadata {
+            nua: NuaState { cumulative_fee_burn: 1_200_000, tree_era: 1, frozen: Vec::new() },
+            ..md.clone()
+        };
+        let back_nua = PruningPointShieldedMetadata::from_wire_bytes(&md_nua.to_wire_bytes()).expect("NU-A layout decodes");
+        assert_eq!(back_nua.nua, md_nua.nua, "the newest layout keeps the NU-A state");
+        assert_eq!(back_nua.miner_accrual, md.miner_accrual);
+
+        // A peer from before NU-A: our blob minus only the trailing NU-A state. Everything else
+        // survives and the NU-A state is the default (the right value for a pre-NU-A pruning point).
+        let from_pre_nua =
+            PruningPointShieldedMetadata::from_wire_bytes(&bytes[..bytes.len() - nua_len]).expect("pre-NU-A layout decodes");
+        assert_eq!(from_pre_nua.nua, NuaState::default());
+        assert_eq!(from_pre_nua.miner_accrual, md.miner_accrual, "a pre-NU-A peer still carries its miner slot");
+        assert_eq!(from_pre_nua.in_window_anchor_source_scores, md.in_window_anchor_source_scores);
+        assert_eq!(from_pre_nua.dev_accrued, 123_456);
 
         // A peer that has the accrual but not the anchor scores: our blob minus the trailing
         // vec. Decodes, with no attested scores — which fails closed rather than inventing one.

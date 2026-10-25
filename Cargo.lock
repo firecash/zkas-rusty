@@ -3981,6 +3981,7 @@ dependencies = [
  "kaspa-notify",
  "kaspa-pow",
  "kaspa-rpc-core",
+ "kaspa-shielded-core",
  "kaspa-utils",
  "log",
  "num_cpus",
