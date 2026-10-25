@@ -28,6 +28,9 @@ use orchard::note::{ExtractedNoteCommitment, NoteVersion, RandomSeed, Rho};
 use orchard::tree::{MerkleHashOrchard, MerklePath};
 use orchard::value::NoteValue;
 
+/// Devnet security fork (1,500) plus a margin.
+const MIN_ANCHOR_DAA: u64 = 1_600;
+
 type R<T> = Result<T, Box<dyn std::error::Error>>;
 
 fn seed(hex: &str) -> [u8; 32] {
@@ -56,19 +59,25 @@ async fn chain(c: &GrpcClient, start: RpcHash) -> R<Vec<RpcShieldedChainBlock>> 
     }
 }
 
-async fn column(c: &GrpcClient, start: RpcHash) -> R<(Vec<ColumnBlock>, TagLog)> {
-    let mut out = Vec::new();
-    let mut from = start;
-    let first = c.get_shielded_tag_column(from, 1000).await?;
-    let log0 = TagLog { count: first.log_before_count, peaks: first.log_before_peaks.iter().map(|h| h.as_bytes()).collect() };
-    let mut r = first;
-    loop {
-        let new: Vec<_> = r.blocks.into_iter().filter(|b| b.hash != from).collect();
-        if new.is_empty() {
-            return Ok((out, log0));
-        }
-        from = new.last().unwrap().hash;
-        for b in new {
+/// The tag column over the whole chain `hashes` (genesis first), in windows anchored at known chain
+/// hashes: a window of pre-activation blocks comes back empty (they have no column), which must
+/// not end the walk. Returns the column and the tag log before its first block.
+async fn column(c: &GrpcClient, hashes: &[RpcHash]) -> R<(Vec<ColumnBlock>, TagLog)> {
+    const W: usize = 1000;
+    let mut out: Vec<ColumnBlock> = Vec::new();
+    let mut log0: Option<TagLog> = None;
+    for start in hashes.iter().step_by(W) {
+        let r = c.get_shielded_tag_column(*start, W as u64).await?;
+        for b in r.blocks {
+            if b.hash == *start || out.last().is_some_and(|l| l.hash == b.hash.as_bytes()) {
+                continue;
+            }
+            if log0.is_none() {
+                // Tag log before the first post-activation block: ask at its predecessor.
+                let i = hashes.iter().position(|h| *h == b.hash).ok_or("column block not on the chain")?;
+                let p = c.get_shielded_tag_column(hashes[i - 1], 1).await?;
+                log0 = Some(TagLog { count: p.log_before_count, peaks: p.log_before_peaks.iter().map(|h| h.as_bytes()).collect() });
+            }
             let txs = b
                 .txs
                 .into_iter()
@@ -76,8 +85,8 @@ async fn column(c: &GrpcClient, start: RpcHash) -> R<(Vec<ColumnBlock>, TagLog)>
                 .collect();
             out.push(ColumnBlock { hash: b.hash.as_bytes(), txs });
         }
-        r = c.get_shielded_tag_column(from, 1000).await?;
     }
+    Ok((out, log0.unwrap_or_default()))
 }
 
 /// Leaves (cmx) in tree order and, per chain block, the tree size after it.
@@ -180,8 +189,12 @@ async fn run(url: &str, alice_sk: [u8; 32], peer: Option<&str>) -> R<()> {
         let all = chain(&c, genesis).await?;
         let first_cb = all.iter().find(|b| b.coinbase_outputs.iter().any(|o| o.script_public_key.ends_with(&me) && o.value > 0));
         let tip = all.last().map_or(0, |b| b.daa_score);
+        let tip_blue = all.last().map_or(0, |b| b.blue_score);
         if let Some(f) = first_cb {
-            if tip >= f.daa_score + depth && tip >= 2_100 {
+            // The anchor must be a chain block at or after devnet's security fork (DAA 1,500): the
+            // anchor-block window only records blocks from there on ("unresolved" otherwise).
+            let ok_anchor = all.iter().any(|b| b.daa_score >= MIN_ANCHOR_DAA && b.daa_score >= f.daa_score && b.blue_score + depth <= tip_blue);
+            if ok_anchor && tip >= 2_100 {
                 break all;
             }
         }
@@ -219,16 +232,17 @@ async fn run(url: &str, alice_sk: [u8; 32], peer: Option<&str>) -> R<()> {
         .unwrap();
     println!("coinbase note: block {} (DAA {}), output {out_index}, value {value}, leaf {position}", cb_block.hash, cb_block.daa_score);
 
-    // Anchor: the youngest chain block at least `depth` below the tip.
-    let tip_daa = all.last().unwrap().daa_score;
-    let anchor = all.iter().rev().find(|b| b.daa_score + depth <= tip_daa && b.daa_score >= cb_block.daa_score).ok_or("chain too short")?;
+    // Anchor: the youngest chain block at least `depth` below the tip in BLUE SCORE (the unit of
+    // shielded_anchor_depth; DAA runs ahead of it on a wide, fast devnet DAG).
+    let tip_blue = all.last().unwrap().blue_score;
+    let anchor = all.iter().rev().find(|b| b.blue_score + depth <= tip_blue && b.daa_score >= cb_block.daa_score && b.daa_score >= MIN_ANCHOR_DAA).ok_or("chain too short")?;
     let (lv, size_at) = leaves(&all);
     let size = size_at[&anchor.hash] as usize;
     let (root, mpath) = path(&lv, size, position as usize);
     let ts = c.get_shielded_tree_state(Some(anchor.hash)).await?;
     assert_eq!(ts.size, size as u64, "rebuilt tree size matches the node's frontier at the anchor block");
     assert_eq!(mpath.root(ExtractedNoteCommitment::from(note.commitment())), orchard::Anchor::from(root), "the note is in the tree");
-    println!("anchor block {} (DAA {}), tree size {size} (node agrees)", anchor.hash, anchor.daa_score);
+    println!("anchor block {} (DAA {}, blue {} of tip {tip_blue}), tree size {size} (node agrees)", anchor.hash, anchor.daa_score, anchor.blue_score);
 
     // 2. Bob issues a request; Alice pays it, change to her self channel.
     let mut rng = rand10::rng();
@@ -270,7 +284,19 @@ async fn run(url: &str, alice_sk: [u8; 32], peer: Option<&str>) -> R<()> {
         tx.payload.len(),
         tx.payload[0]
     );
-    let submitted = c.submit_transaction(RpcTransaction::from(&tx), false).await?;
+    // The node judges maturity against its own virtual; retry while the anchor is still maturing.
+    let mut tries = 0;
+    let submitted = loop {
+        match c.submit_transaction(RpcTransaction::from(&tx), false).await {
+            Ok(id) => break id,
+            Err(e) if tries < 30 && e.to_string().contains("anchor not final") => {
+                tries += 1;
+                println!("not yet final ({tries}): {e}");
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    };
     println!("submitted: {submitted}");
 
     // 3. Wait until a chain block applies it.
@@ -290,8 +316,11 @@ async fn run(url: &str, alice_sk: [u8; 32], peer: Option<&str>) -> R<()> {
 
     // 4. Light client: tag column + only the hit records.
     let t1 = Instant::now();
-    let (col, log0) = column(&c, genesis).await?;
+    let hashes: Vec<RpcHash> = std::iter::once(genesis).chain(all.iter().map(|b| b.hash)).collect();
+    let (col, log0) = column(&c, &hashes).await?;
     let col_s = t1.elapsed().as_secs_f64();
+    // The chain kept growing while the column was fetched: re-read it so every column block is known.
+    let all = chain(&c, genesis).await?;
     let mut records = HashMap::new();
     let mut spent = HashSet::new();
     let by_hash: HashMap<[u8; 32], &RpcShieldedChainBlock> = all.iter().map(|b| (b.hash.as_bytes(), b)).collect();
@@ -326,7 +355,7 @@ async fn run(url: &str, alice_sk: [u8; 32], peer: Option<&str>) -> R<()> {
 
     // 5. The column replays to the node's tag log (the one zkas_state_root2 commits).
     let replayed = TagLog::replay_blocks(&log0, col.iter().map(|b| (&b.hash, b.txs.as_slice())))?;
-    let tip = all.last().unwrap().hash;
+    let tip = RpcHash::from_bytes(col.last().ok_or("empty column")?.hash);
     let at_tip = c.get_shielded_tag_column(tip, 1).await?;
     let node_log = TagLog { count: at_tip.log_before_count, peaks: at_tip.log_before_peaks.iter().map(|h| h.as_bytes()).collect() };
     assert_eq!(replayed.commitment(), node_log.commitment(), "replayed column == node tag log");
