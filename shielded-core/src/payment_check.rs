@@ -131,6 +131,10 @@ pub fn check_prepared_payment(
         return Err(PaymentCheckError::ActionCountMismatch);
     }
     let mine = fvk.address_at(0u32, Scope::External).to_raw_address_bytes();
+    // Stage W change (spec 02 W6) goes to the wallet's INTERNAL address 0. It is this wallet's
+    // own money exactly as external change is, and it is held to the same decryptability check
+    // (6) under the internal viewing key.
+    let mine_internal = fvk.address_at(0u32, Scope::Internal).to_raw_address_bytes();
 
     let mut spent_total: i128 = 0;
     let mut out_total: i128 = 0;
@@ -163,7 +167,7 @@ pub fn check_prepared_payment(
         // (3) Every created note goes to the recipient, back to us, or nowhere.
         if d.out_recipient == *to && d.out_value == amount {
             paid_recipient += 1;
-        } else if d.out_recipient != mine && d.out_value != 0 {
+        } else if d.out_recipient != mine && d.out_recipient != mine_internal && d.out_value != 0 {
             return Err(PaymentCheckError::UnexpectedRecipient(i));
         }
 
@@ -203,9 +207,16 @@ pub fn check_prepared_payment(
     // disclosed value. Checks (1)-(2) pin the commitment and the amounts but say nothing about the
     // ciphertext the sighash signs over, so a malicious prover could otherwise burn the change.
     let received = crate::wallet::scan::scan_bundle(&fvk.to_ivk(Scope::External), wire);
+    let received_internal = if disclosure.iter().any(|d| d.out_recipient == mine_internal && d.out_value != 0) {
+        crate::wallet::scan::scan_bundle(&fvk.to_ivk(Scope::Internal), wire)
+    } else {
+        Vec::new()
+    };
     for (i, d) in disclosure.iter().enumerate() {
-        if d.out_recipient == mine && d.out_value != 0 && !(d.out_recipient == *to && d.out_value == amount) {
-            let found = received.iter().any(|r| r.action_index == i && r.note.value().inner() == d.out_value);
+        let own = d.out_recipient == mine || d.out_recipient == mine_internal;
+        if own && d.out_value != 0 && !(d.out_recipient == *to && d.out_value == amount) {
+            let pool = if d.out_recipient == mine_internal { &received_internal } else { &received };
+            let found = pool.iter().any(|r| r.action_index == i && r.note.value().inner() == d.out_value);
             if !found {
                 return Err(PaymentCheckError::ChangeNotDecryptable(i));
             }
@@ -341,6 +352,27 @@ mod tests {
             200,
         );
         assert_eq!(check_prepared_payment(&b, &d, &fvk, &to, 1_000, 200), Err(PaymentCheckError::ChangeNotDecryptable(1)));
+    }
+
+    /// Internal-scope change (Stage W) is this wallet's own and is held to the same rule: the
+    /// commitment check passes, the ciphertext does not decrypt under the INTERNAL key -> refused.
+    #[test]
+    fn internal_change_that_does_not_decrypt_is_refused() {
+        let fvk = fvk_for([1; 32]);
+        let to = fvk_for([2; 32]).address_at(0u32, Scope::External).to_raw_address_bytes();
+        let mine_internal = fvk.address_at(0u32, Scope::Internal).to_raw_address_bytes();
+        let (b, d) = bundle(vec![action([9; 32], 1_100, 1_000, to), action([8; 32], 500, 400, mine_internal)], 200);
+        assert_eq!(check_prepared_payment(&b, &d, &fvk, &to, 1_000, 200), Err(PaymentCheckError::ChangeNotDecryptable(1)));
+    }
+
+    /// Another wallet's internal address is a stranger, not change.
+    #[test]
+    fn another_wallets_internal_address_is_a_stranger() {
+        let fvk = fvk_for([1; 32]);
+        let to = fvk_for([2; 32]).address_at(0u32, Scope::External).to_raw_address_bytes();
+        let theirs = fvk_for([3; 32]).address_at(0u32, Scope::Internal).to_raw_address_bytes();
+        let (b, d) = bundle(vec![action([9; 32], 1_100, 1_000, to), action([8; 32], 500, 400, theirs)], 200);
+        assert_eq!(check_prepared_payment(&b, &d, &fvk, &to, 1_000, 200), Err(PaymentCheckError::UnexpectedRecipient(1)));
     }
 
     #[test]

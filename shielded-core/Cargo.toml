@@ -75,6 +75,9 @@ zcash_note_encryption = "0.4"
 kaspa-addresses.workspace = true
 
 [dev-dependencies]
+# Stage W conformance vectors (spec 02 §7.1 T1): ChaCha20 with a pinned seed drives the builders.
+rand_chacha = "0.10"
+serde_json.workspace = true
 # Benchmarks only (`bench_concurrent_vs_sequential_proofs`): scoped rayon pools to
 # give each concurrent proof its own bounded thread count.
 rayon.workspace = true

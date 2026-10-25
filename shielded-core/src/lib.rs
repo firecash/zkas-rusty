@@ -43,6 +43,9 @@ pub mod wallet;
 pub mod walletdb;
 pub mod witness_chain;
 
+#[cfg(all(test, feature = "circuit"))]
+mod uniform_tests;
+
 // The human-facing wallet facade (keys -> zkas: address -> scan -> pay).
 pub use account::{PaymentError, ShieldedAccount, orchard_recipient_bytes};
 
