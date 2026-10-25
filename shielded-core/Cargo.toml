@@ -43,9 +43,13 @@ pasta_curves = { package = "zakura-pasta-curves", version = "=2.2.0", features =
 # Shielded-transaction sighash.
 blake2b_simd = { workspace = true }
 chacha20 = "0.9"
+# Tagged channels: the 64-byte channel ciphertext (fork topic 01 §A). Same version zcash_note_encryption links.
+chacha20poly1305 = { version = "0.10", default-features = false }
 # Trial decryption is ~99% of a scan and is per-action independent, so a page batch
 # is split across cores. Needed by the library now, not only the benches.
 rayon.workspace = true
+# examples/tagged_bench.rs: per-thread CPU time (the build box is shared and loaded).
+libc = "0.2"
 # Bridge burn-accumulator hashing. SHA-256 rather than the chain's usual blake2b
 # because the verifier is the Kaspa-side risc0 peg-out guest, whose shared ABI
 # hashes with SHA-256; the two implementations must agree byte-for-byte.

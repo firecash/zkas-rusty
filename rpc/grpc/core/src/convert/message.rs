@@ -220,6 +220,25 @@ from!(item: RpcResult<&kaspa_rpc_core::GetSinkResponse>, protowire::GetSinkRespo
     Self { sink: item.sink.to_string(), error: None }
 });
 
+from!(item: &kaspa_rpc_core::GetShieldedTagColumnRequest, protowire::GetShieldedTagColumnRequestMessage, {
+    Self { start_hash: item.start_hash.to_string(), limit: item.limit }
+});
+from!(item: RpcResult<&kaspa_rpc_core::GetShieldedTagColumnResponse>, protowire::GetShieldedTagColumnResponseMessage, {
+    Self {
+        blocks: item
+            .blocks
+            .iter()
+            .map(|b| protowire::RpcShieldedTagBlock {
+                hash: b.hash.to_string(),
+                txs: b.txs.iter().map(|t| protowire::RpcShieldedTagTx { first_leaf: t.first_leaf, tags: t.tags.clone() }).collect(),
+            })
+            .collect(),
+        log_before_count: item.log_before_count,
+        log_before_peaks: item.log_before_peaks.iter().map(|h| h.to_string()).collect(),
+        error: None,
+    }
+});
+
 from!(item: &kaspa_rpc_core::GetShieldedTreeStateRequest, protowire::GetShieldedTreeStateRequestMessage, {
     Self { block_hash: item.block_hash.map(|h| h.to_string()).unwrap_or_default(), below_daa_score: item.below_daa_score.unwrap_or(0) }
 });
@@ -828,6 +847,26 @@ try_from!(item: &protowire::GetPeerAddressesResponseMessage, RpcResult<kaspa_rpc
 try_from!(&protowire::GetSinkRequestMessage, kaspa_rpc_core::GetSinkRequest);
 try_from!(item: &protowire::GetSinkResponseMessage, RpcResult<kaspa_rpc_core::GetSinkResponse>, {
     Self { sink: RpcHash::from_str(&item.sink)? }
+});
+
+try_from!(item: &protowire::GetShieldedTagColumnRequestMessage, kaspa_rpc_core::GetShieldedTagColumnRequest, {
+    Self { start_hash: RpcHash::from_str(&item.start_hash)?, limit: item.limit }
+});
+try_from!(item: &protowire::GetShieldedTagColumnResponseMessage, RpcResult<kaspa_rpc_core::GetShieldedTagColumnResponse>, {
+    Self {
+        blocks: item
+            .blocks
+            .iter()
+            .map(|b| -> RpcResult<kaspa_rpc_core::RpcShieldedTagBlock> {
+                Ok(kaspa_rpc_core::RpcShieldedTagBlock {
+                    hash: RpcHash::from_str(&b.hash)?,
+                    txs: b.txs.iter().map(|t| kaspa_rpc_core::RpcShieldedTagTx { first_leaf: t.first_leaf, tags: t.tags.clone() }).collect(),
+                })
+            })
+            .collect::<RpcResult<Vec<_>>>()?,
+        log_before_count: item.log_before_count,
+        log_before_peaks: item.log_before_peaks.iter().map(|s| RpcHash::from_str(s)).collect::<Result<Vec<_>, _>>()?,
+    }
 });
 
 try_from!(item: &protowire::GetShieldedTreeStateRequestMessage, kaspa_rpc_core::GetShieldedTreeStateRequest, {

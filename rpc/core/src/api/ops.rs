@@ -152,6 +152,8 @@ pub enum RpcApiOps {
     GetShieldedSupply = 156,
     /// Get the coinbase payments made to given shielded recipients by the selected chain
     GetShieldedCoinbaseRewards = 157,
+    /// Tagged channels (devnet only): the per-chain-block tag column
+    GetShieldedTagColumn = 158,
 }
 
 impl RpcApiOps {

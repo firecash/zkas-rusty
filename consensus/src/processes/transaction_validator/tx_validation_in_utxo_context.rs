@@ -28,8 +28,8 @@ const CHECK_SCRIPTS_PARALLELISM_THRESHOLD: usize = 1;
 /// rules. The signatures are checked against the ZKas shielded sighash,
 /// which binds them to this exact bundle and transaction.
 #[cfg(feature = "shielded-circuit")]
-fn verify_shielded_bundle(tx: &Transaction, network_domain: &[u8; 32], security_fork_active: bool) -> TxResult<()> {
-    let bundle = ShieldedBundle::from_bytes_at(&tx.payload, security_fork_active)
+fn verify_shielded_bundle(tx: &Transaction, network_domain: &[u8; 32], security_fork_active: bool, tagged_active: bool) -> TxResult<()> {
+    let bundle = ShieldedBundle::from_bytes_with(&tx.payload, security_fork_active, tagged_active)
         .map_err(|_| TxRuleError::InvalidShieldedTransaction("malformed Orchard bundle in payload"))?;
     let ctx = tx.shielded_sighash_context();
     // The sighash binds the bundle's signatures to this chain (network_domain) and
@@ -47,7 +47,7 @@ fn verify_shielded_bundle(tx: &Transaction, network_domain: &[u8; 32], security_
 /// it must not accept shielded transactions at all (accepting an unverified
 /// bundle would be a consensus-critical inflation hole). Reject them outright.
 #[cfg(not(feature = "shielded-circuit"))]
-fn verify_shielded_bundle(_tx: &Transaction, _network_domain: &[u8; 32], _security_fork_active: bool) -> TxResult<()> {
+fn verify_shielded_bundle(_tx: &Transaction, _network_domain: &[u8; 32], _security_fork_active: bool, _tagged_active: bool) -> TxResult<()> {
     Err(TxRuleError::InvalidShieldedTransaction("node built without shielded-circuit: cannot verify shielded bundles"))
 }
 
@@ -83,7 +83,12 @@ impl TransactionValidator {
         if self.shielded_verify_cache.get(&id).is_some_and(|ok| ok == 1) {
             return Ok(());
         }
-        let result = verify_shielded_bundle(tx, &self.shielded_network_domain, self.security_fork_activation.is_active(block_daa_score));
+        let result = verify_shielded_bundle(
+            tx,
+            &self.shielded_network_domain,
+            self.security_fork_activation.is_active(block_daa_score),
+            self.tagged_channels_activation.is_active(block_daa_score),
+        );
         // Only successes are cached. A cached failure was never consulted again in practice
         // (a garbage sender mints a fresh txid per attempt) and every one of them evicted a
         // resident success from this count-bounded, randomly evicting cache, which then made
@@ -111,7 +116,8 @@ impl TransactionValidator {
         // is the bundle's public value balance (the amount leaving the shielded
         // pool, which the miner collects). For transparent txs the fee is in - out.
         let fee = if tx.tx().is_shielded() {
-            let bundle = ShieldedBundle::from_bytes_at(&tx.tx().payload, self.security_fork_activation.is_active(block_daa_score))
+            let bundle = self
+                .decode_shielded_at(&tx.tx().payload, block_daa_score)
                 .map_err(|_| TxRuleError::InvalidShieldedTransaction("malformed Orchard bundle in payload"))?;
             if bundle.value_balance < 0 {
                 return Err(TxRuleError::InvalidShieldedTransaction("shielded fee (value balance) must be non-negative"));

@@ -298,6 +298,7 @@ impl RpcApi for GrpcClient {
     route!(get_shielded_blocks_call, GetShieldedBlocks);
     route!(get_shielded_supply_call, GetShieldedSupply);
     route!(get_shielded_coinbase_rewards_call, GetShieldedCoinbaseRewards);
+    route!(get_shielded_tag_column_call, GetShieldedTagColumn);
     route!(get_mempool_entry_call, GetMempoolEntry);
     route!(get_mempool_entries_call, GetMempoolEntries);
     route!(get_connected_peer_info_call, GetConnectedPeerInfo);

@@ -19,6 +19,8 @@ futures-util.workspace = true
 indexmap.workspace = true
 itertools.workspace = true
 kaspa-addresses.workspace = true
+# rand 0.10 (the shielded-core rng API) for the tagged-channel tests.
+rand10 = { package = "rand", version = "0.10" }
 kaspa-consensus-core.workspace = true
 kaspa-consensus-notify.workspace = true
 kaspa-consensusmanager.workspace = true

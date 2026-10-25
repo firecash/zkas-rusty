@@ -85,6 +85,12 @@ pub struct ComputedBlockShielded {
     /// path (nothing to persist) or a shielded-inactive block; `persist` writes it in
     /// the commit batch when present.
     pub scan_block: Option<ShieldedScanBlockData>,
+    /// Size of the global note-commitment tree before this block (absolute position of its
+    /// first leaf). Lets the virtual processor place every tagged tx's outputs in the tag column.
+    pub tree_size_before: u64,
+    /// Tagged channels (devnet only): this block's tag column, attached by the virtual processor
+    /// from the block-time applied set when the activation is reached; `None` otherwise.
+    pub tag_column: Option<Vec<kaspa_shielded_core::tag_log::TaggedTxColumn>>,
 }
 
 impl ComputedBlockShielded {
@@ -587,6 +593,7 @@ pub struct ShieldedStateManager {
     /// Peer-attested blue scores for in-window anchor sources below the pruning point.
     anchor_source_scores: DbShieldedAnchorSourceScoreStore,
     /// Security fork: per-block anchor window and window entries.
+    tag_block: crate::model::stores::shielded::DbShieldedTagBlockStore,
     anchor_window: DbAnchorWindowStore,
 }
 
@@ -611,12 +618,28 @@ impl ShieldedStateManager {
             scan_block: DbShieldedScanBlockStore::new(Arc::clone(&db), cache_policy),
             burn_store: DbShieldedBurnStore::new(Arc::clone(&db), cache_policy),
             anchor_source_scores: DbShieldedAnchorSourceScoreStore::new(Arc::clone(&db), cache_policy),
-            anchor_window: DbAnchorWindowStore::new(db, cache_policy),
+            anchor_window: DbAnchorWindowStore::new(Arc::clone(&db), cache_policy),
+            tag_block: crate::model::stores::shielded::DbShieldedTagBlockStore::new(db, cache_policy),
         }
     }
 
     /// The anchor window as of `block`, `None` if this node holds none (a pre-fork block, or a
     /// post-fork block below the pruning point).
+    /// A post-activation chain block's tag column and the tag log after it (tagged channels).
+    pub fn tag_block_at(&self, block: Hash) -> StoreResult<Option<crate::model::stores::shielded::ShieldedTagBlockData>> {
+        self.tag_block.get(block)
+    }
+
+    /// Stage a block's tag column and tag log in the block-commit batch.
+    pub fn persist_tag_block(
+        &self,
+        batch: &mut WriteBatch,
+        block: Hash,
+        data: crate::model::stores::shielded::ShieldedTagBlockData,
+    ) -> StoreResult<()> {
+        self.tag_block.set_batch(batch, block, data)
+    }
+
     pub fn window_at(&self, block: Hash) -> StoreResult<Option<kaspa_shielded_core::anchor_window::AnchorLog>> {
         self.anchor_window.window(block)
     }
@@ -1316,6 +1339,7 @@ impl ShieldedStateManager {
         for nf in &outcome.new_nullifiers {
             nullifier_muhash.add_element(nf);
         }
+        let tree_size_before = tree.size() - outcome.subtree.len() as u64;
         Ok(ComputedBlockShielded {
             frontier_state: tree.to_state(),
             supply_totals: SupplyTotals {
@@ -1329,6 +1353,8 @@ impl ShieldedStateManager {
             // (it has the original bundle ciphertexts + coinbase); `compute` sees
             // only the distilled `ShieldedTx`, so it cannot build the scan record.
             scan_block: None,
+            tree_size_before,
+            tag_column: None,
         })
     }
 

@@ -51,3 +51,12 @@ heap = []
 
 [lints]
 workspace = true
+
+# examples/tagged_devnet.rs (task C3): drives a live devnet node past the tagged-channels activation.
+[dev-dependencies]
+kaspa-addresses.workspace = true
+kaspa-consensus-core.workspace = true
+kaspa-shielded-core = { workspace = true, features = ["circuit"] }
+orchard = { package = "zakura-orchard", version = "=2.2.0", default-features = false, features = ["std", "weighted-merkle", "circuit"] }
+incrementalmerkletree = { version = "=0.8.2", features = ["legacy-api"] }
+rand10 = { package = "rand", version = "0.10" }

@@ -3968,3 +3968,210 @@ async fn combined_reimport_is_idempotent() {
     node.shutdown(wait);
 }
 
+
+/// Tagged channels on a devnet-shaped chain (task C3), through real PoW blocks and real Halo 2
+/// proofs: a tagged payment to a payment-request channel plus change on the self channel is
+/// applied; a light client finds both tagged
+/// outputs by tag lookup alone from the node's tag column and compact records; the tag column
+/// replays to the tag log the PoW-committed `zkas_state_root2` binds; and a server that hides
+/// the payment's tag is caught.
+#[tokio::test]
+async fn tagged_channels_devnet_end_to_end() {
+    use kaspa_consensus_core::subnets::SUBNETWORK_ID_NATIVE;
+    use kaspa_consensus_core::tx::TX_VERSION_SHIELDED;
+    use kaspa_shielded_core::tag_log::TagLog;
+    use kaspa_shielded_core::tagged_wallet::{ColumnBlock, OutputRecord, TaggedWallet, pay_request};
+
+    let mut params = MAINNET_PARAMS.clone();
+    params.shielded_coinbase = true;
+    params.dev_fee_recipient = None;
+    params.security_fork_activation = ForkActivation::always();
+    params.tagged_channels_activation = ForkActivation::always();
+    params.miner_accrual_payout_interval = 1;
+    let config = ConfigBuilder::new(params)
+        .edit_consensus_params(|p| {
+            p.genesis.bits = 0x207fffff;
+            p.blockrate.finality_depth = 5;
+            p.blockrate.shielded_anchor_depth = 5;
+        })
+        .build();
+    let net = config.genesis.hash.as_bytes();
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+    let miner_seed = [7u8; 32];
+    let miner_addr = kaspa_shielded_core::wallet::address_bytes_from_seed(miner_seed).expect("orchard address");
+    ctx.miner_data = MinerData::new(ScriptPublicKey::new(0, ScriptVec::from_slice(&miner_addr)), vec![]);
+
+    let mut chain = Vec::new();
+    for _ in 0..8 {
+        let b = ctx.mine_real_pow_block();
+        chain.push(b.clone());
+        ctx.consensus.validate_and_insert_block(b).virtual_state_task.await.unwrap();
+    }
+    let block1 = &chain[1];
+    let cb = &block1.transactions[0];
+    let (cb_txid, note_value) = (cb.id(), cb.outputs[0].value);
+
+    // Bob issues a payment request; Alice (the miner) pays it from her block reward, change to her
+    // self channel. Both wallets are seed-derived; the request carries the channel key.
+    let alice_sk = miner_seed;
+    let mut alice = TaggedWallet::new(alice_sk, 3).unwrap();
+    let mut bob = TaggedWallet::new([9u8; 32], 3).unwrap();
+    let req = bob.issue_request(1_000_000);
+    let mut rng = rand10::rng();
+    let (note, path) = kaspa_shielded_core::tagged_build::singleleaf_coinbase_note(alice_sk, cb_txid.as_bytes(), 0, note_value).unwrap();
+    let fee = 3_000u64;
+    let pay = pay_request(&req, 1_000_000, 0, &mut rng);
+    let change = alice.change_output(note_value - 1_000_000 - fee, &[], 0, &mut rng);
+    let mut tx = Transaction::new(TX_VERSION_SHIELDED, vec![], vec![], 0, SUBNETWORK_ID_NATIVE, 0, vec![]);
+    let tx_ctx = tx.shielded_sighash_context();
+    let bundle = kaspa_shielded_core::tagged_build::build_tagged_bundle(
+        alice_sk,
+        vec![(note, path)],
+        &[pay, change],
+        fee,
+        block1.header.hash.as_bytes(),
+        &net,
+        &tx_ctx,
+        &mut rng,
+    )
+    .expect("tagged bundle");
+    tx.payload = bundle.to_bytes();
+    let public_tags: Vec<[u8; 16]> = bundle.tagged.as_ref().unwrap().iter().map(|t| t.tag).collect();
+    assert_eq!(tx.payload[0], kaspa_shielded_core::bundle::FORMAT_TAGGED);
+    tx.finalize();
+    let tagged_id = tx.id();
+
+    let b = ctx.mine_real_pow_block_with(vec![tx]);
+    let tagged_block = b.header.hash;
+    ctx.consensus.validate_and_insert_block(b).virtual_state_task.await.expect("a block carrying a tagged tx is valid");
+    let child = ctx.mine_real_pow_block();
+    let child_hash = child.header.hash;
+    let child_cb_payload = child.transactions[0].payload.clone();
+    ctx.consensus.validate_and_insert_block(child).virtual_state_task.await.unwrap();
+    let applied = ctx.consensus.get_shielded_chain_block_data(child_hash).unwrap();
+    assert!(applied.accepted_txids.contains(&tagged_id), "the tagged payment is applied");
+
+    // ---- Light client: tag column + compact records only. ----
+    let all = ctx.consensus.get_shielded_chain_range(config.genesis.hash, 1_000).unwrap().unwrap();
+    let mut column = Vec::new();
+    let mut records = std::collections::HashMap::new();
+    for h in &all {
+        let (txs, _) = ctx.consensus.get_shielded_tag_block(*h).unwrap().expect("every post-activation chain block has a column");
+        let data = ctx.consensus.get_shielded_chain_block_data(*h).unwrap();
+        // Test glue: here every shielded tx is tagged, so the i-th column tx is the i-th accepted tx.
+        for (t, actions) in txs.iter().zip(&data.accepted_actions) {
+            for (j, rec) in actions.chunks_exact(148).enumerate() {
+                records.insert(t.first_leaf + j as u64, OutputRecord::from_compact(rec).unwrap());
+            }
+        }
+        column.push(ColumnBlock { hash: h.as_bytes(), txs });
+    }
+    for blk in &column {
+        bob.scan_block(blk, |p| records.get(&p).copied());
+        alice.scan_block(blk, |p| records.get(&p).copied());
+    }
+    assert_eq!(bob.found.len(), 1, "Bob finds the request payment by tag");
+    assert_eq!(bob.balance(), 1_000_000);
+    assert_eq!(alice.found.len(), 1, "Alice finds her change on the self channel");
+    assert_eq!(alice.balance(), note_value - 1_000_000 - fee);
+    assert_eq!(bob.stats.open_lane_trials + alice.stats.open_lane_trials, 0, "no trial decryption");
+    // Positions are absolute tree positions: Bob's note sits right after the block's coinbase leaves.
+    let tagged_col = column.iter().find(|c| c.hash == tagged_block.as_bytes()).unwrap();
+    assert!(tagged_col.txs.is_empty(), "the carrying block does not apply it; its merging child does");
+    let applied_col = column.iter().find(|c| c.hash == child_hash.as_bytes()).unwrap();
+    assert_eq!(applied_col.txs.len(), 1);
+    assert!(applied_col.txs[0].tags.contains(&req_tag(&req)));
+    // Privacy: the column (and so the tag log) carries only public data — the tx's own tag bytes, in
+    // action order, at the tree position every node already knows. It reveals nothing a block
+    // observer could not read from the transaction itself.
+    assert_eq!(applied_col.txs[0].tags, public_tags);
+    let pre = ctx.consensus.get_shielded_chain_block_data(Hash::from_bytes(applied_col.hash)).unwrap();
+    assert_eq!(pre.accepted_actions.len(), 1);
+
+    // ---- Integrity: replay the column to the tag log the PoW-committed root binds. ----
+    let vp = ctx.consensus.virtual_processor();
+    let v = *all.last().unwrap();
+    let replayed = TagLog::replay_blocks(&TagLog::default(), column.iter().map(|c| (&c.hash, c.txs.as_slice()))).unwrap();
+    let v1_root = vp.shielded_state_manager_ref().state_root_v1_at(v, false).unwrap();
+    let expected = kaspa_shielded_core::commitment::shielded_state_root_v2(&v1_root, &replayed.commitment());
+    assert_eq!(expected, vp.shielded_state_root_at(v).unwrap(), "the honest column replays to the committed root");
+    // The child of the tagged block committed its parent's v2 root in its coinbase.
+    let committed = kaspa_consensus_core::zkas_state_binding::extract_state_root(&child_cb_payload).unwrap();
+    assert_eq!(committed, vp.shielded_state_root_at(tagged_block).unwrap());
+    // A server that hides Bob's payment (drops its tag) or alters it is caught.
+    let mut hidden = column.clone();
+    let i = hidden.iter().position(|c| c.hash == child_hash.as_bytes()).unwrap();
+    hidden[i].txs[0].tags.retain(|t| *t != req_tag(&req));
+    let lie = TagLog::replay_blocks(&TagLog::default(), hidden.iter().map(|c| (&c.hash, c.txs.as_slice()))).unwrap();
+    assert_ne!(kaspa_shielded_core::commitment::shielded_state_root_v2(&v1_root, &lie.commitment()), expected);
+    let mut dropped = column.clone();
+    dropped[i].txs.clear();
+    let lie = TagLog::replay_blocks(&TagLog::default(), dropped.iter().map(|c| (&c.hash, c.txs.as_slice()))).unwrap();
+    assert_ne!(kaspa_shielded_core::commitment::shielded_state_root_v2(&v1_root, &lie.commitment()), expected);
+}
+
+fn req_tag(req: &kaspa_shielded_core::channel::PaymentRequest) -> [u8; 16] {
+    kaspa_shielded_core::channel::tag(&req.k, 0)
+}
+
+/// Before the activation a tagged payload is not a valid format: the carrying block is invalid,
+/// exactly as on a node that never heard of the format.
+#[tokio::test]
+async fn tagged_bundle_is_refused_before_the_activation() {
+    use kaspa_consensus_core::subnets::SUBNETWORK_ID_NATIVE;
+    use kaspa_consensus_core::tx::TX_VERSION_SHIELDED;
+    let mut params = MAINNET_PARAMS.clone();
+    params.shielded_coinbase = true;
+    params.dev_fee_recipient = None;
+    params.security_fork_activation = ForkActivation::always();
+    params.tagged_channels_activation = ForkActivation::never();
+    params.miner_accrual_payout_interval = 1;
+    let config = ConfigBuilder::new(params)
+        .edit_consensus_params(|p| {
+            p.genesis.bits = 0x207fffff;
+            p.blockrate.finality_depth = 5;
+            p.blockrate.shielded_anchor_depth = 5;
+        })
+        .build();
+    let net = config.genesis.hash.as_bytes();
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+    let miner_seed = [7u8; 32];
+    let miner_addr = kaspa_shielded_core::wallet::address_bytes_from_seed(miner_seed).unwrap();
+    ctx.miner_data = MinerData::new(ScriptPublicKey::new(0, ScriptVec::from_slice(&miner_addr)), vec![]);
+    let mut chain = Vec::new();
+    for _ in 0..8 {
+        let b = ctx.mine_real_pow_block();
+        chain.push(b.clone());
+        ctx.consensus.validate_and_insert_block(b).virtual_state_task.await.unwrap();
+    }
+    let cb = &chain[1].transactions[0];
+    let mut rng = rand10::rng();
+    let (note, path) =
+        kaspa_shielded_core::tagged_build::singleleaf_coinbase_note(miner_seed, cb.id().as_bytes(), 0, cb.outputs[0].value).unwrap();
+    let mut alice = kaspa_shielded_core::tagged_wallet::TaggedWallet::new(miner_seed, 2).unwrap();
+    let change = alice.change_output(cb.outputs[0].value - 3_000, &[], 0, &mut rng);
+    let mut tx = Transaction::new(TX_VERSION_SHIELDED, vec![], vec![], 0, SUBNETWORK_ID_NATIVE, 0, vec![]);
+    let tx_ctx = tx.shielded_sighash_context();
+    tx.payload = kaspa_shielded_core::tagged_build::build_tagged_bundle(
+        miner_seed,
+        vec![(note, path)],
+        &[change],
+        3_000,
+        chain[1].header.hash.as_bytes(),
+        &net,
+        &tx_ctx,
+        &mut rng,
+    )
+    .unwrap()
+    .to_bytes();
+    tx.finalize();
+    let bad = ctx.mine_real_pow_block_injecting(vec![tx]);
+    let verdict = ctx.consensus.validate_and_insert_block(bad).virtual_state_task.await;
+    assert!(
+        matches!(verdict, Err(_) | Ok(BlockStatus::StatusDisqualifiedFromChain)),
+        "a tagged payload before the activation invalidates its block: {verdict:?}"
+    );
+    // And no chain block has a tag column.
+    let all = ctx.consensus.get_shielded_chain_range(config.genesis.hash, 100).unwrap().unwrap();
+    assert!(all.iter().all(|h| ctx.consensus.get_shielded_tag_block(*h).unwrap().is_none()));
+}

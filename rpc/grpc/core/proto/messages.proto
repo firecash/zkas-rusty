@@ -73,6 +73,7 @@ message KaspadRequest {
     GetShieldedBlocksRequestMessage getShieldedBlocksRequest = 1122;
     GetShieldedSupplyRequestMessage getShieldedSupplyRequest = 1124;
     GetShieldedCoinbaseRewardsRequestMessage getShieldedCoinbaseRewardsRequest = 1126;
+    GetShieldedTagColumnRequestMessage getShieldedTagColumnRequest = 1128;
   }
 }
 
@@ -146,6 +147,7 @@ message KaspadResponse {
     GetShieldedBlocksResponseMessage getShieldedBlocksResponse = 1123;
     GetShieldedSupplyResponseMessage getShieldedSupplyResponse = 1125;
     GetShieldedCoinbaseRewardsResponseMessage getShieldedCoinbaseRewardsResponse = 1127;
+    GetShieldedTagColumnResponseMessage getShieldedTagColumnResponse = 1129;
   }
 }
 

@@ -95,6 +95,7 @@ pub enum KaspadPayloadOps {
     GetShieldedBlocks,
     GetShieldedSupply,
     GetShieldedCoinbaseRewards,
+    GetShieldedTagColumn,
 
     // Subscription commands for starting/stopping notifications
     NotifyBlockAdded,

@@ -265,6 +265,29 @@ message GetShieldedTreeStateResponseMessage {
   RPCError error = 1000;
 }
 
+// Tagged channels (devnet only): the per-chain-block tag column after startHash.
+message GetShieldedTagColumnRequestMessage {
+  string startHash = 1;                 // resume cursor (exclusive); must be a chain block
+  uint64 limit = 2;                     // max chain blocks (0 = server default)
+}
+
+message RpcShieldedTagTx {
+  uint64 firstLeaf = 1;                 // absolute tree position of the tx's first output
+  bytes tags = 2;                       // 16-byte tags, concatenated in action order
+}
+
+message RpcShieldedTagBlock {
+  string hash = 1;
+  repeated RpcShieldedTagTx txs = 2;
+}
+
+message GetShieldedTagColumnResponseMessage {
+  repeated RpcShieldedTagBlock blocks = 1;
+  uint64 logBeforeCount = 2;            // tag log at startHash: entry count
+  repeated string logBeforePeaks = 3;   // and its MMR peaks (hex), highest first
+  RPCError error = 1000;
+}
+
 // GetShieldedBlocksRequestMessage requests the shielded effects applied by the
 // chain blocks after startHash (a canonical chain block), oldest first — the
 // exact per-chain-block stream a wallet ingests to mirror the note-commitment

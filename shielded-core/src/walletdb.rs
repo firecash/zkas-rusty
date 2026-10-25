@@ -5812,6 +5812,7 @@ mod tests {
             binding_sig: [0u8; sizes::SIG],
             burn: None,
             anchor_block: None,
+            tagged: None,
         };
 
         // First acceptance appends its commitment; the duplicate appends nothing.

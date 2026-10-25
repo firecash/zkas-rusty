@@ -61,7 +61,7 @@ impl TransactionValidator {
         if !tx.is_shielded() {
             return Ok(());
         }
-        kaspa_shielded_core::bundle::ShieldedBundle::from_bytes_at(&tx.payload, self.security_fork_activation.is_active(block_daa_score))
+        self.decode_shielded_at(&tx.payload, block_daa_score)
             .map(|_| ())
             .map_err(|_| TxRuleError::InvalidShieldedTransaction("malformed Orchard bundle in payload"))
     }

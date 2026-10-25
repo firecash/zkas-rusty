@@ -924,6 +924,45 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         Ok(GetShieldedTreeStateResponse { block_hash, daa_score, size, leaf, ommers, history_from_daa_score, history_complete })
     }
 
+    async fn get_shielded_tag_column_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: GetShieldedTagColumnRequest,
+    ) -> RpcResult<GetShieldedTagColumnResponse> {
+        refuse_if_shielded_state_diverged("serve the tag column")?;
+        const DEFAULT_LIMIT: usize = 1000;
+        const MAX_LIMIT: usize = 5000;
+        let limit = match request.limit as usize {
+            0 => DEFAULT_LIMIT,
+            l => l.min(MAX_LIMIT),
+        };
+        let session = self.consensus_manager.consensus().session().await;
+        let start = request.start_hash;
+        session
+            .spawn_blocking(move |c| -> RpcResult<GetShieldedTagColumnResponse> {
+                let Some(hashes) = c.get_shielded_chain_range(start, limit)? else {
+                    return Err(RpcError::General(format!("{start} is not on the selected chain (reorg): re-anchor")));
+                };
+                let log_before = c.get_shielded_tag_block(start)?.map(|(_, log)| log).unwrap_or_default();
+                let mut blocks = Vec::with_capacity(hashes.len());
+                for hash in hashes {
+                    // A block before the activation has no column; it is skipped, not served empty
+                    // (the tag log has no entry for it).
+                    let Some((txs, _)) = c.get_shielded_tag_block(hash)? else { continue };
+                    blocks.push(RpcShieldedTagBlock {
+                        hash,
+                        txs: txs.into_iter().map(|t| RpcShieldedTagTx { first_leaf: t.first_leaf, tags: t.tags.concat() }).collect(),
+                    });
+                }
+                Ok(GetShieldedTagColumnResponse {
+                    blocks,
+                    log_before_count: log_before.count,
+                    log_before_peaks: log_before.peaks.iter().map(|p| RpcHash::from_bytes(*p)).collect(),
+                })
+            })
+            .await
+    }
+
     async fn get_shielded_blocks_call(
         &self,
         _connection: Option<&DynRpcConnection>,

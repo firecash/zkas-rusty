@@ -166,6 +166,10 @@ pub enum DatabaseStorePrefixes {
     /// Written in the same batch as every change to that set, so after a crash the set says where it
     /// stands and startup can move it to the virtual sink from the per-block diffs.
     ShieldedNullifierCursor = 99,
+    /// Tagged channels (devnet only, `Params::tagged_channels_activation`): each post-activation
+    /// chain block's tag column (applied tagged txs, first leaf + tags) and the tag log after it.
+    /// A fresh prefix, written only from the activation, so no existing row changes layout.
+    ShieldedTagBlock = 110,
 
     // ---- Separator ----
     /// Reserved as a separator

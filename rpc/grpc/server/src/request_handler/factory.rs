@@ -58,6 +58,7 @@ impl Factory {
                 GetShieldedBlocks,
                 GetShieldedSupply,
                 GetShieldedCoinbaseRewards,
+                GetShieldedTagColumn,
                 GetMempoolEntry,
                 GetMempoolEntries,
                 GetConnectedPeerInfo,

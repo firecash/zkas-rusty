@@ -176,6 +176,17 @@ pub mod scan {
             Self { nullifier: a.nullifier, cmx: a.cmx, ephemeral_key: a.ephemeral_key, enc_ciphertext }
         }
 
+        /// The compact record of a **tagged** action: `nullifier ‖ cmx ‖ kem ‖ ct[..52]` (the
+        /// ciphertext body plus 4 MAC bytes). Same 148-byte size as a V1 record, so the scan
+        /// archive and every consumer that chunks by 148 are unchanged; a V1 trial decryption of
+        /// it finds nothing (the kem is not an Orchard epk for anyone). The tag is served
+        /// separately, in the tag column.
+        pub fn from_tagged(a: &ActionWire, t: &crate::bundle::TaggedFields) -> Self {
+            let mut enc_ciphertext = [0u8; 52];
+            enc_ciphertext.copy_from_slice(&t.ct[..52]);
+            Self { nullifier: a.nullifier, cmx: a.cmx, ephemeral_key: a.ephemeral_key, enc_ciphertext }
+        }
+
         /// Fixed-layout encoding for the consensus scan-archive store.
         pub fn to_bytes(&self) -> [u8; Self::SERIALIZED_LEN] {
             let mut out = [0u8; Self::SERIALIZED_LEN];
@@ -1006,6 +1017,7 @@ pub mod build {
             binding_sig,
             burn: None,
             anchor_block: None,
+            tagged: None,
         }
     }
 

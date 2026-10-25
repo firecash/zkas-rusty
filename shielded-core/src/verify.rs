@@ -47,6 +47,10 @@ use crate::bundle::ShieldedBundle;
 /// Personalization for the shielded-transaction sighash (must be 16 bytes).
 const SIGHASH_PERSONALIZATION: &[u8; 16] = b"zkas_tx_sighash0";
 
+/// Personalization of the tagged-channel sighash. Distinct from V1's, so no V1 signature can
+/// verify over a tagged bundle's digest or the reverse (with the format byte as a second guard).
+const SIGHASH_TAGGED_PERSONALIZATION: &[u8; 16] = b"zkas_tx_sighashT";
+
 /// Why a shielded bundle failed cryptographic verification. Any of these makes
 /// the carrying transaction invalid.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,6 +105,9 @@ pub fn verify_spend_auth_sig(rk: &[u8; 32], sighash: &[u8; 32], sig: &[u8; 64]) 
 }
 
 pub fn sighash(bundle: &ShieldedBundle, network_domain: &[u8; 32], tx_context: &[u8]) -> [u8; 32] {
+    if let Some(tagged) = &bundle.tagged {
+        return sighash_tagged(bundle, tagged, network_domain, tx_context);
+    }
     let mut h = Params::new().hash_length(32).personal(SIGHASH_PERSONALIZATION).to_state();
     h.update(network_domain);
     h.update(&[bundle.flags]);
@@ -143,6 +150,66 @@ pub fn sighash(bundle: &ShieldedBundle, network_domain: &[u8; 32], tx_context: &
     let mut out = [0u8; 32];
     out.copy_from_slice(h.finalize().as_bytes());
     out
+}
+
+/// The sighash of a tagged-channel bundle (fork topic 01 §3.2 "sighash v3"): it binds
+/// `tag ‖ kem ‖ ct` of every action in place of `epk ‖ enc_ciphertext ‖ out_ciphertext`, so a
+/// relayer cannot change where a payment is delivered or what its ciphertext says without
+/// invalidating the binding and every spend-auth signature.
+///
+/// Unlike spec 01's sighash v2 this keeps `anchor` and `anchor_block` inside the digest, as V1
+/// does: the prototype has no re-anchoring (S-R5), and binding more is never weaker.
+fn sighash_tagged(
+    bundle: &ShieldedBundle,
+    tagged: &[crate::bundle::TaggedFields],
+    network_domain: &[u8; 32],
+    tx_context: &[u8],
+) -> [u8; 32] {
+    use crate::bundle::{CIRCUIT_ID_ORCHARD_V2, FORMAT_TAGGED, POOL_ID_ZKAS};
+    let mut h = Params::new().hash_length(32).personal(SIGHASH_TAGGED_PERSONALIZATION).to_state();
+    h.update(network_domain);
+    h.update(&[FORMAT_TAGGED, POOL_ID_ZKAS, CIRCUIT_ID_ORCHARD_V2, bundle.flags]);
+    h.update(&bundle.value_balance.to_le_bytes());
+    h.update(&bundle.anchor);
+    h.update(&bundle.anchor_block.unwrap_or([0u8; 32]));
+    h.update(&(bundle.actions.len() as u32).to_le_bytes());
+    for (a, t) in bundle.actions.iter().zip(tagged) {
+        h.update(&a.nullifier);
+        h.update(&a.rk);
+        h.update(&a.cmx);
+        h.update(&a.cv_net);
+        h.update(&a.ephemeral_key); // kem
+        h.update(&t.tag);
+        h.update(&t.ct);
+    }
+    h.update(&(tx_context.len() as u32).to_le_bytes());
+    h.update(tx_context);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(h.finalize().as_bytes());
+    out
+}
+
+/// The flag rule shared by the single and the batched verifier: which raw flags byte a bundle may
+/// carry, and the Orchard flags byte (bits 0..1) the circuit is verified with. `None` = refused.
+///
+/// - V1: bits {0, 1} plus the ZKas anchor-block extension (bit 3), whose presence must match the
+///   field exactly. WHEN the extension is allowed is a header-context rule.
+/// - Tagged: exactly [`crate::bundle::TAGGED_FLAGS`], with the anchor block always present.
+pub(crate) fn orchard_flags_byte(bundle: &ShieldedBundle) -> Option<u8> {
+    if bundle.tagged.is_some() {
+        if bundle.flags != crate::bundle::TAGGED_FLAGS || bundle.anchor_block.is_none() || bundle.burn.is_some() {
+            return None;
+        }
+        if bundle.tagged.as_ref().map(|t| t.len()) != Some(bundle.actions.len()) {
+            return None;
+        }
+        return Some(bundle.flags & 0b11);
+    }
+    let ext = crate::bundle::BUNDLE_FLAG_ANCHOR_BLOCK;
+    if bundle.flags & !(0b11 | ext) != 0 || ((bundle.flags & ext) != 0) != bundle.anchor_block.is_some() {
+        return None;
+    }
+    Some(bundle.flags & 0b11)
 }
 
 #[cfg(feature = "circuit")]
@@ -191,12 +258,11 @@ mod circuit_verify {
         // is masked off before Orchard sees the byte. Its presence must match the field exactly.
         // WHEN it is allowed (only from the security fork) is a consensus-context rule, enforced
         // by the transaction validator, not here.
-        let ext = crate::bundle::BUNDLE_FLAG_ANCHOR_BLOCK;
-        if bundle.flags & !(0b11 | ext) != 0 || ((bundle.flags & ext) != 0) != bundle.anchor_block.is_some() {
-            return Err(BundleVerifyError::NonCanonicalFlags);
-        }
-        let flags =
-            Flags::from_byte(bundle.flags & 0b11, crate::verify::BUNDLE_VERSION).ok_or(BundleVerifyError::NonCanonicalFlags)?;
+        // Tagged bundles: exactly `TAGGED_FLAGS`, the anchor block always named (see
+        // `orchard_flags_byte`). Their `kem` sits in `ephemeral_key`, so the non-identity epk rule
+        // below covers it unchanged.
+        let orchard_byte = super::orchard_flags_byte(bundle).ok_or(BundleVerifyError::NonCanonicalFlags)?;
+        let flags = Flags::from_byte(orchard_byte, crate::verify::BUNDLE_VERSION).ok_or(BundleVerifyError::NonCanonicalFlags)?;
 
         let mut instances = Vec::with_capacity(bundle.actions.len());
         let mut rks = Vec::with_capacity(bundle.actions.len());
@@ -268,7 +334,14 @@ mod circuit_verify {
     /// `try_from_parts` (Strict) rejects non-canonical proof lengths.
     fn to_orchard_bundle(wire: &ShieldedBundle) -> Result<Bundle<Authorized, i64>, BundleVerifyError> {
         let anchor: Anchor = Option::from(Anchor::from_bytes(wire.anchor)).ok_or(BundleVerifyError::NonCanonicalField("anchor"))?;
-        let flags = Flags::from_byte(wire.flags, crate::verify::BUNDLE_VERSION).ok_or(BundleVerifyError::NonCanonicalFlags)?;
+        // A tagged bundle is verified with its Orchard bits only (the shared flag rule). A V1 bundle
+        // keeps passing its raw byte here, unchanged by this prototype.
+        let flags = if wire.tagged.is_some() {
+            let b = super::orchard_flags_byte(wire).ok_or(BundleVerifyError::NonCanonicalFlags)?;
+            Flags::from_byte(b, crate::verify::BUNDLE_VERSION).ok_or(BundleVerifyError::NonCanonicalFlags)?
+        } else {
+            Flags::from_byte(wire.flags, crate::verify::BUNDLE_VERSION).ok_or(BundleVerifyError::NonCanonicalFlags)?
+        };
 
         let mut actions = Vec::with_capacity(wire.actions.len());
         for a in &wire.actions {
@@ -377,6 +450,7 @@ mod e2e {
             binding_sig,
             burn: None,
             anchor_block: None,
+            tagged: None,
         }
     }
 
@@ -588,6 +662,7 @@ mod tests {
             binding_sig: [0u8; 64],
             burn: None,
             anchor_block: None,
+            tagged: None,
         }
     }
 
@@ -617,6 +692,57 @@ mod tests {
         // Changing the network domain changes the sighash (replay protection):
         // the same bundle+context signed for network A is not valid for network B.
         assert_ne!(sighash(&b, &NET_B, b"ctx"), s1);
+    }
+
+    /// The tagged sighash binds every delivery field (tag, kem, ct) and the named anchor block, is
+    /// domain-separated from V1's, and excludes signatures and the proof.
+    #[test]
+    fn tagged_sighash_binds_the_delivery_fields() {
+        let t = ShieldedBundle::sample_tagged_for_test(2);
+        let s0 = sighash(&t, &NET_A, b"ctx");
+        assert_eq!(s0, sighash(&t.clone(), &NET_A, b"ctx"));
+        let mut v1 = t.clone();
+        v1.tagged = None;
+        assert_ne!(sighash(&v1, &NET_A, b"ctx"), s0, "the same effects in V1 form hash differently");
+        let mutations: Vec<(&str, Box<dyn Fn(&mut ShieldedBundle)>)> = vec![
+            ("tag", Box::new(|b| b.tagged.as_mut().unwrap()[1].tag[3] ^= 1)),
+            ("ct", Box::new(|b| b.tagged.as_mut().unwrap()[0].ct[63] ^= 1)),
+            ("kem", Box::new(|b| b.actions[1].ephemeral_key[0] ^= 1)),
+            ("cmx", Box::new(|b| b.actions[0].cmx[0] ^= 1)),
+            ("anchor_block", Box::new(|b| b.anchor_block = Some([0x77; 32]))),
+            ("anchor", Box::new(|b| b.anchor[5] ^= 1)),
+            ("value_balance", Box::new(|b| b.value_balance += 1)),
+        ];
+        for (name, m) in &mutations {
+            let mut b = t.clone();
+            m(&mut b);
+            assert_ne!(sighash(&b, &NET_A, b"ctx"), s0, "changing {name} must change the tagged sighash");
+        }
+        let mut b = t.clone();
+        b.actions[0].spend_auth_sig[0] ^= 1;
+        b.proof[0] ^= 1;
+        b.binding_sig[0] ^= 1;
+        b.actions[0].enc_ciphertext[0] ^= 1; // a placeholder, never on the wire
+        assert_eq!(sighash(&b, &NET_A, b"ctx"), s0, "authorizing data and placeholders are not hashed");
+        assert_ne!(sighash(&t, &NET_B, b"ctx"), s0);
+    }
+
+    /// The flag rule for tagged bundles: exactly `TAGGED_FLAGS`, with a named anchor block.
+    #[test]
+    fn tagged_flag_rule() {
+        let t = ShieldedBundle::sample_tagged_for_test(2);
+        assert_eq!(orchard_flags_byte(&t), Some(0b11));
+        for f in [0b111u8, 0b1011, 0b01, 0b10, 0b1_0011] {
+            let mut b = t.clone();
+            b.flags = f;
+            assert_eq!(orchard_flags_byte(&b), None, "flags {f:#b}");
+        }
+        let mut b = t.clone();
+        b.anchor_block = None;
+        assert_eq!(orchard_flags_byte(&b), None, "a tagged bundle must name its anchor block");
+        let mut b = t.clone();
+        b.tagged.as_mut().unwrap().pop();
+        assert_eq!(orchard_flags_byte(&b), None, "one delivery entry per action");
     }
 
     /// The spend-auth signature is excluded from the sighash (it signs it), so

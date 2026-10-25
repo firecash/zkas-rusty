@@ -29,6 +29,7 @@ pub mod anchor_window;
 pub mod attestation;
 pub mod bundle;
 pub mod burn;
+pub mod channel;
 pub mod coinbase;
 pub mod commitment;
 pub mod message;
@@ -36,6 +37,10 @@ pub mod nullifier;
 pub mod payment_check;
 pub mod payproof;
 pub mod state;
+pub mod tag_log;
+#[cfg(feature = "circuit")]
+pub mod tagged_build;
+pub mod tagged_wallet;
 pub mod tree;
 pub mod turnstile;
 pub mod verify;

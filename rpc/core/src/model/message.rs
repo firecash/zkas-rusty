@@ -562,6 +562,82 @@ impl Deserializer for GetShieldedTreeStateResponse {
     }
 }
 
+/// Tagged channels (devnet only): request the **tag column** of the chain blocks after
+/// `start_hash`, oldest first. A light client probes these 16-byte tags against the tags it
+/// expects (no cryptography), fetches only the outputs that hit, and replays the column onto
+/// `log_before` to check it against the PoW-committed tag log (`zkas_state_root2`), which is what
+/// stops a server from hiding a payment.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetShieldedTagColumnRequest {
+    pub start_hash: RpcHash,
+    pub limit: u64,
+}
+
+impl Serializer for GetShieldedTagColumnRequest {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(RpcHash, &self.start_hash, writer)?;
+        store!(u64, &self.limit, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetShieldedTagColumnRequest {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        Ok(Self { start_hash: load!(RpcHash, reader)?, limit: load!(u64, reader)? })
+    }
+}
+
+/// One applied tagged transaction in a block's tag column.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcShieldedTagTx {
+    /// Absolute tree position of the tx's first output.
+    pub first_leaf: u64,
+    /// The tx's tags, 16 bytes each, concatenated in action order.
+    pub tags: Vec<u8>,
+}
+
+/// One chain block of the tag column.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcShieldedTagBlock {
+    pub hash: RpcHash,
+    pub txs: Vec<RpcShieldedTagTx>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetShieldedTagColumnResponse {
+    pub blocks: Vec<RpcShieldedTagBlock>,
+    /// The tag log as of `start_hash` (count and peaks); empty before the activation.
+    pub log_before_count: u64,
+    pub log_before_peaks: Vec<RpcHash>,
+}
+
+impl Serializer for GetShieldedTagColumnResponse {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(Vec<RpcShieldedTagBlock>, &self.blocks, writer)?;
+        store!(u64, &self.log_before_count, writer)?;
+        store!(Vec<RpcHash>, &self.log_before_peaks, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetShieldedTagColumnResponse {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        Ok(Self {
+            blocks: load!(Vec<RpcShieldedTagBlock>, reader)?,
+            log_before_count: load!(u64, reader)?,
+            log_before_peaks: load!(Vec<RpcHash>, reader)?,
+        })
+    }
+}
+
 /// Request the shielded effects applied by the chain blocks after `start_hash`
 /// (a canonical chain block), oldest first: per chain block, its own coinbase
 /// mint and its accepted (post-anchor-retain) shielded bundles in consensus

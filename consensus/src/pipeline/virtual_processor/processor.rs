@@ -215,6 +215,8 @@ pub struct VirtualStateProcessor {
     pub(crate) shielded_anchor_multi_activation: ForkActivation,
     /// See `Params::security_fork_activation`.
     pub(crate) security_fork_activation: ForkActivation,
+    /// See `Params::tagged_channels_activation` (devnet only).
+    pub(crate) tagged_channels_activation: ForkActivation,
     /// See `Params::dev_fee_accrual_activation` / `Params::dev_fee_end_activation`: outside the
     /// window between them no dev fee is carried, so an imported pruning point must carry none.
     dev_fee_accrual_activation: ForkActivation,
@@ -386,6 +388,7 @@ impl VirtualStateProcessor {
             toccata_activation: params.toccata_activation,
             shielded_anchor_multi_activation: params.shielded_anchor_multi_activation,
             security_fork_activation: params.security_fork_activation,
+            tagged_channels_activation: params.tagged_channels_activation,
             dev_fee_accrual_activation: params.dev_fee_accrual_activation,
             dev_fee_end_activation: params.dev_fee_end_activation,
             shielded_coinbase_seed_activation: params.shielded_coinbase_seed_activation,
@@ -691,6 +694,13 @@ impl VirtualStateProcessor {
     ) -> Result<Option<kaspa_shielded_core::anchor_window::AnchorLog>, String> {
         use crate::processes::shielded::ShieldedStateManager;
         let pp_daa = self.headers_store.get_daa_score(pp).map_err(|e| format!("pruning point header {pp}: {e}"))?;
+        // Tagged channels are a devnet-only prototype with no tag-log export: a pruning point at or
+        // past the activation cannot be bound (its root commits a tag log the metadata does not
+        // carry). Refuse it explicitly — fail closed — rather than by a root mismatch.
+        if self.tagged_channels_activation.is_active(pp_daa) {
+            return Err("pruning-point import past the tagged-channel activation is not supported (devnet prototype: sync from genesis)"
+                .to_string());
+        }
         // Values that consensus rules fix regardless of any root: no dev fee is carried before
         // accrual starts or from the dev-fee end on. Before the security fork the v0 root does not
         // cover `dev_accrued` (nor the miner slot), so without this a peer could seed a balance the
@@ -865,11 +875,25 @@ impl VirtualStateProcessor {
     /// shielded state). Used on the IBD import path to detect whether local state
     /// already matches the PoW-committed root (F-02/F-15).
     pub fn shielded_state_root_at(&self, block: kaspa_hashes::Hash) -> Result<[u8; 32], kaspa_database::prelude::StoreError> {
-        if self.is_post_security_fork(block)? {
-            self.shielded_state_manager.state_root_v1_at(block, block == self.genesis.hash)
+        let base = if self.is_post_security_fork(block)? {
+            self.shielded_state_manager.state_root_v1_at(block, block == self.genesis.hash)?
         } else {
-            self.shielded_state_manager.state_root_at(block)
+            self.shielded_state_manager.state_root_at(block)?
+        };
+        // Tagged channels (devnet only): from the activation the root also commits the tag log.
+        if self.tagged_channels_activation.is_active(self.headers_store.get_daa_score(block)?) {
+            let log = match self.shielded_state_manager.tag_block_at(block)? {
+                Some(rec) => rec.log,
+                None if block == self.genesis.hash => Default::default(),
+                None => {
+                    return Err(kaspa_database::prelude::StoreError::DataInconsistency(format!(
+                        "post-activation block {block} has no tag log"
+                    )));
+                }
+            };
+            return Ok(kaspa_shielded_core::commitment::shielded_state_root_v2(&base, &log.commitment()));
         }
+        Ok(base)
     }
 
     /// Move the global nullifier set from the chain block its cursor names to `target`, in one batch:
@@ -2024,6 +2048,27 @@ impl VirtualStateProcessor {
                 };
                 let window = parent_window.append(&entry).expect("the parent's anchor log is well formed");
                 self.shielded_state_manager.persist_window(&mut batch, current, window, entry, parent_window).unwrap();
+            }
+            // Tagged channels: extend the selected parent's tag log with this block's column. Derived
+            // only from the parent's log and this block's applied set, like the anchor window.
+            if self.tagged_channels_activation.is_active(self.headers_store.get_daa_score(current).unwrap()) {
+                let sp = self.ghostdag_store.get_selected_parent(current).unwrap();
+                let parent_log = match self.shielded_state_manager.tag_block_at(sp).unwrap() {
+                    Some(rec) => rec.log,
+                    None if sp == self.genesis.hash
+                        || !self.tagged_channels_activation.is_active(self.headers_store.get_daa_score(sp).unwrap()) =>
+                    {
+                        Default::default()
+                    }
+                    None => panic!("post-activation selected parent {sp} has no tag log; the shielded store is inconsistent"),
+                };
+                let txs = computed.tag_column.clone().unwrap_or_default();
+                let log = parent_log
+                    .append(&current.as_bytes(), &kaspa_shielded_core::tag_log::block_tag_digest(&txs))
+                    .expect("the parent's tag log is well formed");
+                self.shielded_state_manager
+                    .persist_tag_block(&mut batch, current, crate::model::stores::shielded::ShieldedTagBlockData { txs, log })
+                    .unwrap();
             }
         }
         // Dev-fee accrual rides the same atomic batch, so a crash can never leave a

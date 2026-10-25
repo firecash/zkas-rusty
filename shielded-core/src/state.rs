@@ -715,6 +715,7 @@ mod tests {
             actions: vec![action(1, 100), action(2, 101)],
             burn: None,
             anchor_block: None,
+            tagged: None,
             flags: 0b11,
             value_balance: 7,
             anchor: [0; 32],
@@ -738,6 +739,7 @@ mod tests {
             binding_sig: [0; 64],
             burn: None,
             anchor_block: None,
+            tagged: None,
         };
         assert!(matches!(ShieldedTx::from_bundle(&bundle), Err(BundleExtractError::MintingValueBalance)));
     }
@@ -755,6 +757,7 @@ mod tests {
             binding_sig: [0; 64],
             burn: None,
             anchor_block: None,
+            tagged: None,
         };
         assert!(matches!(ShieldedTx::from_bundle(&bundle), Err(BundleExtractError::NonCanonicalCommitment)));
     }

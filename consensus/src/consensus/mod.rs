@@ -900,6 +900,17 @@ impl ConsensusApi for Consensus {
         Ok((totals.cumulative_coinbase, totals.cumulative_fees, burns))
     }
 
+    fn get_shielded_tag_block(
+        &self,
+        block: Hash,
+    ) -> ConsensusResult<Option<(Vec<kaspa_shielded_core::tag_log::TaggedTxColumn>, kaspa_shielded_core::tag_log::TagLog)>> {
+        self.virtual_processor
+            .shielded_state_manager_ref()
+            .tag_block_at(block)
+            .map(|r| r.map(|r| (r.txs, r.log)))
+            .map_err(|e| ConsensusError::GeneralOwned(e.to_string()))
+    }
+
     fn get_shielded_chain_block_data(&self, block: Hash) -> ConsensusResult<kaspa_consensus_core::api::ShieldedChainBlockData> {
         self.virtual_processor.shielded_chain_block_data(block).map_err(ConsensusError::GeneralOwned)
     }

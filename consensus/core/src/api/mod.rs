@@ -578,6 +578,15 @@ pub trait ConsensusApi: Send + Sync {
     /// wallet must ingest to mirror the note-commitment tree: scanning raw DAG
     /// blocks (e.g. via `get_blocks`) counts non-chain coinbases that never mint
     /// and mis-orders leaves once the DAG is wider than a chain.
+    /// Tagged channels (devnet only): a post-activation chain block's tag column and the tag log
+    /// after it; `None` for a block before the activation (or not a chain block of this node).
+    fn get_shielded_tag_block(
+        &self,
+        _block: Hash,
+    ) -> ConsensusResult<Option<(Vec<kaspa_shielded_core::tag_log::TaggedTxColumn>, kaspa_shielded_core::tag_log::TagLog)>> {
+        unimplemented!()
+    }
+
     fn get_shielded_chain_block_data(&self, _block: Hash) -> ConsensusResult<ShieldedChainBlockData> {
         unimplemented!()
     }

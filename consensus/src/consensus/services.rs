@@ -162,7 +162,8 @@ impl ConsensusServices {
             params.mass_per_sig_op,
             params.genesis.hash.as_bytes(),
         )
-        .with_security_fork_activation(params.security_fork_activation);
+        .with_security_fork_activation(params.security_fork_activation)
+        .with_tagged_channels_activation(params.tagged_channels_activation);
 
         let pruning_point_manager = PruningPointManager::new(
             params.pruning_depth(),

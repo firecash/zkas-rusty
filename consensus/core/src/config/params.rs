@@ -320,6 +320,10 @@ pub struct OverrideParams {
     /// the score it crosses.
     pub security_fork_activation: Option<ForkActivation>,
 
+    /// See [`Params::tagged_channels_activation`]. Overridable for private test networks.
+    #[serde(default)]
+    pub tagged_channels_activation: Option<ForkActivation>,
+
     /// See [`Params::miner_accrual_payout_interval`].
     pub miner_accrual_payout_interval: Option<u64>,
 
@@ -365,6 +369,7 @@ impl From<Params> for OverrideParams {
             toccata_activation: Some(p.toccata_activation),
             merged_mining_activation: Some(p.merged_mining_activation),
             security_fork_activation: Some(p.security_fork_activation),
+            tagged_channels_activation: Some(p.tagged_channels_activation),
             miner_accrual_payout_interval: Some(p.miner_accrual_payout_interval),
             dev_fee_end_activation: Some(p.dev_fee_end_activation),
             shielded_coinbase: Some(p.shielded_coinbase),
@@ -536,6 +541,15 @@ pub struct Params {
     /// - a shielded bundle decodes in the anchor-block format (decided per carrying block's DAA).
     /// Mainnet: [`ZKAS_SECURITY_FORK_DAA`].
     pub security_fork_activation: ForkActivation,
+
+    /// **Tagged channels (fork topic 01 §A), DEVNET-ONLY prototype.** From this DAA score:
+    /// - a shielded payload may be a tagged-channel bundle (`bundle::FORMAT_TAGGED`, judged by the
+    ///   carrying block's DAA; V1 stays valid, the dual window never closes in the prototype);
+    /// - every chain block appends its tag column to the tag log (`shielded_core::tag_log`), and
+    ///   the state root becomes `zkas_state_root2(v1, tag_log)` for blocks at or past it.
+    /// Must not precede `security_fork_activation` (tagged bundles always name their anchor block).
+    /// `never()` on mainnet, testnet and simnet.
+    pub tagged_channels_activation: ForkActivation,
 
     /// ZKas launch difficulty schedule — number of blocks (blue-score units) at the
     /// start of the chain during which difficulty is **pinned** to the genesis target
@@ -873,6 +887,7 @@ impl Params {
             dev_fee_end_activation: overrides.dev_fee_end_activation.unwrap_or(self.dev_fee_end_activation),
             merged_mining_activation: overrides.merged_mining_activation.unwrap_or(self.merged_mining_activation),
             security_fork_activation: overrides.security_fork_activation.unwrap_or(self.security_fork_activation),
+            tagged_channels_activation: overrides.tagged_channels_activation.unwrap_or(self.tagged_channels_activation),
 
             // Consensus-critical launch schedule; not exposed as a CLI override.
             low_difficulty_start_blocks: self.low_difficulty_start_blocks,
@@ -1096,6 +1111,7 @@ pub const MAINNET_PARAMS: Params = Params {
     // intended, correct value. This is historical context, not a planned change.)
     merged_mining_activation: ForkActivation::always(),
     security_fork_activation: ForkActivation::new(ZKAS_SECURITY_FORK_DAA),
+    tagged_channels_activation: ForkActivation::never(),
 
     // ZKas launch difficulty: the low-difficulty bootstrap schedule is DISABLED on mainnet
     // (both 0), so the chain launches under pure upstream KIP-0004 DAA from genesis — the
@@ -1193,6 +1209,7 @@ pub const TESTNET_PARAMS: Params = Params {
     // On testnet, merged mining is available from genesis for testing.
     merged_mining_activation: ForkActivation::always(),
     security_fork_activation: ForkActivation::always(),
+    tagged_channels_activation: ForkActivation::never(),
 
     // Launch difficulty schedule disabled on testnet.
     low_difficulty_start_blocks: 0,
@@ -1260,6 +1277,7 @@ pub const SIMNET_PARAMS: Params = Params {
     dev_fee_end_activation: ForkActivation::never(),
     merged_mining_activation: ForkActivation::always(),
     security_fork_activation: ForkActivation::always(),
+    tagged_channels_activation: ForkActivation::never(),
 
     // Launch difficulty schedule disabled on simnet.
     low_difficulty_start_blocks: 0,
@@ -1339,6 +1357,8 @@ pub const DEVNET_PARAMS: Params = Params {
     dev_fee_end_activation: ForkActivation::never(),
     merged_mining_activation: ForkActivation::always(),
     security_fork_activation: ForkActivation::new(1_500),
+    // Devnet-only prototype (task C3): 500 DAA after the security fork, so a devnet run crosses it.
+    tagged_channels_activation: ForkActivation::new(2_000),
 
     // Pin difficulty to the (easy) genesis target for the first 50k blocks so the
     // short devnet demo chain stays CPU-mineable throughout (mirrors mainnet's launch
@@ -1391,6 +1411,21 @@ mod tests {
             let secs = p.miner_accrual_payout_interval * p.target_time_per_block() / 1000;
             assert_eq!(secs, 100, "{:?}", p.net);
         }
+    }
+
+    /// Tagged channels are a devnet-only prototype: never on a shared network, and on devnet not
+    /// before the security fork (a tagged bundle always names its anchor block).
+    #[test]
+    fn tagged_channels_are_devnet_only_and_follow_the_security_fork() {
+        for p in [&MAINNET_PARAMS, &TESTNET_PARAMS, &SIMNET_PARAMS] {
+            assert!(!p.tagged_channels_activation.is_active(u64::MAX - 1), "{:?}", p.net);
+        }
+        let d = &DEVNET_PARAMS;
+        let t = d.tagged_channels_activation.daa_score();
+        assert!(d.tagged_channels_activation.is_active(t) && !d.tagged_channels_activation.is_active(t - 1));
+        assert!(d.security_fork_activation.is_active(t));
+        let o: OverrideParams = serde_json::from_str(r#"{"tagged_channels_activation":42}"#).unwrap();
+        assert!(MAINNET_PARAMS.override_params(o).tagged_channels_activation.is_active(42));
     }
 
     #[test]

@@ -274,6 +274,7 @@ mod tests {
                 binding_sig: [0; 64],
                 burn: None,
                 anchor_block: None,
+                tagged: None,
             },
             disc,
         )

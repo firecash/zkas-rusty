@@ -49,6 +49,9 @@ pub struct TransactionValidator {
     /// See `Params::security_fork_activation`. Defaults to never; set via
     /// [`TransactionValidator::with_security_fork_activation`].
     security_fork_activation: ForkActivation,
+    /// See `Params::tagged_channels_activation` (devnet only). Defaults to never; set via
+    /// [`TransactionValidator::with_tagged_channels_activation`].
+    tagged_channels_activation: ForkActivation,
     mass_per_sig_op: u64,
     /// Per-network domain separator bound into the shielded-transaction sighash
     /// (the genesis hash). Prevents a shielded bundle valid on one network from
@@ -90,6 +93,7 @@ impl TransactionValidator {
             mass_calculator,
             toccata_activation,
             security_fork_activation: ForkActivation::never(),
+            tagged_channels_activation: ForkActivation::never(),
             mass_per_sig_op,
             shielded_network_domain,
         }
@@ -98,6 +102,26 @@ impl TransactionValidator {
     pub fn with_security_fork_activation(mut self, activation: ForkActivation) -> Self {
         self.security_fork_activation = activation;
         self
+    }
+
+    pub fn with_tagged_channels_activation(mut self, activation: ForkActivation) -> Self {
+        self.tagged_channels_activation = activation;
+        self
+    }
+
+    /// Decode a shielded payload in the format of a block at `daa_score` (security-fork field and
+    /// the tagged-channel format both decided by that score). The one decoder every contextual
+    /// stage uses, so they can never disagree.
+    pub(crate) fn decode_shielded_at(
+        &self,
+        payload: &[u8],
+        daa_score: u64,
+    ) -> Result<kaspa_shielded_core::bundle::ShieldedBundle, kaspa_shielded_core::bundle::BundleDecodeError> {
+        kaspa_shielded_core::bundle::ShieldedBundle::from_bytes_with(
+            payload,
+            self.security_fork_activation.is_active(daa_score),
+            self.tagged_channels_activation.is_active(daa_score),
+        )
     }
 
     pub fn new_for_tests(
@@ -126,6 +150,7 @@ impl TransactionValidator {
             mass_calculator: MassCalculator::new(0, 0, 0),
             toccata_activation: ForkActivation::never(),
             security_fork_activation: ForkActivation::never(),
+            tagged_channels_activation: ForkActivation::never(),
             mass_per_sig_op: 0,
             shielded_network_domain: [0u8; 32],
         }

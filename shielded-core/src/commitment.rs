@@ -96,9 +96,34 @@ pub fn shielded_state_root_v1(
     root
 }
 
+/// Personalization of the tagged-channel state root (v2).
+const STATE_ROOT_V2_PERSONAL: &[u8; 16] = b"zkas_state_root2";
+
+/// The shielded state root from `Params::tagged_channels_activation` on (devnet only): the v1 root
+/// plus the tag log commitment ([`crate::tag_log`]), which binds every delivery tag the chain has
+/// applied since the activation. Selected by the DAA score of the block whose state it describes.
+pub fn shielded_state_root_v2(root_v1: &[u8; 32], tag_log_commitment: &[u8; 32]) -> [u8; 32] {
+    let mut h = Params::new().hash_length(32).personal(STATE_ROOT_V2_PERSONAL).to_state();
+    h.update(root_v1);
+    h.update(tag_log_commitment);
+    let mut root = [0u8; 32];
+    root.copy_from_slice(h.finalize().as_bytes());
+    root
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn v2_binds_the_tag_log_and_differs_from_v1() {
+        let v1 = [0x51; 32];
+        let t = [0x61; 32];
+        let v2 = shielded_state_root_v2(&v1, &t);
+        assert_ne!(v2, v1);
+        assert_ne!(v2, shielded_state_root_v2(&v1, &[0x62; 32]), "the tag log must matter");
+        assert_ne!(v2, shielded_state_root_v2(&[0x52; 32], &t), "the v1 root must matter");
+    }
 
     const A: [u8; 32] = [0x11; 32];
     const N: [u8; 32] = [0x22; 32];

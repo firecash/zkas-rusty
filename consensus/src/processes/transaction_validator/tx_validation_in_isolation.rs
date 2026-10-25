@@ -50,8 +50,11 @@ impl TransactionValidator {
         // block's DAA score is enforced in header context (`check_shielded_format_in_header_context`),
         // so for every byte string a block's validity is what the pre-fork code decided until the
         // activation score, and the new format's decision from it.
+        // The tagged-channel format is accepted here too (context-free); whether it is allowed at the
+        // carrying block's DAA score is a header-context rule, like the anchor-block field.
         let bundle = ShieldedBundle::from_bytes_at(&tx.payload, true)
             .or_else(|_| ShieldedBundle::from_bytes_at(&tx.payload, false))
+            .or_else(|_| ShieldedBundle::from_bytes_with(&tx.payload, true, true))
             .map_err(|_| TxRuleError::InvalidShieldedTransaction("malformed Orchard bundle in payload"))?;
         if bundle.actions.is_empty() {
             return Err(TxRuleError::InvalidShieldedTransaction("shielded bundle has no actions"));
@@ -531,6 +534,7 @@ mod tests {
             binding_sig: [0u8; sizes::SIG],
             burn: Some((20, [0xA1; sizes::FIELD])),
             anchor_block: None,
+            tagged: None,
         };
         let tx = Transaction::new(TX_VERSION_SHIELDED, vec![], vec![], 0, SUBNETWORK_ID_NATIVE, 0, bundle.to_bytes());
 
@@ -569,6 +573,7 @@ mod tests {
             binding_sig: [0u8; sizes::SIG],
             burn: None,
             anchor_block: None,
+            tagged: None,
         };
 
         let params = MAINNET_PARAMS.clone();

@@ -183,6 +183,7 @@ mod tests {
                 binding_sig: [0; 64],
                 burn: None,
                 anchor_block: None,
+                tagged: None,
             },
             disclosure: vec![],
             spend_auth: vec![SpendAuthRequest { action_index: 3, alpha: [9; 32] }],

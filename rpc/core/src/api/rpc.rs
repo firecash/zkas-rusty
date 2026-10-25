@@ -179,6 +179,20 @@ pub trait RpcApi: Sync + Send + AnySync {
         Err(crate::RpcError::General("get_shielded_tree_state is not implemented for this RPC client".to_string()))
     }
 
+    /// Tagged channels (devnet only): the tag column after `start_hash`. Defaults to an error for
+    /// clients that do not implement it; the gRPC client and the node service provide it.
+    async fn get_shielded_tag_column(&self, start_hash: RpcHash, limit: u64) -> RpcResult<GetShieldedTagColumnResponse> {
+        self.get_shielded_tag_column_call(None, GetShieldedTagColumnRequest { start_hash, limit }).await
+    }
+    async fn get_shielded_tag_column_call(
+        &self,
+        connection: Option<&DynRpcConnection>,
+        request: GetShieldedTagColumnRequest,
+    ) -> RpcResult<GetShieldedTagColumnResponse> {
+        let _ = (connection, request);
+        Err(crate::RpcError::General("get_shielded_tag_column is not implemented for this RPC client".to_string()))
+    }
+
     /// The per-chain-block shielded effects stream for wallet sync: coinbase
     /// mint + accepted (post-retain) bundles, consensus order, oldest first.
     async fn get_shielded_blocks(&self, start_hash: RpcHash, limit: u64) -> RpcResult<GetShieldedBlocksResponse> {

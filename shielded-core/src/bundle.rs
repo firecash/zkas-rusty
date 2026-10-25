@@ -75,6 +75,35 @@ pub const BUNDLE_FLAG_ANCHOR_BLOCK: u8 = 0b1000;
 /// Serialized length of a burn declaration: `value(8) | kaspa_recipient(32)`.
 pub const BURN_DECL_LEN: usize = 8 + 32;
 
+/// First payload byte of a **tagged-channel** bundle (fork topic 01 §A; spec 01 §3.5 reserves
+/// bit 7 of byte 0 for versioned formats, and `0x83` for V3). A V1 payload starts with its flags
+/// byte, which never has bit 7 set (the verifier admits only bits {0, 1, 3}), so dispatching on
+/// byte 0 is unambiguous. Valid only from `Params::tagged_channels_activation` (devnet only).
+pub const FORMAT_TAGGED: u8 = 0x83;
+/// `pool_id` of the one ZKAS pool (spec 01 §3.5 byte 1).
+pub const POOL_ID_ZKAS: u8 = 0x01;
+/// `circuit_id` of `FixedPostNu6_2` / `orchard_v2`, the only circuit tagged bundles use: the
+/// tagged format changes no circuit input, so it keeps the chain's verifying key.
+pub const CIRCUIT_ID_ORCHARD_V2: u8 = 0x01;
+/// The only flags byte a tagged user bundle may carry: spends + outputs enabled, Orchard raw bit 2
+/// (cross-address) 0 as circuit 0x01 requires, bit 3 reserved (the anchor block is unconditional),
+/// bit 4 BURN clear (bridge disabled), bits 5-7 reserved (15 A2 binding layout, F-R1/F-R2).
+pub const TAGGED_FLAGS: u8 = 0b011;
+/// Fixed header of a tagged bundle: format 1 + pool_id 1 + circuit_id 1 + flags 1 +
+/// value_balance 8 + anchor 32 + anchor_block 32 + binding_sig 64 + n u16 2 = 142 bytes.
+pub const TAGGED_HEADER_LEN: usize = 4 + 8 + 32 + 32 + 64 + 2;
+
+/// The per-output delivery fields of a tagged bundle, parallel to [`ShieldedBundle::actions`].
+/// The 32-byte `kem` point lives in [`ActionWire::ephemeral_key`], so every encoding rule on the
+/// epk (canonical, non-identity) applies to it unchanged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TaggedFields {
+    /// The 16-byte delivery tag a receiver looks up ([`crate::channel::tag`]).
+    pub tag: [u8; crate::channel::TAG_LEN],
+    /// The 64-byte channel ciphertext ([`crate::channel::seal`]).
+    pub ct: [u8; crate::channel::CT_LEN],
+}
+
 /// A single Orchard action, as it appears on the wire.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ActionWire {
@@ -101,6 +130,11 @@ impl ActionWire {
     /// (nullifier, rk, cmx, cv_net, ephemeral_key) + both ciphertexts + the
     /// spend-auth signature = 884 bytes.
     pub const SERIALIZED_LEN: usize = sizes::FIELD * 5 + sizes::ENC_CIPHERTEXT + sizes::OUT_CIPHERTEXT + sizes::SIG;
+
+    /// Serialized size of one tagged action: nullifier, rk, cmx, cv_net, kem (5 × 32) + tag 16 +
+    /// channel ciphertext 64 + spend-auth signature 64 = 304 bytes (−580 against 884).
+    pub const TAGGED_SERIALIZED_LEN: usize =
+        sizes::FIELD * 5 + crate::channel::TAG_LEN + crate::channel::CT_LEN + sizes::SIG;
 }
 
 /// Size of the Orchard Halo 2 proof for a bundle of `n` actions, in bytes:
@@ -129,6 +163,12 @@ pub const fn expected_wire_len_with_burn(n_actions: usize) -> usize {
     expected_wire_len(n_actions) + BURN_DECL_LEN
 }
 
+/// Exact serialized size of a tagged bundle with `n` actions:
+/// `142 + 304·n + 2720 + 2272·n = 2862 + 2576·n`.
+pub const fn expected_tagged_wire_len(n_actions: usize) -> usize {
+    TAGGED_HEADER_LEN + n_actions * ActionWire::TAGGED_SERIALIZED_LEN + expected_proof_len(n_actions)
+}
+
 /// Cheaply read just the action count from a serialized bundle, without parsing
 /// (or allocating) the actions or the proof. The header reads mirror
 /// [`ShieldedBundle::from_bytes`] exactly, so the two can never disagree.
@@ -140,6 +180,13 @@ pub const fn expected_wire_len_with_burn(n_actions: usize) -> usize {
 /// Returns `None` on a malformed/too-short header or an action count exceeding
 /// [`MAX_ACTIONS_PER_BUNDLE`] (such a bundle is rejected in full decode anyway).
 pub fn action_count_from_bytes(bytes: &[u8]) -> Option<usize> {
+    // A tagged bundle's count is a u16 at the end of its fixed header. Before the tagged
+    // activation such a payload is invalid in header context on every node anyway.
+    if bytes.first() == Some(&FORMAT_TAGGED) {
+        let at = TAGGED_HEADER_LEN - 2;
+        let n = u16::from_be_bytes(bytes.get(at..at + 2)?.try_into().ok()?) as usize;
+        return (n <= MAX_ACTIONS_PER_BUNDLE).then_some(n);
+    }
     let mut r = Reader::new(bytes);
     let _flags = r.u8().ok()?;
     let _value_balance = r.i64().ok()?;
@@ -177,6 +224,13 @@ pub struct ShieldedBundle {
     /// The block whose tree root is `anchor`. Present iff [`BUNDLE_FLAG_ANCHOR_BLOCK`] is set.
     /// Covered by the sighash, so a relayer cannot repoint it.
     pub anchor_block: Option<[u8; 32]>,
+    /// `Some` iff this is a **tagged-channel** bundle ([`FORMAT_TAGGED`]): one entry per action.
+    ///
+    /// In a tagged bundle each action's `ephemeral_key` holds its `kem` point, and its
+    /// `enc_ciphertext` / `out_ciphertext` are all-zero placeholders that are never encoded
+    /// (the format has no such fields). Consumers that trial-decrypt V1 actions therefore find
+    /// nothing in a tagged action, which is the intended behaviour: tagged outputs are found by tag.
+    pub tagged: Option<Vec<TaggedFields>>,
 }
 
 /// Error attaching a burn declaration to a bundle.
@@ -209,6 +263,12 @@ pub enum BundleDecodeError {
     /// The bundle declared more actions than [`MAX_ACTIONS_PER_BUNDLE`]
     /// (anti-DoS: rejected before any parse/verification work is done).
     TooManyActions,
+    /// A versioned format byte this decoder does not accept in this context (a tagged bundle
+    /// before the tagged-channel activation, or an unassigned format).
+    UnknownFormat,
+    /// A tagged bundle whose `pool_id`, `circuit_id` or flags are not the pinned values, or whose
+    /// proof is not the exact length for its action count.
+    NonCanonicalTaggedHeader,
 }
 
 /// A minimal canonical byte writer (big-endian length prefixes).
@@ -227,6 +287,9 @@ impl Writer {
         self.buf.push(v);
     }
     fn u32(&mut self, v: u32) {
+        self.buf.extend_from_slice(&v.to_be_bytes());
+    }
+    fn u16(&mut self, v: u16) {
         self.buf.extend_from_slice(&v.to_be_bytes());
     }
     fn i64(&mut self, v: i64) {
@@ -273,6 +336,9 @@ impl<'a> Reader<'a> {
     fn u32(&mut self) -> Result<u32, BundleDecodeError> {
         Ok(u32::from_be_bytes(self.array::<4>()?))
     }
+    fn u16(&mut self) -> Result<u16, BundleDecodeError> {
+        Ok(u16::from_be_bytes(self.array::<2>()?))
+    }
     fn i64(&mut self) -> Result<i64, BundleDecodeError> {
         Ok(i64::from_be_bytes(self.array::<8>()?))
     }
@@ -291,6 +357,9 @@ impl<'a> Reader<'a> {
 impl ShieldedBundle {
     /// Encode to the canonical payload byte form.
     pub fn to_bytes(&self) -> Vec<u8> {
+        if let Some(tagged) = &self.tagged {
+            return self.to_tagged_bytes(tagged);
+        }
         let mut w = Writer::new();
         w.u8(self.flags);
         w.i64(self.value_balance);
@@ -324,7 +393,113 @@ impl ShieldedBundle {
     /// trailing input. Consensus must use [`Self::from_bytes_at`], which picks the format by the
     /// carrying block's DAA score.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, BundleDecodeError> {
+        // Wallet-side decoder: accepts every format a node may serve. Consensus never uses it.
+        if bytes.first() == Some(&FORMAT_TAGGED) {
+            return Self::decode_tagged(bytes);
+        }
         Self::decode(bytes, true)
+    }
+
+    /// As [`Self::from_bytes_at`], and additionally the tagged-channel format when
+    /// `tagged_active` (the carrying block is at or past `Params::tagged_channels_activation`).
+    /// Before the activation a tagged payload is [`BundleDecodeError::UnknownFormat`]; a V1
+    /// payload decodes exactly as [`Self::from_bytes_at`] in both cases (the dual-format window).
+    pub fn from_bytes_with(bytes: &[u8], security_fork_active: bool, tagged_active: bool) -> Result<Self, BundleDecodeError> {
+        if bytes.first() == Some(&FORMAT_TAGGED) {
+            return if tagged_active { Self::decode_tagged(bytes) } else { Err(BundleDecodeError::UnknownFormat) };
+        }
+        Self::decode(bytes, security_fork_active)
+    }
+
+    /// Whether this is a tagged-channel bundle.
+    pub fn is_tagged(&self) -> bool {
+        self.tagged.is_some()
+    }
+
+    fn to_tagged_bytes(&self, tagged: &[TaggedFields]) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.u8(FORMAT_TAGGED);
+        w.u8(POOL_ID_ZKAS);
+        w.u8(CIRCUIT_ID_ORCHARD_V2);
+        w.u8(self.flags);
+        w.i64(self.value_balance);
+        w.bytes(&self.anchor);
+        w.bytes(&self.anchor_block.unwrap_or([0u8; 32]));
+        w.bytes(&self.binding_sig);
+        w.u16(self.actions.len() as u16);
+        for (a, t) in self.actions.iter().zip(tagged) {
+            w.bytes(&a.nullifier);
+            w.bytes(&a.rk);
+            w.bytes(&a.cmx);
+            w.bytes(&a.cv_net);
+            w.bytes(&a.ephemeral_key);
+            w.bytes(&t.tag);
+            w.bytes(&t.ct);
+            w.bytes(&a.spend_auth_sig);
+        }
+        w.bytes(&self.proof);
+        w.buf
+    }
+
+    /// Strict, canonical decode of the tagged format. Every field has a fixed size, the proof has
+    /// no length prefix (its length is a function of `n`), and the header values are pinned, so
+    /// one bundle has exactly one encoding and a txid fixes the bundle.
+    fn decode_tagged(bytes: &[u8]) -> Result<Self, BundleDecodeError> {
+        use crate::channel::{CT_LEN, TAG_LEN};
+        let mut r = Reader::new(bytes);
+        if r.u8()? != FORMAT_TAGGED {
+            return Err(BundleDecodeError::UnknownFormat);
+        }
+        let (pool_id, circuit_id, flags) = (r.u8()?, r.u8()?, r.u8()?);
+        if pool_id != POOL_ID_ZKAS || circuit_id != CIRCUIT_ID_ORCHARD_V2 || flags != TAGGED_FLAGS {
+            return Err(BundleDecodeError::NonCanonicalTaggedHeader);
+        }
+        let value_balance = r.i64()?;
+        let anchor = r.array::<{ sizes::FIELD }>()?;
+        let anchor_block = r.array::<32>()?;
+        let binding_sig = r.array::<{ sizes::SIG }>()?;
+        let n_actions = r.u16()? as usize;
+        if n_actions > MAX_ACTIONS_PER_BUNDLE {
+            return Err(BundleDecodeError::TooManyActions);
+        }
+        let mut actions = Vec::with_capacity(n_actions);
+        let mut tagged = Vec::with_capacity(n_actions);
+        for _ in 0..n_actions {
+            let nullifier = r.array::<{ sizes::FIELD }>()?;
+            let rk = r.array::<{ sizes::FIELD }>()?;
+            let cmx = r.array::<{ sizes::FIELD }>()?;
+            let cv_net = r.array::<{ sizes::FIELD }>()?;
+            let ephemeral_key = r.array::<{ sizes::FIELD }>()?;
+            let tag = r.array::<TAG_LEN>()?;
+            let ct = r.array::<CT_LEN>()?;
+            let spend_auth_sig = r.array::<{ sizes::SIG }>()?;
+            actions.push(ActionWire {
+                nullifier,
+                rk,
+                cmx,
+                cv_net,
+                ephemeral_key,
+                enc_ciphertext: [0u8; sizes::ENC_CIPHERTEXT],
+                out_ciphertext: [0u8; sizes::OUT_CIPHERTEXT],
+                spend_auth_sig,
+            });
+            tagged.push(TaggedFields { tag, ct });
+        }
+        let proof = r.take(expected_proof_len(n_actions))?.to_vec();
+        if !r.finished() {
+            return Err(BundleDecodeError::TrailingBytes);
+        }
+        Ok(Self {
+            actions,
+            flags,
+            value_balance,
+            anchor,
+            proof,
+            binding_sig,
+            burn: None,
+            anchor_block: Some(anchor_block),
+            tagged: Some(tagged),
+        })
     }
 
     /// Decode in the format of the chain at a given point: the security-fork format when
@@ -389,7 +564,7 @@ impl ShieldedBundle {
             return Err(BundleDecodeError::TrailingBytes);
         }
 
-        Ok(Self { actions, flags, value_balance, anchor, proof, binding_sig, burn, anchor_block })
+        Ok(Self { actions, flags, value_balance, anchor, proof, binding_sig, burn, anchor_block, tagged: None })
     }
 
     /// Name the block whose tree root is `anchor`, setting the flag bit and the field together so
@@ -450,7 +625,24 @@ impl ShieldedBundle {
             binding_sig: [0xcd; sizes::SIG],
             burn: None,
             anchor_block: None,
+            tagged: None,
         }
+    }
+
+    /// A deterministic tagged bundle with `n` actions and a standard-length proof, for tests.
+    #[cfg(test)]
+    pub fn sample_tagged_for_test(n: u8) -> Self {
+        let mut b = Self::sample_for_test(n);
+        b.flags = TAGGED_FLAGS;
+        b.value_balance = 2_000;
+        b.proof = vec![0xab; expected_proof_len(n as usize)];
+        b.anchor_block = Some([0x5a; 32]);
+        for a in &mut b.actions {
+            a.enc_ciphertext = [0u8; sizes::ENC_CIPHERTEXT];
+            a.out_ciphertext = [0u8; sizes::OUT_CIPHERTEXT];
+        }
+        b.tagged = Some((0..n).map(|i| TaggedFields { tag: [i ^ 0x11; 16], ct: [i ^ 0x22; 64] }).collect());
+        b
     }
 
     /// The nullifiers revealed by this bundle, in action order (conflict keys).
@@ -574,6 +766,7 @@ mod tests {
             binding_sig: [0xcd; sizes::SIG],
             burn: None,
             anchor_block: None,
+            tagged: None,
         }
     }
 
@@ -677,6 +870,7 @@ mod tests {
             binding_sig: [0u8; sizes::SIG],
             burn: None,
             anchor_block: None,
+            tagged: None,
         };
         assert_eq!(ShieldedBundle::from_bytes(&at_cap.to_bytes()).map(|b| b.actions.len()), Ok(MAX_ACTIONS_PER_BUNDLE));
     }
@@ -779,6 +973,97 @@ mod tests {
         // payload bytes (rejected at 188 460 transient mass = (payload + 94-byte
         // tx envelope) × 4 against the 100 000 standard cap).
         assert_eq!(expected_wire_len(14), 47_021);
+    }
+
+    fn sample_tagged(n: u8) -> ShieldedBundle {
+        ShieldedBundle::sample_tagged_for_test(n)
+    }
+
+    /// The claim of fork topic 01 §3.2: 304 bytes per action, 2,576 with the proof share, and a
+    /// 2-action payment of 2,862 + 2 × 2,576 = 8,014 bytes (the 01 doc's 8,021 counted spec 01's
+    /// epoch fields, which this prototype does not carry).
+    #[test]
+    fn tagged_format_round_trips_with_the_claimed_sizes() {
+        assert_eq!(ActionWire::TAGGED_SERIALIZED_LEN, 304);
+        assert_eq!(ActionWire::SERIALIZED_LEN - ActionWire::TAGGED_SERIALIZED_LEN, 580);
+        assert_eq!(expected_tagged_wire_len(1) - expected_tagged_wire_len(0), 2_576);
+        assert_eq!(expected_tagged_wire_len(2), 8_014);
+        for n in [0u8, 1, 2, 5, 38] {
+            let b = sample_tagged(n);
+            let bytes = b.to_bytes();
+            assert_eq!(bytes.len(), expected_tagged_wire_len(n as usize));
+            assert_eq!(bytes[0], FORMAT_TAGGED);
+            assert_eq!(ShieldedBundle::from_bytes(&bytes).unwrap(), b);
+            assert_eq!(ShieldedBundle::from_bytes_with(&bytes, true, true).unwrap(), b);
+            assert_eq!(action_count_from_bytes(&bytes), Some(n as usize), "the mass calculator's count agrees");
+        }
+    }
+
+    /// Before the activation a tagged payload decodes in no format, and a V1 payload decodes the
+    /// same with or without the activation (the dual window cannot change any V1 verdict).
+    #[test]
+    fn tagged_format_is_activation_gated_and_leaves_v1_unchanged() {
+        let t = sample_tagged(2).to_bytes();
+        assert_eq!(ShieldedBundle::from_bytes_with(&t, true, false), Err(BundleDecodeError::UnknownFormat));
+        assert!(ShieldedBundle::from_bytes_at(&t, true).is_err() && ShieldedBundle::from_bytes_at(&t, false).is_err());
+        let mut v1 = sample_bundle(2);
+        v1.set_anchor_block([1; 32]);
+        let v1 = v1.to_bytes();
+        for sf in [false, true] {
+            assert_eq!(ShieldedBundle::from_bytes_with(&v1, sf, true), ShieldedBundle::from_bytes_at(&v1, sf));
+            assert_eq!(ShieldedBundle::from_bytes_with(&v1, sf, false), ShieldedBundle::from_bytes_at(&v1, sf));
+        }
+    }
+
+    /// Every pinned header byte is enforced, and the proof length is exact.
+    #[test]
+    fn tagged_header_pins_are_enforced() {
+        let good = sample_tagged(2).to_bytes();
+        for (at, v) in [(1usize, 0x02u8), (2, 0x02), (3, 0b111), (3, 0b1011), (3, 0b1_0011), (3, 0b010)] {
+            let mut b = good.clone();
+            b[at] = v;
+            assert_eq!(ShieldedBundle::from_bytes(&b), Err(BundleDecodeError::NonCanonicalTaggedHeader), "byte {at} = {v:#x}");
+        }
+        let mut long = good.clone();
+        long.push(0);
+        assert_eq!(ShieldedBundle::from_bytes(&long), Err(BundleDecodeError::TrailingBytes));
+        assert_eq!(ShieldedBundle::from_bytes(&good[..good.len() - 1]), Err(BundleDecodeError::UnexpectedEof));
+        let mut over = good.clone();
+        over[TAGGED_HEADER_LEN - 2..TAGGED_HEADER_LEN].copy_from_slice(&(MAX_ACTIONS_PER_BUNDLE as u16 + 1).to_be_bytes());
+        assert_eq!(ShieldedBundle::from_bytes(&over), Err(BundleDecodeError::TooManyActions));
+        assert_eq!(action_count_from_bytes(&over), None);
+    }
+
+    /// Fuzz the tagged decoder: never panics, and anything it accepts re-encodes to itself.
+    #[test]
+    fn fuzz_tagged_decode_is_total_and_canonical() {
+        let mut x: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut rnd = move |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n.max(1)
+        };
+        let seeds: Vec<Vec<u8>> = (0..4u8).map(|n| sample_tagged(n).to_bytes()).collect();
+        let mut accepted = 0;
+        for i in 0..50_000 {
+            let mut b = seeds[i % seeds.len()].clone();
+            match rnd(4) {
+                0 if b.len() > 1 => {
+                    let at = 1 + rnd(b.len() as u64 - 1) as usize;
+                    b[at] ^= 1 << rnd(8);
+                }
+                1 => b.truncate(1 + rnd(b.len() as u64) as usize),
+                2 => b.extend((0..rnd(40)).map(|_| rnd(256) as u8)),
+                _ => {}
+            }
+            if let Ok(d) = ShieldedBundle::from_bytes_with(&b, true, true) {
+                accepted += 1;
+                assert_eq!(d.to_bytes(), b, "case {i}: canonical");
+                assert!(d.is_tagged() && d.anchor_block.is_some() && d.burn.is_none());
+            }
+        }
+        assert!(accepted > 1000, "the fuzz reached accepting inputs: {accepted}");
     }
 
     #[test]

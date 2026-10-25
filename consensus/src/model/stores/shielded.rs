@@ -1460,3 +1460,40 @@ mod tests {
         assert_eq!(store.get(block_b).unwrap(), FrontierState::default());
     }
 }
+
+// ---------------------- Tag column + tag log (tagged channels, devnet only) ----------------------
+
+/// One post-activation chain block's tag column (its applied tagged txs, each with the absolute
+/// tree position of its first output and its tags) and the tag log after appending it
+/// (`kaspa_shielded_core::tag_log`). Written in the block-commit batch, like the anchor window,
+/// and keyed by chain-block hash; a reorg reloads the new selected parent's record.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ShieldedTagBlockData {
+    pub txs: Vec<kaspa_shielded_core::tag_log::TaggedTxColumn>,
+    pub log: kaspa_shielded_core::tag_log::TagLog,
+}
+
+impl MemSizeEstimator for ShieldedTagBlockData {}
+
+#[derive(Clone)]
+pub struct DbShieldedTagBlockStore {
+    access: CachedDbAccess<Hash, ShieldedTagBlockData, BlockHasher>,
+}
+
+impl DbShieldedTagBlockStore {
+    pub fn new(db: Arc<DB>, cache_policy: CachePolicy) -> Self {
+        Self { access: CachedDbAccess::new(db, cache_policy, DatabaseStorePrefixes::ShieldedTagBlock.into()) }
+    }
+
+    pub fn get(&self, block: Hash) -> StoreResult<Option<ShieldedTagBlockData>> {
+        match self.access.read(block) {
+            Ok(d) => Ok(Some(d)),
+            Err(StoreError::KeyNotFound(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub fn set_batch(&self, batch: &mut WriteBatch, block: Hash, data: ShieldedTagBlockData) -> StoreResult<()> {
+        self.access.write(BatchDbWriter::new(batch), block, data)
+    }
+}

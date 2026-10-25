@@ -561,6 +561,67 @@ mod tests {
     const UTXO_COVENANT_STORAGE: u64 = HASH_SIZE as u64;
     const UTXO_UNIT_SIZE: u64 = 100;
 
+    /// Tagged channels (fork topic 01 §3.2): block capacity in actions, measured through the real
+    /// mass calculator and mainnet's block mass limits, for V1 and tagged bundles of the shapes
+    /// the chain carries (2-, 4- and 38-action txs). The design claim was 78 → 96 actions per block.
+    #[test]
+    fn tagged_bundles_raise_block_capacity() {
+        use kaspa_shielded_core::bundle::{ActionWire, ShieldedBundle, TAGGED_FLAGS, TaggedFields, expected_proof_len, sizes};
+        let params: Params = NetworkType::Mainnet.into();
+        let limits = params.block_mass_limits().after();
+        let calc = MassCalculator::new_with_consensus_params(&params);
+        let bundle = |n: usize, tagged: bool| ShieldedBundle {
+            actions: (0..n)
+                .map(|_| ActionWire {
+                    nullifier: [1; 32],
+                    rk: [2; 32],
+                    cmx: [3; 32],
+                    cv_net: [4; 32],
+                    ephemeral_key: [5; 32],
+                    enc_ciphertext: [0; sizes::ENC_CIPHERTEXT],
+                    out_ciphertext: [0; sizes::OUT_CIPHERTEXT],
+                    spend_auth_sig: [6; 64],
+                })
+                .collect(),
+            flags: if tagged { TAGGED_FLAGS } else { 0b1011 },
+            value_balance: 1_000,
+            anchor: [7; 32],
+            proof: vec![0; expected_proof_len(n)],
+            binding_sig: [8; 64],
+            burn: None,
+            anchor_block: Some([9; 32]),
+            tagged: tagged.then(|| vec![TaggedFields { tag: [1; 16], ct: [2; 64] }; n]),
+        };
+        // Capacity is measured two ways. Whole-tx packing (how many identical txs fit) is quantised:
+        // two 38-action txs fit either way. The block-level figure is the continuous one, actions per
+        // block at the binding limit, which is what a block of mixed txs approaches.
+        let per_block = |n: usize, tagged: bool| -> (u64, f64, u64, bool) {
+            let tx = Transaction::new(TX_VERSION_SHIELDED, vec![], vec![], 0, SubnetworkId::from_byte(0), 0, bundle(n, tagged).to_bytes());
+            let m = calc.calc_non_contextual_masses(&tx);
+            let fit = (limits.compute / m.compute_mass).min(limits.transient / m.transient_mass);
+            let by_compute = limits.compute as f64 / m.compute_mass as f64;
+            let by_transient = limits.transient as f64 / m.transient_mass as f64;
+            (fit * n as u64, by_compute.min(by_transient) * n as f64, transaction_estimated_serialized_size(&tx), by_transient <= by_compute)
+        };
+        for n in [2usize, 4, 38] {
+            let (v1_fit, v1, v1_bytes, v1_transient_bound) = per_block(n, false);
+            let (tg_fit, tg, tg_bytes, tg_transient_bound) = per_block(n, true);
+            eprintln!(
+                "capacity n={n}: V1 {v1:.1} actions/block ({v1_fit} whole-tx, {v1_bytes} B/tx), tagged {tg:.1} ({tg_fit} whole-tx, {tg_bytes} B/tx), gain {:+.1}%",
+                (tg / v1 - 1.0) * 100.0
+            );
+            // 580 B per action, and 7 B of header: tagged = 142 B (format, pool and circuit ids, u16 n,
+            // no length prefixes) against V1's 149 B (117 + the anchor block).
+            assert_eq!(v1_bytes - tg_bytes, 580 * n as u64 + 7, "tagged saves 580 B per action plus 7 B of header");
+            assert!(v1_transient_bound && tg_transient_bound, "shielded blocks are byte (transient-mass) bound");
+            assert!(tg_fit >= v1_fit && tg > v1 * 1.12, "tagged raises capacity for every shape: n={n} {v1} -> {tg}");
+            if n == 38 {
+                // Full-size txs: per-action bytes dominate, so the gain approaches 3,236 / 2,654 B = +21.9%.
+                assert!(tg >= v1 * 1.18, "tagged raises full-size capacity by at least 18%: {v1} -> {tg}");
+            }
+        }
+    }
+
     #[test]
     fn verify_utxo_plurality_limits() {
         /*

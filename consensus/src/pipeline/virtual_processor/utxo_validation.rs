@@ -100,6 +100,9 @@ pub(super) struct UtxoProcessingContext<'a> {
     /// (the only point the ciphertexts are in hand); `ShieldedTx` itself carries only
     /// commitments, not the ciphertexts a receiver needs.
     pub shielded_scan: Vec<crate::model::stores::shielded::ShieldedScanTx>,
+    /// Delivery tags of each collected shielded tx (`Some` for a tagged-channel bundle), kept
+    /// parallel to `shielded_txs` exactly as `shielded_scan` is.
+    pub shielded_tags: Vec<Option<Vec<[u8; 16]>>>,
     /// The validated shielded transition for this block, computed during
     /// verification and persisted at commit.
     pub shielded_computed: Option<ComputedBlockShielded>,
@@ -134,6 +137,7 @@ impl<'a> UtxoProcessingContext<'a> {
             pruning_sample_from_pov: Default::default(),
             shielded_txs: Vec::new(),
             shielded_scan: Vec::new(),
+            shielded_tags: Vec::new(),
             shielded_computed: None,
             dev_accrued: 0,
             miner_accrual: Default::default(),
@@ -227,16 +231,32 @@ impl VirtualStateProcessor {
                     // it somehow does not, we DROP that transaction rather than disqualify
                     // the merging block: a single unusable merged tx must never be able to
                     // halt the chain (see the accepted-order drop principle, PLAN §2.4).
-                    if let Some((stx, bundle)) = ShieldedBundle::from_bytes_at(&validated_tx.tx().payload, merged_format_post_fork)
+                    if let Some((stx, bundle)) = ShieldedBundle::from_bytes_with(
+                        &validated_tx.tx().payload,
+                        merged_format_post_fork,
+                        self.tagged_channels_activation.is_active(merged_block_daa_score),
+                    )
                         .ok()
                         .and_then(|b| ShieldedTx::from_bundle(&b).ok().map(|stx| (stx, b)))
                     {
                         // Distill the bundle's actions to compact scan records now, while
                         // the ciphertexts are in hand (kept parallel to shielded_txs).
                         let mut action_bytes = Vec::with_capacity(bundle.actions.len() * CompactActionRecord::SERIALIZED_LEN);
-                        for a in &bundle.actions {
-                            action_bytes.extend_from_slice(&CompactActionRecord::from_wire(a).to_bytes());
+                        match &bundle.tagged {
+                            // Tagged: the same 148-byte record (nf ‖ cmx ‖ kem ‖ ct[..52]); the tags go to
+                            // the tag column.
+                            Some(tagged) => {
+                                for (a, t) in bundle.actions.iter().zip(tagged) {
+                                    action_bytes.extend_from_slice(&CompactActionRecord::from_tagged(a, t).to_bytes());
+                                }
+                            }
+                            None => {
+                                for a in &bundle.actions {
+                                    action_bytes.extend_from_slice(&CompactActionRecord::from_wire(a).to_bytes());
+                                }
+                            }
                         }
+                        ctx.shielded_tags.push(bundle.tagged.as_ref().map(|t| t.iter().map(|f| f.tag).collect()));
                         ctx.shielded_scan
                             .push(crate::model::stores::shielded::ShieldedScanTx { txid: validated_tx.id(), action_bytes });
                         ctx.shielded_txs.push(stx);
@@ -346,7 +366,7 @@ impl VirtualStateProcessor {
             }
 
             let keep: Vec<bool> = outcomes.iter().map(|o| o.kept()).collect();
-            let UtxoProcessingContext { shielded_txs, shielded_scan, mergeset_rewards, .. } = ctx;
+            let UtxoProcessingContext { shielded_txs, shielded_scan, shielded_tags, mergeset_rewards, .. } = ctx;
             let mut idx = 0usize;
             let mut dropped = 0usize;
             shielded_txs.retain(|stx| {
@@ -368,6 +388,12 @@ impl VirtualStateProcessor {
             shielded_scan.retain(|_| {
                 let keep_it = keep[sidx];
                 sidx += 1;
+                keep_it
+            });
+            let mut tidx = 0usize;
+            shielded_tags.retain(|_| {
+                let keep_it = keep[tidx];
+                tidx += 1;
                 keep_it
             });
             if dropped > 0 {
@@ -532,6 +558,20 @@ impl VirtualStateProcessor {
                     coinbase_commitments,
                     accepted,
                 });
+                // Tagged channels: the block's tag column, every applied tagged tx placed at the
+                // absolute position of its first output (coinbase leaves first, then the applied
+                // txs in order — the order `apply_chain_block_to` appends them).
+                if self.tagged_channels_activation.is_active(header.daa_score) {
+                    let mut leaf = computed.tree_size_before + coinbase_mint.as_ref().map_or(0, |m| m.notes.len() as u64);
+                    let mut column = Vec::new();
+                    for &i in &computed.outcome.accepted {
+                        if let Some(Some(tags)) = ctx.shielded_tags.get(i) {
+                            column.push(kaspa_shielded_core::tag_log::TaggedTxColumn { first_leaf: leaf, tags: tags.clone() });
+                        }
+                        leaf += ctx.shielded_txs[i].commitments.len() as u64;
+                    }
+                    computed.tag_column = Some(column);
+                }
                 ctx.shielded_computed = Some(computed);
             }
             Err(crate::processes::shielded::ShieldedManagerError::State(e)) => {
@@ -900,9 +940,11 @@ impl VirtualStateProcessor {
         blue_score: u64,
         pov_daa_score: u64,
     ) -> TxResult<()> {
-        let Ok(bundle) =
-            kaspa_shielded_core::bundle::ShieldedBundle::from_bytes_at(&tx.payload, self.security_fork_activation.is_active(pov_daa_score))
-        else {
+        let Ok(bundle) = kaspa_shielded_core::bundle::ShieldedBundle::from_bytes_with(
+            &tx.payload,
+            self.security_fork_activation.is_active(pov_daa_score),
+            self.tagged_channels_activation.is_active(pov_daa_score),
+        ) else {
             return Ok(());
         };
         let Ok(stx) = kaspa_shielded_core::state::ShieldedTx::from_bundle(&bundle) else {
