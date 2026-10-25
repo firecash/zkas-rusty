@@ -1663,6 +1663,9 @@ mod tests {
         let dir = std::env::var("MIGRATE_DIR").expect("MIGRATE_DIR");
         let store_dir = std::env::var("CATCHUP_STORE").expect("CATCHUP_STORE");
         let max_mb: u64 = std::env::var("CATCHUP_MAX_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(u64::MAX);
+        // Pick ids to leave out (e.g. the 273 K-note wallets, whose old-path catch-up over the
+        // whole chain runs for hours: per-note witness upkeep on every appended leaf).
+        let skip: Vec<String> = std::env::var("CATCHUP_SKIP").unwrap_or_default().split(',').filter(|v| !v.is_empty()).map(String::from).collect();
         let genesis = RpcHash::from_bytes(kaspa_consensus_core::config::params::MAINNET_PARAMS.genesis.hash.as_bytes());
         COINBASE_SEED_ACTIVATION_DAA.store(kaspa_consensus_core::config::params::MAINNET_PARAMS.shielded_coinbase_seed_activation.daa_score(), std::sync::atomic::Ordering::Relaxed);
         let store = ChainStore::open_readonly(Path::new(&store_dir), genesis.as_bytes()).expect("store");
@@ -1676,8 +1679,8 @@ mod tests {
                 println!("CATCHUP {id} not migrated by the engine (no t0)");
                 continue;
             };
-            if file_mb > max_mb {
-                println!("CATCHUP {id} skipped ({file_mb} MB > CATCHUP_MAX_MB)");
+            if file_mb > max_mb || skip.contains(&id) {
+                println!("CATCHUP {id} skipped ({file_mb} MB; CATCHUP_MAX_MB / CATCHUP_SKIP)");
                 continue;
             }
             n += 1;
