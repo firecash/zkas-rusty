@@ -67,7 +67,9 @@ impl core::fmt::Display for PlanError {
 impl std::error::Error for PlanError {}
 
 /// Largest number of note spends whose bundle fits the standard transient-mass
-/// budget. This evaluates to six with the current wire format and node policy.
+/// budget. This evaluates to 38 with the current wire format and node policy (it was six
+/// before shielded transactions were exempted from the 100 KB standard cap). Legacy planning
+/// only: a Stage W wallet spends at most [`crate::uniform::MAX_UNIFORM_SPENDS`] per transaction.
 pub fn max_spends_per_tx() -> usize {
     let budget = (STANDARD_TX_MASS_CAP / TRANSIENT_BYTE_TO_MASS_FACTOR) as usize - TX_ENVELOPE_MARGIN;
     let mut n = 1usize;
