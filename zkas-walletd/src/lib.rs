@@ -329,6 +329,9 @@ const ANCHOR_SLACK: u64 = 30;
 /// Compatibility seam while payment preparation moves into the engine. Inputs
 /// have already been validated by the HTTP boundary; an arithmetic failure is
 /// represented as no selectable notes and becomes the existing conflict error.
+mod uniform;
+pub use uniform::{UniformPolicy, set_uniform_policy, uniform_policy};
+
 fn select_spend_count(values: &[u64], amount: u64, base_fee: u64, max_per: usize) -> (usize, u64) {
     engine_select_spend_count(values, amount, base_fee, max_per).unwrap_or((0, chunk_fee(base_fee, 1)))
 }
@@ -2569,7 +2572,7 @@ fn parse_scan_bytes_why(
         }
     }
     let ring_len = u32::from_le_bytes(take(&mut pos, 4)?.try_into().ok()?) as usize;
-    let mut boundaries = VecDeque::with_capacity(ring_len.min(MATURED_RING));
+    let mut boundaries = VecDeque::with_capacity(ring_len.min(matured_ring()));
     for _ in 0..ring_len {
         let blue = u64::from_le_bytes(take(&mut pos, 8)?.try_into().ok()?);
         let leaves = u64::from_le_bytes(take(&mut pos, 8)?.try_into().ok()?);
@@ -2997,6 +3000,7 @@ fn decode_block(b: &kaspa_rpc_core::RpcShieldedChainBlock) -> Result<DecodedBloc
         compact.push(records);
         txids.push(b.accepted_txids.get(i).map(|h| h.as_bytes()).unwrap_or([0u8; 32]));
     }
+    uniform::note_block_txs(b.blue_score, b.timestamp, b.accepted_actions.len());
     Ok(DecodedBlock {
         hash: b.hash,
         blue_score: b.blue_score,
@@ -3603,6 +3607,11 @@ struct WalletEntry {
     /// the time), so status can NAME the floor — "history available from block N" — rather
     /// than only flag it. Not persisted: 0 after a restart, and status then omits it.
     blind_from_daa: u64,
+    /// Notes held by a scheduled Stage W transaction (built, waiting for its release time) or by
+    /// a uniform `/prepare` session awaiting signatures: position -> when the hold lapses. No
+    /// spend path selects them meanwhile (see [`spend_candidates`]). Not persisted: after a
+    /// restart the scheduled sends are gone too, so the notes are free again.
+    reserved: HashMap<u64, std::time::Instant>,
 }
 
 /// One block's contribution to the rolling unsettled preview (see
@@ -3618,7 +3627,21 @@ struct PreviewRollEntry {
 /// How many chain-block→leaf boundaries [`WalletEntry`] keeps. Anchor maturity is
 /// measured in *blue score*, which advances at least one per chain block, so
 /// `depth + slack` entries always reach the cutoff, with room to spare.
-const MATURED_RING: usize = (DEFAULT_ANCHOR_DEPTH + ANCHOR_SLACK) as usize + 64;
+///
+/// Plus one anchor epoch (`zkas_wallet_engine::uniform::ANCHOR_EPOCH`, 120) and its opener's
+/// parent: a Stage W spend anchors at the newest matured epoch OPENER, which sits up to 119
+/// blue below the cutoff, and the opener predicate needs the block before it. Older
+/// checkpoints simply hold a shorter ring (`ring_len.min(MATURED_RING)` on load).
+const MATURED_RING: usize = (DEFAULT_ANCHOR_DEPTH + ANCHOR_SLACK) as usize + 64 + 128;
+
+/// The ring length in force: [`MATURED_RING`] on a 1-BPS network (mainnet), scaled with the
+/// network's consensus anchor depth elsewhere (set in `serve`). A 10-BPS network's depth is 6,000
+/// blue, which a fixed 822-entry ring can never reach, so no matured anchor would ever be found.
+static MATURED_RING_RT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(MATURED_RING);
+
+fn matured_ring() -> usize {
+    MATURED_RING_RT.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// How close (in DAA/blue score) the wallet's latest ingested block must be to the
 /// node tip to report `synced: true`. On a live ~1-block/s chain the strict
@@ -3701,6 +3724,7 @@ impl WalletEntry {
             force_checkpoint: false,
             blind_below: 0,
             blind_from_daa: 0,
+            reserved: HashMap::new(),
         }
     }
 
@@ -4211,7 +4235,7 @@ impl WalletEntry {
                     // that mints nothing (miner reward accrued) leaves it unchanged, and keying by it
                     // overwrote an old boundary's block with a much younger one.
                     self.boundary_blocks.insert(b.blue_score, b.hash.as_bytes());
-                    if self.boundaries.len() > MATURED_RING {
+                    if self.boundaries.len() > matured_ring() {
                         self.boundaries.pop_front();
                         if let Some(&(oldest_blue, _)) = self.boundaries.front() {
                             self.boundary_blocks.retain(|blue, _| *blue >= oldest_blue);
@@ -4784,6 +4808,22 @@ impl WalletEntry {
             .rev()
             .find(|(bs, leaves)| *bs <= cutoff_blue && *leaves == matured)
             .map(|&(bs, _)| bs);
+        self.anchor_block_at_blue(anchor_blue)
+    }
+
+    /// The checks of [`Self::send_anchor_block`] for an anchor chosen by blue score (the Stage W
+    /// epoch-opener rule chooses it that way): wallet healthy and connected, anchor young enough,
+    /// security-fork holds, and the anchor's block hash.
+    fn anchor_block_at_blue(&self, anchor_blue: Option<u64>) -> Result<Option<[u8; 32]>, (StatusCode, Json<serde_json::Value>)> {
+        if self.db.poisoned() || self.audit_retire {
+            return Err(err(
+                StatusCode::CONFLICT,
+                "this wallet received inconsistent data from its node and is halted or being rebuilt; it resumes after the rebuild",
+            ));
+        }
+        if !self.sink_live {
+            return Err(err(StatusCode::CONFLICT, "wallet is reconnecting to its node; retry in a few seconds"));
+        }
         let budget = MAX_ANCHOR_AGE.load(std::sync::atomic::Ordering::Relaxed).saturating_sub(ANCHOR_AGE_HEADROOM);
         if anchor_blue.is_none_or(|bs| self.sink_blue.saturating_sub(bs) > budget) {
             return Err(err(
@@ -7308,6 +7348,11 @@ async fn mempool_loop(state: Arc<AppState>) {
 /// lets the fast-sync base roll forward past the spent notes, shortening every later
 /// witness rebuild.
 async fn consolidate_loop(state: Arc<AppState>) {
+    // Stage W (operator opt-in `--uniform-merge`): Poisson 4 -> 1 merges above 8 notes replace the
+    // 500-note / 38-at-a-time / 60-s-cooldown loop below, whose cadence is visible on chain.
+    if uniform_policy().merge {
+        return uniform::merge_loop(state).await;
+    }
     let Some(ceiling) = state.auto_consolidate else { return };
     log::info!(
         "auto-consolidate: ON — custodial wallets are kept under {ceiling} notes \
@@ -9957,6 +10002,18 @@ fn sort_candidates_for_spend<T: std::borrow::Borrow<OwnedNote>>(candidates: &mut
     candidates.sort_unstable_by_key(|n| spend_order_key(n.borrow().value(), target));
 }
 
+/// [`matured_candidates`] minus the notes a scheduled Stage W transaction or a uniform prepare
+/// session holds (lapsed holds are ignored). Every spend path selects through this, so a held
+/// note cannot be spent twice by a payment built while it waits for its release time.
+fn spend_candidates(e: &WalletEntry, matured: u64) -> Result<(Vec<&OwnedNote>, u64), (StatusCode, Json<serde_json::Value>)> {
+    let (mut c, stranded) = matured_candidates(&e.db, matured)?;
+    if !e.reserved.is_empty() {
+        let now = std::time::Instant::now();
+        c.retain(|n| e.reserved.get(&n.position).is_none_or(|until| *until <= now));
+    }
+    Ok((c, stranded))
+}
+
 fn matured_candidates(db: &WalletDb, matured: u64) -> Result<(Vec<&OwnedNote>, u64), (StatusCode, Json<serde_json::Value>)> {
     let stranded = db.stranded_notes();
     let stranded_value = sum_note_values(stranded.iter().map(|n| n.value()))?;
@@ -10235,6 +10292,11 @@ async fn wallet_send(
     headers: HeaderMap,
     Json(req): Json<SendReq>,
 ) -> Result<Json<SendResp>, (StatusCode, Json<serde_json::Value>)> {
+    // Stage W (operator opt-in `--uniform-v1`): uniform shape, scheduled independent release of
+    // siblings instead of the group-submit burst below (spec 02 §2.2a).
+    if uniform_policy().enabled {
+        return uniform::legacy_send(state, headers, req).await;
+    }
     require_custodial(&state)?;
     let token = token_from(&headers, state.allow_default_token)?;
     let w = state.get_wallet(&token).await.ok_or_else(|| err(StatusCode::NOT_FOUND, "no wallet loaded"))?;
@@ -10352,7 +10414,7 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
         fork_now = security_fork_active(e.chain_len.max(e.scanned as u64));
         if let Some(matured) = e.boundaries.iter().rev().find(|(bs, _)| *bs <= cutoff_blue).map(|&(_, lc)| lc) {
             anchor_block = e.send_anchor_block(matured)?;
-            let (mut candidates, stranded_value) = matured_candidates(&e.db, matured)?;
+            let (mut candidates, stranded_value) = spend_candidates(&e, matured)?;
             sort_candidates_for_spend(&mut candidates, amount, fee);
             let values: Vec<u64> = candidates.iter().map(|n| n.value()).collect();
             let have = sum_note_values(values.iter().copied())?;
@@ -10638,6 +10700,10 @@ async fn wallet_send_many(
     headers: HeaderMap,
     Json(req): Json<SendManyReq>,
 ) -> Result<Json<SendManyResp>, (StatusCode, Json<serde_json::Value>)> {
+    // Stage W: one payee per transaction at i.i.d. times over the desk window (W10).
+    if uniform_policy().enabled {
+        return uniform::legacy_send_many(state, headers, req).await;
+    }
     require_custodial(&state)?;
     let token = token_from(&headers, state.allow_default_token)?;
     let w = state.get_wallet(&token).await.ok_or_else(|| err(StatusCode::NOT_FOUND, "no wallet loaded"))?;
@@ -10720,7 +10786,7 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
         tokio::task::block_in_place(|| e.advance_spend_witnesses_bounded(shared_covers, shared_base));
         let matured = e.matured_leaves().ok_or_else(|| err(StatusCode::CONFLICT, "wallet has no matured anchor yet"))?;
         anchor_block = e.send_anchor_block(matured)?;
-        let (mut candidates, stranded) = matured_candidates(&e.db, matured)?;
+        let (mut candidates, stranded) = spend_candidates(&e, matured)?;
         sort_candidates_for_spend(&mut candidates, requested, base_fee);
         let have = sum_note_values(candidates.iter().map(|n| n.value()))?;
 
@@ -10930,6 +10996,9 @@ async fn wallet_consolidate(
     headers: HeaderMap,
     body: Option<Json<ConsolidateReq>>,
 ) -> Result<Json<ConsolidateResp>, (StatusCode, Json<serde_json::Value>)> {
+    if uniform_policy().enabled {
+        return uniform::legacy_consolidate(&state, &headers).await.map(Json);
+    }
     require_custodial(&state)?;
     let token = token_from(&headers, state.allow_default_token)?;
     let w = state.get_wallet(&token).await.ok_or_else(|| err(StatusCode::NOT_FOUND, "no wallet loaded"))?;
@@ -10986,7 +11055,7 @@ async fn consolidate_once(
             return Err(err(StatusCode::CONFLICT, "wallet is still syncing the maturity window; try again shortly"));
         };
         let anchor_block = e.send_anchor_block(matured)?;
-        let (mut candidates, _stranded) = matured_candidates(&e.db, matured)?;
+        let (mut candidates, _stranded) = spend_candidates(&e, matured)?;
         if heal {
             // Oldest first: spending the lowest-position notes lets the fast-sync base
             // roll forward past them (`advance_base_capped`), shortening every later
@@ -11109,6 +11178,15 @@ struct PrepareReq {
     /// transaction can spend. The response's `remaining_sompi` is what is still owed;
     /// the caller repeats prepare/submit until it reaches 0.
     allow_partial: Option<bool>,
+    /// Stage W (spec 02): build the uniform shape (4 actions, exact fee F_V1, anchor at the
+    /// newest matured epoch opener). Opt-in per request: the client must then accept a fee of
+    /// exactly F and hold/re-prepare per the returned `uniform` block. A payment needing more
+    /// than 4 notes returns its first sibling only (requires `allow_partial`); the client
+    /// schedules the rest itself (`uniform.split_window_ms`).
+    uniform: Option<bool>,
+    /// Drop this earlier, unsubmitted session first and free the notes it held: a client that
+    /// held a uniform payment past an anchor-epoch roll re-prepares it this way (W5).
+    replace_session: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -11156,6 +11234,11 @@ struct PrepareResp {
     /// a long chain — so the client can warn the user about the wait instead of
     /// looking hung (and fix the token↔FVK mismatch that usually causes it).
     fast_path: bool,
+    /// Stage W facts for a `uniform: true` prepare: anchor epoch and the blue score until which
+    /// consensus accepts it (hold at most until then, else re-prepare), sibling count, split
+    /// window, λ̂. Absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    uniform: Option<serde_json::Value>,
 }
 
 /// [`kaspa_shielded_core::wallet::build::ActionDisclosure`] over the wire.
@@ -11179,6 +11262,15 @@ async fn wallet_prepare(
     let fvk_bytes = unhex(&req.fvk_hex)
         .and_then(|b| <[u8; FVK_LEN]>::try_from(b.as_slice()).ok())
         .ok_or_else(|| err(StatusCode::BAD_REQUEST, "fvk_hex must be 96 bytes of hex"))?;
+
+    if let Some(old) = req.replace_session.as_deref() {
+        let dropped = state.prepared.lock().await.remove(old);
+        if let Some(PreparedSession { token: Some(t), positions, .. }) = dropped {
+            if let Some(w) = state.get_wallet(&t).await {
+                uniform::unreserve(&mut *w.lock().await, &positions);
+            }
+        }
+    }
 
     // Is this wallet paying ITSELF? Decided from the viewing key and the recipient,
     // both cheap to derive, so it is known before anything is reserved.
@@ -11253,6 +11345,8 @@ async fn wallet_prepare(
     // class of bug as the missing `mark_spent`. Callers that don't ask still get the
     // explicit "send in smaller chunks" error.
     let allow_partial = req.allow_partial.unwrap_or(false);
+    let uniform_req = req.uniform.unwrap_or(false);
+    let mut uniform_info: Option<serde_json::Value> = None;
     let mut amount = requested;
     // The caller's fee (or the flat default) is a FLOOR: the actual fee is raised
     // to the node's byte-proportional minimum once the input count is known
@@ -11342,10 +11436,69 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
                     climb,
                     if climb == 0 { "WARM — background pre-advance kept up" } else { "COLD — witnesses were behind" },
                 );
+                if uniform_req {
+                    // Stage W: the newest matured epoch opener, the uniform planner, exactly F.
+                    let choice = match uniform::pick_anchor(&e) {
+                        Ok(c) => c,
+                        Err(uniform::PickErr::Wait(b)) => {
+                            return Err(err(StatusCode::SERVICE_UNAVAILABLE, format!("the anchor epoch changes in about {b} s; prepare again then")));
+                        }
+                        Err(uniform::PickErr::Fail(x)) => return Err(x),
+                    };
+                    anchor_block = Some(choice.block);
+                    let (mut cands, _stranded) = spend_candidates(&e, choice.leaves)?;
+                    cands.retain(|n| n.value() > 0);
+                    have_total = Some(sum_note_values(cands.iter().map(|n| n.value()))?);
+                    let target = zkas_wallet_engine::uniform::uniform_single_note_target(amount);
+                    cands.sort_unstable_by_key(|n| spend_order_key(n.value(), target));
+                    let plan = match zkas_wallet_engine::uniform::plan_uniform_payment(cands.iter().map(|n| n.value()).collect(), amount) {
+                        Ok(p) => p,
+                        Err(zkas_wallet_engine::uniform::UniformPlanError::NeedsConsolidation { siblings }) => {
+                            return Err((
+                                StatusCode::CONFLICT,
+                                Json(serde_json::json!({
+                                    "error": zkas_wallet_engine::uniform::UniformPlanError::NeedsConsolidation { siblings }.to_string(),
+                                    "needs_consolidation": true, "siblings": siblings,
+                                })),
+                            ));
+                        }
+                        Err(e) => return Err(err(StatusCode::CONFLICT, format!("{e} (funds must be ~10 min old to spend)"))),
+                    };
+                    let k = plan.siblings.len();
+                    if k > 1 && !allow_partial {
+                        return Err(err(
+                            StatusCode::CONFLICT,
+                            format!("this payment needs {k} uniform transactions; pass allow_partial and send the rest as scheduled siblings"),
+                        ));
+                    }
+                    let first = &plan.siblings[0];
+                    amount = first.amount;
+                    fee = zkas_wallet_engine::UNIFORM_FEE_V1;
+                    need = amount.saturating_add(fee);
+                    let positions: Vec<u64> = first.notes.iter().map(|&i| cands[i].position).collect();
+                    let inputs_u = uniform_witness(&state, &e, &positions, choice.leaves)?;
+                    for (n, _) in &inputs_u {
+                        selected += n.value().inner();
+                    }
+                    inputs = inputs_u;
+                    spent_positions = positions.clone();
+                    session_token = Some(token.clone());
+                    fast_path = true;
+                    let info = uniform::anchor_info_of(&e, &choice);
+                    let w_ms = zkas_wallet_engine::schedule::split_window_ms(k, info.lambda_per_s, 0);
+                    uniform_info = Some(serde_json::json!({
+                        "anchor_blue": info.anchor_blue, "anchor_epoch": info.anchor_epoch,
+                        "valid_until_blue": info.valid_until_blue, "sink_blue": info.sink_blue,
+                        "lambda_per_s": info.lambda_per_s, "siblings": k, "split_window_ms": w_ms,
+                        "fee_sompi": fee,
+                    }));
+                    // Hold the notes while the device signs and holds (W11), up to the session TTL.
+                    uniform_reserve(&mut e, &positions, PREPARED_TTL);
+                } else {
                 let cutoff_blue = e.sink_blue.saturating_sub(DEFAULT_ANCHOR_DEPTH + ANCHOR_SLACK);
                 if let Some(matured) = e.boundaries.iter().rev().find(|(bs, _)| *bs <= cutoff_blue).map(|&(_, lc)| lc) {
                     anchor_block = e.send_anchor_block(matured)?;
-                    let (mut candidates, _stranded) = matured_candidates(&e.db, matured)?;
+                    let (mut candidates, _stranded) = spend_candidates(&e, matured)?;
                     sort_candidates_for_spend(&mut candidates, amount, base_fee);
                     have_total = Some(sum_note_values(candidates.iter().map(|n| n.value()))?);
                     fast_path = true;
@@ -11406,10 +11559,17 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
                     }
                     session_token = Some(token.clone());
                 }
+                }
             }
         }
     }
 
+    if uniform_req && have_total.is_none() {
+        return Err(err(
+            StatusCode::CONFLICT,
+            "a uniform prepare needs a wallet this daemon tracks: register the key (watch) and send its token",
+        ));
+    }
     // Slow path (no token, unsynced wallet, or a key we don't track): recover the note
     // set from the FVK alone over the settled matured chain prefix, so every witness
     // still roots at a matured canonical anchor.
@@ -11639,7 +11799,8 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
     let t_proof = std::time::Instant::now();
     let payment = tokio::task::spawn_blocking(move || {
         let _proving = ProvingGuard::new();
-        kaspa_shielded_core::wallet::build::prepare_payment_anchored(
+        let shape = if uniform_req { uniform_policy_shape() } else { kaspa_shielded_core::wallet::build::SendShape::LEGACY };
+        kaspa_shielded_core::wallet::build::prepare_payment_shaped(
             &fvk,
             inputs,
             recipient,
@@ -11650,12 +11811,18 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
             recoverable,
             memo,
             anchor_block,
+            shape,
+            &mut rand10::rng(),
         )
     })
     .await
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("proof task failed: {e}")))?
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to prepare payment: {e:?}")))?;
     log::info!("prepare: Halo2 proof took {:.1?}", t_proof.elapsed());
+    if uniform_req {
+        zkas_wallet_engine::check_uniform_effects(&payment.effects)
+            .map_err(|v| err(StatusCode::INTERNAL_SERVER_ERROR, format!("prepared payment is not uniform: {v}")))?;
+    }
 
     let spend_auth: Vec<SpendAuthReq> =
         payment.spend_auth_requests.iter().map(|(i, alpha)| SpendAuthReq { index: *i, alpha: hex(alpha) }).collect();
@@ -11735,7 +11902,31 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
         disclosure,
         prepared_payment,
         fast_path,
+        uniform: uniform_info,
     }))
+}
+
+/// The shape a uniform prepare builds under the operator's policy (internal change or not).
+fn uniform_policy_shape() -> kaspa_shielded_core::wallet::build::SendShape {
+    if uniform_policy().internal_change {
+        kaspa_shielded_core::wallet::build::SendShape::UNIFORM_INTERNAL
+    } else {
+        kaspa_shielded_core::wallet::build::SendShape::UNIFORM
+    }
+}
+
+/// Witnesses for a uniform prepare (shared tree first).
+fn uniform_witness(
+    state: &AppState,
+    e: &WalletEntry,
+    positions: &[u64],
+    leaves: u64,
+) -> Result<Vec<(kaspa_shielded_core::Note, kaspa_shielded_core::MerklePath)>, (StatusCode, Json<serde_json::Value>)> {
+    uniform::witness_inputs_pub(state, e, positions, leaves)
+}
+
+fn uniform_reserve(e: &mut WalletEntry, positions: &[u64], for_how_long: std::time::Duration) {
+    uniform::reserve_pub(e, positions, for_how_long)
 }
 
 #[derive(Deserialize)]
@@ -11836,6 +12027,7 @@ async fn wallet_submit(
                     for p in &positions {
                         e.db.mark_spent(*p, accepted.as_bytes(), now_daa);
                     }
+                    uniform::unreserve(&mut e, &positions);
                     // The parked notes are worth more than amount + fee: the rest is
                     // CHANGE, and until the block carrying it is previewed nothing else
                     // in the status carries it — a one-note wallet read "0" for the
@@ -13187,6 +13379,15 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
         _ => kaspa_consensus_core::config::params::Params::from(state_prefix_network(&cfg.network)).max_shielded_anchor_age(),
     };
     MAX_ANCHOR_AGE.store(max_anchor_age, std::sync::atomic::Ordering::Relaxed);
+    // Stage W's anchor-epoch rule and the ring that serves it follow this network's consensus
+    // anchor depth (600 x BPS): unchanged on mainnet, x10 on the 10-BPS devnet.
+    let anchor_depth = kaspa_consensus_core::config::params::Params::from(state_prefix_network(&cfg.network)).shielded_anchor_depth();
+    let rule = zkas_wallet_engine::uniform::AnchorRule::for_depth(anchor_depth);
+    uniform::set_anchor_rule(rule);
+    MATURED_RING_RT.store(
+        MATURED_RING.max((rule.depth + rule.slack + rule.epoch) as usize + 64 + 8),
+        std::sync::atomic::Ordering::Relaxed,
+    );
 
     let resources = cfg.resources.clone();
     log::info!("wallet resource limits: {:?}", resources);
@@ -13430,6 +13631,11 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
         .route("/api/wallet/send", post(wallet_send))
         .route("/api/wallet/send_many", post(wallet_send_many))
         .route("/api/wallet/consolidate", post(wallet_consolidate))
+        .route("/api/wallet/uniform/send", post(uniform::send))
+        .route("/api/wallet/uniform/send_many", post(uniform::send_many))
+        .route("/api/wallet/uniform/consolidate", post(uniform::consolidate))
+        .route("/api/wallet/uniform/scheduled", get(uniform::scheduled))
+        .route("/api/uniform/anchor", get(uniform::anchor_info))
         .route("/api/wallet/prepare", post(wallet_prepare))
         .route("/api/wallet/submit", post(wallet_submit))
         .route("/api/wallet/sign", post(wallet_sign))

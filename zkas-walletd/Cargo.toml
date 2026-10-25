@@ -82,3 +82,6 @@ hex.workspace = true
 orchard = { package = "zakura-orchard", version = "=2.2.0", default-features = false, features = ["std", "weighted-merkle"] }
 zcash_note_encryption = "=0.4.2"
 blake2b_simd = { workspace = true }
+# Stage W conformance (spec 02 §7.1 T1): walletd's uniform build under the pinned ChaCha20 RNG of
+# the golden vectors (SHA-256 via the regular `sha2` dependency).
+rand_chacha = "0.10"
