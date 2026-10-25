@@ -617,6 +617,85 @@ impl SharedChain {
 // (4) Per-wallet state: own notes, own nullifiers, own history
 // =====================================================================================
 
+/// How a fold record's history row is dated: the transaction id (the coinbase txid for a
+/// mint) and the accepting chain block's DAA score and timestamp.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecMeta {
+    pub txid: [u8; 32],
+    pub daa_score: u64,
+    pub timestamp_ms: u64,
+}
+
+/// A note the detector decrypted for a wallet, in the form a journal can hold: the note's
+/// parts (rebuilt with `Note::from_parts`, exactly as a checkpoint restore rebuilds one),
+/// its action index inside the transaction, and whether the stream had already applied its
+/// nullifier when it arrived (`WalletDb::append_leaf`'s "spent before it appeared" rule,
+/// decided against the shared set at fold time so a replay needs no chain).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecvNote {
+    pub action_index: u16,
+    pub recipient: [u8; 43],
+    pub value: u64,
+    pub rho: [u8; 32],
+    pub rseed: [u8; 32],
+    pub memo: Vec<u8>,
+    pub seen: bool,
+}
+
+impl RecvNote {
+    fn from_received(r: &ReceivedNote, seen: bool) -> Self {
+        Self {
+            action_index: r.action_index as u16,
+            recipient: r.note.recipient().to_raw_address_bytes(),
+            value: r.value(),
+            rho: r.note.rho().to_bytes(),
+            rseed: *r.note.rseed().as_bytes(),
+            memo: r.memo.clone(),
+            seen,
+        }
+    }
+
+    fn note(&self) -> Option<Note> {
+        let addr = Option::<Address>::from(Address::from_raw_address_bytes(&self.recipient))?;
+        let rho = Option::<Rho>::from(Rho::from_bytes(&self.rho))?;
+        let rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes(self.rseed, &rho))?;
+        Option::<Note>::from(Note::from_parts(addr, NoteValue::from_raw(self.value), rho, rseed, orchard::note::NoteVersion::V2))
+    }
+
+    fn received(&self) -> Option<ReceivedNote> {
+        Some(ReceivedNote { action_index: self.action_index as usize, note: self.note()?, memo: self.memo.clone() })
+    }
+}
+
+/// Everything one chain event does to one wallet, self-contained: a wallet's state after
+/// block B is its state at registration with every record of blocks after its start folded
+/// in order ([`WalletLite::fold`]). The engine folds live wallets through exactly these
+/// records, and the hit journal stores exactly these records, so a dormant wallet replaying
+/// its journal runs the same code the live follower ran.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FoldRecord {
+    /// A coinbase leaf at `position` paid to one of the wallet's addresses.
+    Coinbase { position: u64, recipient: [u8; 43], rho: [u8; 32], rseed: [u8; 32], value: u64, meta: Option<RecMeta>, seen: bool },
+    /// An applied transaction that concerns the wallet (a detector hit, or a spend of one of
+    /// its nullifiers). `positions[i]` is action i's leaf (`None` = non-canonical cmx, no leaf).
+    Tx { meta: Option<RecMeta>, nullifiers: Vec<[u8; 32]>, positions: Vec<Option<u64>>, received: Vec<RecvNote> },
+    /// The chain clock: the DAA score of the page's last dated block. Global (every wallet
+    /// that was consistent before that block folds it).
+    Clock { daa: u64 },
+}
+
+/// The persistable private state of a wallet (what a checkpoint's private sections and the
+/// engine's per-wallet file carry). `pending_change` is not part of it, exactly as it is
+/// not part of a checkpoint.
+#[derive(Clone, Default)]
+pub struct WalletState {
+    pub notes: Vec<OwnedNote>,
+    pub pending_spends: Vec<PendingSpend>,
+    pub history: Vec<HistoryEntry>,
+    pub history_enabled: bool,
+    pub last_daa: u64,
+}
+
 /// A wallet reduced to its private output: its keys, its unspent notes (each with its leaf
 /// position and nullifier), pending spends, history rows and chain clock. No commitment
 /// stream, no tree, no applied-nullifier set; witnesses come from [`SharedChain`].
@@ -626,6 +705,7 @@ impl SharedChain {
 /// definition of correct here.
 pub struct WalletLite {
     fvk: FullViewingKey,
+    ovk: orchard::keys::OutgoingViewingKey,
     my_address: [u8; 43],
     notes: Vec<OwnedNote>,
     pending_spends: Vec<PendingSpend>,
@@ -636,9 +716,45 @@ pub struct WalletLite {
     poisoned: bool,
     /// Tree size at registration: the wallet's state is consistent from here on.
     registered_at: u64,
+    /// Engine block sequence the state is consistent through: blocks with a higher sequence
+    /// fold into it, lower ones are already in it.
+    start_seq: u64,
+    /// The caller's stable 16-byte name for this wallet (journal key, file name stem).
+    key16: [u8; 16],
 }
 
 impl WalletLite {
+    /// A wallet with `state`, consistent through block `start_seq` (tree size `size`).
+    pub fn new(fvk: FullViewingKey, state: WalletState, size: u64, start_seq: u64, key16: [u8; 16]) -> Self {
+        let my_address = fvk.address_at(0u32, Scope::External).to_raw_address_bytes();
+        Self {
+            ovk: fvk.to_ovk(Scope::External),
+            fvk,
+            my_address,
+            notes: state.notes,
+            pending_spends: state.pending_spends,
+            pending_change: HashMap::new(),
+            history: state.history,
+            history_enabled: state.history_enabled,
+            last_daa: state.last_daa,
+            poisoned: false,
+            registered_at: size,
+            start_seq,
+            key16,
+        }
+    }
+
+    /// A copy of the persistable state.
+    pub fn state(&self) -> WalletState {
+        WalletState {
+            notes: self.notes.clone(),
+            pending_spends: self.pending_spends.clone(),
+            history: self.history.clone(),
+            history_enabled: self.history_enabled,
+            last_daa: self.last_daa,
+        }
+    }
+
     pub fn notes(&self) -> &[OwnedNote] {
         &self.notes
     }
@@ -660,12 +776,26 @@ impl WalletLite {
     pub fn registered_at(&self) -> u64 {
         self.registered_at
     }
+    pub fn start_seq(&self) -> u64 {
+        self.start_seq
+    }
+    pub fn key16(&self) -> [u8; 16] {
+        self.key16
+    }
+    /// Declare the state consistent through block `seq` (after folding the journal up to it).
+    /// Only moves forward.
+    pub fn advance_to(&mut self, seq: u64) {
+        self.start_seq = self.start_seq.max(seq);
+    }
     pub fn fvk(&self) -> &FullViewingKey {
         &self.fvk
     }
     /// The wallet's default (index 0) external address.
     pub fn my_address(&self) -> [u8; 43] {
         self.my_address
+    }
+    pub fn history_enabled(&self) -> bool {
+        self.history_enabled
     }
     pub fn set_history_enabled(&mut self, on: bool) {
         self.history_enabled = on;
@@ -729,6 +859,66 @@ impl WalletLite {
         reclaimed
     }
 
+    /// `WalletDb::unrecovered_sends`, unchanged.
+    pub fn unrecovered_sends(&self, from: usize) -> Vec<([u8; 32], u64)> {
+        self.history
+            .iter()
+            .skip(from)
+            .filter(|h| h.kind == HistoryKind::Sent && h.recipient.is_none() && !h.fee_known)
+            .map(|h| (h.txid, h.daa_score))
+            .collect()
+    }
+
+    /// `WalletDb::recover_sent_from_bundle`, unchanged: fill a compact-ingested Sent row
+    /// from the transaction's full bundle with this wallet's outgoing viewing key.
+    pub fn recover_sent_from_bundle(&mut self, txid: &[u8; 32], bundle: &crate::bundle::ShieldedBundle) -> bool {
+        use crate::wallet::scan::{reconstruct_action, trim_memo};
+        use orchard::note_encryption::OrchardDomain;
+        let Some(pos) = self.history.iter().rposition(|h| h.kind == HistoryKind::Sent && &h.txid == txid) else {
+            return false;
+        };
+        let fee = bundle.value_balance.max(0) as u64;
+        let mut recipient = None;
+        let mut memo = Vec::new();
+        let mut recovered_paid = 0u64;
+        let mut credits = Vec::new();
+        for a in &bundle.actions {
+            let Some(action) = reconstruct_action(a) else { continue };
+            let domain = OrchardDomain::for_action(&action);
+            let Some((note, addr, m)) =
+                zcash_note_encryption::try_output_recovery_with_ovk(&domain, &self.ovk, &action, action.cv_net(), &a.out_ciphertext)
+            else {
+                continue;
+            };
+            let addr_bytes = addr.to_raw_address_bytes();
+            if addr_bytes == self.my_address {
+                continue; // our own change
+            }
+            let m = trim_memo(&m);
+            recovered_paid = recovered_paid.saturating_add(note.value().inner());
+            if recipient.is_none() {
+                recipient = Some(addr_bytes);
+                memo = m.clone();
+            }
+            credits.push(Credit { recipient: addr_bytes, value: note.value().inner(), memo: m });
+        }
+        let h = &mut self.history[pos];
+        let net_out = if h.amount_is_net_outflow { h.amount } else { h.amount.saturating_add(h.fee) };
+        h.fee = fee;
+        h.fee_known = true;
+        h.amount_is_net_outflow = false;
+        if recipient.is_some() {
+            h.amount = recovered_paid;
+            h.recipient = recipient;
+            h.memo = memo;
+            h.credits = credits;
+            true
+        } else {
+            h.amount = net_out.saturating_sub(fee);
+            false
+        }
+    }
+
     fn prune_pending_change(&mut self) {
         if self.pending_change.is_empty() {
             return;
@@ -737,7 +927,8 @@ impl WalletLite {
         self.pending_change.retain(|t, _| ps.iter().any(|p| &p.txid == t));
     }
 
-    fn owns(&self, nf: &[u8; 32]) -> bool {
+    /// Whether `nf` is the nullifier of one of this wallet's unspent or pending notes.
+    pub fn owns(&self, nf: &[u8; 32]) -> bool {
         self.notes.iter().any(|n| &n.nullifier() == nf) || self.pending_spends.iter().any(|p| &p.note.nullifier() == nf)
     }
 
@@ -756,6 +947,74 @@ impl WalletLite {
         self.history.push(entry);
     }
 
+    /// The nullifier this wallet's key derives for `note`.
+    fn nullifier_of(&self, note: &Note) -> [u8; 32] {
+        note.nullifier(&self.fvk).to_bytes()
+    }
+
+    /// Fold one record. Returns the nullifiers of the notes the wallet gained. A record
+    /// whose note does not rebuild (impossible for one the engine wrote) is skipped.
+    pub fn fold(&mut self, rec: &FoldRecord) -> Vec<[u8; 32]> {
+        match rec {
+            FoldRecord::Clock { daa } => {
+                self.last_daa = self.last_daa.max(*daa);
+                Vec::new()
+            }
+            FoldRecord::Coinbase { position, recipient, rho, rseed, value, meta, seen } => {
+                let desc = CoinbaseNoteDesc { recipient: *recipient, rho: *rho, rseed: *rseed };
+                let Some(note) = Self::coinbase_note(&desc, *value) else { return Vec::new() };
+                if let Some(m) = meta {
+                    if self.history_enabled {
+                        self.push_history(HistoryEntry {
+                            kind: HistoryKind::Coinbase,
+                            txid: m.txid,
+                            daa_score: m.daa_score,
+                            timestamp_ms: m.timestamp_ms,
+                            amount: *value,
+                            fee: 0,
+                            amount_is_net_outflow: false,
+                            fee_known: true,
+                            recipient: None,
+                            memo: Vec::new(),
+                            credits: Vec::new(),
+                        });
+                    }
+                }
+                if *seen {
+                    return Vec::new();
+                }
+                let nf = self.nullifier_of(&note);
+                self.notes.push(OwnedNote::new(note, *position, nf));
+                vec![nf]
+            }
+            FoldRecord::Tx { meta, nullifiers, positions, received } => {
+                let received_notes: Vec<ReceivedNote> = received.iter().filter_map(|r| r.received()).collect();
+                let spent: u64 = nullifiers.iter().filter_map(|nf| self.owned_note_value(nf)).sum();
+                let mut gained = Vec::new();
+                for (i, nf) in nullifiers.iter().enumerate() {
+                    self.notes.retain(|n| &n.nullifier() != nf);
+                    self.pending_spends.retain(|p| &p.note.nullifier() != nf);
+                    self.prune_pending_change();
+                    let Some(pos) = positions.get(i).copied().flatten() else { continue };
+                    if let Some(r) = received.iter().find(|r| r.action_index as usize == i) {
+                        if r.seen {
+                            continue;
+                        }
+                        let Some(note) = r.note() else { continue };
+                        let nf = self.nullifier_of(&note);
+                        self.notes.push(OwnedNote::new(note, pos, nf));
+                        gained.push(nf);
+                    }
+                }
+                if let Some(m) = meta {
+                    let bm = BlockMeta { coinbase_txid: [0u8; 32], txids: Vec::new(), timestamp_ms: m.timestamp_ms, daa_score: m.daa_score };
+                    self.record_history_compact(spent, &received_notes, m.txid, &bm);
+                }
+                gained
+            }
+        }
+    }
+
     /// `WalletDb::recover_coinbase_note` minus the address test (the engine's recipient map
     /// already matched it).
     fn coinbase_note(desc: &CoinbaseNoteDesc, value: u64) -> Option<Note> {
@@ -763,74 +1022,6 @@ impl WalletLite {
         let rho = Option::<Rho>::from(Rho::from_bytes(&desc.rho))?;
         let rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes(desc.rseed, &rho))?;
         Option::<Note>::from(Note::from_parts(addr, NoteValue::from_raw(value), rho, rseed, orchard::note::NoteVersion::V2))
-    }
-
-    /// `WalletDb::append_leaf`'s ownership half: keep the note unless the stream already
-    /// carried its nullifier. Returns the nullifier when the note was kept.
-    fn append_owned(&mut self, note: Note, position: u64, seen: impl Fn(&[u8; 32]) -> bool) -> Option<[u8; 32]> {
-        let nullifier = note.nullifier(&self.fvk).to_bytes();
-        if seen(&nullifier) {
-            return None;
-        }
-        self.notes.push(OwnedNote::new(note, position, nullifier));
-        Some(nullifier)
-    }
-
-    /// A coinbase leaf paid to one of this wallet's addresses, at `position`.
-    fn fold_coinbase(&mut self, desc: &CoinbaseNoteDesc, value: u64, position: u64, meta: Option<&BlockMeta>, seen: impl Fn(&[u8; 32]) -> bool) -> Option<[u8; 32]> {
-        let note = Self::coinbase_note(desc, value)?;
-        if let Some(m) = meta {
-            if self.history_enabled {
-                self.push_history(HistoryEntry {
-                    kind: HistoryKind::Coinbase,
-                    txid: m.coinbase_txid,
-                    daa_score: m.daa_score,
-                    timestamp_ms: m.timestamp_ms,
-                    amount: value,
-                    fee: 0,
-                    amount_is_net_outflow: false,
-                    fee_known: true,
-                    recipient: None,
-                    memo: Vec::new(),
-                    credits: Vec::new(),
-                });
-            }
-        }
-        self.append_owned(note, position, seen)
-    }
-
-    /// One APPLIED transaction that concerns this wallet (a hit, or one of its nullifiers),
-    /// in `WalletDb::ingest_bundles_compact`'s order. `received` carries tx-relative
-    /// `action_index`; `positions[i]` is the leaf position of action i (`None` = non-canonical
-    /// cmx, no leaf); `seen(nf, i)` = was `nf` applied by the stream up to and including
-    /// action i. Returns the nullifiers of notes it gained.
-    #[allow(clippy::too_many_arguments)]
-    fn fold_tx(
-        &mut self,
-        records: &[CompactActionRecord],
-        received: &[ReceivedNote],
-        positions: &[Option<u64>],
-        seen: impl Fn(&[u8; 32], usize) -> bool,
-        meta: Option<&BlockMeta>,
-        txid: Option<[u8; 32]>,
-    ) -> Vec<[u8; 32]> {
-        let spent: u64 = records.iter().filter_map(|a| self.owned_note_value(&a.nullifier)).sum();
-        let mut gained = Vec::new();
-        for (i, rec) in records.iter().enumerate() {
-            self.notes.retain(|n| n.nullifier() != rec.nullifier);
-            self.pending_spends.retain(|p| p.note.nullifier() != rec.nullifier);
-            self.prune_pending_change();
-            let Some(pos) = positions[i] else { continue };
-            if let Some(r) = received.iter().find(|r| r.action_index == i) {
-                if let Some(nf) = self.append_owned(r.note.clone(), pos, |nf| seen(nf, i)) {
-                    gained.push(nf);
-                }
-            }
-        }
-        if let (Some(m), Some(txid)) = (meta, txid) {
-            self.record_history_compact(spent, received, txid, m);
-        }
-        gained
     }
 
     /// `WalletDb::record_history_compact`, unchanged.
@@ -899,9 +1090,22 @@ pub struct EngineStats {
 /// Wallet handle inside one [`ScanEngine`].
 pub type WalletId = u32;
 
+/// What one page did, for the store: every fold record in chain order with the sequence
+/// of the block that produced it and the wallet it concerns (`None` = global clock), and
+/// the nullifiers the page's applied transactions revealed, in chain order.
+#[derive(Default)]
+pub struct PageFolds {
+    /// Sequence of the page's first block (blocks are numbered from 1 since the chain base).
+    pub first_seq: u64,
+    pub records: Vec<(u64, Option<WalletId>, FoldRecord)>,
+    pub applied_nullifiers: Vec<[u8; 32]>,
+    /// Shared tree size after each block of the page.
+    pub sizes_after: Vec<u64>,
+}
+
 /// One chain follower's worth of state for N wallets. Feed it pages in chain order with
 /// [`Self::ingest_page`]; every registered wallet then reflects exactly the blocks ingested
-/// since its registration.
+/// after its start.
 pub struct ScanEngine {
     chain: SharedChain,
     wallets: Vec<WalletLite>,
@@ -916,10 +1120,17 @@ pub struct ScanEngine {
     owned_nf: HashMap<[u8; 32], Vec<WalletId>>,
     kernel: Box<dyn AgreeKernel>,
     stats: EngineStats,
+    /// Blocks ingested since the chain base (the last block's sequence number).
+    seq: u64,
 }
 
 impl ScanEngine {
     pub fn new(chain: SharedChain, kernel: Box<dyn AgreeKernel>) -> Self {
+        Self::resume(chain, kernel, 0)
+    }
+
+    /// An engine whose chain has already ingested `seq` blocks (a reopened store).
+    pub fn resume(chain: SharedChain, kernel: Box<dyn AgreeKernel>, seq: u64) -> Self {
         Self {
             chain,
             wallets: Vec::new(),
@@ -931,14 +1142,29 @@ impl ScanEngine {
             owned_nf: HashMap::new(),
             kernel,
             stats: EngineStats::default(),
+            seq,
         }
     }
 
-    /// Register a wallet at the chain's current height (phase 1 has no catch-up: a wallet is
-    /// consistent from `registered_at` on, which is exactly a `WalletDb` fast-synced from the
-    /// same frontier).
+    /// Register a fresh wallet at the chain's current height (consistent from now on,
+    /// exactly a `WalletDb` fast-synced from the same frontier).
     pub fn register(&mut self, fvk: FullViewingKey) -> Option<WalletId> {
-        let ivk = fvk.to_ivk(Scope::External);
+        let id = self.wallets.len() as u32;
+        let mut key16 = [0u8; 16];
+        key16[..4].copy_from_slice(&id.to_le_bytes());
+        let state = WalletState { history_enabled: true, ..Default::default() };
+        let size = self.chain.size();
+        self.register_wallet(WalletLite::new(fvk, state, size, self.seq, key16))
+    }
+
+    /// Register a wallet with existing state, consistent through block `wallet.start_seq()`
+    /// (a migrated checkpoint, a reopened per-wallet file). Refused if the engine is already
+    /// past that block: the wallet would miss blocks, so it must be caught up first.
+    pub fn register_wallet(&mut self, wallet: WalletLite) -> Option<WalletId> {
+        if wallet.start_seq < self.seq {
+            return None;
+        }
+        let ivk = wallet.fvk.to_ivk(Scope::External);
         let id = self.wallets.len() as WalletId;
         let kid = match self.key_index.get(&ivk.to_bytes()) {
             Some(&k) => k,
@@ -953,24 +1179,17 @@ impl ScanEngine {
         };
         self.key_wallets[kid as usize].push(id);
         self.wallet_key.push(kid);
-        let my_address = fvk.address_at(0u32, Scope::External).to_raw_address_bytes();
-        let mut addrs: HashSet<[u8; 43]> = (0..crate::walletdb::COINBASE_DIVERSIFIER_SCAN).map(|i| fvk.address_at(i, Scope::External).to_raw_address_bytes()).collect();
-        addrs.insert(my_address);
+        let mut addrs: HashSet<[u8; 43]> =
+            (0..crate::walletdb::COINBASE_DIVERSIFIER_SCAN).map(|i| wallet.fvk.address_at(i, Scope::External).to_raw_address_bytes()).collect();
+        addrs.insert(wallet.my_address);
         for a in addrs {
             self.addr_map.entry(a).or_default().push(id);
         }
-        self.wallets.push(WalletLite {
-            fvk,
-            my_address,
-            notes: Vec::new(),
-            pending_spends: Vec::new(),
-            pending_change: HashMap::new(),
-            history: Vec::new(),
-            history_enabled: true,
-            last_daa: 0,
-            poisoned: false,
-            registered_at: self.chain.size(),
-        });
+        let owned: Vec<[u8; 32]> = wallet.notes.iter().map(|n| n.nullifier()).chain(wallet.pending_spends.iter().map(|p| p.note.nullifier())).collect();
+        self.wallets.push(wallet);
+        for nf in owned {
+            self.own(nf, id);
+        }
         Some(id)
     }
 
@@ -979,6 +1198,10 @@ impl ScanEngine {
     }
     pub fn wallet(&self, id: WalletId) -> &WalletLite {
         &self.wallets[id as usize]
+    }
+    /// Mutable access for API-side state changes (sends parking notes, history recovery).
+    pub fn wallet_mut(&mut self, id: WalletId) -> &mut WalletLite {
+        &mut self.wallets[id as usize]
     }
     pub fn wallet_count(&self) -> usize {
         self.wallets.len()
@@ -991,6 +1214,10 @@ impl ScanEngine {
     }
     pub fn kernel_name(&self) -> &'static str {
         self.kernel.name()
+    }
+    /// The last ingested block's sequence number.
+    pub fn seq(&self) -> u64 {
+        self.seq
     }
 
     /// `WalletLite::mark_spent` through the engine (the note's nullifier stays owned).
@@ -1023,15 +1250,40 @@ impl ScanEngine {
     }
 
     fn own(&mut self, nf: [u8; 32], w: WalletId) {
-        self.owned_nf.entry(nf).or_default().push(w);
+        let e = self.owned_nf.entry(nf).or_default();
+        if !e.contains(&w) {
+            e.push(w);
+        }
+    }
+
+    /// Fold one record into wallet `w` and keep the owned-nullifier map exact.
+    fn apply(&mut self, w: WalletId, rec: &FoldRecord) {
+        let gained = self.wallets[w as usize].fold(rec);
+        if let FoldRecord::Tx { nullifiers, .. } = rec {
+            for nf in nullifiers {
+                if let Some(ws) = self.owned_nf.get_mut(nf) {
+                    if ws.contains(&w) && !self.wallets[w as usize].owns(nf) {
+                        ws.retain(|x| *x != w);
+                    }
+                    if ws.is_empty() {
+                        self.owned_nf.remove(nf);
+                    }
+                }
+            }
+        }
+        for nf in gained {
+            self.own(nf, w);
+        }
     }
 
     /// Ingest one page for every wallet: one detection pass over all keys, then one walk
     /// over the blocks that touches only the wallets a block concerns, then the shared tree.
-    pub fn ingest_page(&mut self, page: &SharedPage) {
+    /// Returns what the page did, for the journal.
+    pub fn ingest_page(&mut self, page: &SharedPage) -> PageFolds {
         self.stats.pages += 1;
         self.stats.actions += page.actions.len() as u64;
         self.stats.pairs += (page.actions.len() * self.keys.len()) as u64;
+        let mut out = PageFolds { first_seq: self.seq + 1, ..Default::default() };
         // (2) one detection pass: flat action index -> [(key, note)].
         let t = std::time::Instant::now();
         let mut hits_at: HashMap<usize, Vec<(u32, ReceivedNote)>> = HashMap::new();
@@ -1047,21 +1299,34 @@ impl ScanEngine {
         }
         self.stats.detect_ns += t.elapsed().as_nanos();
         let mut flat = 0usize;
+        let mut clock: Option<(u64, u64)> = None;
         for b in &page.blocks {
-            self.ingest_block(b, &mut flat, &hits_at);
-        }
-        // `WalletDb` raises its clock on every block with meta; the maximum is the same.
-        if let Some(d) = page.blocks.iter().filter_map(|b| b.meta.as_ref().map(|m| m.daa_score)).max() {
-            for w in &mut self.wallets {
-                w.last_daa = w.last_daa.max(d);
+            self.seq += 1;
+            if let Some(m) = &b.meta {
+                clock = Some((self.seq, m.daa_score));
             }
+            self.ingest_block(b, &mut flat, &hits_at, &mut out);
         }
+        // `WalletDb` raises its clock on every block with meta; the last one is the maximum
+        // (DAA scores increase along the chain), and only wallets consistent before it fold it.
+        if let Some((seq, daa)) = clock {
+            let rec = FoldRecord::Clock { daa };
+            for w in 0..self.wallets.len() {
+                if self.wallets[w].start_seq < seq {
+                    self.wallets[w].fold(&rec);
+                }
+            }
+            out.records.push((seq, None, rec));
+        }
+        out
     }
 
-    fn ingest_block(&mut self, b: &SharedBlock, flat: &mut usize, hits_at: &HashMap<usize, Vec<(u32, ReceivedNote)>>) {
+    fn ingest_block(&mut self, b: &SharedBlock, flat: &mut usize, hits_at: &HashMap<usize, Vec<(u32, ReceivedNote)>>, out: &mut PageFolds) {
         self.stats.blocks += 1;
+        let seq = self.seq;
         let t_fold = std::time::Instant::now();
         let size0 = self.chain.size();
+        let live = |wallets: &Vec<WalletLite>, w: WalletId| wallets[w as usize].start_seq < seq;
         let meta = b.meta.as_ref();
         // Nullifiers applied by earlier transactions of THIS block (the chain set is still at
         // the block's start; the tree ingests the block after the walk).
@@ -1070,11 +1335,22 @@ impl ScanEngine {
         for (k, (desc, value, _cmx)) in b.coinbase.iter().enumerate() {
             let Some(ws) = self.addr_map.get(&desc.recipient).cloned() else { continue };
             for w in ws {
-                self.stats.coinbase_hits += 1;
-                let chain = &self.chain;
-                if let Some(nf) = self.wallets[w as usize].fold_coinbase(desc, *value, size0 + k as u64, meta, |nf| chain.nf_seen(nf)) {
-                    self.own(nf, w);
+                if !live(&self.wallets, w) {
+                    continue;
                 }
+                self.stats.coinbase_hits += 1;
+                let seen = Self::coinbase_note_nf(&self.wallets[w as usize], desc, *value).is_some_and(|nf| self.chain.nf_seen(&nf));
+                let rec = FoldRecord::Coinbase {
+                    position: size0 + k as u64,
+                    recipient: desc.recipient,
+                    rho: desc.rho,
+                    rseed: desc.rseed,
+                    value: *value,
+                    meta: meta.map(|m| RecMeta { txid: m.coinbase_txid, daa_score: m.daa_score, timestamp_ms: m.timestamp_ms }),
+                    seen,
+                };
+                self.apply(w, &rec);
+                out.records.push((seq, Some(w), rec));
             }
         }
         let mut pos = size0 + b.coinbase.len() as u64;
@@ -1118,37 +1394,48 @@ impl ScanEngine {
             }
             touched.sort_unstable();
             touched.dedup();
+            touched.retain(|&w| live(&self.wallets, w));
             let txid = meta.and_then(|m| m.txids.get(bi).copied());
+            let nullifiers: Vec<[u8; 32]> = records.iter().map(|r| r.nullifier).collect();
             for w in touched {
                 self.stats.folds += 1;
-                let rec = received.remove(&w).unwrap_or_default();
+                let rec_notes = received.remove(&w).unwrap_or_default();
+                let wl = &self.wallets[w as usize];
                 let chain = &self.chain;
                 let block_nfs = &block_nfs;
-                let seen = |nf: &[u8; 32], i: usize| chain.nf_seen(nf) || block_nfs.contains(nf) || records[..=i].iter().any(|r| &r.nullifier == nf);
-                let gained = self.wallets[w as usize].fold_tx(records, &rec, &positions, seen, meta, txid);
-                // Keep the owned-nullifier map exact: drop what the fold spent, add what it gained.
-                for r in records {
-                    if let Some(ws) = self.owned_nf.get_mut(&r.nullifier) {
-                        if ws.contains(&w) && !self.wallets[w as usize].owns(&r.nullifier) {
-                            ws.retain(|x| *x != w);
-                        }
-                        if ws.is_empty() {
-                            self.owned_nf.remove(&r.nullifier);
-                        }
-                    }
-                }
-                for nf in gained {
-                    self.own(nf, w);
-                }
+                let recv: Vec<RecvNote> = rec_notes
+                    .iter()
+                    .map(|r| {
+                        let nf = wl.nullifier_of(&r.note);
+                        let seen = chain.nf_seen(&nf) || block_nfs.contains(&nf) || records[..=r.action_index].iter().any(|x| x.nullifier == nf);
+                        RecvNote::from_received(r, seen)
+                    })
+                    .collect();
+                let rec = FoldRecord::Tx {
+                    meta: match (meta, txid) {
+                        (Some(m), Some(txid)) => Some(RecMeta { txid, daa_score: m.daa_score, timestamp_ms: m.timestamp_ms }),
+                        _ => None,
+                    },
+                    nullifiers: nullifiers.clone(),
+                    positions: positions.clone(),
+                    received: recv,
+                };
+                self.apply(w, &rec);
+                out.records.push((seq, Some(w), rec));
             }
             block_nfs.extend(records.iter().map(|r| r.nullifier));
+            out.applied_nullifiers.extend_from_slice(&nullifiers);
         }
         self.stats.fold_ns += t_fold.elapsed().as_nanos();
         let t_tree = std::time::Instant::now();
         self.chain.ingest(b);
         self.stats.tree_ns += t_tree.elapsed().as_nanos();
-        debug_assert_eq!(self.chain.size(), pos, "engine leaf positions drifted from the shared tree");
         assert_eq!(self.chain.size(), pos, "engine leaf positions drifted from the shared tree");
+        out.sizes_after.push(pos);
+    }
+
+    fn coinbase_note_nf(w: &WalletLite, desc: &CoinbaseNoteDesc, value: u64) -> Option<[u8; 32]> {
+        WalletLite::coinbase_note(desc, value).map(|n| w.nullifier_of(&n))
     }
 }
 

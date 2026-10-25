@@ -32,6 +32,7 @@ pub mod burn;
 pub mod coinbase;
 pub mod commitment;
 pub mod engine;
+pub mod engine_store;
 pub mod message;
 pub mod nullifier;
 pub mod payment_check;

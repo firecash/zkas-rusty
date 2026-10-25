@@ -3445,12 +3445,7 @@ impl WalletDb {
         }
         out.extend_from_slice(&(self.notes.len() as u64).to_le_bytes());
         for n in &self.notes {
-            out.extend_from_slice(&n.position.to_le_bytes());
-            out.extend_from_slice(&n.nullifier);
-            out.extend_from_slice(&n.note.recipient().to_raw_address_bytes());
-            out.extend_from_slice(&n.note.value().inner().to_le_bytes());
-            out.extend_from_slice(&n.note.rho().to_bytes());
-            out.extend_from_slice(n.note.rseed().as_bytes());
+            write_note(&mut out, n);
         }
         // v3: the spent-nullifier set, in iteration order.
         //
@@ -3523,38 +3518,7 @@ impl WalletDb {
         // v6: the chain-derived history rows, length-prefixed and best-effort like
         // the witness section — parse trouble degrades to "history starts fresh",
         // never a failed restore.
-        let mut hsec = Vec::new();
-        hsec.extend_from_slice(&(self.history.len() as u64).to_le_bytes());
-        for h in &self.history {
-            hsec.push(h.kind as u8);
-            hsec.extend_from_slice(&h.txid);
-            hsec.extend_from_slice(&h.daa_score.to_le_bytes());
-            hsec.extend_from_slice(&h.timestamp_ms.to_le_bytes());
-            hsec.extend_from_slice(&h.amount.to_le_bytes());
-            hsec.extend_from_slice(&h.fee.to_le_bytes());
-            hsec.push((h.amount_is_net_outflow as u8) | ((h.fee_known as u8) << 1));
-            match &h.recipient {
-                Some(r) => {
-                    hsec.push(1);
-                    hsec.extend_from_slice(r);
-                }
-                None => hsec.push(0),
-            }
-            let memo_len = h.memo.len().min(u16::MAX as usize) as u16;
-            hsec.extend_from_slice(&memo_len.to_le_bytes());
-            hsec.extend_from_slice(&h.memo[..memo_len as usize]);
-            // v10: the per-output breakdown, written inside the row (not as a
-            // trailing section) so a row and its credits cannot drift apart.
-            let ncred = h.credits.len().min(CREDITS_CAP) as u16;
-            hsec.extend_from_slice(&ncred.to_le_bytes());
-            for c in h.credits.iter().take(ncred as usize) {
-                hsec.extend_from_slice(&c.recipient);
-                hsec.extend_from_slice(&c.value.to_le_bytes());
-                let cm = c.memo.len().min(u16::MAX as usize) as u16;
-                hsec.extend_from_slice(&cm.to_le_bytes());
-                hsec.extend_from_slice(&c.memo[..cm as usize]);
-            }
-        }
+        let hsec = encode_history_section(&self.history);
         out.extend_from_slice(&(hsec.len() as u64).to_le_bytes());
         out.extend_from_slice(&hsec);
 
@@ -3564,19 +3528,7 @@ impl WalletDb {
         // never a failed restore. Layout: [last_daa:u64][n:u64]
         // (position:u64, nullifier:32, recipient:43, value:u64, rho:32, rseed:32,
         //  txid:32, submitted_daa:u64)*.
-        let mut psec = Vec::new();
-        psec.extend_from_slice(&self.last_daa.to_le_bytes());
-        psec.extend_from_slice(&(self.pending_spends.len() as u64).to_le_bytes());
-        for p in &self.pending_spends {
-            psec.extend_from_slice(&p.note.position.to_le_bytes());
-            psec.extend_from_slice(&p.note.nullifier);
-            psec.extend_from_slice(&p.note.note.recipient().to_raw_address_bytes());
-            psec.extend_from_slice(&p.note.note.value().inner().to_le_bytes());
-            psec.extend_from_slice(&p.note.note.rho().to_bytes());
-            psec.extend_from_slice(p.note.note.rseed().as_bytes());
-            psec.extend_from_slice(&p.txid);
-            psec.extend_from_slice(&p.submitted_daa.to_le_bytes());
-        }
+        let psec = encode_pending_section(self.last_daa, &self.pending_spends);
         out.extend_from_slice(&(psec.len() as u64).to_le_bytes());
         out.extend_from_slice(&psec);
 
@@ -3734,15 +3686,7 @@ impl WalletDb {
         }
         let n_notes = r.u64()? as usize;
         for _ in 0..n_notes {
-            let position = r.u64()?;
-            let nullifier = r.arr::<32>()?;
-            let recipient = r.arr::<43>()?;
-            let value = r.u64()?;
-            let rho = Option::<Rho>::from(Rho::from_bytes(&r.arr()?))?;
-            let rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes(r.arr()?, &rho))?;
-            let addr = Option::<Address>::from(Address::from_raw_address_bytes(&recipient))?;
-            let note = Option::<Note>::from(Note::from_parts(addr, NoteValue::from_raw(value), rho, rseed, orchard::note::NoteVersion::V2))?;
-            db.notes.push(OwnedNote { note, position, nullifier });
+            db.notes.push(read_note(&mut r)?);
         }
         let n_nfs = r.u64()? as usize;
         for _ in 0..n_nfs {
@@ -3891,30 +3835,7 @@ impl WalletDb {
     /// Best-effort restore of the v7 pending-spend section — any malformed record
     /// drops the whole section, never fails the restore.
     fn read_pending_section(db: &mut Self, buf: &[u8]) {
-        let mut r = Cursor { buf, pos: 0 };
-        let parse = |r: &mut Cursor<'_>| -> Option<(u64, Vec<PendingSpend>)> {
-            let last_daa = r.u64()?;
-            let n = r.u64()? as usize;
-            let mut out = Vec::with_capacity(n.min(1024));
-            for _ in 0..n {
-                let position = r.u64()?;
-                let nullifier = r.arr::<32>()?;
-                let recipient = r.arr::<43>()?;
-                let value = r.u64()?;
-                let rho = Option::<Rho>::from(Rho::from_bytes(&r.arr()?))?;
-                let rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes(r.arr()?, &rho))?;
-                let addr = Option::<Address>::from(Address::from_raw_address_bytes(&recipient))?;
-                let note = Option::<Note>::from(Note::from_parts(addr, NoteValue::from_raw(value), rho, rseed, orchard::note::NoteVersion::V2))?;
-                let txid = r.arr::<32>()?;
-                let submitted_daa = r.u64()?;
-                out.push(PendingSpend { note: OwnedNote { note, position, nullifier }, txid, submitted_daa });
-            }
-            if !r.done() {
-                return None;
-            }
-            Some((last_daa, out))
-        };
-        if let Some((last_daa, pending)) = parse(&mut r) {
+        if let Some((last_daa, pending)) = parse_pending_section(buf) {
             db.last_daa = last_daa;
             db.pending_spends = pending;
         }
@@ -3924,69 +3845,7 @@ impl WalletDb {
     /// Any malformed row drops the
     /// whole section (history restarts from here on) — never fails the restore.
     fn read_history_section(db: &mut Self, buf: &[u8], has_compact_flags: bool, has_credits: bool) {
-        let mut r = Cursor { buf, pos: 0 };
-        let parse = |r: &mut Cursor<'_>| -> Option<Vec<HistoryEntry>> {
-            let n = (r.u64()? as usize).min(HISTORY_CAP);
-            let mut out = Vec::with_capacity(n);
-            for _ in 0..n {
-                let kind = match r.u8()? {
-                    0 => HistoryKind::Coinbase,
-                    1 => HistoryKind::Received,
-                    2 => HistoryKind::Sent,
-                    _ => return None,
-                };
-                let txid = r.arr::<32>()?;
-                let daa_score = r.u64()?;
-                let timestamp_ms = r.u64()?;
-                let amount = r.u64()?;
-                let fee = r.u64()?;
-                let (amount_is_net_outflow, fee_known) = if has_compact_flags {
-                    let flags = r.u8()?;
-                    if flags & !0b11 != 0 {
-                        return None;
-                    }
-                    (flags & 1 != 0, flags & 2 != 0)
-                } else {
-                    (false, true)
-                };
-                let recipient = match r.u8()? {
-                    0 => None,
-                    1 => Some(r.arr::<43>()?),
-                    _ => return None,
-                };
-                let memo_len = u16::from_le_bytes(r.arr::<2>()?) as usize;
-                let memo = r.take(memo_len)?.to_vec();
-                // A pre-v10 row has no breakdown; it restores with an empty vector
-                // and the client falls back to `amount`/`recipient` as before.
-                let mut credits = Vec::new();
-                if has_credits {
-                    let n = (u16::from_le_bytes(r.arr::<2>()?) as usize).min(CREDITS_CAP);
-                    credits.reserve(n);
-                    for _ in 0..n {
-                        let recipient = r.arr::<43>()?;
-                        let value = r.u64()?;
-                        let cm = u16::from_le_bytes(r.arr::<2>()?) as usize;
-                        let cmemo = r.take(cm)?.to_vec();
-                        credits.push(Credit { recipient, value, memo: cmemo });
-                    }
-                }
-                out.push(HistoryEntry {
-                    kind,
-                    txid,
-                    daa_score,
-                    timestamp_ms,
-                    amount,
-                    fee,
-                    amount_is_net_outflow,
-                    fee_known,
-                    recipient,
-                    memo,
-                    credits,
-                });
-            }
-            r.done().then_some(out)
-        };
-        if let Some(h) = parse(&mut r) {
+        if let Some(h) = parse_history_section(buf, has_compact_flags, has_credits) {
             db.history = h;
         }
     }
@@ -4026,6 +3885,472 @@ impl WalletDb {
                 db.witnesses = ws;
             }
         }
+    }
+}
+
+/// The v6 history section body (rows with v9 flags and v10 credits), byte-for-byte what
+/// [`WalletDb::to_checkpoint`] writes; [`parse_history_section`] reads it back.
+pub(crate) fn encode_history_section(history: &[HistoryEntry]) -> Vec<u8> {
+    let mut hsec = Vec::new();
+    hsec.extend_from_slice(&(history.len() as u64).to_le_bytes());
+    for h in history {
+        hsec.push(h.kind as u8);
+        hsec.extend_from_slice(&h.txid);
+        hsec.extend_from_slice(&h.daa_score.to_le_bytes());
+        hsec.extend_from_slice(&h.timestamp_ms.to_le_bytes());
+        hsec.extend_from_slice(&h.amount.to_le_bytes());
+        hsec.extend_from_slice(&h.fee.to_le_bytes());
+        hsec.push((h.amount_is_net_outflow as u8) | ((h.fee_known as u8) << 1));
+        match &h.recipient {
+            Some(r) => {
+                hsec.push(1);
+                hsec.extend_from_slice(r);
+            }
+            None => hsec.push(0),
+        }
+        let memo_len = h.memo.len().min(u16::MAX as usize) as u16;
+        hsec.extend_from_slice(&memo_len.to_le_bytes());
+        hsec.extend_from_slice(&h.memo[..memo_len as usize]);
+        // v10: the per-output breakdown, written inside the row (not as a
+        // trailing section) so a row and its credits cannot drift apart.
+        let ncred = h.credits.len().min(CREDITS_CAP) as u16;
+        hsec.extend_from_slice(&ncred.to_le_bytes());
+        for c in h.credits.iter().take(ncred as usize) {
+            hsec.extend_from_slice(&c.recipient);
+            hsec.extend_from_slice(&c.value.to_le_bytes());
+            let cm = c.memo.len().min(u16::MAX as usize) as u16;
+            hsec.extend_from_slice(&cm.to_le_bytes());
+            hsec.extend_from_slice(&c.memo[..cm as usize]);
+        }
+    }
+    hsec
+}
+
+/// The v7 pending-spend section body, byte-for-byte what [`WalletDb::to_checkpoint`] writes.
+pub(crate) fn encode_pending_section(last_daa: u64, pending: &[PendingSpend]) -> Vec<u8> {
+    let mut psec = Vec::new();
+    psec.extend_from_slice(&last_daa.to_le_bytes());
+    psec.extend_from_slice(&(pending.len() as u64).to_le_bytes());
+    for p in pending {
+        psec.extend_from_slice(&p.note.position.to_le_bytes());
+        psec.extend_from_slice(&p.note.nullifier);
+        psec.extend_from_slice(&p.note.note.recipient().to_raw_address_bytes());
+        psec.extend_from_slice(&p.note.note.value().inner().to_le_bytes());
+        psec.extend_from_slice(&p.note.note.rho().to_bytes());
+        psec.extend_from_slice(p.note.note.rseed().as_bytes());
+        psec.extend_from_slice(&p.txid);
+        psec.extend_from_slice(&p.submitted_daa.to_le_bytes());
+    }
+    psec
+}
+
+/// The v7 pending-spend section (`[last_daa][n](record)*`), exactly as a restore parses it.
+/// `None` = malformed: a restore then keeps no pending spends and a zero clock. Shared by
+/// [`WalletDb`]'s restore and the migration reader ([`read_checkpoint_private`]).
+fn parse_pending_section(buf: &[u8]) -> Option<(u64, Vec<PendingSpend>)> {
+    let mut r = Cursor { buf, pos: 0 };
+    let parse = |r: &mut Cursor<'_>| -> Option<(u64, Vec<PendingSpend>)> {
+        let last_daa = r.u64()?;
+        let n = r.u64()? as usize;
+        let mut out = Vec::with_capacity(n.min(1024));
+        for _ in 0..n {
+            let position = r.u64()?;
+            let nullifier = r.arr::<32>()?;
+            let recipient = r.arr::<43>()?;
+            let value = r.u64()?;
+            let rho = Option::<Rho>::from(Rho::from_bytes(&r.arr()?))?;
+            let rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes(r.arr()?, &rho))?;
+            let addr = Option::<Address>::from(Address::from_raw_address_bytes(&recipient))?;
+            let note = Option::<Note>::from(Note::from_parts(addr, NoteValue::from_raw(value), rho, rseed, orchard::note::NoteVersion::V2))?;
+            let txid = r.arr::<32>()?;
+            let submitted_daa = r.u64()?;
+            out.push(PendingSpend { note: OwnedNote { note, position, nullifier }, txid, submitted_daa });
+        }
+        if !r.done() {
+            return None;
+        }
+        Some((last_daa, out))
+    };
+    parse(&mut r)
+}
+
+/// The v6 history section, exactly as a restore parses it (v9 adds compact-send flags, v10
+/// credits). `None` = malformed: a restore then starts history fresh.
+fn parse_history_section(buf: &[u8], has_compact_flags: bool, has_credits: bool) -> Option<Vec<HistoryEntry>> {
+    let mut r = Cursor { buf, pos: 0 };
+    let parse = |r: &mut Cursor<'_>| -> Option<Vec<HistoryEntry>> {
+        let n = (r.u64()? as usize).min(HISTORY_CAP);
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            let kind = match r.u8()? {
+                0 => HistoryKind::Coinbase,
+                1 => HistoryKind::Received,
+                2 => HistoryKind::Sent,
+                _ => return None,
+            };
+            let txid = r.arr::<32>()?;
+            let daa_score = r.u64()?;
+            let timestamp_ms = r.u64()?;
+            let amount = r.u64()?;
+            let fee = r.u64()?;
+            let (amount_is_net_outflow, fee_known) = if has_compact_flags {
+                let flags = r.u8()?;
+                if flags & !0b11 != 0 {
+                    return None;
+                }
+                (flags & 1 != 0, flags & 2 != 0)
+            } else {
+                (false, true)
+            };
+            let recipient = match r.u8()? {
+                0 => None,
+                1 => Some(r.arr::<43>()?),
+                _ => return None,
+            };
+            let memo_len = u16::from_le_bytes(r.arr::<2>()?) as usize;
+            let memo = r.take(memo_len)?.to_vec();
+            // A pre-v10 row has no breakdown; it restores with an empty vector
+            // and the client falls back to `amount`/`recipient` as before.
+            let mut credits = Vec::new();
+            if has_credits {
+                let n = (u16::from_le_bytes(r.arr::<2>()?) as usize).min(CREDITS_CAP);
+                credits.reserve(n);
+                for _ in 0..n {
+                    let recipient = r.arr::<43>()?;
+                    let value = r.u64()?;
+                    let cm = u16::from_le_bytes(r.arr::<2>()?) as usize;
+                    let cmemo = r.take(cm)?.to_vec();
+                    credits.push(Credit { recipient, value, memo: cmemo });
+                }
+            }
+            out.push(HistoryEntry {
+                kind,
+                txid,
+                daa_score,
+                timestamp_ms,
+                amount,
+                fee,
+                amount_is_net_outflow,
+                fee_known,
+                recipient,
+                memo,
+                credits,
+            });
+        }
+        r.done().then_some(out)
+    };
+    parse(&mut r)
+}
+
+// ---------------------------------------------------------------------------
+// Multi-wallet engine, phase 2: what the engine needs from a checkpoint and from a
+// persisted shared tree (walletd-scale task E2, `09-engine-phase2.md`).
+// ---------------------------------------------------------------------------
+
+/// The part of a checkpoint blob that belongs to the wallet itself: its notes, pending
+/// spends, history and chain clock, plus the counts and tip frontier that bind it to the
+/// public stream. Read by [`read_checkpoint_private`] WITHOUT loading the leaf stream, the
+/// applied-nullifier set, the witness section or the subtree index (all public chain data,
+/// which the engine holds once for every wallet).
+#[derive(Clone)]
+pub struct CheckpointPrivate {
+    pub version: u8,
+    /// Absolute leaf count summarised by the base frontier.
+    pub base_size: u64,
+    /// Absolute tree size at the wallet's cursor.
+    pub size: u64,
+    /// Leaves the blob holds after the base (inline + v11-referenced).
+    pub leaf_count: u64,
+    /// v11: how many of those are referenced from the shared stream (0 otherwise).
+    pub shared_leaves: u64,
+    /// Applied nullifiers the blob holds (skipped, counted).
+    pub nullifier_count: u64,
+    pub notes: Vec<OwnedNote>,
+    /// The tip frontier at `size` (v4+). `None` for v3 or for a borrowing writer that had
+    /// nothing valid to record (empty tag with `size > 0`): a restore then marks its tree invalid.
+    pub tip: Option<FrontierState>,
+    pub history: Vec<HistoryEntry>,
+    pub pending: Vec<PendingSpend>,
+    pub last_daa: u64,
+    /// Bytes of the blob actually read; everything else was seeked past.
+    pub bytes_read: u64,
+}
+
+/// A bounded forward reader over a blob inside a seekable file. Reads are counted, skips
+/// are seeks, and nothing past `len` is ever touched.
+struct BlobReader<'a, R: std::io::Read + std::io::Seek> {
+    r: &'a mut R,
+    pos: u64,
+    len: u64,
+    read: u64,
+}
+
+impl<R: std::io::Read + std::io::Seek> BlobReader<'_, R> {
+    fn remaining(&self) -> u64 {
+        self.len - self.pos
+    }
+    fn take(&mut self, n: u64) -> Result<Vec<u8>, String> {
+        if n > self.remaining() {
+            return Err(format!("blob truncated: need {n} bytes at {}, {} left", self.pos, self.remaining()));
+        }
+        let mut v = vec![0u8; n as usize];
+        self.r.read_exact(&mut v).map_err(|e| format!("read: {e}"))?;
+        self.pos += n;
+        self.read += n;
+        Ok(v)
+    }
+    fn skip(&mut self, n: u64) -> Result<(), String> {
+        if n > self.remaining() {
+            return Err(format!("blob truncated: cannot skip {n} bytes at {}, {} left", self.pos, self.remaining()));
+        }
+        self.r.seek(std::io::SeekFrom::Current(n as i64)).map_err(|e| format!("seek: {e}"))?;
+        self.pos += n;
+        Ok(())
+    }
+    fn u8(&mut self) -> Result<u8, String> {
+        Ok(self.take(1)?[0])
+    }
+    fn u64(&mut self) -> Result<u64, String> {
+        Ok(u64::from_le_bytes(self.take(8)?.try_into().expect("8 bytes")))
+    }
+    /// A frontier exactly as [`read_frontier`] accepts it, as a portable [`FrontierState`]
+    /// (`leaf: None` = the empty tag).
+    fn frontier(&mut self, size: u64) -> Result<FrontierState, String> {
+        match self.u8()? {
+            0 => Ok(FrontierState { size: 0, leaf: None, ommers: Vec::new() }),
+            1 => {
+                let leaf: [u8; 32] = self.take(32)?.try_into().expect("32 bytes");
+                let n = self.u64()?;
+                if n > TREE_DEPTH as u64 {
+                    return Err(format!("frontier with {n} ommers"));
+                }
+                let raw = self.take(32 * n)?;
+                let ommers: Vec<[u8; 32]> = raw.chunks_exact(32).map(|c| c.try_into().expect("32 bytes")).collect();
+                let fs = FrontierState { size, leaf: Some(leaf), ommers };
+                GlobalTree::from_state(&fs).map_err(|_| "inconsistent frontier".to_string())?;
+                Ok(fs)
+            }
+            t => Err(format!("frontier tag {t}")),
+        }
+    }
+}
+
+/// One note record (position, nullifier, recipient, value, rho, rseed: 155 bytes), as the
+/// checkpoint writes it.
+pub(crate) const NOTE_RECORD_LEN: usize = 8 + 32 + 43 + 8 + 32 + 32;
+
+fn write_note(out: &mut Vec<u8>, n: &OwnedNote) {
+    out.extend_from_slice(&n.position.to_le_bytes());
+    out.extend_from_slice(&n.nullifier);
+    out.extend_from_slice(&n.note.recipient().to_raw_address_bytes());
+    out.extend_from_slice(&n.note.value().inner().to_le_bytes());
+    out.extend_from_slice(&n.note.rho().to_bytes());
+    out.extend_from_slice(n.note.rseed().as_bytes());
+}
+
+fn read_note(r: &mut Cursor<'_>) -> Option<OwnedNote> {
+    let position = r.u64()?;
+    let nullifier = r.arr::<32>()?;
+    let recipient = r.arr::<43>()?;
+    let value = r.u64()?;
+    let rho = Option::<Rho>::from(Rho::from_bytes(&r.arr()?))?;
+    let rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes(r.arr()?, &rho))?;
+    let addr = Option::<Address>::from(Address::from_raw_address_bytes(&recipient))?;
+    let note = Option::<Note>::from(Note::from_parts(addr, NoteValue::from_raw(value), rho, rseed, orchard::note::NoteVersion::V2))?;
+    Some(OwnedNote { note, position, nullifier })
+}
+
+/// Notes as `[n:u64] (record)*` — the checkpoint's note encoding, for the engine's per-wallet file.
+pub fn encode_notes(notes: &[OwnedNote]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8 + notes.len() * NOTE_RECORD_LEN);
+    out.extend_from_slice(&(notes.len() as u64).to_le_bytes());
+    for n in notes {
+        write_note(&mut out, n);
+    }
+    out
+}
+
+/// Inverse of [`encode_notes`]; `None` on any malformed record or trailing byte.
+pub fn decode_notes(buf: &[u8]) -> Option<Vec<OwnedNote>> {
+    let mut r = Cursor { buf, pos: 0 };
+    let n = r.u64()? as usize;
+    if n > r.remaining() / NOTE_RECORD_LEN {
+        return None;
+    }
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        out.push(read_note(&mut r)?);
+    }
+    r.done().then_some(out)
+}
+
+/// [`encode_history_section`] for the engine's per-wallet file.
+pub fn encode_history(history: &[HistoryEntry]) -> Vec<u8> {
+    encode_history_section(history)
+}
+
+/// The current-format history parse (v9 flags + v10 credits); `None` = malformed.
+pub fn decode_history(buf: &[u8]) -> Option<Vec<HistoryEntry>> {
+    parse_history_section(buf, true, true)
+}
+
+/// [`encode_pending_section`] for the engine's per-wallet file.
+pub fn encode_pending(last_daa: u64, pending: &[PendingSpend]) -> Vec<u8> {
+    encode_pending_section(last_daa, pending)
+}
+
+/// Inverse of [`encode_pending`]; `None` = malformed.
+pub fn decode_pending(buf: &[u8]) -> Option<(u64, Vec<PendingSpend>)> {
+    parse_pending_section(buf)
+}
+
+/// Read the private sections of a checkpoint blob of `blob_len` bytes starting at the
+/// reader's current position, seeking past the public ones.
+///
+/// Accepts exactly the versions [`WalletDb::from_checkpoint`] accepts and parses every
+/// section it reads with the restore's own code (notes, history, pending, frontiers), so the
+/// notes, pending spends, history rows and clock are those a full restore would install.
+/// What it does NOT do is validate the skipped public data (each leaf's canonical encoding,
+/// the witness and subtree sections' internals): those are replaced by the engine's own
+/// shared stream, against which every note is checked separately. A blob a restore would
+/// refuse for a reason inside a skipped section can therefore read here; the opposite
+/// cannot happen for a well-formed file.
+pub fn read_checkpoint_private<R: std::io::Read + std::io::Seek>(r: &mut R, blob_len: u64) -> Result<CheckpointPrivate, String> {
+    let mut b = BlobReader { r, pos: 0, len: blob_len, read: 0 };
+    let version = b.u8()?;
+    if !(CHECKPOINT_VERSION_V3..=CHECKPOINT_VERSION_V11).contains(&version) {
+        return Err(format!("checkpoint version {version}"));
+    }
+    let base_size = b.u64()?;
+    let _base = b.frontier(base_size)?;
+    let size = b.u64()?;
+    let leaf_count = b.u64()?;
+    let shared_leaves = if version >= CHECKPOINT_VERSION_V11 {
+        let n = b.u64()?;
+        if n == 0 || n > leaf_count {
+            return Err("v11 shared range out of bounds".into());
+        }
+        n
+    } else {
+        0
+    };
+    let inline = leaf_count - shared_leaves;
+    if inline > b.remaining() / 32 {
+        return Err("leaf count exceeds the blob".into());
+    }
+    b.skip(inline * 32)?;
+    let n_notes = b.u64()?;
+    if n_notes > b.remaining() / NOTE_RECORD_LEN as u64 {
+        return Err("note count exceeds the blob".into());
+    }
+    let raw = b.take(n_notes * NOTE_RECORD_LEN as u64)?;
+    let mut c = Cursor { buf: &raw, pos: 0 };
+    let mut notes = Vec::with_capacity(n_notes as usize);
+    for _ in 0..n_notes {
+        notes.push(read_note(&mut c).ok_or("malformed note record")?);
+    }
+    let nullifier_count = b.u64()?;
+    if nullifier_count > b.remaining() / 32 {
+        return Err("nullifier count exceeds the blob".into());
+    }
+    b.skip(nullifier_count * 32)?;
+    let tip = if version >= CHECKPOINT_VERSION_V4 {
+        let fs = b.frontier(size)?;
+        if size > 0 && fs.leaf.is_none() { None } else { Some(fs) }
+    } else {
+        None
+    };
+    // Length-prefixed best-effort sections, in restore's order. A section whose length
+    // prefix is absent ends the blob there (restore reads `None` and finds `done()`).
+    let mut history = Vec::new();
+    let (mut last_daa, mut pending) = (0u64, Vec::new());
+    if version >= CHECKPOINT_VERSION_V5 && b.remaining() >= 8 {
+        let n = b.u64()?;
+        b.skip(n)?;
+    }
+    if version >= CHECKPOINT_VERSION_V6 && b.remaining() >= 8 {
+        let n = b.u64()?;
+        let buf = b.take(n)?;
+        history = parse_history_section(&buf, version >= CHECKPOINT_VERSION_V9, version >= CHECKPOINT_VERSION_V10).unwrap_or_default();
+    }
+    if version >= CHECKPOINT_VERSION_V7 && b.remaining() >= 8 {
+        let n = b.u64()?;
+        let buf = b.take(n)?;
+        if let Some((d, p)) = parse_pending_section(&buf) {
+            last_daa = d;
+            pending = p;
+        }
+    }
+    if version >= CHECKPOINT_VERSION_V8 && b.remaining() >= 8 {
+        let n = b.u64()?;
+        b.skip(n)?;
+    }
+    if b.remaining() != 0 {
+        return Err(format!("{} trailing bytes", b.remaining()));
+    }
+    Ok(CheckpointPrivate {
+        version,
+        base_size,
+        size,
+        leaf_count,
+        shared_leaves,
+        nullifier_count,
+        notes,
+        tip,
+        history,
+        pending,
+        last_daa,
+        bytes_read: b.read,
+    })
+}
+
+impl WalletDb {
+    /// A keyless leaves-only tree (the shared chain) rebuilt from persisted parts: the
+    /// commitment stream from genesis, the applied-nullifier set, and the tip frontier.
+    ///
+    /// No Sinsemilla work: the tip tree comes from the frontier, which must describe exactly
+    /// `leaves.len()` leaves and end in the last of them; anything else is refused. The
+    /// stream itself is trusted as the caller's durable copy (the engine store checks it
+    /// against the node and can refold it with [`Self::verify_stream_root`]).
+    pub fn leaves_only_from_parts(seed: [u8; 32], leaves: &[[u8; 32]], nullifiers: impl IntoIterator<Item = [u8; 32]>, tip: &FrontierState) -> Option<Self> {
+        if tip.size != leaves.len() as u64 {
+            return None;
+        }
+        if tip.leaf != leaves.last().copied() {
+            return None;
+        }
+        let mut db = Self::from_seed(seed)?;
+        db.leaves.reserve_exact(leaves.len());
+        for l in leaves {
+            db.leaves.push(Option::<MerkleHashOrchard>::from(MerkleHashOrchard::from_bytes(l))?);
+        }
+        db.size = tip.size;
+        if tip.size > 0 {
+            db.tree = CommitmentTree::from_frontier(GlobalTree::from_state(tip).ok()?.frontier());
+        }
+        for nf in nullifiers {
+            db.nf_insert(&nf);
+        }
+        db.leaves_only = true;
+        Some(db)
+    }
+
+    /// Refold the whole stream (O(N) Sinsemilla) and check it reaches the tip root.
+    /// The expensive, complete integrity check of a persisted shared tree.
+    pub fn verify_stream_root(&self) -> bool {
+        let mut t = CommitmentTree::from_frontier(&self.base_frontier);
+        for l in &self.leaves {
+            if t.append(*l).is_err() {
+                return false;
+            }
+        }
+        self.tree_valid && t.root() == self.tree.root()
+    }
+
+    /// The canonical bytes of the leaf at absolute `position`, if this stream holds it.
+    pub fn leaf_at(&self, position: u64) -> Option<[u8; 32]> {
+        let rel = usize::try_from(position.checked_sub(self.base_size)?).ok()?;
+        self.leaves.get(rel).map(|l| l.to_bytes())
     }
 }
 
