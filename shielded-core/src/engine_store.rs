@@ -58,6 +58,13 @@ fn h32(parts: &[&[u8]]) -> [u8; 32] {
     st.finalize().as_bytes().try_into().expect("32 bytes")
 }
 
+/// A wallet's stable 16-byte engine name, from the host's own identifier (a token): the
+/// journal key and `.w2` file stem. A keyed hash, so no file carries the identifier itself.
+pub fn wallet_key16(id: &[u8]) -> [u8; 16] {
+    let h = blake2b_simd::Params::new().hash_length(16).personal(b"zkas-engine-wkey").hash(id);
+    h.as_bytes().try_into().expect("16 bytes")
+}
+
 /// Write `bytes` to `path` atomically and durably: a unique tmp file in the same directory,
 /// fsync, rename over `path`, fsync the directory. A crash leaves either the old file or the
 /// new one, never a torn one (a stray `.tmp` is ignored by every reader).
@@ -424,6 +431,10 @@ pub struct Committed {
     pub last_daa: u64,
     pub last_blue: u64,
     pub tip: FrontierState,
+    /// Whether `chain.ccs` (the compact block archive) is kept. Fixed when the store is
+    /// created: an archive with a hole cannot serve a replay, so it can never be switched on
+    /// later (or off).
+    pub archive: bool,
 }
 
 impl Committed {
@@ -439,6 +450,7 @@ impl Committed {
         o.extend_from_slice(&self.last_daa.to_le_bytes());
         o.extend_from_slice(&self.last_blue.to_le_bytes());
         put_frontier(&mut o, &self.tip);
+        o.push(self.archive as u8);
         let h = h32(&[&o]);
         o.extend_from_slice(&h);
         o
@@ -468,6 +480,11 @@ impl Committed {
             last_daa: r.u64()?,
             last_blue: r.u64()?,
             tip: get_frontier(&mut r)?,
+            archive: match r.u8()? {
+                0 => false,
+                1 => true,
+                _ => return None,
+            },
         };
         r.done().then_some(c)
     }
@@ -559,12 +576,26 @@ impl ChainStore {
     /// Open (or create) the store in `dir` and rebuild the shared chain from it. A new store
     /// starts at the empty tree (genesis). Returns the store and the chain.
     pub fn open(dir: &Path, genesis: [u8; 32]) -> Result<(Self, SharedChain), String> {
+        Self::open_with(dir, genesis, true)
+    }
+
+    /// [`Self::open`]; `archive` says whether a NEW store keeps the compact block archive
+    /// (`chain.ccs`, ~20 MB per chain-day). An existing store keeps what it was created with;
+    /// asking for the other answer is refused.
+    pub fn open_with(dir: &Path, genesis: [u8; 32], archive: bool) -> Result<(Self, SharedChain), String> {
         std::fs::create_dir_all(dir.join("wallets")).map_err(|e| format!("mkdir: {e}"))?;
         let f = |n: &str| open_append(&dir.join(n)).map_err(|e| format!("{n}: {e}"));
         let (chain, idx, leaves, nfs, journal) = (f("chain.ccs")?, f("blocks.idx")?, f("leaves.bin")?, f("nfs.bin")?, f("journal.bin")?);
         let committed = match std::fs::read(dir.join("committed")) {
             Ok(b) => Committed::decode(&b).ok_or("committed: corrupt or wrong version; refusing to open")?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Committed {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // A new store: every append file must be empty (bytes without a committed record
+                // were never committed), and the empty record is written at once so the
+                // creation-time choices are durable.
+                for (f, n) in [(&chain, "chain.ccs"), (&idx, "blocks.idx"), (&leaves, "leaves.bin"), (&nfs, "nfs.bin"), (&journal, "journal.bin")] {
+                    settle(f, 0, n)?;
+                }
+                let c = Committed {
                 genesis,
                 seq: 0,
                 chain_len: 0,
@@ -576,9 +607,16 @@ impl ChainStore {
                 last_daa: 0,
                 last_blue: 0,
                 tip: FrontierState { size: 0, leaf: None, ommers: Vec::new() },
-            },
+                archive,
+                };
+                write_atomic(&dir.join("committed"), &c.encode()).map_err(|e| format!("committed: {e}"))?;
+                c
+            }
             Err(e) => return Err(format!("committed: {e}")),
         };
+        if committed.archive != archive {
+            return Err(format!("store was created with archive={}, asked for archive={archive}", committed.archive));
+        }
         if committed.genesis != genesis {
             return Err("store belongs to another chain (genesis mismatch)".into());
         }
@@ -603,6 +641,33 @@ impl ChainStore {
         Ok((store, SharedChain::from_tree(tree)))
     }
 
+    /// Open a store that another process may be writing, for reading only: nothing is
+    /// truncated, created or written, and the shared tree is not rebuilt. Sees exactly the
+    /// commit that was current at open (every file is at least that long, or it refuses).
+    pub fn open_readonly(dir: &Path, genesis: [u8; 32]) -> Result<Self, String> {
+        let committed = Committed::decode(&std::fs::read(dir.join("committed")).map_err(|e| format!("committed: {e}"))?).ok_or("committed: corrupt")?;
+        if committed.genesis != genesis {
+            return Err("store belongs to another chain (genesis mismatch)".into());
+        }
+        let ro = |n: &str, want: u64| -> Result<File, String> {
+            let f = File::open(dir.join(n)).map_err(|e| format!("{n}: {e}"))?;
+            let have = f.metadata().map_err(|e| e.to_string())?.len();
+            if have < want {
+                return Err(format!("{n}: shorter than committed"));
+            }
+            Ok(f)
+        };
+        Ok(Self {
+            dir: dir.to_path_buf(),
+            chain: ro("chain.ccs", committed.chain_len)?,
+            idx: ro("blocks.idx", committed.seq * IDX_ENTRY)?,
+            leaves: ro("leaves.bin", committed.leaves * 32)?,
+            nfs: ro("nfs.bin", committed.nfs * 32)?,
+            journal: ro("journal.bin", committed.journal_len)?,
+            committed,
+        })
+    }
+
     /// Persist one page the engine has ingested: its blocks, their index, the new leaves,
     /// the applied nullifiers and the fold records, then `committed`. The engine must have
     /// ingested exactly `blocks` since the last commit. On `Err` (or a fault) nothing is
@@ -621,7 +686,7 @@ impl ChainStore {
         let mut cbuf = Vec::new();
         let mut ibuf = Vec::new();
         for (b, &size_after) in blocks.iter().zip(&folds.sizes_after) {
-            let off = c.chain_len + cbuf.len() as u64;
+            let off = if c.archive { c.chain_len + cbuf.len() as u64 } else { 0 };
             frame(&encode_block(b), &mut cbuf);
             ibuf.extend_from_slice(&IdxEntry { hash: b.hash, blue: b.blue_score, daa: b.daa_score, size_after, chain_off: off }.encode());
         }
@@ -634,6 +699,9 @@ impl ChainStore {
             f.write_all(bytes).map_err(io)?;
             f.sync_data().map_err(io)
         };
+        if !c.archive {
+            cbuf.clear();
+        }
         append(&mut self.chain, c.chain_len, &cbuf)?;
         if fault == CommitFault::AfterChain {
             return Err("fault: after chain".into());
@@ -686,6 +754,7 @@ impl ChainStore {
             last_daa: last.map(|b| b.daa_score).unwrap_or(c.last_daa),
             last_blue: last.map(|b| b.blue_score).unwrap_or(c.last_blue),
             tip: engine.chain().tree().tip_frontier_state().ok_or("shared tree has no valid tip frontier")?,
+            archive: c.archive,
         };
         if fault == CommitFault::BeforeCommitted {
             return Err("fault: before committed".into());
@@ -735,6 +804,9 @@ impl ChainStore {
 
     /// Blocks `from..=to` (1-based sequences) from `chain.ccs`, checksums verified.
     pub fn blocks(&self, from: u64, to: u64) -> Result<Vec<SharedBlock>, String> {
+        if !self.committed.archive {
+            return Err("this store keeps no block archive (created with archive=false)".into());
+        }
         if from == 0 || to > self.committed.seq || from > to {
             return Ok(Vec::new());
         }

@@ -138,7 +138,8 @@ fn state_key(w: &WalletLite) -> String {
 /// Open the store in `dir`, rebuild the engine and every wallet (from its `.w2` + the
 /// journal, or fresh at the base), as a restarting host does.
 fn reopen(dir: &Path, fv: &[FullViewingKey]) -> (ChainStore, ScanEngine) {
-    let (store, chain) = ChainStore::open(dir, GENESIS).expect("open");
+    let archive = std::fs::read(dir.join("committed")).ok().and_then(|b| Committed::decode(&b)).map(|c| c.archive).unwrap_or(true);
+    let (store, chain) = ChainStore::open_with(dir, GENESIS, archive).expect("open");
     let mut eng = ScanEngine::resume(chain, Box::new(LadderKernel), store.committed().seq);
     for (i, f) in fv.iter().enumerate() {
         let p = store.wallet_path(&format!("w{i}"));
@@ -308,6 +309,45 @@ fn a_crash_at_every_commit_step_recovers_to_the_uninterrupted_result() {
     for x in [rdir, d, d2] {
         let _ = std::fs::remove_dir_all(x);
     }
+}
+
+/// The same crash matrix (fewer points) on a store that keeps no block archive: identical
+/// recovery, `chain.ccs` stays empty, replays are refused, and the flag cannot be flipped.
+#[test]
+fn a_store_without_the_block_archive_recovers_the_same_and_refuses_to_flip() {
+    let fv = fvks();
+    let rdir = tmpdir("noarch-ref");
+    {
+        let (_s, _) = ChainStore::open_with(&rdir, GENESIS, false).unwrap();
+    }
+    run(&rdir, &fv, None).unwrap();
+    let reference = snapshot(&rdir, &fv);
+    assert!(reference.0[0].1.is_empty(), "no archive bytes");
+    for f in [CommitFault::AfterChain, CommitFault::AfterJournal, CommitFault::BeforeCommitted] {
+        let d = tmpdir(&format!("noarch-{f:?}"));
+        {
+            let (_s, _) = ChainStore::open_with(&d, GENESIS, false).unwrap();
+        }
+        assert!(run(&d, &fv, Some((3, f))).is_err());
+        run(&d, &fv, None).unwrap();
+        assert_eq!(snapshot(&d, &fv), reference, "{f:?}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+    let (s, _) = ChainStore::open_with(&rdir, GENESIS, false).unwrap();
+    assert!(s.blocks(1, 2).is_err(), "no archive: replays are refused, not invented");
+    // A read-only open beside a writer: same commit, nothing cut.
+    let lens: Vec<u64> = ["leaves.bin", "journal.bin"].iter().map(|n| std::fs::metadata(rdir.join(n)).unwrap().len()).collect();
+    {
+        let mut f = OpenOptions::new().append(true).open(rdir.join("journal.bin")).unwrap();
+        f.write_all(&[1u8; 40]).unwrap();
+    }
+    let r = ChainStore::open_readonly(&rdir, GENESIS).unwrap();
+    assert_eq!(r.committed(), s.committed());
+    assert_eq!(std::fs::metadata(rdir.join("journal.bin")).unwrap().len(), lens[1] + 40, "a reader truncates nothing");
+    assert_eq!(r.journal_from(0).unwrap().len() as u64, s.committed().journal_records);
+    drop(s);
+    assert!(ChainStore::open_with(&rdir, GENESIS, true).is_err(), "the archive flag is fixed at creation");
+    let _ = std::fs::remove_dir_all(&rdir);
 }
 
 /// Real process death: a child runs the pipeline and is SIGKILLed at random moments, over

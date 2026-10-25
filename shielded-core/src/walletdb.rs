@@ -910,16 +910,21 @@ impl WalletDb {
     /// a valid Orchard spending key (negligibly rare).
     pub fn from_seed(seed: [u8; 32]) -> Option<Self> {
         let sk = Option::<SpendingKey>::from(SpendingKey::from_bytes(seed))?;
-        let fvk = FullViewingKey::from(&sk);
+        Some(Self::with_fvk(FullViewingKey::from(&sk), true))
+    }
+
+    /// One constructor for every key source. `scan_addresses = false` leaves the coinbase
+    /// recognition set empty: only for a read-only view that never ingests
+    /// ([`Self::view_from_parts`]); deriving the 256 addresses is most of a construction.
+    fn with_fvk(fvk: FullViewingKey, scan_addresses: bool) -> Self {
         let ivk = fvk.to_ivk(Scope::External);
         let prepared_ivk = ivk.prepare();
         let agree_scalar = crate::wallet::ivk_agreement_scalar(&ivk);
         let my_address = fvk.address_at(0u32, Scope::External).to_raw_address_bytes();
-        let known_addresses = (0..COINBASE_DIVERSIFIER_SCAN)
-            .map(|i| fvk.address_at(i, Scope::External).to_raw_address_bytes())
-            .collect();
+        let known_addresses =
+            if scan_addresses { (0..COINBASE_DIVERSIFIER_SCAN).map(|i| fvk.address_at(i, Scope::External).to_raw_address_bytes()).collect() } else { HashSet::new() };
         let ovk = fvk.to_ovk(Scope::External);
-        Some(Self {
+        Self {
             ivk,
             prepared_ivk,
             fvk,
@@ -951,7 +956,7 @@ impl WalletDb {
             last_daa: 0,
             subtree: SubtreeCache::default(),
             scan_cost: ScanCost::default(),
-        })
+        }
     }
 
     /// Build a **watch-only** wallet view from a serialized full viewing key
@@ -964,47 +969,39 @@ impl WalletDb {
     /// are not a valid full viewing key.
     pub fn from_fvk(fvk_bytes: &[u8; 96]) -> Option<Self> {
         let fvk = FullViewingKey::from_bytes(fvk_bytes)?;
-        let ivk = fvk.to_ivk(Scope::External);
-        let prepared_ivk = ivk.prepare();
-        let agree_scalar = crate::wallet::ivk_agreement_scalar(&ivk);
-        let my_address = fvk.address_at(0u32, Scope::External).to_raw_address_bytes();
-        let known_addresses = (0..COINBASE_DIVERSIFIER_SCAN)
-            .map(|i| fvk.address_at(i, Scope::External).to_raw_address_bytes())
-            .collect();
-        let ovk = fvk.to_ovk(Scope::External);
-        Some(Self {
-            ivk,
-            prepared_ivk,
-            fvk,
-            my_address,
-            known_addresses,
-            tree: CommitmentTree::empty(),
-            base_frontier: Frontier::empty(),
-            base_size: 0,
-            leaves: Vec::new(),
-            notes: Vec::new(),
-            size: 0,
-            witnesses: Vec::new(),
-            witness_budget: MAX_LIVE_WITNESSES,
-            lag_tree: CommitmentTree::empty(),
-            witnessed_upto: 0,
-            spent_nullifiers: HashSet::new(),
-            nf_shared: DEFAULT_NF_INTERNER.get().map(|i| SharedNfSet { interner: i.clone(), bits: Vec::new(), count: 0 }),
-            ovk,
-            history: Vec::new(),
-            history_enabled: true,
-            agree_scalar,
-            predecrypted: None,
-            leaves_only: false,
-            poisoned: false,
-            borrow_tree: false,
-            tree_valid: true,
-            pending_spends: Vec::new(),
-            pending_change: HashMap::new(),
-            last_daa: 0,
-            subtree: SubtreeCache::default(),
-            scan_cost: ScanCost::default(),
-        })
+        Some(Self::with_fvk(fvk, true))
+    }
+
+    /// A read-only VIEW of a wallet for rendering its API answers: its own private state on a
+    /// tree that is only the tip frontier at `tip.size` (no leaves, no applied-nullifier set).
+    /// Balance, notes, pending spends, history, clock and anchor read exactly as from the full
+    /// database; it can never witness a note (every position is below its base) and must never
+    /// ingest or spend. The multi-wallet engine serves `/api/*` reads through it.
+    pub fn view_from_parts(
+        fvk: &FullViewingKey,
+        notes: Vec<OwnedNote>,
+        pending_spends: Vec<PendingSpend>,
+        history: Vec<HistoryEntry>,
+        history_enabled: bool,
+        last_daa: u64,
+        tip: &FrontierState,
+    ) -> Option<Self> {
+        let mut db = Self::with_fvk(fvk.clone(), false);
+        if tip.size > 0 {
+            let gt = GlobalTree::from_state(tip).ok()?;
+            db.base_frontier = gt.frontier().clone();
+            db.tree = CommitmentTree::from_frontier(&db.base_frontier);
+            db.lag_tree = CommitmentTree::from_frontier(&db.base_frontier);
+        }
+        db.base_size = tip.size;
+        db.size = tip.size;
+        db.witnessed_upto = tip.size;
+        db.notes = notes;
+        db.pending_spends = pending_spends;
+        db.history = history;
+        db.history_enabled = history_enabled;
+        db.last_daa = last_daa;
+        Some(db)
     }
 
     /// This wallet's full viewing key. Grants viewing (not spend) capability; the
@@ -4160,6 +4157,21 @@ fn read_note(r: &mut Cursor<'_>) -> Option<OwnedNote> {
     Some(OwnedNote { note, position, nullifier })
 }
 
+/// Parse `n` consecutive note records from `raw`, in parallel above a small count (each record
+/// costs a note-commitment check inside `Note::from_parts`, ~0.2 ms: 275 K notes were 60 s on
+/// one core). Same per-record parse as the restore; `None` if any record is malformed.
+fn read_notes_par(raw: &[u8], n: usize) -> Option<Vec<OwnedNote>> {
+    if raw.len() != n * NOTE_RECORD_LEN {
+        return None;
+    }
+    let one = |c: &[u8]| read_note(&mut Cursor { buf: c, pos: 0 });
+    if n < 512 {
+        return raw.chunks_exact(NOTE_RECORD_LEN).map(one).collect();
+    }
+    use rayon::prelude::*;
+    raw.par_chunks_exact(NOTE_RECORD_LEN).map(one).collect()
+}
+
 /// Notes as `[n:u64] (record)*` — the checkpoint's note encoding, for the engine's per-wallet file.
 pub fn encode_notes(notes: &[OwnedNote]) -> Vec<u8> {
     let mut out = Vec::with_capacity(8 + notes.len() * NOTE_RECORD_LEN);
@@ -4177,10 +4189,8 @@ pub fn decode_notes(buf: &[u8]) -> Option<Vec<OwnedNote>> {
     if n > r.remaining() / NOTE_RECORD_LEN {
         return None;
     }
-    let mut out = Vec::with_capacity(n);
-    for _ in 0..n {
-        out.push(read_note(&mut r)?);
-    }
+    let raw = r.take(n * NOTE_RECORD_LEN)?;
+    let out = read_notes_par(raw, n)?;
     r.done().then_some(out)
 }
 
@@ -4244,11 +4254,7 @@ pub fn read_checkpoint_private<R: std::io::Read + std::io::Seek>(r: &mut R, blob
         return Err("note count exceeds the blob".into());
     }
     let raw = b.take(n_notes * NOTE_RECORD_LEN as u64)?;
-    let mut c = Cursor { buf: &raw, pos: 0 };
-    let mut notes = Vec::with_capacity(n_notes as usize);
-    for _ in 0..n_notes {
-        notes.push(read_note(&mut c).ok_or("malformed note record")?);
-    }
+    let notes = read_notes_par(&raw, n_notes as usize).ok_or("malformed note record")?;
     let nullifier_count = b.u64()?;
     if nullifier_count > b.remaining() / 32 {
         return Err("nullifier count exceeds the blob".into());

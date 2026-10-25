@@ -40,6 +40,9 @@ use pasta_curves::arithmetic::CurveExt;
 use pasta_curves::glv::{Decomposed, GlvParams, Table};
 use pasta_curves::pallas;
 
+/// Re-exported so a host can name a wallet's key without depending on orchard directly.
+pub use orchard::keys::FullViewingKey as WalletFvk;
+
 use crate::coinbase::CoinbaseNoteDesc;
 use crate::tree::FrontierState;
 use crate::wallet::scan::{CompactActionRecord, ReceivedNote, decompress_epk, ivk_agreement_scalar, scan_compact_cpu};
