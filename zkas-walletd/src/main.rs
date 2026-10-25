@@ -200,6 +200,33 @@ struct Cli {
     /// action for the cohort). Off by default. Kernel: ZKAS_ENGINE_KERNEL=comb|ladder (default comb).
     #[arg(long)]
     shared_scan_engine: bool,
+    /// Phase 2 of the multi-wallet scan engine (with `--shared-scan-engine`): run THIS process
+    /// as the engine instead of the per-wallet daemon. One follower stores the chain once in
+    /// DIR; the wallets of `--wallet-dir` are migrated from their checkpoints without a rescan
+    /// (never writing to `--wallet-dir`); `/api/*` READS are served from the engine (no sends).
+    #[arg(long, value_name = "DIR")]
+    engine_dir: Option<String>,
+    /// Engine mode: compare each wallet with the LIVE daemon's checkpoints in DIR whenever one
+    /// is rewritten (reads headers and private sections only; never writes there).
+    #[arg(long, value_name = "DIR")]
+    engine_compare_live: Option<String>,
+    /// Engine mode: ingest no block above this DAA score (experiments).
+    #[arg(long, value_name = "DAA")]
+    engine_stop_at_daa: Option<u64>,
+    /// Engine mode: snapshot every wallet file when the follower passes tip minus each of these
+    /// many seconds (comma-separated), for dormant catch-up measurements.
+    #[arg(long, value_name = "SECS,...", value_delimiter = ',')]
+    engine_dormant_marks: Vec<u64>,
+    /// Engine mode: do not keep the compact block archive (fixed when the store is created).
+    #[arg(long)]
+    engine_no_archive: bool,
+    /// Engine mode: old-path twins (a per-wallet `WalletDb` per migrated wallet, fed the same
+    /// blocks and compared with the engine) within this total memory estimate (MB; 0 = none).
+    #[arg(long, value_name = "MB", default_value_t = 0)]
+    engine_twin_max_mb: u64,
+    /// Engine mode: pause the follower below this much free space (MB).
+    #[arg(long, value_name = "MB", default_value_t = 4096)]
+    engine_min_free_mb: u64,
     /// Defer optional subtree-index builds below this MemAvailable value.
     #[arg(long, value_name = "MIB")]
     subtree_free_floor_mb: Option<u64>,
@@ -462,6 +489,28 @@ async fn run(cli: Cli) {
             listen
         );
         std::process::exit(1);
+    }
+
+    if let (true, Some(dir)) = (cli.shared_scan_engine, cli.engine_dir.clone()) {
+        let ecfg = zkas_walletd::EngineConfig {
+            rpc_server: cli.rpc_server,
+            listen,
+            wallet_dir,
+            engine_dir: std::path::PathBuf::from(dir),
+            network: cli.network,
+            wallet_secret,
+            compare_live_dir: cli.engine_compare_live,
+            stop_at_daa: cli.engine_stop_at_daa,
+            dormant_marks: cli.engine_dormant_marks,
+            archive: !cli.engine_no_archive,
+            twin_max_mb: cli.engine_twin_max_mb,
+            min_free_mb: cli.engine_min_free_mb,
+        };
+        if let Err(e) = zkas_walletd::serve_engine(ecfg, shutdown_rx).await {
+            log::error!("{e}");
+            std::process::exit(1);
+        }
+        return;
     }
 
     let cfg = Config {

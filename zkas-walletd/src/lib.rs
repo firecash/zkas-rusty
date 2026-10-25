@@ -46,6 +46,8 @@ use std::sync::Arc;
 
 pub mod selfhost;
 pub use selfhost::{SelfHostConfig, run_selfhost};
+mod engine_host;
+pub use engine_host::{EngineConfig, serve_engine};
 
 use axum::{
     Json, Router,
@@ -8936,24 +8938,14 @@ struct StatusResp {
     blocks_behind: u64,
 }
 
-async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Json<StatusResp> {
-    let token = token_from(&headers, state.allow_default_token).ok();
-    // Do NOT call the node here. The gRPC client is shared with the background sync loop,
-    // whose block fetches make a fresh get_block_dag_info queue for seconds — which made
-    // every status call take ~4s. The sync loop already refreshes `node_tip` every pass,
-    // and a dedicated ticker keeps it current even with no wallets loaded, so status reads
-    // the cached tip instantly. `node_connected` follows whether the tip is fresh.
-    let (node_connected, daa_score) = {
-        let (tip, at) = *state.node_tip.lock().await;
-        (at.elapsed() < std::time::Duration::from_secs(30), tip)
-    };
-
-    let mut resp = StatusResp {
+/// The `/api/status` answer before any wallet is consulted (shared with `engine_host`).
+fn status_base(network: &str, node_connected: bool, daa_score: u64) -> StatusResp {
+    StatusResp {
         has_wallet: false,
         address: None,
         birthday: None,
         private_sends: false,
-        network: state.network.clone(),
+        network: network.to_string(),
         node_connected,
         daa_score,
         synced: false,
@@ -8985,7 +8977,22 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Json<
         missing_history: false,
         history_from_daa: None,
         watch_only: false,
+    }
+}
+
+async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Json<StatusResp> {
+    let token = token_from(&headers, state.allow_default_token).ok();
+    // Do NOT call the node here. The gRPC client is shared with the background sync loop,
+    // whose block fetches make a fresh get_block_dag_info queue for seconds — which made
+    // every status call take ~4s. The sync loop already refreshes `node_tip` every pass,
+    // and a dedicated ticker keeps it current even with no wallets loaded, so status reads
+    // the cached tip instantly. `node_connected` follows whether the tip is fresh.
+    let (node_connected, daa_score) = {
+        let (tip, at) = *state.node_tip.lock().await;
+        (at.elapsed() < std::time::Duration::from_secs(30), tip)
     };
+
+    let mut resp = status_base(&state.network, node_connected, daa_score);
 
     if let Some(token) = token {
         // NEVER load on the request path. A wallet load makes node RPCs and rebuilds a
@@ -9459,6 +9466,12 @@ async fn wallet_balance(
     let w = state.get_wallet(&token).await.ok_or_else(|| err(StatusCode::NOT_FOUND, "no wallet loaded"))?;
     let e = w.lock().await;
     let want_notes = matches!(query.notes.as_deref(), Some("1" | "true" | "yes"));
+    Ok(Json(balance_resp(state.prefix, &e, want_notes)))
+}
+
+/// `/api/wallet/balance` for one wallet entry. Shared by the per-wallet daemon and the
+/// multi-wallet engine (`engine_host`), so both render byte-identical answers from equal state.
+fn balance_resp(prefix: Prefix, e: &WalletEntry, want_notes: bool) -> BalanceResp {
     let note_count = e.db.notes().len();
     let notes = want_notes.then(|| {
         e.db.notes()
@@ -9466,11 +9479,11 @@ async fn wallet_balance(
             .map(|n| NoteInfo {
                 position: n.position,
                 value: n.value(),
-                recipient: String::from(&Address::new(state.prefix, Version::ShieldedOrchard, &n.note.recipient().to_raw_address_bytes())),
+                recipient: String::from(&Address::new(prefix, Version::ShieldedOrchard, &n.note.recipient().to_raw_address_bytes())),
             })
             .collect()
     });
-    Ok(Json(BalanceResp {
+    BalanceResp {
         balance_sompi: e.db.balance().to_string(),
         balance_fc: fmt_fc(e.db.balance()),
         // Same `tip > 0` guard `status` carries: an unknown tip is NOT evidence of being
@@ -9487,7 +9500,7 @@ async fn wallet_balance(
         note_count,
         updated_unix: e.updated_unix,
         error: e.error.clone(),
-    }))
+    }
 }
 
 #[derive(Deserialize)]
@@ -9693,8 +9706,13 @@ async fn wallet_history(
     let token = token_from(&headers, state.allow_default_token)?;
     let w = state.get_wallet(&token).await.ok_or_else(|| err(StatusCode::NOT_FOUND, "no wallet loaded"))?;
     let e = w.lock().await;
-    let history_page = query.limit.unwrap_or(500).clamp(1, 5_000);
-    let offset = query.offset.unwrap_or(0);
+    Ok(Json(history_json(state.prefix, &e, query.limit, query.offset)))
+}
+
+/// `/api/wallet/history` for one wallet entry (see [`balance_resp`]).
+fn history_json(prefix: Prefix, e: &WalletEntry, limit: Option<usize>, offset: Option<usize>) -> serde_json::Value {
+    let history_page = limit.unwrap_or(500).clamp(1, 5_000);
+    let offset = offset.unwrap_or(0);
     let rows: Vec<serde_json::Value> =
         e.db.history()
             .iter()
@@ -9718,7 +9736,7 @@ async fn wallet_history(
                     "feeSompi": h.fee,
                     "feeSompiExact": h.fee.to_string(),
                     "feeKnown": h.fee_known,
-                    "recipient": h.recipient.map(|r| String::from(&Address::new(state.prefix, Version::ShieldedOrchard, &r))),
+                    "recipient": h.recipient.map(|r| String::from(&Address::new(prefix, Version::ShieldedOrchard, &r))),
                     "memo": (!h.memo.is_empty()).then(|| String::from_utf8_lossy(&h.memo).into_owned()),
                     // Per-output breakdown. `recipient`/`amountSompi` stay exactly
                     // as they were for every existing client; a caller that must
@@ -9727,7 +9745,7 @@ async fn wallet_history(
                     // means no breakdown was recorded (coinbase, compact-only, or a
                     // row written before this daemon version) — not zero received.
                     "credits": h.credits.iter().map(|c| serde_json::json!({
-                        "recipient": String::from(&Address::new(state.prefix, Version::ShieldedOrchard, &c.recipient)),
+                        "recipient": String::from(&Address::new(prefix, Version::ShieldedOrchard, &c.recipient)),
                         "amountSompi": c.value,
                         "amountSompiExact": c.value.to_string(),
                         "amountZkas": c.value as f64 / SOMPI_PER_ZKAS as f64,
@@ -9751,14 +9769,14 @@ async fn wallet_history(
                 })
             })
             .collect();
-    Ok(Json(serde_json::json!({
+    serde_json::json!({
         "recoverableHistory": e.recoverable_history,
         "total": e.db.history().len(),
         "offset": offset,
         "limit": history_page,
         "rows": rows,
         "pendingOutgoing": pending,
-    })))
+    })
 }
 
 #[derive(Deserialize)]
