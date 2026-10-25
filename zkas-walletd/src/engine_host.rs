@@ -763,7 +763,7 @@ impl Host {
             }
             let r = self.compare_one(i, id, &t0, seq, &sp);
             self.stats.compares += 1;
-            if r.get("result").and_then(|v| v.as_str()) != Some("equal") {
+            if r.get("result").and_then(|v| v.as_str()) == Some("MISMATCH") {
                 self.stats.compare_mismatches += 1;
             }
             out.push(r);
@@ -801,7 +801,7 @@ impl Host {
             }
             let r = self.compare_one(i, id, &t0, seq, &sp);
             self.stats.compares += 1;
-            if r.get("result").and_then(|v| v.as_str()) != Some("equal") {
+            if r.get("result").and_then(|v| v.as_str()) == Some("MISMATCH") {
                 self.stats.compare_mismatches += 1;
             }
             out.push(r);
@@ -856,12 +856,33 @@ impl Host {
         if !hist_eq {
             diffs.push("history");
         }
+        // The engine journals ONE clock record per ingested page, at the page's last block
+        // (`ScanEngine::ingest_page`), so every committed state carries the exact clock, but
+        // a replay stopped at a block inside a page lacks that page's record. A live cursor
+        // need not fall on an engine page end; the clock a per-block `WalletDb` holds there
+        // is the cursor block's own DAA score (it raises it on every block with metadata,
+        // and DAA scores increase along the chain). Compare against that; anything else is
+        // still a clock mismatch.
+        let page_clock = if seq > t0.1 { self.store.idx(seq).ok().map(|e| st.last_daa.max(e.daa)) } else { None };
         if st.last_daa != sp.p.last_daa {
-            diffs.push("clock");
+            if page_clock == Some(sp.p.last_daa) {
+                st.last_daa = sp.p.last_daa;
+                diffs.push("clock(mid-page replay)");
+            } else {
+                diffs.push("clock");
+            }
         }
         let ring = self.ring_at(seq);
         if ring != sp.boundaries {
-            diffs.push("boundary ring");
+            // The old path's ring holds the blocks that daemon has SEEN since it loaded the
+            // wallet (up to MATURED_RING); the engine's is the last MATURED_RING stored blocks.
+            // A live ring that is a strict suffix of the engine's is that, not a disagreement.
+            let n = sp.boundaries.len();
+            if n < ring.len() && ring.iter().skip(ring.len() - n).eq(sp.boundaries.iter()) {
+                diffs.push("boundary ring(live shorter: blocks seen since its load)");
+            } else {
+                diffs.push("boundary ring");
+            }
         }
         // The API answers, rendered by the same functions from both states, same context.
         let ctx = EntryContext { chain_len: sp.scanned + 1000, caught_up: true, sink_live: true, updated_unix: 1, spend_fast_ready: true };
@@ -895,6 +916,9 @@ impl Host {
             });
         }
         // Classify the expected differences (anything else is UNEXPLAINED).
+        // A send submitted on the live daemon parks its notes as pending spends (notes ->
+        // pending) before anything reaches the chain; the shadow engine never sends, so its
+        // notes and pending lists differ while their union is the same set.
         let live_send = ep != lp && {
             let eset: HashSet<_> = en.iter().chain(ep.iter().map(|p| &p.0)).collect();
             let lset: HashSet<_> = ln.iter().chain(lp.iter().map(|p| &p.0)).collect();
@@ -910,7 +934,7 @@ impl Host {
             "history": sp.p.history.len(),
             "balance_live": sp.p.notes.iter().map(|n| n.value() as u128).sum::<u128>().to_string(),
             "balance_engine": st.notes.iter().map(|n| n.value() as u128).sum::<u128>().to_string(),
-            "result": if diffs.is_empty() { "equal" } else if live_send && diffs.iter().all(|d| *d == "pending" || d.starts_with("api:")) { "live-only send event (parked/reclaimed on the live daemon; not a chain event)" } else { "MISMATCH" },
+            "result": if diffs.is_empty() { "equal" } else if diffs.iter().all(|d| *d == "clock(mid-page replay)" || d.starts_with("boundary ring(live shorter")) { "equal (expected differences only: mid-page clock, live ring shorter)" } else if live_send && diffs.iter().all(|d| matches!(*d, "pending" | "notes" | "clock(mid-page replay)") || d.starts_with("api:")) { "live-only send event (parked/reclaimed on the live daemon; not a chain event)" } else { "MISMATCH" },
             "diffs": diffs,
         })
     }
@@ -1225,6 +1249,34 @@ async fn engine_stats(State(host): HostState) -> Json<serde_json::Value> {
         "heap_chain": chain_heap, "heap_wallets": wallet_heap, "rss_kb": status_kb("VmRSS:"), "hwm_kb": status_kb("VmHWM:"), "cpu_s": cpu,
         "stats": h.stats, "engine": format!("{:?}", h.engine.stats()), "wallets": wallets,
     }))
+}
+
+/// Field-level history difference (tests and diagnostics): one entry per differing row,
+/// naming kinds and fields only (no txids, amounts, addresses or memos).
+#[cfg(test)]
+pub(crate) fn history_field_diff(eh: &[kaspa_shielded_core::walletdb::HistoryEntry], lh: &[kaspa_shielded_core::walletdb::HistoryEntry]) -> Vec<String> {
+    let mut fields: Vec<String> = Vec::new();
+    for (i, (a, b)) in eh.iter().zip(lh.iter()).enumerate() {
+        let mut f = Vec::new();
+        if format!("{:?}", a.kind) != format!("{:?}", b.kind) { f.push("kind"); }
+        if format!("{:?}", a.txid) != format!("{:?}", b.txid) { f.push("txid"); }
+        if format!("{:?}", a.daa_score) != format!("{:?}", b.daa_score) { f.push("daa"); }
+        if format!("{:?}", a.amount) != format!("{:?}", b.amount) { f.push("amount"); }
+        if format!("{:?}", a.fee) != format!("{:?}", b.fee) { f.push("fee"); }
+        if format!("{:?}", a.fee_known) != format!("{:?}", b.fee_known) { f.push("fee_known"); }
+        if format!("{:?}", a.amount_is_net_outflow) != format!("{:?}", b.amount_is_net_outflow) { f.push("net_outflow"); }
+        if format!("{:?}", a.recipient) != format!("{:?}", b.recipient) { f.push("recipient"); }
+        if format!("{:?}", a.memo) != format!("{:?}", b.memo) { f.push("memo"); }
+        if format!("{:?}", a.credits) != format!("{:?}", b.credits) { f.push("credits"); }
+        if f.is_empty() && format!("{a:?}") != format!("{b:?}") { f.push("other"); }
+        if !f.is_empty() {
+            fields.push(format!("row{i}/{}:{:?}/{:?}(a: net_out={} fee_known={} recipient={}; b: net_out={} fee_known={} recipient={}):{}", eh.len(), a.kind, b.kind, a.amount_is_net_outflow, a.fee_known, a.recipient.is_some(), b.amount_is_net_outflow, b.fee_known, b.recipient.is_some(), f.join("+")));
+        }
+    }
+    if eh.len() != lh.len() {
+        fields.push(format!("len {} vs {}", eh.len(), lh.len()));
+    }
+    fields
 }
 
 #[cfg(test)]
@@ -1670,6 +1722,7 @@ mod tests {
             }
             if format!("{:?}", db.history()) != format!("{:?}", w.history()) {
                 diffs.push("history");
+                println!("CATCHUP {id} {} history old-vs-engine: {:?}", log_pseudonym(&token).chars().take(8).collect::<String>(), history_field_diff(db.history(), w.history()));
             }
             if db.last_daa() != w.last_daa() {
                 diffs.push("clock");
@@ -1692,6 +1745,42 @@ mod tests {
         assert_eq!(ok, n);
     }
 
+
+    /// T3's comparison of a caught-up state with the wallet's current one. Send details
+    /// (`recover_sent_from_bundle`, fee/recipient of a `Sent` row) are filled in by the
+    /// daemon's maintenance pass AFTER a sync by fetching the transaction from the node, on
+    /// both the old path and the engine; they are not chain folds and are not journaled. A
+    /// caught-up replay therefore holds those rows unrecovered; take them from the current
+    /// state exactly as that pass would (same txid, `Sent`, recovered there) and count them.
+    /// Returns (differing fields, rows completed that way).
+    fn dormant_diff(notes: Vec<String>, pending: Vec<String>, history: &[kaspa_shielded_core::walletdb::HistoryEntry], clock: u64, now: &WalletLite) -> (Vec<String>, usize) {
+        let nk = |n: &OwnedNote| format!("{:?}", (n.position, n.value(), n.nullifier()));
+        let mut d = Vec::new();
+        if notes != now.notes().iter().map(nk).collect::<Vec<_>>() {
+            d.push(format!("notes {} vs now {}", notes.len(), now.notes().len()));
+        }
+        let np: Vec<String> = now.pending_spends().iter().map(|p| format!("{:?}{:?}", nk(&p.note), p.txid)).collect();
+        if pending != np {
+            d.push(format!("pending {} vs now {}", pending.len(), np.len()));
+        }
+        let mut h = history.to_vec();
+        let mut completed = 0;
+        for r in h.iter_mut() {
+            if r.kind == HistoryKind::Sent && !r.fee_known {
+                if let Some(x) = now.history().iter().find(|x| x.kind == HistoryKind::Sent && x.txid == r.txid && x.fee_known) {
+                    *r = x.clone();
+                    completed += 1;
+                }
+            }
+        }
+        if format!("{h:?}") != format!("{:?}", now.history()) {
+            d.push(format!("history {:?}", history_field_diff(&h, now.history())));
+        }
+        if clock != now.last_daa() {
+            d.push(format!("clock {} vs now {}", clock, now.last_daa()));
+        }
+        (d, completed)
+    }
     /// T3: dormant catch-up from the hit journal: each wallet's snapshot from `markS` (taken
     /// when the follower passed tip − S seconds) + the journal since must equal its current
     /// file; time-to-tip measured.
@@ -1703,6 +1792,8 @@ mod tests {
         let genesis = RpcHash::from_bytes(kaspa_consensus_core::config::params::MAINNET_PARAMS.genesis.hash.as_bytes());
         let store = ChainStore::open_readonly(Path::new(&store_dir), genesis.as_bytes()).expect("store");
         let marks: Vec<u64> = std::env::var("DORMANT_MARKS").unwrap_or_else(|_| "86400,604800,2592000".into()).split(',').filter_map(|v| v.parse().ok()).collect();
+        COINBASE_SEED_ACTIVATION_DAA.store(kaspa_consensus_core::config::params::MAINNET_PARAMS.shielded_coinbase_seed_activation.daa_score(), std::sync::atomic::Ordering::Relaxed);
+        let old_ids: Vec<String> = std::env::var("DORMANT_OLD").unwrap_or_default().split(',').filter(|v| !v.is_empty()).map(String::from).collect();
         let (mut ok, mut n) = (0, 0);
         for (id, token) in picks() {
             let name = hex16(&wallet_key16(&token));
@@ -1712,6 +1803,7 @@ mod tests {
             let fvk = fvk_of(&key).unwrap();
             let mut now = WalletLite::new(fvk.clone(), cs, ch.size, ch.seq, ch.key16);
             store.catch_up(&mut now, ch.journal_off).unwrap();
+            let nk = |n: &OwnedNote| (n.position, n.value(), n.nullifier());
             for m in &marks {
                 let Ok(b) = std::fs::read(store.wallet_path(&format!("{name}.mark{m}"))) else { continue };
                 n += 1;
@@ -1720,11 +1812,18 @@ mod tests {
                 let mut w = WalletLite::new(fvk.clone(), s, h.size, h.seq, h.key16);
                 let (folded, _) = store.catch_up(&mut w, h.journal_off).unwrap();
                 let ms = t.elapsed().as_secs_f64() * 1e3;
-                let nk = |n: &OwnedNote| (n.position, n.value(), n.nullifier());
-                let equal = w.notes().iter().map(nk).collect::<Vec<_>>() == now.notes().iter().map(nk).collect::<Vec<_>>()
-                    && format!("{:?}", w.history()) == format!("{:?}", now.history())
-                    && w.last_daa() == now.last_daa()
-                    && w.pending_spends().len() == now.pending_spends().len();
+                let snk = |n: &OwnedNote| format!("{:?}", nk(n));
+                let (diffs, completed) = dormant_diff(
+                    w.notes().iter().map(snk).collect(),
+                    w.pending_spends().iter().map(|p| format!("{:?}{:?}", snk(&p.note), p.txid)).collect(),
+                    w.history(),
+                    w.last_daa(),
+                    &now,
+                );
+                let equal = diffs.is_empty();
+                if !equal || completed > 0 {
+                    println!("DORMANT {id} idle={}d diffs={diffs:?} send_details_completed={completed}", m / 86400);
+                }
                 if equal {
                     ok += 1;
                 }
@@ -1734,9 +1833,184 @@ mod tests {
                     store.committed().seq - h.seq,
                     store.committed().journal_len - h.journal_off
                 );
+                // The old path for the same dormancy: the per-wallet `WalletDb` restored from the
+                // copy, brought (untimed) to the mark, then timed from the mark to the store's
+                // end over the stored blocks (decode and RPC excluded: shared by both shapes).
+                if old_ids.iter().any(|x| x == &id) {
+                    let Ok(t0b) = std::fs::read(store.wallet_path(&format!("{name}.t0"))) else { continue };
+                    let (h0, _) = decode_w2(&t0b).unwrap();
+                    if h0.seq > h.seq {
+                        println!("DORMANT-OLD {id} idle={}d: migrated after the mark", m / 86400);
+                        continue;
+                    }
+                    let buf = std::fs::read(scan_path(&dir, &token)).unwrap();
+                    let (_, (mut db, _, _, _, _, _)) = parse_scan_bytes(&buf, key.clone(), None, None).expect("restore");
+                    drop(buf);
+                    let feed = |db: &mut WalletDb, from: u64, to: u64| -> usize {
+                        let mut seq = from;
+                        let mut actions = 0;
+                        while seq <= to {
+                            let hi = (seq + 999).min(to);
+                            let page = store.blocks(seq, hi).unwrap();
+                            let acts: Vec<CompactActionRecord> = page.iter().flat_map(|b| b.txs.iter().flatten().copied()).collect();
+                            actions += acts.len();
+                            db.predecrypt_page(&acts);
+                            for b in &page {
+                                db.ingest_block_compact_precomputed_with_meta(&b.coinbase, &b.txs, b.meta.as_ref());
+                            }
+                            db.end_page();
+                            seq = hi + 1;
+                        }
+                        actions
+                    };
+                    feed(&mut db, h0.seq + 1, h.seq);
+                    let t = std::time::Instant::now();
+                    let actions = feed(&mut db, h.seq + 1, store.committed().seq);
+                    let old_ms = t.elapsed().as_secs_f64() * 1e3;
+                    let snk = |n: &OwnedNote| format!("{:?}", nk(n));
+                    let (odiffs, ocompleted) = dormant_diff(
+                        db.notes().iter().map(snk).collect(),
+                        db.pending_spends().iter().map(|p| format!("{:?}{:?}", snk(&p.note), p.txid)).collect(),
+                        db.history(),
+                        db.last_daa(),
+                        &now,
+                    );
+                    let same = odiffs.is_empty();
+                    if !same || ocompleted > 0 {
+                        println!("DORMANT-OLD {id} idle={}d diffs={odiffs:?} send_details_completed={ocompleted}", m / 86400);
+                    }
+                    println!(
+                        "DORMANT-OLD {id} idle={}d blocks={} actions={actions} old_ingest={old_ms:.0}ms old_heap={:.0}MB equal_to_engine={same}",
+                        m / 86400,
+                        store.committed().seq - h.seq,
+                        db.approx_heap_bytes() as f64 / 1048576.0
+                    );
+                }
             }
         }
         println!("DORMANT SUMMARY {ok}/{n} equal");
         assert_eq!(ok, n);
+    }
+}
+
+#[cfg(test)]
+mod diag_tests {
+    use super::*;
+
+    /// Diagnose the live comparison, verbosely, for every pick: the live checkpoint NOW
+    /// (private sections only) against the engine's state at exactly its cursor (migrated
+    /// state + journal), field by field. Prints pick ids, counts and field names; no txids,
+    /// addresses or tokens. Opens the store read-only (the shadow may be writing it).
+    #[test]
+    #[ignore = "CATCHUP_STORE, MIGRATE_DIR, MIGRATE_PICKS, CMP_LIVE"]
+    fn diagnose_live_compare() {
+        let dir = std::env::var("MIGRATE_DIR").expect("MIGRATE_DIR");
+        let live = std::env::var("CMP_LIVE").expect("CMP_LIVE");
+        let store_dir = std::env::var("CATCHUP_STORE").expect("CATCHUP_STORE");
+        let genesis = RpcHash::from_bytes(kaspa_consensus_core::config::params::MAINNET_PARAMS.genesis.hash.as_bytes());
+        let store = ChainStore::open_readonly(Path::new(&store_dir), genesis.as_bytes()).expect("store");
+        let idx = store.idx_all().unwrap();
+        let daa_of: Vec<u64> = idx.iter().map(|e| e.daa).collect();
+        let journal = store.journal_from(0).unwrap();
+        let picks: Vec<(String, String)> = std::fs::read_to_string(std::env::var("MIGRATE_PICKS").unwrap())
+            .unwrap()
+            .lines()
+            .filter_map(|l| l.split_once('\t'))
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .collect();
+        for (id, token) in picks {
+            let pseud: String = log_pseudonym(&token).chars().take(10).collect();
+            let name = hex16(&wallet_key16(&token));
+            let Ok(t0b) = std::fs::read(store.wallet_path(&format!("{name}.t0"))) else { continue };
+            let (h0, s0) = decode_w2(&t0b).unwrap();
+            let Ok(sp) = read_scan_private(Path::new(&scan_path(&live, &token))) else {
+                println!("DIAG {id} {pseud} live unreadable");
+                continue;
+            };
+            let Some(seq) = daa_of.binary_search(&sp.scanned).ok().map(|i| i as u64 + 1).filter(|s| idx[(*s - 1) as usize].hash == sp.low.as_bytes()) else {
+                println!("DIAG {id} {pseud} live cursor not in the store (daa {})", sp.scanned);
+                continue;
+            };
+            if seq < h0.seq {
+                println!("DIAG {id} {pseud} live cursor before migration");
+                continue;
+            }
+            let (key, _, _) = load_wallet_meta(&dir, &token, None).expect("key");
+            let mut w = WalletLite::new(fvk_of(&key).unwrap(), s0, h0.size, h0.seq, h0.key16);
+            // Clock records around the cursor.
+            let (mut last_clock_le, mut next_clock_gt) = (None, None);
+            for (_, s, k, rec) in &journal {
+                if *s <= h0.seq || (k.is_some() && *k != Some(h0.key16)) {
+                    continue;
+                }
+                if let kaspa_shielded_core::engine::FoldRecord::Clock { daa } = rec {
+                    if *s <= seq {
+                        last_clock_le = Some((*s, *daa));
+                    } else if next_clock_gt.is_none() {
+                        next_clock_gt = Some((*s, *daa));
+                    }
+                }
+                if *s <= seq {
+                    w.fold(rec);
+                }
+            }
+            let mut out = Vec::new();
+            if w.last_daa() != sp.p.last_daa {
+                out.push(format!(
+                    "clock engine={} live={} cursor_daa={} last_clock<=cursor={:?} next_clock={:?} (seq {seq})",
+                    w.last_daa(),
+                    sp.p.last_daa,
+                    sp.scanned,
+                    last_clock_le.map(|c| (seq - c.0, c.1)),
+                    next_clock_gt.map(|c| (c.0 - seq, c.1))
+                ));
+            }
+            let from = seq.saturating_sub(MATURED_RING as u64 - 1).max(1);
+            let ring: VecDeque<(u64, u64)> = (from..=seq).map(|s| (idx[(s - 1) as usize].blue, idx[(s - 1) as usize].size_after)).collect();
+            if ring != sp.boundaries {
+                let first_diff = ring.iter().rev().zip(sp.boundaries.iter().rev()).position(|(a, b)| a != b);
+                let live_set: HashSet<(u64, u64)> = sp.boundaries.iter().copied().collect();
+                let eng_set: HashSet<(u64, u64)> = ring.iter().copied().collect();
+                out.push(format!(
+                    "ring engine_len={} live_len={} newest_equal={} first_diff_from_newest={first_diff:?} live_not_in_engine={} engine_not_in_live={} live_blue_span={:?} engine_blue_span={:?}",
+                    ring.len(),
+                    sp.boundaries.len(),
+                    ring.back() == sp.boundaries.back(),
+                    live_set.difference(&eng_set).count(),
+                    eng_set.difference(&live_set).count(),
+                    (sp.boundaries.front().map(|b| b.0), sp.boundaries.back().map(|b| b.0)),
+                    (ring.front().map(|b| b.0), ring.back().map(|b| b.0)),
+                ));
+            }
+            let (eh, lh) = (w.history(), &sp.p.history);
+            if format!("{eh:?}") != format!("{lh:?}") {
+                let mut fields: Vec<String> = Vec::new();
+                for (i, (a, b)) in eh.iter().zip(lh.iter()).enumerate() {
+                    let mut f = Vec::new();
+                    if format!("{:?}", a.kind) != format!("{:?}", b.kind) { f.push("kind"); }
+                    if format!("{:?}", a.txid) != format!("{:?}", b.txid) { f.push("txid"); }
+                    if format!("{:?}", a.daa_score) != format!("{:?}", b.daa_score) { f.push("daa"); }
+                    if format!("{:?}", a.amount) != format!("{:?}", b.amount) { f.push("amount"); }
+                    if format!("{:?}", a.fee) != format!("{:?}", b.fee) { f.push("fee"); }
+                    if format!("{:?}", a.fee_known) != format!("{:?}", b.fee_known) { f.push("fee_known"); }
+                    if format!("{:?}", a.amount_is_net_outflow) != format!("{:?}", b.amount_is_net_outflow) { f.push("net_outflow"); }
+                    if format!("{:?}", a.recipient) != format!("{:?}", b.recipient) { f.push("recipient"); }
+                    if format!("{:?}", a.memo) != format!("{:?}", b.memo) { f.push("memo"); }
+                    if format!("{:?}", a.credits) != format!("{:?}", b.credits) { f.push("credits"); }
+                    if !f.is_empty() {
+                        fields.push(format!("row{i}:{:?}/{:?}(engine net_out={} fee_known={}; live net_out={} fee_known={} recipient={}):{}", a.kind, b.kind, a.amount_is_net_outflow, a.fee_known, b.amount_is_net_outflow, b.fee_known, b.recipient.is_some(), f.join("+")));
+                    }
+                }
+                out.push(format!("history engine_rows={} live_rows={} differing={:?}", eh.len(), lh.len(), fields));
+            }
+            let nk = |n: &OwnedNote| (n.position, n.value(), n.nullifier());
+            if w.notes().iter().map(nk).ne(sp.p.notes.iter().map(nk)) {
+                out.push(format!("notes engine={} live={}", w.notes().len(), sp.p.notes.len()));
+            }
+            if w.pending_spends().len() != sp.p.pending.len() {
+                out.push(format!("pending engine={} live={}", w.pending_spends().len(), sp.p.pending.len()));
+            }
+            println!("DIAG {id} {pseud} seq={seq} migrated_at={} {}", h0.seq, if out.is_empty() { "EQUAL".to_string() } else { out.join(" | ") });
+        }
     }
 }
