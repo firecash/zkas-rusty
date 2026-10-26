@@ -2183,6 +2183,9 @@ struct CheckpointParts {
     head: Vec<u8>,
     db_blob: Vec<u8>,
     tail: Vec<u8>,
+    /// The viewing key whose wallet these bytes describe. Not written to the file; it
+    /// lets [`write_checkpoint_bytes`] refuse a write for a key the token has left.
+    fvk: [u8; FVK_LEN],
 }
 
 impl CheckpointParts {
@@ -2231,7 +2234,48 @@ fn checkpoint_bytes(
     }
     tail.extend_from_slice(&sink_blue.to_le_bytes());
     tail.extend_from_slice(&blind_below.to_le_bytes());
-    CheckpointParts { head, db_blob, tail }
+    CheckpointParts { head, db_blob, tail, fvk: db.fvk().to_bytes() }
+}
+
+/// The viewing key each RE-KEYED token's checkpoint belongs to, by scan path.
+///
+/// Re-registering a token under a different key deletes its old checkpoint, but a
+/// writer already holding the old wallet (the eviction sweep, the sync loop's off-lock
+/// write, `/api/checkpoint`) could finish after that delete and put the old key's
+/// checkpoint back, which the next load restored under the new key
+/// (ZKAS-WALLETD-2026-001). [`rekey_checkpoint`] updates this map and deletes under
+/// this lock, and [`write_checkpoint_bytes`] checks it and renames under the same
+/// lock, so an old writer either lands before the delete (and is deleted) or is
+/// refused. Only tokens re-keyed since startup are listed: after a restart no old
+/// writer exists.
+static CHECKPOINT_OWNERS: std::sync::LazyLock<std::sync::Mutex<HashMap<String, [u8; FVK_LEN]>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Hand `token`'s checkpoint to viewing key `fvk`: delete the old file and refuse
+/// every later write of it by any other key. See [`CHECKPOINT_OWNERS`].
+fn rekey_checkpoint(dir: &str, token: &str, fvk: &[u8; FVK_LEN]) {
+    let path = scan_path(dir, token);
+    let mut owners = CHECKPOINT_OWNERS.lock().unwrap_or_else(|p| p.into_inner());
+    owners.insert(path.clone(), *fvk);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Put a file at `token`'s `.scan` (`place` renames, links or copies onto the path it is
+/// given) only while `fvk` still owns that checkpoint. Every way a file reaches that name
+/// goes through here, so none can bring a re-keyed token's old checkpoint back. See
+/// [`CHECKPOINT_OWNERS`].
+fn place_checkpoint<T>(
+    dir: &str,
+    token: &str,
+    fvk: &[u8; FVK_LEN],
+    place: impl FnOnce(&str) -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    let path = scan_path(dir, token);
+    let owners = CHECKPOINT_OWNERS.lock().unwrap_or_else(|p| p.into_inner());
+    if owners.get(&path).is_some_and(|owner| owner != fvk) {
+        return Err(std::io::Error::other("token was re-registered under another viewing key; not placing the old key's checkpoint"));
+    }
+    place(&path)
 }
 
 /// Write a serialised checkpoint (from [`checkpoint_bytes`]) atomically: tmp + rename.
@@ -2274,7 +2318,7 @@ fn write_checkpoint_bytes(dir: &str, token: &str, parts: &CheckpointParts) -> st
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
     }
-    std::fs::rename(&tmp, &path).inspect_err(|_| {
+    place_checkpoint(dir, token, &parts.fvk, |to| std::fs::rename(&tmp, to)).inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
     })
 }
@@ -2440,6 +2484,9 @@ fn retire_quarantine_copies(dir: &str, token: &str) {
         }
     }
     let _ = std::fs::remove_file(receipt_mark_path(dir, token));
+    // An interrupted twin adoption's set-aside copy is the old key's too; the next load
+    // would otherwise put it back at `.scan`.
+    let _ = std::fs::remove_file(format!("{}.own", scan_path(dir, token)));
 }
 
 /// Marker that `token`'s scan state was adopted from a scan receipt rather than built from
@@ -2526,6 +2573,15 @@ fn load_checkpoint_why(
     let (saved_genesis, rest) = parse_scan_bytes_why(&buf, key, tip, leaf_dir, &mut why).ok_or(why)?;
     if saved_genesis != *current_genesis {
         return Err(CheckpointReject::Malformed); // chain relaunched → rescan
+    }
+    // A checkpoint carries no key, so bind it here, as `restore_quarantined` does: notes
+    // this key does not derive are another wallet's (ZKAS-WALLETD-2026-001). Refuse only,
+    // never delete: `best_twin_scanned` peeks other tokens' files under THIS key from an
+    // index that can be stale, so a mismatch is not proof the file is wrong for ITS token.
+    // Every consumer loads through this check, twin adoption included.
+    if rest.0.notes_bound_to_key(8) == Some(false) {
+        log::warn!("wallet {}: checkpoint holds notes not derived under the loading key; refusing it", log_pseudonym(token));
+        return Err(CheckpointReject::Malformed);
     }
     Ok(rest)
 }
@@ -2782,10 +2838,8 @@ fn adopt_twin_checkpoint(
     // or a filesystem without hardlinks. `hard_link` also fails if the destination
     // exists, which is correct here: adoption is for a token with no checkpoint yet,
     // and clobbering an existing one would be a bug either way.
-    let (from, to) = (scan_path(dir, &donor), scan_path(dir, token));
-    if std::fs::hard_link(&from, &to).is_err() {
-        std::fs::copy(&from, &to).ok()?;
-    }
+    let from = scan_path(dir, &donor);
+    place_checkpoint(dir, token, fvk, |to| std::fs::hard_link(&from, to).or_else(|_| std::fs::copy(&from, to).map(|_| ()))).ok()?;
     Some((donor, if birthday == 0 { donor_birthday } else { donor_birthday.min(birthday) }))
 }
 
@@ -7031,9 +7085,14 @@ impl AppState {
         let live = scan_path(&self.wallet_dir, token);
         // Copy first, swap last: a failed copy must not leave the token with no `.scan`.
         let tmp = format!("{live}.tmp");
+        let fvk = key.fvk_bytes()?;
         std::fs::copy(&path, &tmp).ok()?;
         let _ = std::fs::rename(&live, format!("{live}.replaced-{}", now_unix()));
-        std::fs::rename(&tmp, &live).ok()?;
+        place_checkpoint(&self.wallet_dir, token, &fvk, |to| std::fs::rename(&tmp, to))
+            .inspect_err(|_| {
+                let _ = std::fs::remove_file(&tmp);
+            })
+            .ok()?;
         // Consumed: a copy is restored at most once. If the sync loop then finds this cursor
         // unusable on a node that has reached it (retired to `.bak`), the next reload must
         // not bring the same copy back and start that cycle over; a later false quarantine
@@ -7206,7 +7265,11 @@ impl AppState {
         {
             let own_scan = scan_path(&self.wallet_dir, token);
             let own_aside = format!("{own_scan}.own");
-            if !std::path::Path::new(&own_scan).exists() && std::fs::rename(&own_aside, &own_scan).is_ok() {
+            if !std::path::Path::new(&own_scan).exists()
+                && key.fvk_bytes().is_some_and(|fvk| {
+                    place_checkpoint(&self.wallet_dir, token, &fvk, |to| std::fs::rename(&own_aside, to)).is_ok()
+                })
+            {
                 log::warn!("wallet {token_p}: restored its own checkpoint set aside by an interrupted twin adoption", token_p = log_pseudonym(&token));
             }
         }
@@ -7478,7 +7541,7 @@ impl AppState {
                 let put_back = || {
                     if set_aside {
                         // Over whatever the adoption left at the name (a rejected copy, or nothing).
-                        if let Err(e) = std::fs::rename(&own_aside, &own_scan) {
+                        if let Err(e) = place_checkpoint(&self.wallet_dir, token, &fvk, |to| std::fs::rename(&own_aside, to)) {
                             log::warn!("wallet {token_p}: could not restore its own checkpoint after a declined twin ({e})", token_p = log_pseudonym(&token));
                         }
                     }
@@ -9515,7 +9578,12 @@ async fn load_new_wallet(
     // Drop any prior scan checkpoint: a (re)imported seed must rescan from its own
     // birthday, not resume a different wallet's stream. That includes quarantined copies,
     // which `restore_quarantined` would otherwise bring back on the next load.
-    let _ = std::fs::remove_file(scan_path(&state.wallet_dir, token));
+    match key.fvk_bytes() {
+        Some(fvk) => rekey_checkpoint(&state.wallet_dir, token, &fvk),
+        None => {
+            let _ = std::fs::remove_file(scan_path(&state.wallet_dir, token));
+        }
+    }
     retire_quarantine_copies(&state.wallet_dir, token);
     // Same-wallet-on-another-device fast path (see wallet_watch): a re-imported seed
     // whose viewing key some other token already scanned resumes from that
@@ -9705,7 +9773,7 @@ async fn wallet_watch(
     // have one restored from a quarantined copy on the next load. The same key
     // re-registering while its own checkpoint sits in quarantine keeps those copies:
     // that is the case `restore_quarantined` exists for.
-    let _ = std::fs::remove_file(scan_path(&state.wallet_dir, &token));
+    rekey_checkpoint(&state.wallet_dir, &token, &fvk);
     if !same_key {
         retire_quarantine_copies(&state.wallet_dir, &token);
     }
@@ -14493,6 +14561,138 @@ mod fvk_index_fallback_tests {
         assert!(fvk_index_fallback_slot(&ready, &slot).is_some());
         ready.store(true, Ordering::Release);
         assert!(fvk_index_fallback_slot(&ready, &slot).is_none(), "once ready, a missing key is a new key: no directory pass");
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_key_binding_tests {
+    //! ZKAS-WALLETD-2026-001: a token re-registered under a new viewing key must never
+    //! end up serving the old key's checkpoint, whether a stale writer puts it back or
+    //! the file is already on disk.
+    use super::*;
+
+    fn fixture(name: &str) -> (String, RpcHash, RpcHash, [u8; FVK_LEN], [u8; FVK_LEN], WalletDb) {
+        let dir = std::env::temp_dir().join(format!("ckpt-bind-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fvk_a = WalletDb::from_seed([11u8; 32]).unwrap().fvk().to_bytes();
+        let fvk_b = WalletDb::from_seed([22u8; 32]).unwrap().fvk().to_bytes();
+        let mut db_a = WalletDb::from_fvk(&fvk_a).unwrap();
+        let desc = derive_coinbase_note_desc(db_a.my_address_bytes(), b"ckpt-bind");
+        db_a.ingest_block(&[(desc, 5_000_000)], &[]);
+        (dir.to_string_lossy().into_owned(), RpcHash::from_bytes([0x42u8; 32]), RpcHash::from_bytes([0x43u8; 32]), fvk_a, fvk_b, db_a)
+    }
+
+    fn save(dir: &str, token: &str, genesis: &RpcHash, low: &RpcHash, db: &WalletDb) -> std::io::Result<()> {
+        save_checkpoint(dir, token, genesis, low, 1000, db, &VecDeque::new(), &HashMap::new(), 0, 0)
+    }
+
+    #[test]
+    fn stale_writer_cannot_resurrect_after_rekey() {
+        let (dir, genesis, low, fvk_a, fvk_b, db_a) = fixture("stale");
+        save(&dir, "t", &genesis, &low, &db_a).unwrap();
+        // The sync loop serialised A's bytes under the lock and is about to write them off it.
+        let in_flight = checkpoint_bytes(0, &genesis, &low, 1300, &db_a, &VecDeque::new(), 0, 0);
+        // ...and an interrupted twin adoption left A's file set aside at `.scan.own`.
+        std::fs::copy(scan_path(&dir, "t"), format!("{}.own", scan_path(&dir, "t"))).unwrap();
+
+        // The token is re-registered under B (what `wallet_watch` does on a changed key).
+        rekey_checkpoint(&dir, "t", &fvk_b);
+        // A load of the old key still in flight puts its set-aside copy back, before the
+        // handler's `retire_quarantine_copies` gets to it.
+        assert!(
+            place_checkpoint(&dir, "t", &fvk_a, |to| std::fs::rename(format!("{}.own", scan_path(&dir, "t")), to)).is_err(),
+            "old key's set-aside copy must not be put back"
+        );
+        retire_quarantine_copies(&dir, "t");
+        save_fvk(&dir, "t", "mainnet", &fvk_b, 0, true).unwrap();
+        assert!(!std::path::Path::new(&scan_path(&dir, "t")).exists());
+
+        // Both old writers finish late: the eviction sweep's save, the sync loop's write.
+        assert!(save(&dir, "t", &genesis, &low, &db_a).is_err(), "eviction flush of the old key must be refused");
+        assert!(write_checkpoint_bytes(&dir, "t", &in_flight).is_err(), "off-lock write of the old key must be refused");
+        assert!(!std::path::Path::new(&scan_path(&dir, "t")).exists(), "old key's checkpoint resurrected");
+        assert!(!std::path::Path::new(&format!("{}.own", scan_path(&dir, "t"))).exists(), "old key's set-aside copy survives the re-key");
+        assert!(load_checkpoint(&dir, "t", WalletKey::Fvk(fvk_b), &genesis, None).is_none());
+
+        // The new key's own writes are untouched.
+        let db_b = WalletDb::from_fvk(&fvk_b).unwrap();
+        save(&dir, "t", &genesis, &low, &db_b).unwrap();
+        assert!(load_checkpoint(&dir, "t", WalletKey::Fvk(fvk_b), &genesis, None).is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rekey_to_the_same_key_keeps_its_writers() {
+        // Re-importing the same seed / re-registering the same key must not lock it out.
+        let (dir, genesis, low, fvk_a, _, db_a) = fixture("same");
+        // Its own set-aside copy from an interrupted twin adoption is still its own.
+        save(&dir, "aside", &genesis, &low, &db_a).unwrap();
+        std::fs::rename(scan_path(&dir, "aside"), format!("{}.own", scan_path(&dir, "t"))).unwrap();
+        rekey_checkpoint(&dir, "t", &fvk_a);
+        assert!(std::path::Path::new(&format!("{}.own", scan_path(&dir, "t"))).exists(), "same-key rekey keeps its own copy");
+        place_checkpoint(&dir, "t", &fvk_a, |to| std::fs::rename(format!("{}.own", scan_path(&dir, "t")), to)).unwrap();
+        save(&dir, "t", &genesis, &low, &db_a).unwrap();
+        let (db, ..) = load_checkpoint(&dir, "t", WalletKey::Fvk(fvk_a), &genesis, None).expect("own checkpoint loads");
+        assert_eq!(db.balance(), 5_000_000);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn foreign_checkpoint_is_refused_on_load() {
+        let (dir, genesis, low, fvk_a, fvk_b, db_a) = fixture("load");
+        // A's checkpoint already on disk under a token whose wallet file now says B.
+        save(&dir, "t", &genesis, &low, &db_a).unwrap();
+        save_fvk(&dir, "t", "mainnet", &fvk_b, 0, true).unwrap();
+        assert!(load_checkpoint(&dir, "t", WalletKey::Fvk(fvk_b), &genesis, None).is_none(), "B must not load A's notes");
+        assert!(load_checkpoint(&dir, "t", WalletKey::Fvk(fvk_b), &genesis, None).is_none(), "... on every load");
+
+        // Control: the same blob still loads under the key that wrote it.
+        save(&dir, "own", &genesis, &low, &db_a).unwrap();
+        let (db, ..) = load_checkpoint(&dir, "own", WalletKey::Fvk(fvk_a), &genesis, None).expect("own key loads");
+        assert_eq!(db.balance(), 5_000_000);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_wrong_key_peek_leaves_the_file_alone() {
+        // `best_twin_scanned` peeks twins under the caller's key from an index that can be
+        // stale (the twin re-keyed since). That peek must not destroy the twin's own file.
+        let (dir, genesis, low, fvk_a, fvk_b, db_a) = fixture("peek");
+        save_fvk(&dir, "twin", "mainnet", &fvk_a, 0, true).unwrap();
+        save(&dir, "twin", &genesis, &low, &db_a).unwrap();
+        assert!(load_checkpoint(&dir, "twin", WalletKey::Fvk(fvk_b), &genesis, None).is_none());
+        let (db, ..) = load_checkpoint(&dir, "twin", WalletKey::Fvk(fvk_a), &genesis, None).expect("the twin's own checkpoint survives");
+        assert_eq!(db.balance(), 5_000_000);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_old_key_twin_adoption_cannot_place_after_rekey() {
+        // A load of the old key, in flight across the re-key, adopts an old-key twin.
+        let (dir, genesis, low, fvk_a, fvk_b, db_a) = fixture("adopt");
+        save_fvk(&dir, "donor", "mainnet", &fvk_a, 0, true).unwrap();
+        save(&dir, "donor", &genesis, &low, &db_a).unwrap();
+        rekey_checkpoint(&dir, "t", &fvk_b);
+        let candidates = vec!["donor".to_string()];
+        assert!(adopt_twin_checkpoint(&dir, "t", &fvk_a, 0, true, &genesis, None, &candidates).is_none());
+        assert!(!std::path::Path::new(&scan_path(&dir, "t")).exists(), "old key's twin placed after the re-key");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn twin_adoption_cannot_spread_a_foreign_checkpoint() {
+        let (dir, genesis, low, _, fvk_b, db_a) = fixture("twin");
+        // Donor token: wallet file B, checkpoint A (the state the race used to leave).
+        save_fvk(&dir, "donor", "mainnet", &fvk_b, 0, true).unwrap();
+        save(&dir, "donor", &genesis, &low, &db_a).unwrap();
+        // A second token registers B and adopts the donor's file.
+        save_fvk(&dir, "twin", "mainnet", &fvk_b, 0, true).unwrap();
+        let candidates = vec!["donor".to_string()];
+        adopt_twin_checkpoint(&dir, "twin", &fvk_b, 0, true, &genesis, None, &candidates).expect("twin adopts the donor's file");
+        assert!(load_checkpoint(&dir, "twin", WalletKey::Fvk(fvk_b), &genesis, None).is_none(), "holder of only B must not see A's notes");
+        assert!(load_checkpoint(&dir, "donor", WalletKey::Fvk(fvk_b), &genesis, None).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
