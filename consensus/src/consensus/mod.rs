@@ -1757,9 +1757,6 @@ impl ConsensusApi for Consensus {
         // records to satisfy a requester's anti-drip floor; `HISTORY_CHUNK_MAX_BYTES` is the
         // backstop that holds even if single records are huge. Stopping early is not an error:
         // `index > 0` keeps `done` false and the requester re-anchors at the lowest record it got.
-        const HISTORY_CHUNK_SOFT_BYTES: usize = 16 * 1024 * 1024;
-        const HISTORY_CHUNK_MAX_BYTES: usize = 128 * 1024 * 1024;
-        const HISTORY_CHUNK_MIN_RECORDS: usize = 1_000;
         let record_bytes = |d: &kaspa_consensus_core::api::ShieldedChainBlockData| -> usize {
             d.accepted_actions.iter().map(|a| a.len().saturating_add(8)).sum::<usize>()
                 + d.coinbase_outputs.iter().map(|(script, _)| script.len().saturating_add(16)).sum::<usize>()
@@ -1781,8 +1778,7 @@ impl ConsensusApi for Consensus {
         let mut index = anchor_index;
         while out.len() <= max_blocks
             && index > 0
-            && !(bytes >= HISTORY_CHUNK_SOFT_BYTES && out.len() >= HISTORY_CHUNK_MIN_RECORDS)
-            && bytes < HISTORY_CHUNK_MAX_BYTES
+            && history_chunk_has_room(bytes, out.len())
         {
             index -= 1;
             let Some(hash) = sc_read.get_by_index(index).optional().unwrap() else { break };
@@ -3248,5 +3244,64 @@ mod tests {
             }
             other => panic!("expected a downstream ShieldedStateError, got {other:?}"),
         }
+    }
+}
+
+/// Normal stop for a shielded-history chunk, taken once it also holds
+/// [`HISTORY_CHUNK_MIN_RECORDS`] records (a requester's anti-drip floor in records).
+pub const HISTORY_CHUNK_SOFT_BYTES: usize = 16 * 1024 * 1024;
+
+/// Backstop for a shielded-history chunk, whatever its record count. Checked BEFORE each record is
+/// added, so a chunk ends at most one record above it: with records of at most 8 MiB the whole
+/// `ShieldedHistoryChunk` message stays at or below ~32 MiB. It used to be 128 MiB, which made this
+/// the largest message a node sent after the legacy pruning proof. A chunk that stops here holds at
+/// least 24 MiB, above the requester's 8 MiB byte floor, so it is never refused as a drip feed.
+pub const HISTORY_CHUNK_MAX_BYTES: usize = 24 * 1024 * 1024;
+
+/// Records a chunk must hold before the soft byte stop applies.
+pub const HISTORY_CHUNK_MIN_RECORDS: usize = 1_000;
+
+/// Whether a shielded-history chunk that already holds `records` records of `bytes` estimated
+/// bytes may take one more record.
+pub fn history_chunk_has_room(bytes: usize, records: usize) -> bool {
+    !(bytes >= HISTORY_CHUNK_SOFT_BYTES && records >= HISTORY_CHUNK_MIN_RECORDS) && bytes < HISTORY_CHUNK_MAX_BYTES
+}
+
+#[cfg(test)]
+mod history_chunk_budget_tests {
+    use super::*;
+
+    /// Fills a chunk the way `get_shielded_history_indexed_below` does and returns its bytes and records.
+    fn fill(record: impl Fn(usize) -> usize, max_blocks: usize) -> (usize, usize) {
+        let (mut bytes, mut records) = (record(0), 1); // the anchor record goes in unconditionally
+        while records <= max_blocks && history_chunk_has_room(bytes, records) {
+            bytes += record(records);
+            records += 1;
+        }
+        (bytes, records)
+    }
+
+    #[test]
+    fn a_history_chunk_ends_within_one_record_of_the_24_mib_backstop() {
+        const MIB: usize = 1024 * 1024;
+        // Light records: the block count ends the chunk long before any byte budget.
+        assert_eq!(fill(|_| 2_000, 4_000), (4_001 * 2_000, 4_001));
+        // Medium records past 1,000: the 16 MiB soft stop.
+        let (bytes, records) = fill(|_| 20_000, 4_000);
+        assert_eq!((bytes, records), (1_000 * 20_000, 1_000), "16 MiB passed at 839 records; the stop waits for the 1,000-record floor");
+        assert!(bytes >= HISTORY_CHUNK_SOFT_BYTES && bytes < HISTORY_CHUNK_MAX_BYTES);
+        // Heavy records, fewer than 1,000 fit 16 MiB: the 24 MiB backstop, overshooting by one record at most.
+        for record in [64 * 1024, MIB, 3 * MIB, 8 * MIB] {
+            let (bytes, records) = fill(|_| record, 4_000);
+            assert!(records < 1_000);
+            assert!(bytes >= HISTORY_CHUNK_MAX_BYTES, "{record}: {bytes}");
+            assert!(bytes < HISTORY_CHUNK_MAX_BYTES + record, "{record}: {bytes}");
+            assert!(bytes <= 32 * MIB, "records of at most 8 MiB keep a chunk at or below 32 MiB: {bytes}");
+            // A chunk stopped by bytes always clears the requester's 8 MiB anti-drip floor.
+            assert!(bytes >= 8 * MIB);
+        }
+        // The old backstop let one chunk reach 128 MiB; the new one cannot pass 24 MiB + one record.
+        let (bytes, _) = fill(|_| 100 * 1024, 4_000);
+        assert!(bytes < 25 * MIB, "{bytes}");
     }
 }

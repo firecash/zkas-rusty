@@ -106,10 +106,13 @@ const MAX_HISTORY_CHUNK_RECORDS: usize = 8_000;
 /// record dominate memory.
 const MAX_HISTORY_RECORD_BYTES: usize = 32 * 1024 * 1024;
 
-/// One history chunk's serialized records in total, checked before any is decoded. Kept under the
-/// p2p transport cap (`P2P_MAX_MESSAGE_SIZE`, 256 MB) with room for protobuf framing, so an
-/// oversized chunk fails with this protocol error rather than as an opaque transport decode error.
-const MAX_HISTORY_CHUNK_BYTES: usize = 192 * 1024 * 1024;
+/// One history chunk's serialized records in total, checked before any is decoded. A server of
+/// this version stops a chunk at 24 MiB plus one record (`HISTORY_CHUNK_MAX_BYTES` in consensus),
+/// and one record is at most [`MAX_HISTORY_RECORD_BYTES`], so an honest chunk is below the sum.
+/// Older servers had a 128 MiB backstop; a chunk of theirs above this ceiling needs records that
+/// average over ~56 KB (fewer than 1,000 of them), and refusing it only moves the backfill to
+/// another peer.
+const MAX_HISTORY_CHUNK_BYTES: usize = 24 * 1024 * 1024 + MAX_HISTORY_RECORD_BYTES;
 
 /// A chunk that is not the last may be short in RECORDS if it is long in BYTES: a server that
 /// stopped on its own byte budget is doing the right thing, and refusing it as a drip feed would

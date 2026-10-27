@@ -311,6 +311,7 @@ message PruningPointProofChunkMessage {
   uint32 level = 2;                 // the level all `headers` belong to; never decreases
   repeated BlockHeader headers = 3; // in level order, continuing the previous chunk of this level
   bool done = 4;                    // set on the final chunk only
+  uint32 seq = 5;                   // 0 for the first chunk, +1 for each next one
 }
 
 message RequestNextPruningPointProofChunkMessage {

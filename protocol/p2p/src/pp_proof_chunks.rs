@@ -13,6 +13,8 @@
 //!   proof has empty upper levels only when the chain is young, but the legacy form allowed them);
 //! * every chunk repeats `levelCount`, the number of levels of the whole proof (consensus requires
 //!   exactly `max_block_level + 1`; the receiver refuses more before allocating anything);
+//! * `seq` numbers the chunks 0, 1, 2, ... in sending order; the receiver refuses any other value,
+//!   so a duplicated, replayed, skipped or reordered chunk is refused at the P2P layer;
 //! * only the final chunk has `done`, and only the final chunk may be empty (a proof with no
 //!   headers at all, which consensus then rejects, is one empty `done` chunk);
 //! * flow control: after every [`PP_PROOF_CHUNK_WINDOW`]-th chunk that is not `done`, the receiver
@@ -88,6 +90,7 @@ pub struct ProofChunker {
     max_headers: usize,
     level: usize,
     index: usize,
+    seq: u32,
     finished: bool,
 }
 
@@ -98,7 +101,7 @@ impl ProofChunker {
 
     pub fn with_limits(proof: Arc<PruningPointProof>, header_format: HeaderFormat, target_bytes: usize, max_headers: usize) -> Self {
         let mut chunker =
-            Self { proof, header_format, target_bytes, max_headers: max_headers.max(1), level: 0, index: 0, finished: false };
+            Self { proof, header_format, target_bytes, max_headers: max_headers.max(1), level: 0, index: 0, seq: 0, finished: false };
         chunker.skip_exhausted_levels();
         chunker
     }
@@ -131,6 +134,7 @@ impl Iterator for ProofChunker {
                 level: 0,
                 headers: vec![],
                 done: true,
+                seq: self.seq,
             });
         }
         let level = self.level;
@@ -150,11 +154,16 @@ impl Iterator for ProofChunker {
         self.skip_exhausted_levels();
         let done = self.level >= self.proof.len();
         self.finished = done;
+        let seq = self.seq;
+        // A proof needs far fewer than 2^32 chunks (the receiver's total budget caps it near 2^16);
+        // saturate rather than wrap, so an absurd proof is refused by the receiver, never a panic here.
+        self.seq = self.seq.saturating_add(1);
         Some(protowire::PruningPointProofChunkMessage {
             level_count: self.level_count(),
             level: u32::try_from(level).unwrap_or(u32::MAX),
             headers,
             done,
+            seq,
         })
     }
 }
@@ -232,6 +241,10 @@ impl ProofAssembler {
     pub fn push(&mut self, chunk: protowire::PruningPointProofChunkMessage) -> Result<bool, ProtocolError> {
         if self.done {
             return Err(refuse("a chunk arrived after the final one".into()));
+        }
+        // `chunks` counts accepted chunks only, so it is exactly the next expected `seq`.
+        if chunk.seq as usize != self.chunks {
+            return Err(refuse(format!("chunk seq {} where seq {} was expected (duplicate, skipped or reordered)", chunk.seq, self.chunks)));
         }
         let level_count = chunk.level_count as usize;
         if level_count == 0 || level_count > self.limits.max_levels {
@@ -406,13 +419,19 @@ mod tests {
         assert_eq!(hashes(&rebuilt), vec![Vec::<Hash>::new(), vec![]]);
     }
 
-    fn chunk(level_count: u32, level: u32, headers: Vec<Arc<Header>>, done: bool) -> protowire::PruningPointProofChunkMessage {
+    fn chunk_seq(seq: u32, level_count: u32, level: u32, headers: Vec<Arc<Header>>, done: bool) -> protowire::PruningPointProofChunkMessage {
         protowire::PruningPointProofChunkMessage {
             level_count,
             level,
             headers: headers.iter().map(|h| (HeaderFormat::Compressed, h.as_ref()).into()).collect(),
             done,
+            seq,
         }
+    }
+
+    /// A first chunk (`seq` 0).
+    fn chunk(level_count: u32, level: u32, headers: Vec<Arc<Header>>, done: bool) -> protowire::PruningPointProofChunkMessage {
+        chunk_seq(0, level_count, level, headers, done)
     }
 
     fn refused(asm: &mut ProofAssembler, c: protowire::PruningPointProofChunkMessage, why: &str) {
@@ -436,10 +455,10 @@ mod tests {
 
         let mut asm = ProofAssembler::new(fmt, limits);
         asm.push(chunk(4, 2, vec![h(1)], false)).unwrap();
-        refused(&mut asm, chunk(4, 1, vec![h(2)], false), "a level going backwards");
-        refused(&mut asm, chunk(3, 2, vec![h(2)], false), "a changed level count");
-        assert!(asm.push(chunk(4, 3, vec![h(3)], true)).unwrap());
-        refused(&mut asm, chunk(4, 3, vec![h(4)], true), "a chunk after the final one");
+        refused(&mut asm, chunk_seq(1, 4, 1, vec![h(2)], false), "a level going backwards");
+        refused(&mut asm, chunk_seq(1, 3, 2, vec![h(2)], false), "a changed level count");
+        assert!(asm.push(chunk_seq(1, 4, 3, vec![h(3)], true)).unwrap());
+        refused(&mut asm, chunk_seq(2, 4, 3, vec![h(4)], true), "a chunk after the final one");
         let proof = asm.finish().unwrap();
         assert_eq!(hashes(&proof), vec![vec![], vec![], vec![h(1).hash], vec![h(3).hash]]);
 
@@ -457,13 +476,50 @@ mod tests {
         let limits = ProofChunkLimits { max_levels: 1, max_chunk_headers: 100, max_chunk_bytes: one - 1, max_total_bytes: usize::MAX };
         refused(&mut ProofAssembler::new(fmt, limits), c.clone(), "a chunk above the byte ceiling");
 
-        let limits = ProofChunkLimits { max_levels: 1, max_chunk_headers: 100, max_chunk_bytes: one, max_total_bytes: 2 * one };
+        // A non-zero seq adds its own field bytes, so the budget is set from the real encodings.
+        let with_seq = |seq| protowire::PruningPointProofChunkMessage { seq, ..c.clone() };
+        let (first, second) = (with_seq(0).encoded_len(), with_seq(1).encoded_len());
+        let limits =
+            ProofChunkLimits { max_levels: 1, max_chunk_headers: 100, max_chunk_bytes: second, max_total_bytes: first + second };
         let mut asm = ProofAssembler::new(fmt, limits);
-        asm.push(c.clone()).unwrap();
-        asm.push(c.clone()).unwrap();
-        assert_eq!(asm.total_bytes(), 2 * one);
-        refused(&mut asm, c, "the total byte budget is spent");
+        asm.push(with_seq(0)).unwrap();
+        asm.push(with_seq(1)).unwrap();
+        assert_eq!(asm.total_bytes(), first + second);
+        refused(&mut asm, with_seq(2), "the total byte budget is spent");
         assert_eq!(asm.chunks(), 2, "a refused chunk is not counted");
+    }
+
+    #[test]
+    fn duplicate_skipped_and_reordered_chunks_are_refused_by_seq() {
+        let proof = Arc::new(sample_proof());
+        let fmt = HeaderFormat::Compressed;
+        let chunks: Vec<_> = ProofChunker::with_limits(proof.clone(), fmt, 2_000, 1000).collect();
+        assert!(chunks.len() >= 4, "{}", chunks.len());
+        assert!(chunks.iter().enumerate().all(|(i, c)| c.seq as usize == i), "the server numbers chunks 0, 1, 2, ...");
+        let limits = ProofChunkLimits::new(6);
+
+        // Duplicate: chunk 1 sent twice. It is the same level (a level check alone accepts it).
+        let mut asm = ProofAssembler::new(fmt, limits);
+        asm.push(chunks[0].clone()).unwrap();
+        asm.push(chunks[1].clone()).unwrap();
+        assert_eq!(chunks[1].level, chunks[2].level, "the duplicate would pass the level-order check");
+        refused(&mut asm, chunks[1].clone(), "a duplicated chunk");
+        // The stream is still usable after a refusal only in tests; production drops the peer.
+        refused(&mut asm, chunks[3].clone(), "a skipped chunk");
+
+        // Reordered: 0, 2, 1.
+        let mut asm = ProofAssembler::new(fmt, limits);
+        asm.push(chunks[0].clone()).unwrap();
+        refused(&mut asm, chunks[2].clone(), "a chunk ahead of its turn");
+
+        // A first chunk that is not seq 0, including the largest seq.
+        refused(&mut ProofAssembler::new(fmt, limits), chunks[1].clone(), "a stream starting mid-way");
+        let mut huge = chunks[0].clone();
+        huge.seq = u32::MAX;
+        refused(&mut ProofAssembler::new(fmt, limits), huge, "seq u32::MAX");
+
+        // The honest order still rebuilds the proof.
+        assert_eq!(hashes(&assemble(chunks, fmt, limits).unwrap()), hashes(&proof));
     }
 
     #[test]

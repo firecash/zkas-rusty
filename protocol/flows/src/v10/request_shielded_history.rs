@@ -105,7 +105,7 @@ impl RequestShieldedHistoryFlow {
     }
 
     async fn handle_request(&mut self, anchor: kaspa_hashes::Hash, max_blocks: usize) -> Result<(), ProtocolError> {
-        // Pace BEFORE building the chunk (up to 128 MiB, `HISTORY_CHUNK_MAX_BYTES` in consensus) and
+        // Pace BEFORE building the chunk (~24 MiB plus one record, `HISTORY_CHUNK_MAX_BYTES` in consensus) and
         // before taking the session: pacing after building held a finished chunk for as long as the
         // peer chose not to read, one per request it sent blind.
         self.router.pace_outgoing().await?;
