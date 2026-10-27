@@ -5,12 +5,20 @@ use std::{fmt::Display, net::SocketAddr, sync::Arc, time::Instant};
 #[derive(Debug, Clone, Default)]
 pub struct PeerProperties {
     pub user_agent: String,
-    // TODO: add services
+    /// `VersionMessage.services` as the peer sent it (see `pp_proof_chunks::SERVICE_PRUNING_PROOF_CHUNKS`).
+    pub services: u64,
     pub advertised_protocol_version: u32,
     pub protocol_version: u32,
     pub disable_relay_tx: bool,
     pub subnetwork_id: Option<SubnetworkId>,
     pub time_offset: i64,
+}
+
+impl PeerProperties {
+    /// Whether the peer serves the chunked pruning-point proof.
+    pub fn serves_pruning_proof_chunks(&self) -> bool {
+        self.services & crate::pp_proof_chunks::SERVICE_PRUNING_PROOF_CHUNKS != 0
+    }
 }
 
 #[derive(Debug)]

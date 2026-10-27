@@ -59,6 +59,9 @@ pub enum KaspadMessagePayloadType {
     ShieldedHistoryChunk,
     RequestNextShieldedHistoryChunk,
     RequestNextPruningPointShieldedChunk,
+    RequestPruningPointProofChunks,
+    PruningPointProofChunk,
+    RequestNextPruningPointProofChunk,
 }
 
 impl From<&KaspadMessagePayload> for KaspadMessagePayloadType {
@@ -128,6 +131,9 @@ impl From<&KaspadMessagePayload> for KaspadMessagePayloadType {
             KaspadMessagePayload::RequestNextPruningPointShieldedChunk(_) => {
                 KaspadMessagePayloadType::RequestNextPruningPointShieldedChunk
             }
+            KaspadMessagePayload::RequestPruningPointProofChunks(_) => KaspadMessagePayloadType::RequestPruningPointProofChunks,
+            KaspadMessagePayload::PruningPointProofChunk(_) => KaspadMessagePayloadType::PruningPointProofChunk,
+            KaspadMessagePayload::RequestNextPruningPointProofChunk(_) => KaspadMessagePayloadType::RequestNextPruningPointProofChunk,
         }
     }
 }

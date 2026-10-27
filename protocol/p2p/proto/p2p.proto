@@ -300,6 +300,22 @@ message PruningPointProofHeaderArray {
   repeated BlockHeader headers = 1;
 }
 
+// Chunked pruning-point proof (ZKas). The legacy PruningPointProofMessage carries the whole proof
+// (~221 MB on mainnet) in one message; this carries it as a stream of chunks of one level each, so
+// the transport decode cap can drop below the proof size. Rules: see protocol/p2p/src/pp_proof_chunks.rs.
+message RequestPruningPointProofChunksMessage {
+}
+
+message PruningPointProofChunkMessage {
+  uint32 levelCount = 1;            // levels in the whole proof; identical in every chunk
+  uint32 level = 2;                 // the level all `headers` belong to; never decreases
+  repeated BlockHeader headers = 3; // in level order, continuing the previous chunk of this level
+  bool done = 4;                    // set on the final chunk only
+}
+
+message RequestNextPruningPointProofChunkMessage {
+}
+
 message ReadyMessage {
 }
 

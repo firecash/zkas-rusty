@@ -23,7 +23,7 @@ use kaspa_muhash::MuHash;
 use kaspa_p2p_lib::{
     PeerKey,
     IncomingRoute, Router,
-    common::ProtocolError,
+    common::{DEFAULT_TIMEOUT, ProtocolError},
     convert::{
         header::{HeaderFormat, Versioned},
         model::trusted::TrustedDataPackage,
@@ -31,9 +31,10 @@ use kaspa_p2p_lib::{
     dequeue_with_timeout, make_message, make_request,
     pb::{
         RequestAntipastMessage, RequestBlockBodiesMessage, RequestHeadersMessage, RequestIbdBlocksMessage,
-        RequestPruningPointAndItsAnticoneMessage, RequestPruningPointProofMessage, RequestPruningPointUtxoSetMessage,
-        kaspad_message::Payload,
+        RequestNextPruningPointProofChunkMessage, RequestPruningPointAndItsAnticoneMessage, RequestPruningPointProofChunksMessage,
+        RequestPruningPointProofMessage, RequestPruningPointUtxoSetMessage, kaspad_message::Payload,
     },
+    pp_proof_chunks::{ProofAssembler, ProofChunkLimits, requests_next_after},
 };
 use kaspa_utils::channel::JobReceiver;
 use std::{
@@ -123,6 +124,14 @@ const MIN_HISTORY_CHUNK_RECORDS: usize = 1_000;
 /// The whole backfill, fetch and verification together. Mainnet takes 10-60 minutes; a peer that
 /// stretches it past this is dropped and the next one is asked.
 const MAX_HISTORY_BACKFILL_DURATION: std::time::Duration = std::time::Duration::from_secs(4 * 3600);
+
+/// How long a requester waits for the first reply to a pruning-point proof request, legacy or
+/// chunked: the server may have to build the proof first, which takes minutes.
+const PRUNING_PROOF_FIRST_REPLY_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// The whole chunked proof transfer. ~221 MB in 30 minutes is ~120 KB/s, below any link an IBD can
+/// use anyway; a peer that is slower than that is dropped and the IBD starts over with another.
+const PRUNING_PROOF_CHUNKS_MAX_DURATION: Duration = Duration::from_secs(30 * 60);
 
 pub enum IbdType {
     Sync {
@@ -633,6 +642,43 @@ impl IbdFlow {
         Ok(())
     }
 
+    /// Receives the pruning-point proof as `PruningPointProofChunk`s (see
+    /// `kaspa_p2p_lib::pp_proof_chunks`). Every chunk is checked against the level, header and byte
+    /// ceilings before any of its headers is converted, and the window ask is sent before the chunk
+    /// is converted so the server's next window overlaps this one's conversion.
+    async fn receive_pruning_proof_chunks(&mut self) -> Result<PruningPointProof, ProtocolError> {
+        self.router.enqueue(make_message!(Payload::RequestPruningPointProofChunks, RequestPruningPointProofChunksMessage {})).await?;
+        let started = Instant::now();
+        let max_levels = self.ctx.config.max_block_level as usize + 1;
+        let mut assembler = ProofAssembler::new(self.header_format, ProofChunkLimits::new(max_levels));
+        loop {
+            // The first chunk may wait for the server to build the proof; later ones only for the
+            // transfer of one chunk. The whole stream is bounded too, so a peer dripping one header
+            // per chunk just inside the per-chunk timeout cannot hold the IBD for days.
+            let per_chunk = if assembler.chunks() == 0 { PRUNING_PROOF_FIRST_REPLY_TIMEOUT } else { DEFAULT_TIMEOUT };
+            let Some(left) = PRUNING_PROOF_CHUNKS_MAX_DURATION.checked_sub(started.elapsed()) else {
+                return Err(ProtocolError::Timeout(PRUNING_PROOF_CHUNKS_MAX_DURATION));
+            };
+            let msg = dequeue_with_timeout!(self.incoming_route, Payload::PruningPointProofChunk, per_chunk.min(left))?;
+            if requests_next_after(assembler.chunks() + 1, msg.done) {
+                self.router
+                    .enqueue(make_message!(Payload::RequestNextPruningPointProofChunk, RequestNextPruningPointProofChunkMessage {}))
+                    .await?;
+            }
+            if assembler.push(msg)? {
+                break;
+            }
+        }
+        debug!(
+            "received the pruning point proof from {} in {} chunks, {} bytes, {:.1}s",
+            self.router,
+            assembler.chunks(),
+            assembler.total_bytes(),
+            started.elapsed().as_secs_f64()
+        );
+        assembler.finish()
+    }
+
     async fn sync_and_validate_pruning_proof(&mut self, staging: &ConsensusProxy, relay_block: &Block) -> Result<Hash, ProtocolError> {
         // [Toccata] Guard IBD from outdated nodes. P2P flow registration does not protect
         // fresh IBD peers, and the relay block is usually the syncer sink, so reject an unexpected
@@ -649,11 +695,14 @@ impl IbdFlow {
             )));
         }
 
-        self.router.enqueue(make_message!(Payload::RequestPruningPointProof, RequestPruningPointProofMessage {})).await?;
-
-        // Pruning proof generation and communication might take several minutes, so we allow a long 10 minute timeout
-        let msg = dequeue_with_timeout!(self.incoming_route, Payload::PruningPointProof, Duration::from_secs(600))?;
-        let proof: PruningPointProof = Versioned(self.header_format, msg).try_into()?;
+        let proof = if self.router.properties().serves_pruning_proof_chunks() {
+            self.receive_pruning_proof_chunks().await?
+        } else {
+            self.router.enqueue(make_message!(Payload::RequestPruningPointProof, RequestPruningPointProofMessage {})).await?;
+            // Pruning proof generation and communication might take several minutes, so we allow a long 10 minute timeout
+            let msg = dequeue_with_timeout!(self.incoming_route, Payload::PruningPointProof, PRUNING_PROOF_FIRST_REPLY_TIMEOUT)?;
+            PruningPointProof::try_from(Versioned(self.header_format, msg))?
+        };
         info!(
             "Received headers proof with overall {} headers ({} unique)",
             proof.iter().map(|l| l.len()).sum::<usize>(),

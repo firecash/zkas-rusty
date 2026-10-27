@@ -953,6 +953,9 @@ impl FlowContext {
         let mut self_version_message =
             Version::new(local_address, self.node_id, network_name.clone(), None, advertised_protocol_version);
         self_version_message.add_user_agent(name(), version(), &self.config.user_agent_comments);
+        // Serves `RequestPruningPointProofChunks` (every node of this version does). Old peers
+        // ignore `services`, and they are still asked for the proof in the legacy single message.
+        self_version_message.services |= kaspa_p2p_lib::pp_proof_chunks::SERVICE_PRUNING_PROOF_CHUNKS;
         // TODO: disable_relay_tx from config/cmd
 
         // Perform the handshake
@@ -1036,6 +1039,7 @@ impl FlowContext {
         // Build and register the peer properties
         let peer_properties = Arc::new(PeerProperties {
             user_agent: peer_version.user_agent,
+            services: peer_version.services,
             advertised_protocol_version: peer_version.protocol_version,
             protocol_version: applied_protocol_version,
             disable_relay_tx: peer_version.disable_relay_tx,

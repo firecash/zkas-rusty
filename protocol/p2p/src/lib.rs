@@ -6,6 +6,7 @@ pub mod pb {
 pub mod common;
 pub mod convert;
 pub mod echo;
+pub mod pp_proof_chunks;
 
 mod core;
 mod handshake;

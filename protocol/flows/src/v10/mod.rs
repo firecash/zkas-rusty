@@ -46,6 +46,7 @@ pub fn register(ctx: FlowContext, router: Arc<Router>, protocol_version: u32) ->
                 KaspadMessagePayloadType::TrustedData,
                 KaspadMessagePayloadType::PruningPoints,
                 KaspadMessagePayloadType::PruningPointProof,
+                KaspadMessagePayloadType::PruningPointProofChunk,
                 KaspadMessagePayloadType::UnexpectedPruningPoint,
                 KaspadMessagePayloadType::PruningPointUtxoSetChunk,
                 KaspadMessagePayloadType::DonePruningPointUtxoSetChunks,
@@ -84,7 +85,11 @@ pub fn register(ctx: FlowContext, router: Arc<Router>, protocol_version: u32) ->
         Box::new(RequestPruningPointProofFlow::new(
             ctx.clone(),
             router.clone(),
-            router.subscribe(vec![KaspadMessagePayloadType::RequestPruningPointProof]),
+            router.subscribe(vec![
+                KaspadMessagePayloadType::RequestPruningPointProof,
+                KaspadMessagePayloadType::RequestPruningPointProofChunks,
+                KaspadMessagePayloadType::RequestNextPruningPointProofChunk,
+            ]),
             header_format,
         )),
         Box::new(RequestIbdChainBlockLocatorFlow::new(
