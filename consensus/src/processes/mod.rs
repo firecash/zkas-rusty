@@ -10,6 +10,7 @@ pub mod reachability;
 pub mod relations;
 pub mod shielded;
 pub mod shielded_diag;
+pub mod shielded_import;
 pub mod sync;
 pub mod transaction_validator;
 pub mod traversal_manager;

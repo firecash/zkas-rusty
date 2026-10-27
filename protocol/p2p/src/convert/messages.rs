@@ -186,6 +186,21 @@ impl TryFrom<protowire::RequestPruningPointShieldedStateMessage> for Hash {
     }
 }
 
+/// A decoded `RequestPruningPointShieldedChunkFrom`: `(pruning point, from, before, with_metadata)`.
+pub type ShieldedRangeRequest = (Hash, Option<[u8; 32]>, Option<[u8; 32]>, bool);
+
+impl TryFrom<protowire::RequestPruningPointShieldedChunkFromMessage> for ShieldedRangeRequest {
+    type Error = ConversionError;
+
+    fn try_from(msg: protowire::RequestPruningPointShieldedChunkFromMessage) -> Result<Self, Self::Error> {
+        // Empty = unbounded; otherwise a fixed 32-byte field (a wrong width is `ArrayBytesSizeError`).
+        let bound = |b: &[u8]| -> Result<Option<[u8; 32]>, ConversionError> { if b.is_empty() { Ok(None) } else { Ok(Some(b.try_into()?)) } };
+        let from = bound(&msg.from_key)?;
+        let before = bound(&msg.before_key)?;
+        Ok((msg.pruning_point_hash.try_into_ex()?, from, before, msg.with_metadata))
+    }
+}
+
 impl TryFrom<protowire::InvRelayBlockMessage> for Hash {
     type Error = ConversionError;
 

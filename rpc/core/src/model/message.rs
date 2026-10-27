@@ -527,13 +527,20 @@ pub struct GetShieldedTreeStateResponse {
     /// treat a balance from it as final unless the wallet's birthday is above
     /// [`Self::history_from_daa_score`].
     pub history_complete: bool,
+    /// Size of the global spent-nullifier set as of `block_hash` (N1, spec 08 R3.7): a counter the
+    /// node maintains per chain block, not a scan. `None` when this node holds no count for that
+    /// block (a block validated by an older build, or an older node: v2 and earlier send nothing).
+    /// This replaces the explorer's restart-relative counter (09 V1).
+    #[serde(default)]
+    pub nullifier_count: Option<u64>,
 }
 
 impl Serializer for GetShieldedTreeStateResponse {
     fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        // Version 2 adds the history-coverage fields. Bumped rather than appended silently so a
-        // reader can tell "this node did not report coverage" from "coverage is zero".
-        store!(u16, &2, writer)?;
+        // Version 2 adds the history-coverage fields, version 3 (N1) the nullifier count. Bumped
+        // rather than appended silently so a reader can tell "this node did not report it" from
+        // "it is zero".
+        store!(u16, &3, writer)?;
         store!(RpcHash, &self.block_hash, writer)?;
         store!(u64, &self.daa_score, writer)?;
         store!(u64, &self.size, writer)?;
@@ -541,6 +548,7 @@ impl Serializer for GetShieldedTreeStateResponse {
         store!(Vec<RpcHash>, &self.ommers, writer)?;
         store!(u64, &self.history_from_daa_score, writer)?;
         store!(bool, &self.history_complete, writer)?;
+        store!(Option<u64>, &self.nullifier_count, writer)?;
         Ok(())
     }
 }
@@ -558,7 +566,9 @@ impl Deserializer for GetShieldedTreeStateResponse {
         // history — that is the same silent-partial failure these fields exist to end.
         let (history_from_daa_score, history_complete) =
             if version >= 2 { (load!(u64, reader)?, load!(bool, reader)?) } else { (0, false) };
-        Ok(Self { block_hash, daa_score, size, leaf, ommers, history_from_daa_score, history_complete })
+        // A v2 node sends no count: "unknown", never 0.
+        let nullifier_count = if version >= 3 { load!(Option<u64>, reader)? } else { None };
+        Ok(Self { block_hash, daa_score, size, leaf, ommers, history_from_daa_score, history_complete, nullifier_count })
     }
 }
 
@@ -4339,5 +4349,54 @@ impl Deserializer for GetSeqCommitLaneProofResponse {
             lanes_root,
             miner_payload_leaves,
         })
+    }
+}
+
+#[cfg(test)]
+mod n1_tests {
+    use super::*;
+
+    fn response(nullifier_count: Option<u64>) -> GetShieldedTreeStateResponse {
+        GetShieldedTreeStateResponse {
+            block_hash: RpcHash::from_u64_word(7),
+            daa_score: 1,
+            size: 2,
+            leaf: RpcHash::from_u64_word(8),
+            ommers: vec![RpcHash::from_u64_word(9)],
+            history_from_daa_score: 3,
+            history_complete: true,
+            nullifier_count,
+        }
+    }
+
+    /// N1 (spec 08 R3.7): `nullifierCount` round-trips in the v3 wire form, and a v2 node's answer
+    /// (no field) decodes as "unknown", never as 0. The SubmitBlock response keeps its version 2.
+    #[test]
+    fn shielded_tree_state_v3_carries_the_nullifier_count_and_v2_reads_as_unknown() {
+        for count in [None, Some(0), Some(7_182_185), Some(u64::MAX)] {
+            let mut buf = Vec::new();
+            Serializer::serialize(&response(count), &mut buf).unwrap();
+            assert_eq!(u16::from_le_bytes([buf[0], buf[1]]), 3, "written as version 3");
+            let back = <GetShieldedTreeStateResponse as Deserializer>::deserialize(&mut buf.as_slice()).unwrap();
+            assert_eq!(back.nullifier_count, count);
+            assert!(back.history_complete);
+        }
+        // A v2 writer: the same fields up to `history_complete`, nothing after.
+        let r = response(None);
+        let mut v2 = Vec::new();
+        store!(u16, &2, &mut v2).unwrap();
+        store!(RpcHash, &r.block_hash, &mut v2).unwrap();
+        store!(u64, &r.daa_score, &mut v2).unwrap();
+        store!(u64, &r.size, &mut v2).unwrap();
+        store!(RpcHash, &r.leaf, &mut v2).unwrap();
+        store!(Vec<RpcHash>, &r.ommers, &mut v2).unwrap();
+        store!(u64, &r.history_from_daa_score, &mut v2).unwrap();
+        store!(bool, &r.history_complete, &mut v2).unwrap();
+        let back = <GetShieldedTreeStateResponse as Deserializer>::deserialize(&mut v2.as_slice()).unwrap();
+        assert_eq!(back.nullifier_count, None);
+
+        let mut buf = Vec::new();
+        Serializer::serialize(&SubmitBlockResponse::reject(SubmitBlockRejectReason::BlockInvalid, "x"), &mut buf).unwrap();
+        assert_eq!(u16::from_le_bytes([buf[0], buf[1]]), 2, "SubmitBlockResponse is unchanged");
     }
 }

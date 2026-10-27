@@ -338,7 +338,7 @@ mod tests {
     }
 
     fn legacy_round_trip(proof: &PruningPointProof, format: HeaderFormat) -> PruningPointProof {
-        let msg = protowire::PruningPointProofMessage { headers: proof.iter().map(|level| (format, level).into()).collect() };
+        let msg = protowire::PruningPointProofMessage { headers: proof.iter().map(|level| (format, level).into()).collect(), ..Default::default() };
         Versioned(format, msg).try_into().unwrap()
     }
 

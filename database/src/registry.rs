@@ -166,6 +166,10 @@ pub enum DatabaseStorePrefixes {
     /// Written in the same batch as every change to that set, so after a crash the set says where it
     /// stands and startup can move it to the virtual sink from the per-block diffs.
     ShieldedNullifierCursor = 99,
+    /// `u64` size of the global spent-nullifier set as of each chain block (N1, 08 R3.7): the selected
+    /// parent's count plus the block's new nullifiers, written in the block's commit batch, pruned with
+    /// the other per-block snapshots, seeded at the pruning point by the shielded IBD import.
+    ShieldedNullifierCount = 100,
 
     // ---- Separator ----
     /// Reserved as a separator

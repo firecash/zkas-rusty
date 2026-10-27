@@ -62,6 +62,7 @@ pub enum KaspadMessagePayloadType {
     RequestPruningPointProofChunks,
     PruningPointProofChunk,
     RequestNextPruningPointProofChunk,
+    RequestPruningPointShieldedChunkFrom,
 }
 
 impl From<&KaspadMessagePayload> for KaspadMessagePayloadType {
@@ -134,6 +135,9 @@ impl From<&KaspadMessagePayload> for KaspadMessagePayloadType {
             KaspadMessagePayload::RequestPruningPointProofChunks(_) => KaspadMessagePayloadType::RequestPruningPointProofChunks,
             KaspadMessagePayload::PruningPointProofChunk(_) => KaspadMessagePayloadType::PruningPointProofChunk,
             KaspadMessagePayload::RequestNextPruningPointProofChunk(_) => KaspadMessagePayloadType::RequestNextPruningPointProofChunk,
+            KaspadMessagePayload::RequestPruningPointShieldedChunkFrom(_) => {
+                KaspadMessagePayloadType::RequestPruningPointShieldedChunkFrom
+            }
         }
     }
 }

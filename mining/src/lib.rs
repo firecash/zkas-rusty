@@ -35,6 +35,11 @@ pub struct MiningCounters {
     pub tx_evicted_counts: AtomicU64,
     pub input_counts: AtomicU64,
     pub output_counts: AtomicU64,
+    /// Shielded transactions rejected for their fee BEFORE proof verification (N1, spec 08 R1.1.3):
+    /// each one is a Halo 2 verification not spent.
+    pub shielded_verify_skipped_fee: AtomicU64,
+    /// Relayed peer batches discarded whole for an invalid shielded proof (N1, spec 08 R1.3.6).
+    pub shielded_invalid_proof_batches: AtomicU64,
 
     // Samples
     pub ready_txs_sample: AtomicU64,
@@ -54,6 +59,8 @@ impl Default for MiningCounters {
             tx_evicted_counts: Default::default(),
             input_counts: Default::default(),
             output_counts: Default::default(),
+            shielded_verify_skipped_fee: Default::default(),
+            shielded_invalid_proof_batches: Default::default(),
             ready_txs_sample: Default::default(),
             txs_sample: Default::default(),
             orphans_sample: Default::default(),

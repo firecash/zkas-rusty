@@ -37,6 +37,10 @@ pub enum ConversionError {
     // carry the borsh decode failure as a string rather than `#[from]`.
     #[error("AuxPoW borsh decode error: {0}")]
     AuxPowDecodeError(String),
+
+    /// A deduplicated pruning-point proof that breaks one of its structural rules (N1, spec 13 L1).
+    #[error("{0}")]
+    MalformedDedupProof(String),
 }
 
 impl ConversionError {
@@ -66,7 +70,9 @@ impl ConversionError {
             | Self::IntCastingError(_)
             | Self::AddressParsingError(_)
             | Self::CompressedParentsError(_)
-            | Self::AuxPowDecodeError(_) => false,
+            | Self::AuxPowDecodeError(_)
+            // A new message form; disconnect only, like the other encodings of this fork.
+            | Self::MalformedDedupProof(_) => false,
         }
     }
 }

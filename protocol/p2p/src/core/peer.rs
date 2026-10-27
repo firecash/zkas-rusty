@@ -5,7 +5,8 @@ use std::{fmt::Display, net::SocketAddr, sync::Arc, time::Instant};
 #[derive(Debug, Clone, Default)]
 pub struct PeerProperties {
     pub user_agent: String,
-    /// `VersionMessage.services` as the peer sent it (see `pp_proof_chunks::SERVICE_PRUNING_PROOF_CHUNKS`).
+    /// `VersionMessage.services` as the peer sent it: `common::SERVICE_NF_SORTED_STREAM` (1 << 6) and
+    /// `pp_proof_chunks::SERVICE_PRUNING_PROOF_CHUNKS` (1 << 40).
     pub services: u64,
     pub advertised_protocol_version: u32,
     pub protocol_version: u32,

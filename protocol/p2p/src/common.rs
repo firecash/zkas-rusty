@@ -7,6 +7,12 @@ use thiserror::Error;
 /// Default P2P communication timeout
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120); // 2 minutes
 
+/// Version-message service bit (spec 08 R3.4.2, bit 6): this node serves the pruning-point nullifier
+/// set as a sorted stream and answers `RequestPruningPointShieldedChunkFrom` (resume after a given
+/// nullifier). An older node closes the connection on a message it does not know, so a requester
+/// sends that message only to peers that advertise this bit.
+pub const SERVICE_NF_SORTED_STREAM: u64 = 1 << 6;
+
 #[derive(Error, Debug, Clone)]
 pub enum ProtocolError {
     #[error("timeout expired after {0:?}")]
@@ -48,6 +54,12 @@ pub enum ProtocolError {
 
     #[error("misbehaving peer: {0}")]
     MisbehavingPeer(String),
+
+    /// The peer relayed a shielded transaction whose Halo 2 proof or signatures fail (N1, spec 08
+    /// R1.4.4). Context-free: an honest peer verifies before relaying. Banned by default unless the
+    /// peer advertises a newer protocol or release (an upgraded circuit looks invalid to an old node).
+    #[error("invalid shielded proof: {0}")]
+    InvalidShieldedProof(String),
 
     /// The peer's address is in the ban store. A refusal this node CHOSE, and one a banned peer
     /// meets on every redial, so it is logged quietly (see the inbound handler) rather than as a
@@ -137,6 +149,9 @@ impl ProtocolError {
             | Self::Other(_)
             | Self::OtherOwned(_)
             | Self::MisbehavingPeer(_)
+            // Handled by its own default-on ban class (`FlowContext::ban_if_protocol_violation`,
+            // N1 spec 08 R1.4.4), not by `--enablebanning`.
+            | Self::InvalidShieldedProof(_)
             | Self::PeerBanned(_)
             | Self::ConnectionClosed
             | Self::IncomingRouteCapacityReached(_, _)

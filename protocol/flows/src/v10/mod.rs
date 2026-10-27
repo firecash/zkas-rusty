@@ -133,6 +133,8 @@ pub fn register(ctx: FlowContext, router: Arc<Router>, protocol_version: u32) ->
             router.subscribe(vec![
                 KaspadMessagePayloadType::RequestPruningPointShieldedState,
                 KaspadMessagePayloadType::RequestNextPruningPointShieldedChunk,
+                // N1: resume after a given nullifier (only sent to peers advertising the bit).
+                KaspadMessagePayloadType::RequestPruningPointShieldedChunkFrom,
             ]),
         )),
         Box::new(HandleIbdBlockRequests::new(

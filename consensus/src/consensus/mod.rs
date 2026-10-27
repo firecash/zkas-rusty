@@ -83,7 +83,7 @@ use crossbeam_channel::{
 use itertools::Itertools;
 use kaspa_consensusmanager::{SessionLock, SessionReadGuard};
 
-use kaspa_core::info;
+use kaspa_core::{info, warn};
 #[cfg(feature = "test-smt-pruning-diagnostics")]
 use kaspa_database::prelude::StoreResult;
 use kaspa_database::prelude::StoreResultExt;
@@ -165,6 +165,11 @@ pub struct Consensus {
 
     // Signals
     is_consensus_exiting: Arc<AtomicBool>,
+
+    /// The staged pruning-point nullifier import (N1, spec 08 R3.2/R3.3), with whether the pruning
+    /// point's selected child was already UTXO-validated when the import began. Persisted on disk
+    /// (see `NullifierStaging`), so an interrupted import resumes, also after a restart.
+    shielded_import_staging: parking_lot::Mutex<Option<(Arc<crate::processes::shielded_import::NullifierStaging>, bool)>>,
 }
 
 impl Deref for Consensus {
@@ -413,6 +418,7 @@ impl Consensus {
             config,
             creation_timestamp,
             is_consensus_exiting,
+            shielded_import_staging: parking_lot::Mutex::new(None),
         };
 
         // Run database upgrades if any
@@ -426,6 +432,98 @@ impl Consensus {
         // Upgrade to initialize the new retention root field correctly
         self.retention_root_database_upgrade();
         self.consensus_transitional_flags_upgrade();
+        self.shielded_nullifier_count_upgrade();
+    }
+
+    /// Decode the peer's pruning-point metadata and bind it to the PoW-committed root, before any
+    /// nullifier is accepted (F-02/F-08). Returns the declared accumulator digest.
+    fn bind_shielded_import_metadata(
+        &self,
+        new_pruning_point: Hash,
+        metadata: &kaspa_consensus_core::api::ShieldedExportMetadata,
+        expected_state_root: Option<[u8; 32]>,
+    ) -> PruningImportResult<[u8; 32]> {
+        use crate::processes::shielded::PruningPointShieldedMetadata;
+        // F-08: `nullifier_count` is declared by an untrusted sync peer. Never pre-allocate from it.
+        // N1 (spec 08 R3.1): there is no count cap any more (it was 2^26, which the honest set will
+        // pass). The set streams to sorted files on disk, so memory does not depend on the count; the
+        // only count bound is the committed note count, checked below after the PoW binding.
+        let md = PruningPointShieldedMetadata::from_wire_bytes(&metadata.data).map_err(PruningImportError::ShieldedStateError)?;
+        // The peer pairs and scores are outside every root, so the binding below cannot bound them;
+        // refuse a padded blob before any work proportional to it.
+        {
+            use crate::processes::shielded::{MAX_IMPORTED_BURN_RECEIPTS, MAX_IMPORTED_IN_WINDOW_ANCHORS};
+            if md.in_window_anchors.len() > MAX_IMPORTED_IN_WINDOW_ANCHORS
+                || md.in_window_anchor_source_scores.len() > MAX_IMPORTED_IN_WINDOW_ANCHORS
+                || md.burns.receipts.len() > MAX_IMPORTED_BURN_RECEIPTS
+            {
+                return Err(PruningImportError::ShieldedStateError(
+                    "pruning-point metadata exceeds a structural ceiling; refusing it before streaming".to_string(),
+                ));
+            }
+        }
+        // Unbound means unverified: nothing in the metadata is proven. The IBD flow already refuses
+        // this; the import itself must too, so no caller can seed peer data the PoW does not cover.
+        let Some(committed) = expected_state_root else {
+            return Err(PruningImportError::ShieldedStateError(
+                "shielded import is not bound to a PoW-committed state root; refusing".to_string(),
+            ));
+        };
+        self.virtual_processor
+            .verify_import_binding_versioned(new_pruning_point, &md, committed)
+            .map_err(PruningImportError::ShieldedStateError)?;
+        // A spend implies a note: the set can never exceed the committed leaf count (R3.1).
+        if metadata.nullifier_count > md.frontier.size {
+            return Err(PruningImportError::ShieldedStateError(format!(
+                "declared nullifier count {} exceeds the committed note count {}; a spend implies a note",
+                metadata.nullifier_count, md.frontier.size
+            )));
+        }
+        let mut m = md.nullifier_muhash.clone();
+        Ok(m.finalize().as_bytes())
+    }
+
+    /// Test hook: drop the in-memory staging handle, as a process restart would, so only what the
+    /// on-disk manifest holds survives.
+    #[cfg(test)]
+    pub(crate) fn forget_shielded_import_staging_handle(&self) {
+        self.shielded_import_staging.lock().take();
+    }
+
+    /// The staging for `pp`, if one is active.
+    fn active_shielded_staging(&self, pp: Hash) -> PruningImportResult<Arc<crate::processes::shielded_import::NullifierStaging>> {
+        match self.shielded_import_staging.lock().as_ref() {
+            Some((s, _)) if s.pruning_point == pp => Ok(s.clone()),
+            _ => Err(PruningImportError::ShieldedStateError(format!("no shielded import of pruning point {pp} has begun"))),
+        }
+    }
+
+    /// Where a streamed shielded import stages its sorted files: next to the consensus database, on
+    /// the same filesystem, so the ingest moves them instead of copying.
+    ///
+    /// A node's consensus databases are `<datadir>/consensus/consensus-NNN` (see the factory), and
+    /// IBD imports into a NEW instance each attempt, so the staging lives in the shared parent: an
+    /// attempt after a restart (a new instance) still finds it and resumes. Any other database (a
+    /// test's temporary one) gets a sibling of its own, so concurrent instances never share one.
+    fn shielded_import_staging_dir(&self) -> std::path::PathBuf {
+        let db_path = self.db.path();
+        let name = db_path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        match db_path.parent() {
+            Some(parent) if name.starts_with("consensus-") => parent.join("shielded-nf-staging"),
+            Some(parent) => parent.join(format!("{name}.shielded-nf-staging")),
+            None => db_path.join("shielded-nf-staging"),
+        }
+    }
+
+    /// N1 (spec 08 R3.7): a database an older build wrote has no per-block nullifier counts. Record
+    /// the size of the global set at the block it reflects (its cursor), once, so every chain block
+    /// validated from here on carries `count(selected parent) + new`. O(set size) key iteration.
+    fn shielded_nullifier_count_upgrade(&self) {
+        match self.virtual_processor.backfill_shielded_nullifier_count() {
+            Ok(Some((cursor, n))) => info!("shielded: recorded the nullifier-set size {n} at the set's cursor {cursor} (one-time backfill)"),
+            Ok(None) => {}
+            Err(e) => warn!("shielded: nullifier-count backfill failed ({e}); nullifierCount stays unreported until a fresh import"),
+        }
     }
 
     fn retention_root_database_upgrade(&self) {
@@ -858,6 +956,14 @@ impl ConsensusApi for Consensus {
             .transaction_validator
             .preverify_shielded_bundle(transaction, daa)
             .map_err(|e| ConsensusError::GeneralOwned(format!("shielded transaction rejected: {e}")))
+    }
+
+    fn preverify_shielded_batch(
+        &self,
+        transactions: &[&Transaction],
+    ) -> Result<(), (kaspa_consensus_core::tx::TransactionId, kaspa_consensus_core::errors::tx::TxRuleError)> {
+        let daa = self.lkg_virtual_state.load().daa_score;
+        self.services.transaction_validator.preverify_shielded_batch(transactions, daa)
     }
 
     fn get_shielded_tree_frontier(&self, block: Hash) -> ConsensusResult<(u64, Option<[u8; 32]>, Vec<[u8; 32]>)> {
@@ -2864,6 +2970,196 @@ impl ConsensusApi for Consensus {
             .map_err(|e| ConsensusError::GeneralOwned(format!("shielded metadata export failed: {e}")))
     }
 
+    fn stream_pruning_point_shielded_nullifiers(
+        &self,
+        expected_pruning_point: Hash,
+        from: Option<[u8; 32]>,
+        before: Option<[u8; 32]>,
+        chunk_size: usize,
+        sink: &mut dyn FnMut(Vec<[u8; 32]>) -> bool,
+    ) -> ConsensusResult<u64> {
+        let pp = self.pruning_point_store.read().pruning_point().unwrap();
+        if pp != expected_pruning_point {
+            return Err(ConsensusError::UnexpectedPruningPoint);
+        }
+        self.virtual_processor
+            .stream_pruning_point_nullifiers(pp, from, before, chunk_size, sink)
+            .map_err(|e| ConsensusError::GeneralOwned(format!("nullifier-set stream failed: {e}")))
+    }
+
+    fn get_shielded_nullifier_count(&self, block: Hash) -> ConsensusResult<Option<u64>> {
+        self.virtual_processor
+            .shielded_nullifier_count_at(block)
+            .map_err(|e| ConsensusError::GeneralOwned(format!("shielded nullifier count at {block}: {e}")))
+    }
+
+    fn begin_pruning_point_shielded_import(
+        &self,
+        new_pruning_point: Hash,
+        metadata: kaspa_consensus_core::api::ShieldedExportMetadata,
+        expected_state_root: Option<[u8; 32]>,
+    ) -> PruningImportResult<Vec<kaspa_consensus_core::api::ShieldedImportRange>> {
+        use crate::processes::shielded_import::NullifierStaging;
+        let declared_muhash = self.bind_shielded_import_metadata(new_pruning_point, &metadata, expected_state_root)?;
+        // Whether the pruning point's selected child was already validated before the stream, which
+        // arrives at the peers' pace. The IBD flow refuses to import in that case; what this records
+        // is the case the flow's check cannot see, a chain walk validating it while the data streams.
+        let child_validated_before = self.pruning_point_selected_child(new_pruning_point).is_some_and(|c| self.is_utxo_valid(c));
+        let mut guard = self.shielded_import_staging.lock();
+        // A staging of this exact set (in memory, or left on disk by an earlier process) is resumed.
+        if guard.is_none() {
+            *guard = NullifierStaging::load(self.shielded_import_staging_dir()).map(|s| (Arc::new(s), false));
+        }
+        let resumable = guard.as_ref().is_some_and(|(s, _)| s.matches(new_pruning_point, declared_muhash, metadata.nullifier_count));
+        if !resumable {
+            if let Some((old, _)) = guard.take() {
+                old.discard();
+            }
+            let dir = self.shielded_import_staging_dir();
+            NullifierStaging::check_disk(&dir, metadata.nullifier_count).map_err(|e| PruningImportError::ShieldedStateError(e.to_string()))?;
+            let staging = NullifierStaging::new(dir, new_pruning_point, declared_muhash, metadata.nullifier_count)
+                .map_err(|e| PruningImportError::ShieldedStateError(e.to_string()))?;
+            *guard = Some((Arc::new(staging), child_validated_before));
+        } else if let Some((s, flag)) = guard.as_mut() {
+            *flag = child_validated_before;
+            info!("shielded import of pruning point {}: resuming with {} of {} nullifiers staged", new_pruning_point, s.received(), s.declared);
+        }
+        let (staging, _) = guard.as_ref().expect("set above");
+        Ok(staging
+            .resume_points()
+            .into_iter()
+            .map(|r| kaspa_consensus_core::api::ShieldedImportRange {
+                range: r.range,
+                from: r.from,
+                before: r.before,
+                received: r.received,
+                complete: r.complete,
+            })
+            .collect())
+    }
+
+    fn stage_pruning_point_shielded_nullifiers(
+        &self,
+        pruning_point: Hash,
+        scope: kaspa_consensus_core::api::ShieldedStreamScope,
+        nullifier_batches: kaspa_consensus_core::api::ShieldedNullifierBatchIterator<'_>,
+    ) -> PruningImportResult<u64> {
+        use crate::processes::shielded_import::{StreamImportError as E, StreamScope};
+        let staging = self.active_shielded_staging(pruning_point)?;
+        let scope = match scope {
+            kaspa_consensus_core::api::ShieldedStreamScope::Full => StreamScope::Full,
+            kaspa_consensus_core::api::ShieldedStreamScope::Range(i) => StreamScope::Range(i),
+        };
+        match staging.consume(scope, nullifier_batches) {
+            Ok(n) => Ok(n),
+            // Not the source's fault: the caller asked for something the staging cannot take now.
+            Err(e @ (E::RangeUnavailable { .. } | E::NotFresh)) => Err(PruningImportError::ShieldedStateError(e.to_string())),
+            Err(e) => {
+                // A refused chunk (or a local I/O failure) discards the whole staging: what the
+                // sources sent before it cannot be told apart from what this one corrupted.
+                self.discard_shielded_import_staging();
+                Err(match e {
+                    E::NotAscending { index } => PruningImportError::ShieldedStreamNotAscending(index),
+                    other => PruningImportError::ShieldedStateError(other.to_string()),
+                })
+            }
+        }
+    }
+
+    fn get_pruning_point_shielded_import_ranges(&self, pruning_point: Hash) -> Option<Vec<kaspa_consensus_core::api::ShieldedImportRange>> {
+        let staging = self.active_shielded_staging(pruning_point).ok()?;
+        Some(
+            staging
+                .resume_points()
+                .into_iter()
+                .map(|r| kaspa_consensus_core::api::ShieldedImportRange {
+                    range: r.range,
+                    from: r.from,
+                    before: r.before,
+                    received: r.received,
+                    complete: r.complete,
+                })
+                .collect(),
+        )
+    }
+
+    fn complete_pruning_point_shielded_range(&self, pruning_point: Hash, range: usize) -> PruningImportResult<()> {
+        self.active_shielded_staging(pruning_point)?.complete_range(range).map_err(|e| PruningImportError::ShieldedStateError(e.to_string()))
+    }
+
+    fn finish_pruning_point_shielded_import(
+        &self,
+        new_pruning_point: Hash,
+        metadata: kaspa_consensus_core::api::ShieldedExportMetadata,
+        expected_state_root: Option<[u8; 32]>,
+    ) -> PruningImportResult<()> {
+        let (staging, child_validated_before) = match self.shielded_import_staging.lock().as_ref() {
+            Some((s, f)) if s.pruning_point == new_pruning_point => (s.clone(), *f),
+            _ => return Err(PruningImportError::ShieldedStateError(format!("no shielded import of pruning point {new_pruning_point} has begun"))),
+        };
+        if !staging.is_complete() {
+            return Err(PruningImportError::ShieldedImportIncomplete { received: staging.received(), declared: staging.declared });
+        }
+        let (count, fold) = staging.folded();
+        // Verify with no lock held; a failed check discards the staging, since a wrong set cannot be
+        // completed into a right one.
+        let verified = match self.virtual_processor.verify_pruning_point_shielded_import_folded(
+            new_pruning_point,
+            metadata,
+            expected_state_root,
+            count,
+            fold,
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                self.discard_shielded_import_staging();
+                return Err(PruningImportError::ShieldedStateError(e));
+            }
+        };
+        // The swap: one write (range-clear of the old set, seed of the verified new state, stable flag
+        // false; the flow sets it true after this returns) under the virtual write lock, which every
+        // chain walk holds (upgradably) while it moves the live set, then the ingest of the staged
+        // files, still under the lock. A crash between the write and the ingest leaves the stable flag
+        // false and an empty set, and the next start re-imports (the flag protocol the in-memory
+        // import already relied on).
+        let virtual_write = self.virtual_stores.write();
+        let selected_child = self.pruning_point_selected_child(new_pruning_point);
+        // A walk validated the child while the data streamed: its nullifiers (and those of every chain
+        // block above it) are in the live set, and the clear would destroy them without revalidation.
+        if !child_validated_before
+            && let Some(child) = selected_child
+            && self.is_utxo_valid(child)
+        {
+            return Err(PruningImportError::ShieldedStateError(format!(
+                "chain block {child} above pruning point {new_pruning_point} was validated while the shielded state was \
+                 streaming; refusing to clear live shielded state"
+            )));
+        }
+        let mut batch = rocksdb::WriteBatch::default();
+        let n = self.virtual_processor.stage_verified_shielded_import(&mut batch, verified).map_err(PruningImportError::ShieldedStateError)?;
+        self.pruning_meta_stores.write().set_pruning_shielded_stable_flag(&mut batch, false).unwrap();
+        self.db.write(batch).unwrap();
+        let ingested = staging.ingest_into(&self.db);
+        // The store cache may hold rows of the old set (or none of the new); forget it either way.
+        self.virtual_processor.discard_cached_shielded_writes();
+        drop(virtual_write);
+        self.discard_shielded_import_staging();
+        ingested.map_err(|e| PruningImportError::ShieldedStateError(e.to_string()))?;
+        info!("Imported shielded state for pruning point {}: {} nullifiers imported (streamed)", new_pruning_point, n);
+        Ok(())
+    }
+
+    fn discard_shielded_import_staging(&self) {
+        let taken = self.shielded_import_staging.lock().take();
+        match taken {
+            Some((s, _)) => s.discard(),
+            // Also a staging an earlier process left on disk.
+            None => {
+                let _ = std::fs::remove_dir_all(self.shielded_import_staging_dir());
+            }
+        }
+    }
+
     fn open_pruning_point_shielded_nullifier_stream(
         &self,
         expected_pruning_point: Hash,
@@ -2887,106 +3183,15 @@ impl ConsensusApi for Consensus {
         expected_state_root: Option<[u8; 32]>,
         nullifier_batches: kaspa_consensus_core::api::ShieldedNullifierBatchIterator<'_>,
     ) -> PruningImportResult<()> {
-        // F-08: `nullifier_count` is declared by an untrusted sync peer. Never
-        // pre-allocate from it (a huge value aborts the process on allocation
-        // failure), cap it to bound memory/CPU, and fail as soon as the stream
-        // overruns the declared count instead of buffering unboundedly first.
-        if metadata.nullifier_count > kaspa_consensus_core::api::MAX_SHIELDED_NULLIFIER_IMPORT_COUNT {
-            return Err(PruningImportError::ShieldedStateError(format!(
-                "declared nullifier count {} exceeds the sanity cap {}",
-                metadata.nullifier_count,
-                kaspa_consensus_core::api::MAX_SHIELDED_NULLIFIER_IMPORT_COUNT
-            )));
+        // One full ascending stream (an older peer's export, and the tests): begin (bind before a
+        // single chunk is read), stage, finish. A full stream cannot resume a partial staging.
+        let ranges = self.begin_pruning_point_shielded_import(new_pruning_point, metadata.clone(), expected_state_root)?;
+        if ranges.iter().any(|r| r.received > 0 || r.complete) {
+            self.discard_shielded_import_staging();
+            self.begin_pruning_point_shielded_import(new_pruning_point, metadata.clone(), expected_state_root)?;
         }
-        // Bind the metadata to the PoW-committed root and bound the declared count by the committed
-        // note count BEFORE consuming a single chunk. Previously both ran after the whole stream was
-        // buffered (up to 2^26 entries), so a peer could force a multi-GiB allocation and minutes of
-        // MuHash work with metadata that was never going to pass.
-        {
-            use crate::processes::shielded::PruningPointShieldedMetadata;
-            let md = PruningPointShieldedMetadata::from_wire_bytes(&metadata.data).map_err(PruningImportError::ShieldedStateError)?;
-            // The peer pairs and scores are outside every root, so the binding below cannot bound
-            // them; their ceilings used to apply only after the whole nullifier stream was read and the
-            // blob decoded twice, so a padded blob cost gigabytes first. Refuse it before any of that.
-            {
-                use crate::processes::shielded::{MAX_IMPORTED_BURN_RECEIPTS, MAX_IMPORTED_IN_WINDOW_ANCHORS};
-                if md.in_window_anchors.len() > MAX_IMPORTED_IN_WINDOW_ANCHORS
-                    || md.in_window_anchor_source_scores.len() > MAX_IMPORTED_IN_WINDOW_ANCHORS
-                    || md.burns.receipts.len() > MAX_IMPORTED_BURN_RECEIPTS
-                {
-                    return Err(PruningImportError::ShieldedStateError(
-                        "pruning-point metadata exceeds a structural ceiling; refusing it before streaming".to_string(),
-                    ));
-                }
-            }
-            // Unbound means unverified: nothing in the metadata is proven, and a post-fork import would
-            // also replace the proven anchor window with none. The IBD flow already refuses this; the
-            // import itself must too, so no caller can seed peer data the PoW does not cover.
-            let Some(committed) = expected_state_root else {
-                return Err(PruningImportError::ShieldedStateError(
-                    "shielded import is not bound to a PoW-committed state root; refusing".to_string(),
-                ));
-            };
-            self.virtual_processor
-                .verify_import_binding_versioned(new_pruning_point, &md, committed)
-                .map_err(PruningImportError::ShieldedStateError)?;
-            if metadata.nullifier_count > md.frontier.size {
-                return Err(PruningImportError::ShieldedStateError(format!(
-                    "declared nullifier count {} exceeds the committed note count {}; a spend implies a note",
-                    metadata.nullifier_count, md.frontier.size
-                )));
-            }
-        }
-        // Whether the pruning point's selected child was already validated before the stream, which
-        // arrives at the peer's pace. The IBD flow refuses to import in that case; what this records is
-        // the case the flow's check cannot see, a chain walk validating it while the data streams.
-        let selected_child = self.pruning_point_selected_child(new_pruning_point);
-        let child_validated_before = selected_child.is_some_and(|child| self.is_utxo_valid(child));
-        let mut nullifiers: Vec<[u8; 32]> = Vec::new();
-        for batch in nullifier_batches {
-            nullifiers.extend(batch);
-            if nullifiers.len() as u64 > metadata.nullifier_count {
-                return Err(PruningImportError::ShieldedStateError(format!(
-                    "streamed nullifiers exceed the declared count {}",
-                    metadata.nullifier_count
-                )));
-            }
-        }
-        // Stage, then swap. Everything above and the verification below run with no lock held: the data
-        // arrives at the peer's pace, and a lock held across it would hand a slow peer a stall of block
-        // processing. (The pruning lock in particular cannot be taken here at all: the IBD flow holds a
-        // session, a read guard on that same lock, across this call, so a write lock would deadlock.)
-        let verified = self
-            .virtual_processor
-            .verify_pruning_point_shielded_import(new_pruning_point, metadata, expected_state_root, nullifiers)
-            .map_err(PruningImportError::ShieldedStateError)?;
-        // The swap: one write (clear of the old state, seed of the verified new state, stable flag
-        // false; the flow sets it true after this returns) under the virtual write lock, which every
-        // chain walk holds (upgradably) while it moves the live set. The clear enumerates the live set,
-        // so without the lock a nullifier a walk inserted after the enumeration survived the clear and
-        // a block the walk committed above the pruning point lost its nullifiers to it.
-        let virtual_write = self.virtual_stores.write();
-        // A walk validated the child while the data streamed: its nullifiers (and those of every chain
-        // block above it) are in the live set, and the clear would destroy them without revalidation.
-        if !child_validated_before
-            && let Some(child) = selected_child
-            && self.is_utxo_valid(child)
-        {
-            return Err(PruningImportError::ShieldedStateError(format!(
-                "chain block {child} above pruning point {new_pruning_point} was validated while the shielded state was \
-                 streaming; refusing to clear live shielded state"
-            )));
-        }
-        let mut batch = rocksdb::WriteBatch::default();
-        let n = self
-            .virtual_processor
-            .stage_verified_shielded_import(&mut batch, verified)
-            .map_err(PruningImportError::ShieldedStateError)?;
-        self.pruning_meta_stores.write().set_pruning_shielded_stable_flag(&mut batch, false).unwrap();
-        self.db.write(batch).unwrap();
-        drop(virtual_write);
-        info!("Imported shielded state for pruning point {}: {} nullifiers imported", new_pruning_point, n);
-        Ok(())
+        self.stage_pruning_point_shielded_nullifiers(new_pruning_point, kaspa_consensus_core::api::ShieldedStreamScope::Full, nullifier_batches)?;
+        self.finish_pruning_point_shielded_import(new_pruning_point, metadata, expected_state_root)
     }
 
     fn get_shielded_state_root(&self, block: Hash) -> ConsensusResult<[u8; 32]> {
@@ -3209,16 +3414,20 @@ mod tests {
         let consensus = tc.consensus_clone();
         let pp = config.genesis.hash;
 
-        // 1. `u64::MAX` declared count: rejected by the sanity cap before any
-        //    allocation or store access (pre-fix: allocation-failure abort).
+        // 1. `u64::MAX` declared count: a clean rejection before any allocation, store access or
+        //    staging (pre-fix: allocation-failure abort). Since N1 (spec 08 R3.1) there is no 2^26
+        //    sanity cap; the count is bounded by the PoW-bound committed note count instead, which
+        //    `n1_declared_count_above_the_committed_note_count_is_refused` covers with valid metadata.
+        //    Here the metadata does not even decode, so that is the refusal, and nothing was staged.
         let metadata = ShieldedExportMetadata { data: vec![], nullifier_count: u64::MAX };
         let mut empty = std::iter::empty();
         match consensus.import_pruning_point_shielded(pp, metadata, None, &mut empty) {
             Err(PruningImportError::ShieldedStateError(msg)) => {
-                assert!(msg.contains("exceeds the sanity cap"), "cap rejection, got: {msg}")
+                assert!(msg.contains("malformed shielded pruning-point metadata"), "metadata rejection, got: {msg}")
             }
-            other => panic!("expected sanity-cap ShieldedStateError, got {other:?}"),
+            other => panic!("expected a ShieldedStateError, got {other:?}"),
         }
+        assert!(!consensus.shielded_import_staging_dir().exists(), "a refused import stages nothing");
 
         // 2. Metadata is decoded and bound BEFORE the stream is touched: with malformed metadata
         //    not a single chunk may be consumed (pre-fix: the whole stream was buffered first and

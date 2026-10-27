@@ -15,6 +15,9 @@ use kaspa_consensus_core::{
     mass::MassCalculator,
 };
 
+/// Entries in the shielded verdict cache (N1, spec 08 R1.3.4; was 2,000).
+pub const SHIELDED_VERIFY_CACHE_ENTRIES: usize = 65_536;
+
 #[derive(Clone)]
 pub struct TransactionValidator {
     max_tx_inputs: usize,
@@ -83,10 +86,13 @@ impl TransactionValidator {
             coinbase_maturity,
             ghostdag_k,
             sig_cache: Cache::with_counters(10_000, counters),
-            // Sized well under the sig cache: a shielded tx is ~123 KB at full size, so the
-            // population that matters here is the mempool and a template's worth of
-            // transactions, not every signature the node has ever seen.
-            shielded_verify_cache: kaspa_database::prelude::Cache::new(kaspa_database::prelude::CachePolicy::Count(2_000)),
+            // Sized to the mempool's turnover at full load, not to one template (N1, spec 08
+            // R1.3.4): ~26 txs/s x 600 s anchor maturity = ~15,600 txs; 2,000 entries covered 77 s
+            // of full-load two-action traffic, so mempool-verified txs were re-verified at block
+            // time. Only txids are stored (32 B key + 1 B), ~4-6 MB at capacity.
+            shielded_verify_cache: kaspa_database::prelude::Cache::new(kaspa_database::prelude::CachePolicy::Count(
+                SHIELDED_VERIFY_CACHE_ENTRIES,
+            )),
             mass_calculator,
             toccata_activation,
             security_fork_activation: ForkActivation::never(),
@@ -119,10 +125,13 @@ impl TransactionValidator {
             coinbase_maturity,
             ghostdag_k,
             sig_cache: Cache::with_counters(10_000, counters),
-            // Sized well under the sig cache: a shielded tx is ~123 KB at full size, so the
-            // population that matters here is the mempool and a template's worth of
-            // transactions, not every signature the node has ever seen.
-            shielded_verify_cache: kaspa_database::prelude::Cache::new(kaspa_database::prelude::CachePolicy::Count(2_000)),
+            // Sized to the mempool's turnover at full load, not to one template (N1, spec 08
+            // R1.3.4): ~26 txs/s x 600 s anchor maturity = ~15,600 txs; 2,000 entries covered 77 s
+            // of full-load two-action traffic, so mempool-verified txs were re-verified at block
+            // time. Only txids are stored (32 B key + 1 B), ~4-6 MB at capacity.
+            shielded_verify_cache: kaspa_database::prelude::Cache::new(kaspa_database::prelude::CachePolicy::Count(
+                SHIELDED_VERIFY_CACHE_ENTRIES,
+            )),
             mass_calculator: MassCalculator::new(0, 0, 0),
             toccata_activation: ForkActivation::never(),
             security_fork_activation: ForkActivation::never(),

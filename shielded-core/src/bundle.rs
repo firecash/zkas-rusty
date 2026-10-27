@@ -152,6 +152,17 @@ pub fn action_count_from_bytes(bytes: &[u8]) -> Option<usize> {
     Some(n_actions)
 }
 
+/// Cheaply read the declared value balance (the fee of a shielded transaction) from a serialized
+/// bundle, without parsing the actions or the proof (N1, spec 08 R1.1: the mempool checks the fee
+/// BEFORE any proof work). The header reads mirror [`ShieldedBundle::from_bytes`]; the field sits
+/// before anything the security-fork format changes, so one reader serves both formats. Returns
+/// `None` on a header too short to hold it.
+pub fn value_balance_from_bytes(bytes: &[u8]) -> Option<i64> {
+    let mut r = Reader::new(bytes);
+    let _flags = r.u8().ok()?;
+    r.i64().ok()
+}
+
 /// An Orchard bundle as carried in a shielded transaction's payload.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShieldedBundle {
@@ -462,6 +473,26 @@ impl ShieldedBundle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// N1 fee-first: the header-only fee read agrees with the full decode in both formats, and
+    /// never panics on a truncated header.
+    #[test]
+    fn value_balance_from_bytes_matches_the_full_decode() {
+        for (vb, block) in [(0i64, None), (3_117_800, Some([7u8; 32])), (-5_000, None), (i64::MAX, Some([1u8; 32]))] {
+            let mut b = ShieldedBundle::sample_for_test(2);
+            b.value_balance = vb;
+            if let Some(blk) = block {
+                b.set_anchor_block(blk);
+            }
+            let bytes = b.to_bytes();
+            assert_eq!(value_balance_from_bytes(&bytes), Some(vb));
+            assert_eq!(ShieldedBundle::from_bytes_at(&bytes, block.is_some()).unwrap().value_balance, vb);
+        }
+        let bytes = ShieldedBundle::sample_for_test(1).to_bytes();
+        for cut in 0..9 {
+            assert_eq!(value_balance_from_bytes(&bytes[..cut]), None, "cut {cut}");
+        }
+    }
 
     fn sample_action(seed: u8) -> ActionWire {
         ActionWire {
