@@ -4314,9 +4314,11 @@ dependencies = [
  "kaspa-seq-commit",
  "nonempty",
  "rand 0.10.1",
+ "rand_chacha 0.10.0",
  "rand_core 0.10.1",
  "rayon",
  "serde",
+ "serde_json",
  "sha2",
  "zakura-orchard",
  "zakura-pasta-curves",
@@ -6452,6 +6454,16 @@ checksum = "d3022b5f1df60f26e1ffddd6c66e8aa15de382ae63b3a0c1bfc0e4d3e3f325cb"
 dependencies = [
  "ppv-lite86",
  "rand_core 0.9.3",
+]
+
+[[package]]
+name = "rand_chacha"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3e6af7f3e25ded52c41df4e0b1af2d047e45896c2f3281792ed68a1c243daedb"
+dependencies = [
+ "ppv-lite86",
+ "rand_core 0.10.1",
 ]
 
 [[package]]
@@ -10052,6 +10064,7 @@ version = "2.0.1"
 dependencies = [
  "kaspa-shielded-core",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -10076,6 +10089,7 @@ dependencies = [
  "qrcode",
  "rand 0.10.1",
  "rand 0.8.6",
+ "rand_chacha 0.10.0",
  "rayon",
  "rcgen",
  "rustls",

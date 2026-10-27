@@ -77,6 +77,25 @@ struct Cli {
     /// receive, and a note-heavy wallet's payments get slower without bound.
     #[arg(long, default_value_t = false)]
     no_auto_consolidate: bool,
+    /// Stage W of uniform transactions (spec 02), opt-in: every send, payout and merge this daemon
+    /// builds has one public shape (4 actions, exact fee 0.031178 ZKAS, anchor at the epoch
+    /// opener) and is released at a scheduled random time: interactive sends after a hold
+    /// (`--uniform-hold`), large payments as <= 8 independently released siblings, payouts one
+    /// payee per transaction over a 300 s window. Changes fees and latency of the legacy
+    /// endpoints; the `/api/wallet/uniform/*` endpoints work without it.
+    #[arg(long, default_value_t = false)]
+    uniform_v1: bool,
+    /// With --uniform-v1: send change to the wallet's internal address. Only when every client
+    /// that holds these seeds/viewing keys runs the internal-key trigger scan of this release.
+    #[arg(long, default_value_t = false)]
+    uniform_internal_change: bool,
+    /// Default interactive hold under Stage W: immediate | standard (U[0,120 s]) | private (U[0,30 min]).
+    #[arg(long, default_value = "standard")]
+    uniform_hold: String,
+    /// Stage W background merges (W9): custodial wallets above 8 notes merge 4 -> 1 at Poisson
+    /// times. Replaces the --auto-consolidate merger. Spends those wallets' fees.
+    #[arg(long, default_value_t = false)]
+    uniform_merge: bool,
     /// Cap the CPU threads Halo2 proving may use. Default: every core.
     ///
     /// This is a THROTTLE, not a tuning knob — lowering it makes payments slower, and
@@ -277,6 +296,25 @@ struct Cli {
 fn main() {
     kaspa_core::log::try_init_logger("info");
     let cli = Cli::parse();
+    let Some(uniform_hold) = zkas_wallet_engine::HoldMode::parse(&cli.uniform_hold) else {
+        eprintln!("--uniform-hold must be immediate, standard or private, not {:?}", cli.uniform_hold);
+        std::process::exit(2);
+    };
+    zkas_walletd::set_uniform_policy(zkas_walletd::UniformPolicy {
+        enabled: cli.uniform_v1,
+        internal_change: cli.uniform_v1 && cli.uniform_internal_change,
+        hold: uniform_hold,
+        merge: cli.uniform_merge,
+    });
+    if cli.uniform_v1 || cli.uniform_merge {
+        log::info!(
+            "uniform transactions (Stage W): send path {}, internal change {}, hold {:?}, background merges {}",
+            if cli.uniform_v1 { "ON" } else { "off" },
+            if cli.uniform_v1 && cli.uniform_internal_change { "ON" } else { "off" },
+            uniform_hold,
+            if cli.uniform_merge { "ON" } else { "off" }
+        );
+    }
     let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
     let runtime_threads = cli.runtime_threads.filter(|n| *n > 0).unwrap_or_else(|| cores.saturating_mul(2).max(2));
     let runtime = tokio::runtime::Builder::new_multi_thread()

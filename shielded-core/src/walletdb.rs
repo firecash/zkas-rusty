@@ -389,6 +389,15 @@ pub struct WalletDb {
     /// `IncomingViewingKey::prepare` is not free, so doing it per bundle — as the
     /// old per-action path did — repeated the same setup on every scanned bundle.
     prepared_ivk: PreparedIncomingViewingKey,
+    /// The INTERNAL-scope incoming viewing key, prepared. Change sent to the wallet's internal
+    /// address (spec 10-CORE B1 / 02 W6) decrypts only under this key. It is tried on the
+    /// outputs of a bundle only when that bundle spends one of this wallet's notes (spec 11 R4):
+    /// an internal note is created only by the wallet's own spend, and that spend reveals one of
+    /// the wallet's nullifiers, so the trigger is complete and costs ~0 instead of the +80% of
+    /// trial-decrypting every action twice.
+    prepared_ivk_internal: PreparedIncomingViewingKey,
+    /// The wallet's internal-scope address 0 (where Stage W change goes when enabled).
+    internal_address: [u8; 43],
     /// Full viewing key — derives each owned note's nullifier for spent-detection.
     fvk: FullViewingKey,
     /// This wallet's raw external address — matches coinbase recipients.
@@ -941,9 +950,13 @@ impl WalletDb {
         let known_addresses =
             if scan_addresses { (0..COINBASE_DIVERSIFIER_SCAN).map(|i| fvk.address_at(i, Scope::External).to_raw_address_bytes()).collect() } else { HashSet::new() };
         let ovk = fvk.to_ovk(Scope::External);
+        let prepared_ivk_internal = fvk.to_ivk(Scope::Internal).prepare();
+        let internal_address = fvk.address_at(0u32, Scope::Internal).to_raw_address_bytes();
         Self {
             ivk,
             prepared_ivk,
+            prepared_ivk_internal,
+            internal_address,
             fvk,
             my_address,
             known_addresses,
@@ -1040,6 +1053,31 @@ impl WalletDb {
     /// viewing key, so a watch-only wallet knows it too.
     pub fn my_address_bytes(&self) -> [u8; 43] {
         self.my_address
+    }
+
+    /// This wallet's internal-scope address 0: where Stage W change goes when internal change is
+    /// enabled. Never handed out to payers; found by the R4 trigger scan (see
+    /// [`Self::internal_hits`]).
+    pub fn internal_address_bytes(&self) -> [u8; 43] {
+        self.internal_address
+    }
+
+    /// Whether `addr` is one of this wallet's own change addresses (external 0 or internal 0).
+    fn is_own_change_address(&self, addr: &[u8; 43]) -> bool {
+        *addr == self.my_address || *addr == self.internal_address
+    }
+
+    /// Spec 11 R4: the internal-scope notes a bundle that spends one of ours created, merged into
+    /// the external hits. Only called for bundles with an owned nullifier, so a wallet's scan cost
+    /// grows by one key agreement per action of its OWN bundles and by nothing else.
+    fn merge_internal_hits(&self, mut received: Vec<ReceivedNote>, internal: Vec<ReceivedNote>) -> Vec<ReceivedNote> {
+        for r in internal {
+            if !received.iter().any(|x| x.action_index == r.action_index) {
+                received.push(r);
+            }
+        }
+        received.sort_by_key(|r| r.action_index);
+        received
     }
 
     /// The wallet's diversified address at `index` (0 = [`Self::my_address_bytes`]).
@@ -1248,7 +1286,10 @@ impl WalletDb {
             // missing them here would make the wallet record its own confirmed
             // send as a "Received <change>" row instead of a Sent one.
             let spent: u64 = bundle.actions.iter().filter_map(|a| self.owned_note_value(&a.nullifier)).sum();
-            let received = scan_bundle_prepared(&self.prepared_ivk, bundle);
+            let mut received = scan_bundle_prepared(&self.prepared_ivk, bundle);
+            if !self.leaves_only && self.owns_any_nullifier(bundle.actions.iter().map(|a| &a.nullifier)) {
+                received = self.merge_internal_hits(received, scan_bundle_prepared(&self.prepared_ivk_internal, bundle));
+            }
             for (i, action) in bundle.actions.iter().enumerate() {
                 // Each action reveals the nullifier of the note it spends. If that is
                 // one of ours, the note is now spent — drop it from the unspent set so
@@ -1366,6 +1407,12 @@ impl WalletDb {
             } else {
                 scan_compact_auto(&self.prepared_ivk, self.agree_scalar.as_ref(), records)
             };
+            // R4 trigger (after the external hits, which may come from the page memo).
+            let received = if !self.leaves_only && self.owns_any_nullifier(records.iter().map(|r| &r.nullifier)) {
+                self.merge_internal_hits(received, scan_compact_prepared(&self.prepared_ivk_internal, records))
+            } else {
+                received
+            };
             // A memo hit did its decryption in `predecrypt_page`, which already charged
             // for it; charging again here would double-count the same actions.
             if !from_memo {
@@ -1481,6 +1528,10 @@ impl WalletDb {
 
     /// Value of the owned note (unspent or pending-spend) this nullifier would
     /// reveal, if it is one of ours.
+    fn owns_any_nullifier<'n>(&self, mut nullifiers: impl Iterator<Item = &'n [u8; 32]>) -> bool {
+        nullifiers.any(|nf| self.owned_note_value(nf).is_some())
+    }
+
     fn owned_note_value(&self, nullifier: &[u8; 32]) -> Option<u64> {
         // Called for every action on the chain; nearly all of them are someone else's.
         if !self.owned_nfs.contains(nullifier) {
@@ -1552,7 +1603,7 @@ impl WalletDb {
                     continue;
                 };
                 let addr_bytes = addr.to_raw_address_bytes();
-                if addr_bytes == self.my_address {
+                if self.is_own_change_address(&addr_bytes) {
                     continue; // our own change
                 }
                 let m = trim_memo(&m);
@@ -1638,7 +1689,7 @@ impl WalletDb {
                 continue;
             };
             let addr_bytes = addr.to_raw_address_bytes();
-            if addr_bytes == self.my_address {
+            if self.is_own_change_address(&addr_bytes) {
                 continue; // our own change
             }
             let m = trim_memo(&m);
@@ -1830,8 +1881,12 @@ impl WalletDb {
                 .filter_map(|a| self.notes.iter().find(|n| n.nullifier == a.nullifier))
                 .map(|n| n.value() as u128)
                 .sum();
-            // What this bundle gives us: anything decryptable to our ivk.
-            let received: u128 = scan_bundle_prepared(&self.prepared_ivk, bundle).iter().map(|r| r.note.value().inner() as u128).sum();
+            // What this bundle gives us: anything decryptable to our ivk, plus (R4) internal
+            // change when the bundle spends one of our notes.
+            let mut received: u128 = scan_bundle_prepared(&self.prepared_ivk, bundle).iter().map(|r| r.note.value().inner() as u128).sum();
+            if spent > 0 {
+                received += scan_bundle_prepared(&self.prepared_ivk_internal, bundle).iter().map(|r| r.note.value().inner() as u128).sum::<u128>();
+            }
 
             if spent > 0 {
                 // OUR OWN spend. The received part is our CHANGE coming back, not an
@@ -1866,8 +1921,11 @@ impl WalletDb {
             }
             let spent: u128 =
                 records.iter().filter_map(|a| self.notes.iter().find(|n| n.nullifier == a.nullifier)).map(|n| n.value() as u128).sum();
-            let received: u128 =
+            let mut received: u128 =
                 scan_compact_prepared(&self.prepared_ivk, records).iter().map(|r| r.note.value().inner() as u128).sum();
+            if spent > 0 {
+                received += scan_compact_prepared(&self.prepared_ivk_internal, records).iter().map(|r| r.note.value().inner() as u128).sum::<u128>();
+            }
             if spent > 0 {
                 p.outgoing += spent.saturating_sub(received);
             } else {
