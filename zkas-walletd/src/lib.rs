@@ -1738,8 +1738,9 @@ static MEM_AVAILABLE_MB: std::sync::Mutex<Option<(u64, std::time::Instant)>> = s
 
 /// Free memory in MB, cached for [`MEM_AVAILABLE_TTL`]: the host's `MemAvailable`,
 /// clamped by the headroom left in this process's own cgroup (see
-/// [`cgroup_headroom_bytes_at`]). `None` on any platform or kernel that doesn't publish
-/// `MemAvailable` — callers then skip the memory gate rather than refuse to work.
+/// [`cgroup_headroom_bytes_at`]). Without `/proc/meminfo` (Windows, macOS) the OS's own
+/// figure ([`os_available_mb`]). `None` only when neither gives a reading — callers then
+/// skip the memory gate rather than refuse to work.
 ///
 /// The clamp (follow-up F4, 2026-10-22). `/proc/meminfo` describes the BOX. The hosted
 /// daemon runs in a systemd-run scope that throttles it at `memory.high`, and every gate
@@ -1755,19 +1756,38 @@ fn mem_available_mb() -> Option<u64> {
             return Some(mb);
         }
     }
-    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
-    let kb: u64 = text
-        .lines()
-        .find_map(|l| l.strip_prefix("MemAvailable:"))
-        .and_then(|v| v.split_whitespace().next())
-        .and_then(|v| v.parse().ok())?;
-    let host_mb = kb / 1024;
+    let host_mb = match std::fs::read_to_string("/proc/meminfo") {
+        Ok(text) => {
+            let kb: u64 = text
+                .lines()
+                .find_map(|l| l.strip_prefix("MemAvailable:"))
+                .and_then(|v| v.split_whitespace().next())
+                .and_then(|v| v.parse().ok())?;
+            kb / 1024
+        }
+        Err(_) => os_available_mb()?,
+    };
     let mb = match own_cgroup_dir().and_then(|d| cgroup_headroom_bytes_at(&d)) {
         Some(cg) => host_mb.min(cg >> 20),
         None => host_mb,
     };
     *slot = Some((mb, std::time::Instant::now()));
     Some(mb)
+}
+
+/// Available memory in MB from the OS itself, for platforms without `/proc/meminfo`
+/// (Windows, macOS). Until this existed [`mem_available_mb`] returned `None` there, so on
+/// every Windows and macOS daemon the resident cap fell back to a flat 32 wallets, sync and
+/// proof fan-out never shrank, and every low-memory gate stood open: the daemon ran the box
+/// out of memory and crashed instead of backing off (reported on Windows after v1.0.11).
+/// Windows reports the physical memory available to new work (standby cache included), the
+/// same meaning as `MemAvailable`. `None` if the OS reports nothing (0), so callers keep
+/// their no-reading behaviour rather than gate on a zero.
+fn os_available_mb() -> Option<u64> {
+    let mut sys = sysinfo::System::new();
+    sys.refresh_memory();
+    let bytes = sys.available_memory();
+    (bytes > 0).then_some(bytes >> 20)
 }
 
 /// Headroom left under the cgroup at `base`, in bytes: the binding ceiling
@@ -1937,7 +1957,7 @@ const PROOF_MEM_PER_EXTRA_MB: u64 = 2_000;
 fn proof_concurrency() -> usize {
     let cores = std::thread::available_parallelism().map(|c| c.get()).unwrap_or(1);
     let by_cores = (cores / PROOF_THREADS_EACH).max(1);
-    // Unknown memory (non-Linux, no /proc) keeps the core-derived answer.
+    // Unknown memory (no reading from /proc or the OS) keeps the core-derived answer.
     match mem_available_mb() {
         Some(free) => by_cores.min(1 + (free / PROOF_MEM_PER_EXTRA_MB) as usize),
         None => by_cores,
@@ -17470,5 +17490,26 @@ mod checkpoint_cursor_tests {
         let node_src = include_str!("../../consensus/src/consensus/mod.rs");
         assert!(node_src.contains("lies in peer-supplied history; this node serves no frontier there"));
         assert!(node_src.contains(super::PEER_SUPPLIED_HISTORY));
+    }
+}
+
+#[cfg(test)]
+mod mem_available_tests {
+    use super::{mem_available_mb, os_available_mb};
+
+    /// Every platform walletd ships on must report free memory, or every memory gate stands open
+    /// and the daemon runs the box out instead of backing off. Before `os_available_mb` this was
+    /// `None` on Windows and macOS.
+    #[test]
+    fn free_memory_is_read_on_this_platform() {
+        let mut sys = sysinfo::System::new();
+        sys.refresh_memory();
+        let total_mb = sys.total_memory() >> 20;
+        let free = mem_available_mb().expect("walletd must read free memory on this platform");
+        assert!(free > 0 && free <= total_mb, "free {free} MB must be within total {total_mb} MB");
+        if !std::path::Path::new("/proc/meminfo").exists() {
+            let os = os_available_mb().expect("the OS reports available memory");
+            assert!(os > 0 && os <= total_mb, "OS free {os} MB must be within total {total_mb} MB");
+        }
     }
 }

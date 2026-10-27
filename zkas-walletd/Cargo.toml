@@ -38,6 +38,8 @@ kaspa-consensus-core.workspace = true
 kaspa-core.workspace = true
 # gRPC transport to a running kaspad (ZKas) node.
 kaspa-grpc-client.workspace = true
+# Free memory on platforms without /proc/meminfo (Windows, macOS) for the memory gates.
+sysinfo.workspace = true
 kaspa-rpc-core.workspace = true
 # The shielded engine: WalletDb (scan/witness/balance), the real Halo 2 payment
 # builder (circuit feature), coinbase-note reconstruction, and message sign/verify.
