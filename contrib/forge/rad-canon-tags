@@ -1,0 +1,14 @@
+#!/bin/bash
+# Re-push every tag so the refs/tags/* canonical rule (added 2026-10-27) applies to tags
+# that were pushed before the rule existed.
+export PATH=/root/.radicle/bin:$PATH RAD_PASSPHRASE="$(cat /root/.radicle-passphrase)"
+for d in /root/repos/*/; do
+  cd $d; n=0
+  canon=$(git for-each-ref --format="%(refname)" refs/tags | wc -l)
+  for t in $(git tag); do
+    git ls-remote --exit-code https://127.0.0.1 >/dev/null 2>&1
+    git push -q rad ":refs/tags/$t" 2>/dev/null; git push -q rad "refs/tags/$t" 2>/dev/null && n=$((n+1))
+  done
+  rad sync --announce >/dev/null 2>&1
+  echo "$(basename $d): $n of $canon tags re-pushed"
+done

@@ -62,6 +62,11 @@ pub struct Config {
     /// `ProtocolError::is_auto_ban_eligible` for what qualifies and why consensus rejections never do.
     pub enable_banning: bool,
 
+    /// N1 (spec 08 R1.4.4): ban (24 h) a peer that relays a shielded transaction whose proof or
+    /// signatures fail, unless it advertises a newer protocol or release. ON by default, unlike
+    /// `enable_banning`; `--no-ban-shielded` turns it off.
+    pub ban_invalid_shielded_proofs: bool,
+
     /// Allow the node to accept blocks from RPC while not synced
     /// (required when initiating a new network from genesis)
     pub enable_unsynced_mining: bool,
@@ -177,6 +182,7 @@ impl Config {
             utxoindex: false,
             unsafe_rpc: false,
             enable_banning: false,
+            ban_invalid_shielded_proofs: true,
             enable_unsynced_mining: false,
             enable_mainnet_mining: false,
             user_agent_comments: Default::default(),

@@ -971,6 +971,64 @@ pub mod build {
         Empty,
     }
 
+    /// Actions in every Stage W uniform transaction (spec 02 U0). Mirrored by
+    /// `zkas_wallet_engine::uniform::UNIFORM_ACTIONS`, which asserts the two agree.
+    pub const UNIFORM_ACTIONS: usize = 4;
+
+    /// Orchard bundle type of a uniform transaction: padded with Orchard's native dummies (random
+    /// zero-value spends, outputs to random addresses with no OVK) to exactly
+    /// [`UNIFORM_ACTIONS`] actions (spec 02 W2/W3). Never pad with notes to our own addresses:
+    /// that reveals the real input/output count to every holder of the wallet's viewing key.
+    pub const UNIFORM_BUNDLE_TYPE: BundleType = BundleType::Transactional { bundle_required: false, pad_to_minimum: Some(UNIFORM_ACTIONS as u8) };
+
+    /// The public shape a payment builder produces.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct SendShape {
+        /// Stage W: at most 4 spends and 3 payees, padded to exactly 4 actions, change output
+        /// always present (possibly zero), and the action count asserted before proving.
+        pub uniform: bool,
+        /// Send change to the wallet's INTERNAL address 0 instead of external address 0 (spec
+        /// 10-CORE B1, 02 W6). Requires every client that can hold this seed to run the spec 11
+        /// R4 internal-IVK trigger scan, or the change is invisible to it.
+        pub internal_change: bool,
+    }
+
+    impl SendShape {
+        /// Today's shape: `BundleType::DEFAULT` (pad to 2), external change.
+        pub const LEGACY: SendShape = SendShape { uniform: false, internal_change: false };
+        /// Stage W with external change (the opt-in default of `uniform_v1`).
+        pub const UNIFORM: SendShape = SendShape { uniform: true, internal_change: false };
+        /// Stage W with internal change.
+        pub const UNIFORM_INTERNAL: SendShape = SendShape { uniform: true, internal_change: true };
+
+        fn bundle_type(&self) -> BundleType {
+            if self.uniform { UNIFORM_BUNDLE_TYPE } else { BundleType::DEFAULT }
+        }
+
+        fn change_address(&self, fvk: &FullViewingKey) -> Address {
+            fvk.address_at(0u32, if self.internal_change { Scope::Internal } else { Scope::External })
+        }
+
+        /// Refuse a request that cannot be a uniform transaction before any proving work.
+        fn check_request(&self, spends: usize, payees: usize) -> Result<(), BuildError> {
+            if self.uniform && (spends > UNIFORM_ACTIONS || payees + 1 > UNIFORM_ACTIONS) {
+                return Err(BuildError::Builder(format!(
+                    "a uniform transaction carries at most {UNIFORM_ACTIONS} spends and {} payees; got {spends} spends, {payees} payees",
+                    UNIFORM_ACTIONS - 1
+                )));
+            }
+            Ok(())
+        }
+
+        /// The builder output MUST have exactly 4 actions before it is proved (W2).
+        fn check_built(&self, actions: usize) -> Result<(), BuildError> {
+            if self.uniform && actions != UNIFORM_ACTIONS {
+                return Err(BuildError::Builder(format!("uniform bundle built with {actions} actions, not {UNIFORM_ACTIONS}")));
+            }
+            Ok(())
+        }
+    }
+
     /// Serialize an authorized/proven Orchard bundle into our wire format, using
     /// `spend_auth_sig` to extract each action's signature (zeroed before signing)
     /// and the given bundle-level `proof` / `binding_sig`.
@@ -1321,12 +1379,44 @@ pub mod build {
         recoverable: bool,
         anchor_block: Option<[u8; 32]>,
     ) -> Result<Vec<u8>, BuildError> {
+        build_wallet_payment_multi_shaped(
+            owner_seed,
+            inputs,
+            payees,
+            fee,
+            network_domain,
+            tx_context,
+            recoverable,
+            anchor_block,
+            SendShape::LEGACY,
+            &mut rand::rng(),
+        )
+    }
+
+    /// [`build_wallet_payment_multi_anchored`] with an explicit [`SendShape`] and RNG. The RNG
+    /// drives every random choice (dummy keys, shuffles, note randomness, proof blinding,
+    /// signatures), so a seeded RNG gives byte-identical output: the conformance vectors of
+    /// spec 02 §7.1 T1 are built through here. Production callers pass an OS-seeded RNG.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_wallet_payment_multi_shaped<R: RngCore + CryptoRng>(
+        owner_seed: [u8; 32],
+        inputs: Vec<(Note, MerklePath)>,
+        payees: &[([u8; 43], u64, [u8; 512])],
+        fee: u64,
+        network_domain: &[u8; 32],
+        tx_context: &[u8],
+        recoverable: bool,
+        anchor_block: Option<[u8; 32]>,
+        shape: SendShape,
+        rng: &mut R,
+    ) -> Result<Vec<u8>, BuildError> {
         let (first_note, first_path) = inputs.first().ok_or(BuildError::Empty)?;
         if payees.is_empty() {
             return Err(BuildError::Empty);
         }
+        shape.check_request(inputs.len(), payees.len())?;
         let keys = ShieldedKeys::from_seed(owner_seed).ok_or(BuildError::Empty)?;
-        let change_addr = keys.address();
+        let change_addr = shape.change_address(&keys.fvk);
         let ovk = recoverable.then(|| keys.fvk.to_ovk(Scope::External));
 
         // Resolve every payee before touching the builder, so a malformed address
@@ -1344,7 +1434,7 @@ pub mod build {
 
         // The shared anchor: all supplied witnesses were taken at one tree state.
         let anchor = first_path.root(ExtractedNoteCommitment::from(first_note.commitment()));
-        let mut builder = Builder::new(BundleType::DEFAULT, crate::verify::BUNDLE_VERSION, orchard::bundle::Flags::ENABLED, anchor).expect("orchard v2 ENABLED flags are always representable");
+        let mut builder = Builder::new(shape.bundle_type(), crate::verify::BUNDLE_VERSION, orchard::bundle::Flags::ENABLED, anchor).expect("orchard v2 ENABLED flags are always representable");
         for (note, merkle_path) in inputs {
             builder.add_spend(keys.fvk.clone(), note, merkle_path).map_err(|e| BuildError::Builder(format!("{e:?}")))?;
         }
@@ -1358,10 +1448,10 @@ pub mod build {
             .map_err(|e| BuildError::Builder(format!("{e:?}")))?;
 
         let pk = proving_key();
-        let mut rng = rand::rng();
         let (unauth, _meta) =
-            builder.build::<i64>(&mut rng).map_err(|e| BuildError::Builder(format!("{e:?}")))?.ok_or(BuildError::Empty)?;
-        let proven = unauth.create_proof(pk, &mut rng).map_err(|e| BuildError::Proof(format!("{e:?}")))?;
+            builder.build::<i64>(&mut *rng).map_err(|e| BuildError::Builder(format!("{e:?}")))?.ok_or(BuildError::Empty)?;
+        shape.check_built(unauth.actions().len())?;
+        let proven = unauth.create_proof(pk, &mut *rng).map_err(|e| BuildError::Proof(format!("{e:?}")))?;
 
         let mut effects = to_wire(&proven, |_| [0u8; 64], Vec::new(), [0u8; 64]);
         if let Some(block) = anchor_block {
@@ -1370,7 +1460,7 @@ pub mod build {
         let msg = sighash(&effects, network_domain, tx_context);
         let ask = SpendAuthorizingKey::from(&keys.sk);
         let authorized: Bundle<Authorized, i64> =
-            proven.apply_signatures(&mut rng, msg, &[ask]).map_err(|e| BuildError::Proof(format!("{e:?}")))?;
+            proven.apply_signatures(&mut *rng, msg, &[ask]).map_err(|e| BuildError::Proof(format!("{e:?}")))?;
 
         let mut wire = to_wire(
             &authorized,
@@ -1475,33 +1565,68 @@ pub mod build {
         memo: [u8; 512],
         anchor_block: Option<[u8; 32]>,
     ) -> Result<PreparedPayment, BuildError> {
+        prepare_payment_shaped(
+            fvk,
+            inputs,
+            recipient_addr,
+            amount,
+            fee,
+            network_domain,
+            tx_context,
+            recoverable,
+            memo,
+            anchor_block,
+            SendShape::LEGACY,
+            &mut rand::rng(),
+        )
+    }
+
+    /// [`prepare_payment_anchored`] with an explicit [`SendShape`] and RNG (see
+    /// [`build_wallet_payment_multi_shaped`]). In the uniform shape the change output is always
+    /// present, even at zero value, so a 1-note payment and a 4-note payment look alike.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_payment_shaped<R: RngCore + CryptoRng>(
+        fvk: &FullViewingKey,
+        inputs: Vec<(Note, MerklePath)>,
+        recipient_addr: [u8; 43],
+        amount: u64,
+        fee: u64,
+        network_domain: &[u8; 32],
+        tx_context: &[u8],
+        recoverable: bool,
+        memo: [u8; 512],
+        anchor_block: Option<[u8; 32]>,
+        shape: SendShape,
+        rng: &mut R,
+    ) -> Result<PreparedPayment, BuildError> {
         use group::ff::PrimeField;
         let ovk = recoverable.then(|| fvk.to_ovk(Scope::External));
 
         let (first_note, first_path) = inputs.first().ok_or(BuildError::Empty)?;
+        shape.check_request(inputs.len(), 1)?;
         let recipient = Option::<Address>::from(Address::from_raw_address_bytes(&recipient_addr)).ok_or(BuildError::Empty)?;
-        let change_addr = fvk.address_at(0u32, Scope::External);
+        let change_addr = shape.change_address(fvk);
         let total_in: u64 = inputs.iter().map(|(n, _)| n.value().inner()).sum();
         let change = total_in.checked_sub(amount).and_then(|v| v.checked_sub(fee)).ok_or(BuildError::Empty)?;
         let anchor = first_path.root(ExtractedNoteCommitment::from(first_note.commitment()));
 
-        let mut builder = Builder::new(BundleType::DEFAULT, crate::verify::BUNDLE_VERSION, orchard::bundle::Flags::ENABLED, anchor).expect("orchard v2 ENABLED flags are always representable");
+        let mut builder = Builder::new(shape.bundle_type(), crate::verify::BUNDLE_VERSION, orchard::bundle::Flags::ENABLED, anchor).expect("orchard v2 ENABLED flags are always representable");
         for (note, merkle_path) in inputs {
             builder.add_spend(fvk.clone(), note, merkle_path).map_err(|e| BuildError::Builder(format!("{e:?}")))?;
         }
         builder
             .add_output(ovk.clone(), recipient, NoteValue::from_raw(amount), memo)
             .map_err(|e| BuildError::Builder(format!("{e:?}")))?;
-        if change > 0 {
+        if change > 0 || shape.uniform {
             builder
                 .add_output(ovk, change_addr, NoteValue::from_raw(change), [0u8; 512])
                 .map_err(|e| BuildError::Builder(format!("{e:?}")))?;
         }
 
         let pk = proving_key();
-        let mut rng = rand::rng();
-        let (mut pczt, _meta) = builder.build_for_pczt(&mut rng).map_err(|e| BuildError::Builder(format!("{e:?}")))?;
-        pczt.create_proof(pk, &mut rng).map_err(|e| BuildError::Proof(format!("{e:?}")))?;
+        let (mut pczt, _meta) = builder.build_for_pczt(&mut *rng).map_err(|e| BuildError::Builder(format!("{e:?}")))?;
+        shape.check_built(pczt.actions().len())?;
+        pczt.create_proof(pk, &mut *rng).map_err(|e| BuildError::Proof(format!("{e:?}")))?;
 
         let effects = pczt.extract_effects::<i64>().map_err(|e| BuildError::Proof(format!("{e:?}")))?.ok_or(BuildError::Empty)?;
         let value_balance = *effects.value_balance();
@@ -1524,7 +1649,7 @@ pub mod build {
         }
         for (i, sk) in dummies {
             let ask = SpendAuthorizingKey::from(&sk);
-            pczt.actions_mut()[i].sign(sighash, &ask, &mut rng).map_err(|e| BuildError::Proof(format!("{e:?}")))?;
+            pczt.actions_mut()[i].sign(sighash, &ask, &mut *rng).map_err(|e| BuildError::Proof(format!("{e:?}")))?;
         }
 
         // Disclose each action's plaintext so the device can verify the payment instead
@@ -1548,18 +1673,35 @@ pub mod build {
     /// DEVICE role (spend key only): produce the RedPallas spend-auth signature for one
     /// real spend, from its `alpha` randomizer and the payment sighash.
     pub fn sign_spend_auth(ask: &SpendAuthorizingKey, alpha: [u8; 32], sighash: [u8; 32]) -> Option<[u8; 64]> {
+        sign_spend_auth_with_rng(ask, alpha, sighash, &mut rand::rng())
+    }
+
+    /// [`sign_spend_auth`] with an explicit RNG (deterministic conformance vectors).
+    pub fn sign_spend_auth_with_rng<R: RngCore + CryptoRng>(
+        ask: &SpendAuthorizingKey,
+        alpha: [u8; 32],
+        sighash: [u8; 32],
+        rng: &mut R,
+    ) -> Option<[u8; 64]> {
         use group::ff::PrimeField;
         let alpha = Option::<pallas::Scalar>::from(pallas::Scalar::from_repr(alpha))?;
-        let mut rng = rand::rng();
-        let sig = ask.randomize(&alpha).sign(&mut rng, &sighash);
+        let sig = ask.randomize(&alpha).sign(&mut *rng, &sighash);
         Some(<[u8; 64]>::from(&sig))
     }
 
     /// SERVER role: apply the device's spend-auth signatures, finalize IO, and emit the
     /// verifiable wire bundle. Still never touches the spend key.
-    pub fn finalize_payment(mut prepared: PreparedPayment, device_sigs: Vec<(usize, [u8; 64])>) -> Result<ShieldedBundle, BuildError> {
+    pub fn finalize_payment(prepared: PreparedPayment, device_sigs: Vec<(usize, [u8; 64])>) -> Result<ShieldedBundle, BuildError> {
+        finalize_payment_with_rng(prepared, device_sigs, &mut rand::rng())
+    }
+
+    /// [`finalize_payment`] with an explicit RNG (deterministic conformance vectors).
+    pub fn finalize_payment_with_rng<R: RngCore + CryptoRng>(
+        mut prepared: PreparedPayment,
+        device_sigs: Vec<(usize, [u8; 64])>,
+        rng: &mut R,
+    ) -> Result<ShieldedBundle, BuildError> {
         let sighash = prepared.sighash;
-        let mut rng = rand::rng();
         for (i, sig) in device_sigs {
             let sig = Signature::<SpendAuth>::from(sig);
             // Return an error rather than indexing. One caller is a daemon endpoint whose index
@@ -1573,9 +1715,9 @@ pub mod build {
                 .ok_or_else(|| BuildError::Proof(format!("signature for action {i}, which this bundle does not have")))?;
             action.apply_signature(sighash, sig).map_err(|e| BuildError::Proof(format!("{e:?}")))?;
         }
-        prepared.pczt.finalize_io(sighash, &mut rng).map_err(|e| BuildError::Proof(format!("{e:?}")))?;
+        prepared.pczt.finalize_io(sighash, &mut *rng).map_err(|e| BuildError::Proof(format!("{e:?}")))?;
         let unbound = prepared.pczt.extract::<i64>().map_err(|e| BuildError::Proof(format!("{e:?}")))?.ok_or(BuildError::Empty)?;
-        let authorized = unbound.apply_binding_signature(sighash, &mut rng).ok_or_else(|| BuildError::Proof("binding".into()))?;
+        let authorized = unbound.apply_binding_signature(sighash, &mut *rng).ok_or_else(|| BuildError::Proof("binding".into()))?;
         let mut wire = to_wire(
             &authorized,
             |a| <[u8; 64]>::from(a.authorization()),

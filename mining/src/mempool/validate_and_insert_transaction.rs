@@ -21,6 +21,7 @@ impl Mempool {
         &self,
         consensus: &dyn ConsensusApi,
         mut transaction: MutableTransaction,
+        priority: Priority,
         rbf_policy: RbfPolicy,
     ) -> RuleResult<TransactionPreValidation> {
         let transaction_id = transaction.id();
@@ -31,6 +32,9 @@ impl Mempool {
         let virtual_daa_score = consensus.get_virtual_daa_score();
         self.validate_transaction_limits_in_isolation(&transaction, virtual_daa_score)?;
         self.validate_transaction_std_in_isolation(&transaction, virtual_daa_score)?;
+        // N1 (spec 08 R1.1): a shielded transaction's fee is checked here, before consensus
+        // validation verifies its proof.
+        self.check_shielded_fee_first(&transaction, priority, virtual_daa_score)?;
         let feerate_threshold = self.get_replace_by_fee_constraint(&transaction, rbf_policy, virtual_daa_score)?;
         self.populate_mempool_entries(&mut transaction)?;
         Ok(TransactionPreValidation { transaction, feerate_threshold })

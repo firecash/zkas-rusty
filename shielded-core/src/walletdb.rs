@@ -80,6 +80,12 @@ impl OwnedNote {
     pub fn nullifier(&self) -> [u8; 32] {
         self.nullifier
     }
+
+    /// For the multi-wallet engine ([`crate::engine::WalletLite`]), which derives the
+    /// nullifier exactly as [`WalletDb`]'s ingest does.
+    pub(crate) fn new(note: Note, position: u64, nullifier: [u8; 32]) -> Self {
+        Self { note, position, nullifier }
+    }
 }
 
 /// A note whose spend has been **submitted** to the network but not yet observed
@@ -364,6 +370,14 @@ impl SharedNfSet {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test builds check the owned-nullifier index after every ingested action. That check is
+    /// itself O(notes) per action, so the bookkeeping bench turns it off for its own thread;
+    /// left on, the bench measures the check instead of the code.
+    static OWNED_NF_INDEX_CHECK: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
 /// A wallet's running view of the global note-commitment tree: it walks the
 /// canonical commitment stream, recognises its own notes, and keeps a spendable
 /// witness for each.
@@ -375,6 +389,15 @@ pub struct WalletDb {
     /// `IncomingViewingKey::prepare` is not free, so doing it per bundle — as the
     /// old per-action path did — repeated the same setup on every scanned bundle.
     prepared_ivk: PreparedIncomingViewingKey,
+    /// The INTERNAL-scope incoming viewing key, prepared. Change sent to the wallet's internal
+    /// address (spec 10-CORE B1 / 02 W6) decrypts only under this key. It is tried on the
+    /// outputs of a bundle only when that bundle spends one of this wallet's notes (spec 11 R4):
+    /// an internal note is created only by the wallet's own spend, and that spend reveals one of
+    /// the wallet's nullifiers, so the trigger is complete and costs ~0 instead of the +80% of
+    /// trial-decrypting every action twice.
+    prepared_ivk_internal: PreparedIncomingViewingKey,
+    /// The wallet's internal-scope address 0 (where Stage W change goes when enabled).
+    internal_address: [u8; 43],
     /// Full viewing key — derives each owned note's nullifier for spent-detection.
     fvk: FullViewingKey,
     /// This wallet's raw external address — matches coinbase recipients.
@@ -536,6 +559,15 @@ pub struct WalletDb {
     /// Excluded from the balance and from spend selection (like spent notes), but
     /// recoverable if the transaction is lost.
     pending_spends: Vec<PendingSpend>,
+    /// Every nullifier held in `notes` or `pending_spends`, and possibly a few that no longer
+    /// are: a SUPERSET, never a subset. Ingest probes it once per action and touches `notes`
+    /// and `pending_spends` only on a hit, which is what makes per-action bookkeeping O(1)
+    /// instead of two linear scans of the wallet's notes for every action on the chain (spec
+    /// 10 B6: a 10,000-note wallet lost 14–34 s per chain-day to those scans). Superset is the
+    /// safe direction: a stale entry only costs the old retain on that one action, while a
+    /// missing entry would leave a spent note in the balance. Every insertion into either Vec
+    /// adds here (`index_owned_nf`); removal happens only where ingest removes the note.
+    owned_nfs: HashSet<[u8; 32]>,
     /// Change owed back by each parked spend, keyed by txid — see
     /// [`Self::note_pending_outflow`]. Display-only: `mark_spent` removes the WHOLE
     /// input note from the balance, so without this a one-note wallet reads 0 from
@@ -888,7 +920,7 @@ impl SubtreeCache {
 /// row per block, so an uncapped history would grow by ~86K rows/day at 1 BPS;
 /// 20K keeps weeks of ordinary use and days of solo mining while bounding the
 /// checkpoint blob.
-const HISTORY_CAP: usize = 20_000;
+pub(crate) const HISTORY_CAP: usize = 20_000;
 
 /// How many diversified addresses to derive up front for coinbase recognition.
 ///
@@ -897,25 +929,34 @@ const HISTORY_CAP: usize = 20_000;
 /// operation on half of every block's leaves. 256 covers per-customer deposit
 /// addresses at the scale this daemon actually serves; see `known_addresses` for
 /// what it does not cover.
-const COINBASE_DIVERSIFIER_SCAN: u32 = 256;
+pub(crate) const COINBASE_DIVERSIFIER_SCAN: u32 = 256;
 
 impl WalletDb {
     /// Build a wallet view from a 32-byte seed. Returns `None` if the seed is not
     /// a valid Orchard spending key (negligibly rare).
     pub fn from_seed(seed: [u8; 32]) -> Option<Self> {
         let sk = Option::<SpendingKey>::from(SpendingKey::from_bytes(seed))?;
-        let fvk = FullViewingKey::from(&sk);
+        Some(Self::with_fvk(FullViewingKey::from(&sk), true))
+    }
+
+    /// One constructor for every key source. `scan_addresses = false` leaves the coinbase
+    /// recognition set empty: only for a read-only view that never ingests
+    /// ([`Self::view_from_parts`]); deriving the 256 addresses is most of a construction.
+    fn with_fvk(fvk: FullViewingKey, scan_addresses: bool) -> Self {
         let ivk = fvk.to_ivk(Scope::External);
         let prepared_ivk = ivk.prepare();
         let agree_scalar = crate::wallet::ivk_agreement_scalar(&ivk);
         let my_address = fvk.address_at(0u32, Scope::External).to_raw_address_bytes();
-        let known_addresses = (0..COINBASE_DIVERSIFIER_SCAN)
-            .map(|i| fvk.address_at(i, Scope::External).to_raw_address_bytes())
-            .collect();
+        let known_addresses =
+            if scan_addresses { (0..COINBASE_DIVERSIFIER_SCAN).map(|i| fvk.address_at(i, Scope::External).to_raw_address_bytes()).collect() } else { HashSet::new() };
         let ovk = fvk.to_ovk(Scope::External);
-        Some(Self {
+        let prepared_ivk_internal = fvk.to_ivk(Scope::Internal).prepare();
+        let internal_address = fvk.address_at(0u32, Scope::Internal).to_raw_address_bytes();
+        Self {
             ivk,
             prepared_ivk,
+            prepared_ivk_internal,
+            internal_address,
             fvk,
             my_address,
             known_addresses,
@@ -941,11 +982,12 @@ impl WalletDb {
             borrow_tree: false,
             tree_valid: true,
             pending_spends: Vec::new(),
+            owned_nfs: HashSet::new(),
             pending_change: HashMap::new(),
             last_daa: 0,
             subtree: SubtreeCache::default(),
             scan_cost: ScanCost::default(),
-        })
+        }
     }
 
     /// Build a **watch-only** wallet view from a serialized full viewing key
@@ -958,47 +1000,40 @@ impl WalletDb {
     /// are not a valid full viewing key.
     pub fn from_fvk(fvk_bytes: &[u8; 96]) -> Option<Self> {
         let fvk = FullViewingKey::from_bytes(fvk_bytes)?;
-        let ivk = fvk.to_ivk(Scope::External);
-        let prepared_ivk = ivk.prepare();
-        let agree_scalar = crate::wallet::ivk_agreement_scalar(&ivk);
-        let my_address = fvk.address_at(0u32, Scope::External).to_raw_address_bytes();
-        let known_addresses = (0..COINBASE_DIVERSIFIER_SCAN)
-            .map(|i| fvk.address_at(i, Scope::External).to_raw_address_bytes())
-            .collect();
-        let ovk = fvk.to_ovk(Scope::External);
-        Some(Self {
-            ivk,
-            prepared_ivk,
-            fvk,
-            my_address,
-            known_addresses,
-            tree: CommitmentTree::empty(),
-            base_frontier: Frontier::empty(),
-            base_size: 0,
-            leaves: Vec::new(),
-            notes: Vec::new(),
-            size: 0,
-            witnesses: Vec::new(),
-            witness_budget: MAX_LIVE_WITNESSES,
-            lag_tree: CommitmentTree::empty(),
-            witnessed_upto: 0,
-            spent_nullifiers: HashSet::new(),
-            nf_shared: DEFAULT_NF_INTERNER.get().map(|i| SharedNfSet { interner: i.clone(), bits: Vec::new(), count: 0 }),
-            ovk,
-            history: Vec::new(),
-            history_enabled: true,
-            agree_scalar,
-            predecrypted: None,
-            leaves_only: false,
-            poisoned: false,
-            borrow_tree: false,
-            tree_valid: true,
-            pending_spends: Vec::new(),
-            pending_change: HashMap::new(),
-            last_daa: 0,
-            subtree: SubtreeCache::default(),
-            scan_cost: ScanCost::default(),
-        })
+        Some(Self::with_fvk(fvk, true))
+    }
+
+    /// A read-only VIEW of a wallet for rendering its API answers: its own private state on a
+    /// tree that is only the tip frontier at `tip.size` (no leaves, no applied-nullifier set).
+    /// Balance, notes, pending spends, history, clock and anchor read exactly as from the full
+    /// database; it can never witness a note (every position is below its base) and must never
+    /// ingest or spend. The multi-wallet engine serves `/api/*` reads through it.
+    pub fn view_from_parts(
+        fvk: &FullViewingKey,
+        notes: Vec<OwnedNote>,
+        pending_spends: Vec<PendingSpend>,
+        history: Vec<HistoryEntry>,
+        history_enabled: bool,
+        last_daa: u64,
+        tip: &FrontierState,
+    ) -> Option<Self> {
+        let mut db = Self::with_fvk(fvk.clone(), false);
+        if tip.size > 0 {
+            let gt = GlobalTree::from_state(tip).ok()?;
+            db.base_frontier = gt.frontier().clone();
+            db.tree = CommitmentTree::from_frontier(&db.base_frontier);
+            db.lag_tree = CommitmentTree::from_frontier(&db.base_frontier);
+        }
+        db.base_size = tip.size;
+        db.size = tip.size;
+        db.witnessed_upto = tip.size;
+        db.notes = notes;
+        db.pending_spends = pending_spends;
+        db.history = history;
+        db.history_enabled = history_enabled;
+        db.last_daa = last_daa;
+        db.reindex_owned_nfs();
+        Some(db)
     }
 
     /// This wallet's full viewing key. Grants viewing (not spend) capability; the
@@ -1018,6 +1053,31 @@ impl WalletDb {
     /// viewing key, so a watch-only wallet knows it too.
     pub fn my_address_bytes(&self) -> [u8; 43] {
         self.my_address
+    }
+
+    /// This wallet's internal-scope address 0: where Stage W change goes when internal change is
+    /// enabled. Never handed out to payers; found by the R4 trigger scan (see
+    /// [`Self::internal_hits`]).
+    pub fn internal_address_bytes(&self) -> [u8; 43] {
+        self.internal_address
+    }
+
+    /// Whether `addr` is one of this wallet's own change addresses (external 0 or internal 0).
+    fn is_own_change_address(&self, addr: &[u8; 43]) -> bool {
+        *addr == self.my_address || *addr == self.internal_address
+    }
+
+    /// Spec 11 R4: the internal-scope notes a bundle that spends one of ours created, merged into
+    /// the external hits. Only called for bundles with an owned nullifier, so a wallet's scan cost
+    /// grows by one key agreement per action of its OWN bundles and by nothing else.
+    fn merge_internal_hits(&self, mut received: Vec<ReceivedNote>, internal: Vec<ReceivedNote>) -> Vec<ReceivedNote> {
+        for r in internal {
+            if !received.iter().any(|x| x.action_index == r.action_index) {
+                received.push(r);
+            }
+        }
+        received.sort_by_key(|r| r.action_index);
+        received
     }
 
     /// The wallet's diversified address at `index` (0 = [`Self::my_address_bytes`]).
@@ -1214,6 +1274,7 @@ impl WalletDb {
     /// spent in this stream appends nothing (see `spent_nullifiers`). Shared by both
     /// ingest paths above.
     fn ingest_bundles(&mut self, txs: &[&ShieldedBundle], meta: Option<&BlockMeta>) {
+        let mut pruned_change = false;
         for (bi, bundle) in txs.iter().enumerate() {
             if bundle.actions.iter().any(|a| self.nf_contains(&a.nullifier)) {
                 self.poisoned = true;
@@ -1225,16 +1286,17 @@ impl WalletDb {
             // missing them here would make the wallet record its own confirmed
             // send as a "Received <change>" row instead of a Sent one.
             let spent: u64 = bundle.actions.iter().filter_map(|a| self.owned_note_value(&a.nullifier)).sum();
-            let received = scan_bundle_prepared(&self.prepared_ivk, bundle);
+            let mut received = scan_bundle_prepared(&self.prepared_ivk, bundle);
+            if !self.leaves_only && self.owns_any_nullifier(bundle.actions.iter().map(|a| &a.nullifier)) {
+                received = self.merge_internal_hits(received, scan_bundle_prepared(&self.prepared_ivk_internal, bundle));
+            }
             for (i, action) in bundle.actions.iter().enumerate() {
                 // Each action reveals the nullifier of the note it spends. If that is
                 // one of ours, the note is now spent — drop it from the unspent set so
                 // balance and spend-selection never count or re-offer it. A pending
                 // spend whose nullifier appears is CONFIRMED: the parked note is gone
                 // for good.
-                self.notes.retain(|n| n.nullifier != action.nullifier);
-                self.pending_spends.retain(|p| p.note.nullifier != action.nullifier);
-                self.prune_pending_change();
+                self.forget_spent_owned(&action.nullifier, &mut pruned_change);
                 self.nf_insert(&action.nullifier);
 
                 let Some(cmx) = Option::<ExtractedNoteCommitment>::from(ExtractedNoteCommitment::from_bytes(&action.cmx)) else {
@@ -1316,6 +1378,7 @@ impl WalletDb {
     /// Compact counterpart of [`Self::ingest_bundles`] — identical drop rule and
     /// tree-append order, over compact action records.
     fn ingest_bundles_compact(&mut self, txs: &[Vec<CompactActionRecord>], meta: Option<&BlockMeta>) {
+        let mut pruned_change = false;
         for (bi, records) in txs.iter().enumerate() {
             if records.iter().any(|a| self.nf_contains(&a.nullifier)) {
                 self.poisoned = true;
@@ -1344,6 +1407,12 @@ impl WalletDb {
             } else {
                 scan_compact_auto(&self.prepared_ivk, self.agree_scalar.as_ref(), records)
             };
+            // R4 trigger (after the external hits, which may come from the page memo).
+            let received = if !self.leaves_only && self.owns_any_nullifier(records.iter().map(|r| &r.nullifier)) {
+                self.merge_internal_hits(received, scan_compact_prepared(&self.prepared_ivk_internal, records))
+            } else {
+                received
+            };
             // A memo hit did its decryption in `predecrypt_page`, which already charged
             // for it; charging again here would double-count the same actions.
             if !from_memo {
@@ -1351,9 +1420,7 @@ impl WalletDb {
                 self.scan_cost.actions += records.len() as u64;
             }
             for (i, rec) in records.iter().enumerate() {
-                self.notes.retain(|n| n.nullifier != rec.nullifier);
-                self.pending_spends.retain(|p| p.note.nullifier != rec.nullifier);
-                self.prune_pending_change();
+                self.forget_spent_owned(&rec.nullifier, &mut pruned_change);
                 self.nf_insert(&rec.nullifier);
 
                 let Some(cmx) = Option::<ExtractedNoteCommitment>::from(ExtractedNoteCommitment::from_bytes(&rec.cmx)) else {
@@ -1417,9 +1484,59 @@ impl WalletDb {
         self.push_history(entry);
     }
 
+    /// Record that `notes` or `pending_spends` now holds a note with this nullifier.
+    fn index_owned_nf(&mut self, nullifier: [u8; 32]) {
+        self.owned_nfs.insert(nullifier);
+    }
+
+    /// Rebuild [`Self::owned_nfs`] from scratch, for code that replaces `notes` or
+    /// `pending_spends` wholesale.
+    fn reindex_owned_nfs(&mut self) {
+        self.owned_nfs = self.notes.iter().map(|n| n.nullifier).chain(self.pending_spends.iter().map(|p| p.note.nullifier)).collect();
+    }
+
+    /// An action on the chain revealed `nullifier`: if it spends one of our notes (unspent or
+    /// parked), that note is gone for good. The same effect as the two `retain`s and the
+    /// `pending_change` prune ingest used to run for EVERY action, paid only on a hit.
+    ///
+    /// `pruned_change` keeps the prune exactly where it was observable: the old code pruned
+    /// after the first action of an ingest call even without a hit (clearing change of spends
+    /// that had left `pending_spends` some other way), and after every hit. Between those it
+    /// was a no-op, because nothing else in the loop changes `pending_spends`.
+    fn forget_spent_owned(&mut self, nullifier: &[u8; 32], pruned_change: &mut bool) {
+        if self.owned_nfs.remove(nullifier) {
+            self.notes.retain(|n| &n.nullifier != nullifier);
+            self.pending_spends.retain(|p| &p.note.nullifier != nullifier);
+            self.prune_pending_change();
+            *pruned_change = true;
+        } else if !*pruned_change {
+            self.prune_pending_change();
+            *pruned_change = true;
+        }
+        #[cfg(test)]
+        if OWNED_NF_INDEX_CHECK.with(|c| c.get()) {
+            self.assert_owned_nfs_cover_notes();
+        }
+    }
+
+    #[cfg(test)]
+    fn assert_owned_nfs_cover_notes(&self) {
+        for nf in self.notes.iter().map(|n| &n.nullifier).chain(self.pending_spends.iter().map(|p| &p.note.nullifier)) {
+            assert!(self.owned_nfs.contains(nf), "owned-nullifier index lost a held note");
+        }
+    }
+
     /// Value of the owned note (unspent or pending-spend) this nullifier would
     /// reveal, if it is one of ours.
+    fn owns_any_nullifier<'n>(&self, mut nullifiers: impl Iterator<Item = &'n [u8; 32]>) -> bool {
+        nullifiers.any(|nf| self.owned_note_value(nf).is_some())
+    }
+
     fn owned_note_value(&self, nullifier: &[u8; 32]) -> Option<u64> {
+        // Called for every action on the chain; nearly all of them are someone else's.
+        if !self.owned_nfs.contains(nullifier) {
+            return None;
+        }
         self.notes
             .iter()
             .find(|n| &n.nullifier == nullifier)
@@ -1486,7 +1603,7 @@ impl WalletDb {
                     continue;
                 };
                 let addr_bytes = addr.to_raw_address_bytes();
-                if addr_bytes == self.my_address {
+                if self.is_own_change_address(&addr_bytes) {
                     continue; // our own change
                 }
                 let m = trim_memo(&m);
@@ -1572,7 +1689,7 @@ impl WalletDb {
                 continue;
             };
             let addr_bytes = addr.to_raw_address_bytes();
-            if addr_bytes == self.my_address {
+            if self.is_own_change_address(&addr_bytes) {
                 continue; // our own change
             }
             let m = trim_memo(&m);
@@ -1764,8 +1881,12 @@ impl WalletDb {
                 .filter_map(|a| self.notes.iter().find(|n| n.nullifier == a.nullifier))
                 .map(|n| n.value() as u128)
                 .sum();
-            // What this bundle gives us: anything decryptable to our ivk.
-            let received: u128 = scan_bundle_prepared(&self.prepared_ivk, bundle).iter().map(|r| r.note.value().inner() as u128).sum();
+            // What this bundle gives us: anything decryptable to our ivk, plus (R4) internal
+            // change when the bundle spends one of our notes.
+            let mut received: u128 = scan_bundle_prepared(&self.prepared_ivk, bundle).iter().map(|r| r.note.value().inner() as u128).sum();
+            if spent > 0 {
+                received += scan_bundle_prepared(&self.prepared_ivk_internal, bundle).iter().map(|r| r.note.value().inner() as u128).sum::<u128>();
+            }
 
             if spent > 0 {
                 // OUR OWN spend. The received part is our CHANGE coming back, not an
@@ -1800,8 +1921,11 @@ impl WalletDb {
             }
             let spent: u128 =
                 records.iter().filter_map(|a| self.notes.iter().find(|n| n.nullifier == a.nullifier)).map(|n| n.value() as u128).sum();
-            let received: u128 =
+            let mut received: u128 =
                 scan_compact_prepared(&self.prepared_ivk, records).iter().map(|r| r.note.value().inner() as u128).sum();
+            if spent > 0 {
+                received += scan_compact_prepared(&self.prepared_ivk_internal, records).iter().map(|r| r.note.value().inner() as u128).sum::<u128>();
+            }
             if spent > 0 {
                 p.outgoing += spent.saturating_sub(received);
             } else {
@@ -2205,6 +2329,7 @@ impl WalletDb {
             // never offer the note as spendable.
             if !self.nf_contains(&nullifier) {
                 self.notes.push(OwnedNote { note, position: self.size, nullifier });
+                self.index_owned_nf(nullifier);
             }
         }
         self.size += 1;
@@ -2320,7 +2445,19 @@ impl WalletDb {
         // is supposed to measure is worse than none, and I nearly reported it as a win.
         let t_dec = std::time::Instant::now();
         let found = crate::wallet::scan_compact_auto_prepared(&self.prepared_ivk, self.agree_scalar.as_ref(), all, prep, epks);
-        self.scan_cost.decrypt_ns += t_dec.elapsed().as_nanos();
+        self.install_predecrypted(all, found, t_dec.elapsed().as_nanos());
+    }
+
+    /// Install a page memo that somebody else decided: `found` must be exactly what
+    /// [`Self::predecrypt_page_prepared`] would have computed for `all` with this wallet's
+    /// key (the multi-wallet detector, [`crate::engine::detect`], computes it for a whole
+    /// cohort at once). `decrypt_ns` is charged to this wallet's scan cost. Like the memo it
+    /// replaces it is purely an optimisation input: [`Self::end_page`] drops it.
+    pub fn install_predecrypted(&mut self, all: &[CompactActionRecord], found: Vec<ReceivedNote>, decrypt_ns: u128) {
+        if self.leaves_only || all.is_empty() {
+            return;
+        }
+        self.scan_cost.decrypt_ns += decrypt_ns;
         self.scan_cost.actions += all.len() as u64;
         let mut map: std::collections::HashMap<[u8; 32], Option<ReceivedNote>> = all.iter().map(|r| (r.nullifier, None)).collect();
         for n in found {
@@ -2329,6 +2466,12 @@ impl WalletDb {
             }
         }
         self.predecrypted = Some(map);
+    }
+
+    /// The prepared external viewing key and its agreement scalar — what a multi-wallet
+    /// detector needs to decide this wallet's actions ([`crate::engine::IvkKey`]).
+    pub fn incoming_viewing_key(&self) -> &IncomingViewingKey {
+        &self.ivk
     }
 
     /// Drop the page memo. Always call after the page's blocks are ingested — a stale
@@ -2371,6 +2514,12 @@ impl WalletDb {
             }
             Some(sh) => sh.insert(nf),
         }
+    }
+
+    /// Whether the stream this wallet ingested has applied `nf` (the set the consensus drop
+    /// rule and the "spent before it appeared" rule read).
+    pub fn applied_nullifier(&self, nf: &[u8; 32]) -> bool {
+        self.nf_contains(nf)
     }
 
     /// Number of applied nullifiers this wallet's stream holds (either representation).
@@ -3357,6 +3506,7 @@ impl WalletDb {
         witnesses.retain(|(p, _)| owned.contains(p));
 
         db.notes = kept;
+        db.reindex_owned_nfs();
         db.witnesses = witnesses;
         db.witnessed_upto = size;
         db.lag_tree = db.tree.clone();
@@ -3415,12 +3565,7 @@ impl WalletDb {
         }
         out.extend_from_slice(&(self.notes.len() as u64).to_le_bytes());
         for n in &self.notes {
-            out.extend_from_slice(&n.position.to_le_bytes());
-            out.extend_from_slice(&n.nullifier);
-            out.extend_from_slice(&n.note.recipient().to_raw_address_bytes());
-            out.extend_from_slice(&n.note.value().inner().to_le_bytes());
-            out.extend_from_slice(&n.note.rho().to_bytes());
-            out.extend_from_slice(n.note.rseed().as_bytes());
+            write_note(&mut out, n);
         }
         // v3: the spent-nullifier set, in iteration order.
         //
@@ -3493,38 +3638,7 @@ impl WalletDb {
         // v6: the chain-derived history rows, length-prefixed and best-effort like
         // the witness section — parse trouble degrades to "history starts fresh",
         // never a failed restore.
-        let mut hsec = Vec::new();
-        hsec.extend_from_slice(&(self.history.len() as u64).to_le_bytes());
-        for h in &self.history {
-            hsec.push(h.kind as u8);
-            hsec.extend_from_slice(&h.txid);
-            hsec.extend_from_slice(&h.daa_score.to_le_bytes());
-            hsec.extend_from_slice(&h.timestamp_ms.to_le_bytes());
-            hsec.extend_from_slice(&h.amount.to_le_bytes());
-            hsec.extend_from_slice(&h.fee.to_le_bytes());
-            hsec.push((h.amount_is_net_outflow as u8) | ((h.fee_known as u8) << 1));
-            match &h.recipient {
-                Some(r) => {
-                    hsec.push(1);
-                    hsec.extend_from_slice(r);
-                }
-                None => hsec.push(0),
-            }
-            let memo_len = h.memo.len().min(u16::MAX as usize) as u16;
-            hsec.extend_from_slice(&memo_len.to_le_bytes());
-            hsec.extend_from_slice(&h.memo[..memo_len as usize]);
-            // v10: the per-output breakdown, written inside the row (not as a
-            // trailing section) so a row and its credits cannot drift apart.
-            let ncred = h.credits.len().min(CREDITS_CAP) as u16;
-            hsec.extend_from_slice(&ncred.to_le_bytes());
-            for c in h.credits.iter().take(ncred as usize) {
-                hsec.extend_from_slice(&c.recipient);
-                hsec.extend_from_slice(&c.value.to_le_bytes());
-                let cm = c.memo.len().min(u16::MAX as usize) as u16;
-                hsec.extend_from_slice(&cm.to_le_bytes());
-                hsec.extend_from_slice(&c.memo[..cm as usize]);
-            }
-        }
+        let hsec = encode_history_section(&self.history);
         out.extend_from_slice(&(hsec.len() as u64).to_le_bytes());
         out.extend_from_slice(&hsec);
 
@@ -3534,19 +3648,7 @@ impl WalletDb {
         // never a failed restore. Layout: [last_daa:u64][n:u64]
         // (position:u64, nullifier:32, recipient:43, value:u64, rho:32, rseed:32,
         //  txid:32, submitted_daa:u64)*.
-        let mut psec = Vec::new();
-        psec.extend_from_slice(&self.last_daa.to_le_bytes());
-        psec.extend_from_slice(&(self.pending_spends.len() as u64).to_le_bytes());
-        for p in &self.pending_spends {
-            psec.extend_from_slice(&p.note.position.to_le_bytes());
-            psec.extend_from_slice(&p.note.nullifier);
-            psec.extend_from_slice(&p.note.note.recipient().to_raw_address_bytes());
-            psec.extend_from_slice(&p.note.note.value().inner().to_le_bytes());
-            psec.extend_from_slice(&p.note.note.rho().to_bytes());
-            psec.extend_from_slice(p.note.note.rseed().as_bytes());
-            psec.extend_from_slice(&p.txid);
-            psec.extend_from_slice(&p.submitted_daa.to_le_bytes());
-        }
+        let psec = encode_pending_section(self.last_daa, &self.pending_spends);
         out.extend_from_slice(&(psec.len() as u64).to_le_bytes());
         out.extend_from_slice(&psec);
 
@@ -3704,15 +3806,9 @@ impl WalletDb {
         }
         let n_notes = r.u64()? as usize;
         for _ in 0..n_notes {
-            let position = r.u64()?;
-            let nullifier = r.arr::<32>()?;
-            let recipient = r.arr::<43>()?;
-            let value = r.u64()?;
-            let rho = Option::<Rho>::from(Rho::from_bytes(&r.arr()?))?;
-            let rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes(r.arr()?, &rho))?;
-            let addr = Option::<Address>::from(Address::from_raw_address_bytes(&recipient))?;
-            let note = Option::<Note>::from(Note::from_parts(addr, NoteValue::from_raw(value), rho, rseed, orchard::note::NoteVersion::V2))?;
-            db.notes.push(OwnedNote { note, position, nullifier });
+            let note = read_note(&mut r)?;
+            db.index_owned_nf(note.nullifier);
+            db.notes.push(note);
         }
         let n_nfs = r.u64()? as usize;
         for _ in 0..n_nfs {
@@ -3861,32 +3957,10 @@ impl WalletDb {
     /// Best-effort restore of the v7 pending-spend section — any malformed record
     /// drops the whole section, never fails the restore.
     fn read_pending_section(db: &mut Self, buf: &[u8]) {
-        let mut r = Cursor { buf, pos: 0 };
-        let parse = |r: &mut Cursor<'_>| -> Option<(u64, Vec<PendingSpend>)> {
-            let last_daa = r.u64()?;
-            let n = r.u64()? as usize;
-            let mut out = Vec::with_capacity(n.min(1024));
-            for _ in 0..n {
-                let position = r.u64()?;
-                let nullifier = r.arr::<32>()?;
-                let recipient = r.arr::<43>()?;
-                let value = r.u64()?;
-                let rho = Option::<Rho>::from(Rho::from_bytes(&r.arr()?))?;
-                let rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes(r.arr()?, &rho))?;
-                let addr = Option::<Address>::from(Address::from_raw_address_bytes(&recipient))?;
-                let note = Option::<Note>::from(Note::from_parts(addr, NoteValue::from_raw(value), rho, rseed, orchard::note::NoteVersion::V2))?;
-                let txid = r.arr::<32>()?;
-                let submitted_daa = r.u64()?;
-                out.push(PendingSpend { note: OwnedNote { note, position, nullifier }, txid, submitted_daa });
-            }
-            if !r.done() {
-                return None;
-            }
-            Some((last_daa, out))
-        };
-        if let Some((last_daa, pending)) = parse(&mut r) {
+        if let Some((last_daa, pending)) = parse_pending_section(buf) {
             db.last_daa = last_daa;
             db.pending_spends = pending;
+            db.reindex_owned_nfs();
         }
     }
 
@@ -3894,69 +3968,7 @@ impl WalletDb {
     /// Any malformed row drops the
     /// whole section (history restarts from here on) — never fails the restore.
     fn read_history_section(db: &mut Self, buf: &[u8], has_compact_flags: bool, has_credits: bool) {
-        let mut r = Cursor { buf, pos: 0 };
-        let parse = |r: &mut Cursor<'_>| -> Option<Vec<HistoryEntry>> {
-            let n = (r.u64()? as usize).min(HISTORY_CAP);
-            let mut out = Vec::with_capacity(n);
-            for _ in 0..n {
-                let kind = match r.u8()? {
-                    0 => HistoryKind::Coinbase,
-                    1 => HistoryKind::Received,
-                    2 => HistoryKind::Sent,
-                    _ => return None,
-                };
-                let txid = r.arr::<32>()?;
-                let daa_score = r.u64()?;
-                let timestamp_ms = r.u64()?;
-                let amount = r.u64()?;
-                let fee = r.u64()?;
-                let (amount_is_net_outflow, fee_known) = if has_compact_flags {
-                    let flags = r.u8()?;
-                    if flags & !0b11 != 0 {
-                        return None;
-                    }
-                    (flags & 1 != 0, flags & 2 != 0)
-                } else {
-                    (false, true)
-                };
-                let recipient = match r.u8()? {
-                    0 => None,
-                    1 => Some(r.arr::<43>()?),
-                    _ => return None,
-                };
-                let memo_len = u16::from_le_bytes(r.arr::<2>()?) as usize;
-                let memo = r.take(memo_len)?.to_vec();
-                // A pre-v10 row has no breakdown; it restores with an empty vector
-                // and the client falls back to `amount`/`recipient` as before.
-                let mut credits = Vec::new();
-                if has_credits {
-                    let n = (u16::from_le_bytes(r.arr::<2>()?) as usize).min(CREDITS_CAP);
-                    credits.reserve(n);
-                    for _ in 0..n {
-                        let recipient = r.arr::<43>()?;
-                        let value = r.u64()?;
-                        let cm = u16::from_le_bytes(r.arr::<2>()?) as usize;
-                        let cmemo = r.take(cm)?.to_vec();
-                        credits.push(Credit { recipient, value, memo: cmemo });
-                    }
-                }
-                out.push(HistoryEntry {
-                    kind,
-                    txid,
-                    daa_score,
-                    timestamp_ms,
-                    amount,
-                    fee,
-                    amount_is_net_outflow,
-                    fee_known,
-                    recipient,
-                    memo,
-                    credits,
-                });
-            }
-            r.done().then_some(out)
-        };
-        if let Some(h) = parse(&mut r) {
+        if let Some(h) = parse_history_section(buf, has_compact_flags, has_credits) {
             db.history = h;
         }
     }
@@ -3996,6 +4008,481 @@ impl WalletDb {
                 db.witnesses = ws;
             }
         }
+    }
+}
+
+/// The v6 history section body (rows with v9 flags and v10 credits), byte-for-byte what
+/// [`WalletDb::to_checkpoint`] writes; [`parse_history_section`] reads it back.
+pub(crate) fn encode_history_section(history: &[HistoryEntry]) -> Vec<u8> {
+    let mut hsec = Vec::new();
+    hsec.extend_from_slice(&(history.len() as u64).to_le_bytes());
+    for h in history {
+        hsec.push(h.kind as u8);
+        hsec.extend_from_slice(&h.txid);
+        hsec.extend_from_slice(&h.daa_score.to_le_bytes());
+        hsec.extend_from_slice(&h.timestamp_ms.to_le_bytes());
+        hsec.extend_from_slice(&h.amount.to_le_bytes());
+        hsec.extend_from_slice(&h.fee.to_le_bytes());
+        hsec.push((h.amount_is_net_outflow as u8) | ((h.fee_known as u8) << 1));
+        match &h.recipient {
+            Some(r) => {
+                hsec.push(1);
+                hsec.extend_from_slice(r);
+            }
+            None => hsec.push(0),
+        }
+        let memo_len = h.memo.len().min(u16::MAX as usize) as u16;
+        hsec.extend_from_slice(&memo_len.to_le_bytes());
+        hsec.extend_from_slice(&h.memo[..memo_len as usize]);
+        // v10: the per-output breakdown, written inside the row (not as a
+        // trailing section) so a row and its credits cannot drift apart.
+        let ncred = h.credits.len().min(CREDITS_CAP) as u16;
+        hsec.extend_from_slice(&ncred.to_le_bytes());
+        for c in h.credits.iter().take(ncred as usize) {
+            hsec.extend_from_slice(&c.recipient);
+            hsec.extend_from_slice(&c.value.to_le_bytes());
+            let cm = c.memo.len().min(u16::MAX as usize) as u16;
+            hsec.extend_from_slice(&cm.to_le_bytes());
+            hsec.extend_from_slice(&c.memo[..cm as usize]);
+        }
+    }
+    hsec
+}
+
+/// The v7 pending-spend section body, byte-for-byte what [`WalletDb::to_checkpoint`] writes.
+pub(crate) fn encode_pending_section(last_daa: u64, pending: &[PendingSpend]) -> Vec<u8> {
+    let mut psec = Vec::new();
+    psec.extend_from_slice(&last_daa.to_le_bytes());
+    psec.extend_from_slice(&(pending.len() as u64).to_le_bytes());
+    for p in pending {
+        psec.extend_from_slice(&p.note.position.to_le_bytes());
+        psec.extend_from_slice(&p.note.nullifier);
+        psec.extend_from_slice(&p.note.note.recipient().to_raw_address_bytes());
+        psec.extend_from_slice(&p.note.note.value().inner().to_le_bytes());
+        psec.extend_from_slice(&p.note.note.rho().to_bytes());
+        psec.extend_from_slice(p.note.note.rseed().as_bytes());
+        psec.extend_from_slice(&p.txid);
+        psec.extend_from_slice(&p.submitted_daa.to_le_bytes());
+    }
+    psec
+}
+
+/// The v7 pending-spend section (`[last_daa][n](record)*`), exactly as a restore parses it.
+/// `None` = malformed: a restore then keeps no pending spends and a zero clock. Shared by
+/// [`WalletDb`]'s restore and the migration reader ([`read_checkpoint_private`]).
+fn parse_pending_section(buf: &[u8]) -> Option<(u64, Vec<PendingSpend>)> {
+    let mut r = Cursor { buf, pos: 0 };
+    let parse = |r: &mut Cursor<'_>| -> Option<(u64, Vec<PendingSpend>)> {
+        let last_daa = r.u64()?;
+        let n = r.u64()? as usize;
+        let mut out = Vec::with_capacity(n.min(1024));
+        for _ in 0..n {
+            let position = r.u64()?;
+            let nullifier = r.arr::<32>()?;
+            let recipient = r.arr::<43>()?;
+            let value = r.u64()?;
+            let rho = Option::<Rho>::from(Rho::from_bytes(&r.arr()?))?;
+            let rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes(r.arr()?, &rho))?;
+            let addr = Option::<Address>::from(Address::from_raw_address_bytes(&recipient))?;
+            let note = Option::<Note>::from(Note::from_parts(addr, NoteValue::from_raw(value), rho, rseed, orchard::note::NoteVersion::V2))?;
+            let txid = r.arr::<32>()?;
+            let submitted_daa = r.u64()?;
+            out.push(PendingSpend { note: OwnedNote { note, position, nullifier }, txid, submitted_daa });
+        }
+        if !r.done() {
+            return None;
+        }
+        Some((last_daa, out))
+    };
+    parse(&mut r)
+}
+
+/// The v6 history section, exactly as a restore parses it (v9 adds compact-send flags, v10
+/// credits). `None` = malformed: a restore then starts history fresh.
+fn parse_history_section(buf: &[u8], has_compact_flags: bool, has_credits: bool) -> Option<Vec<HistoryEntry>> {
+    let mut r = Cursor { buf, pos: 0 };
+    let parse = |r: &mut Cursor<'_>| -> Option<Vec<HistoryEntry>> {
+        let n = (r.u64()? as usize).min(HISTORY_CAP);
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            let kind = match r.u8()? {
+                0 => HistoryKind::Coinbase,
+                1 => HistoryKind::Received,
+                2 => HistoryKind::Sent,
+                _ => return None,
+            };
+            let txid = r.arr::<32>()?;
+            let daa_score = r.u64()?;
+            let timestamp_ms = r.u64()?;
+            let amount = r.u64()?;
+            let fee = r.u64()?;
+            let (amount_is_net_outflow, fee_known) = if has_compact_flags {
+                let flags = r.u8()?;
+                if flags & !0b11 != 0 {
+                    return None;
+                }
+                (flags & 1 != 0, flags & 2 != 0)
+            } else {
+                (false, true)
+            };
+            let recipient = match r.u8()? {
+                0 => None,
+                1 => Some(r.arr::<43>()?),
+                _ => return None,
+            };
+            let memo_len = u16::from_le_bytes(r.arr::<2>()?) as usize;
+            let memo = r.take(memo_len)?.to_vec();
+            // A pre-v10 row has no breakdown; it restores with an empty vector
+            // and the client falls back to `amount`/`recipient` as before.
+            let mut credits = Vec::new();
+            if has_credits {
+                let n = (u16::from_le_bytes(r.arr::<2>()?) as usize).min(CREDITS_CAP);
+                credits.reserve(n);
+                for _ in 0..n {
+                    let recipient = r.arr::<43>()?;
+                    let value = r.u64()?;
+                    let cm = u16::from_le_bytes(r.arr::<2>()?) as usize;
+                    let cmemo = r.take(cm)?.to_vec();
+                    credits.push(Credit { recipient, value, memo: cmemo });
+                }
+            }
+            out.push(HistoryEntry {
+                kind,
+                txid,
+                daa_score,
+                timestamp_ms,
+                amount,
+                fee,
+                amount_is_net_outflow,
+                fee_known,
+                recipient,
+                memo,
+                credits,
+            });
+        }
+        r.done().then_some(out)
+    };
+    parse(&mut r)
+}
+
+// ---------------------------------------------------------------------------
+// Multi-wallet engine, phase 2: what the engine needs from a checkpoint and from a
+// persisted shared tree (walletd-scale task E2, `09-engine-phase2.md`).
+// ---------------------------------------------------------------------------
+
+/// The part of a checkpoint blob that belongs to the wallet itself: its notes, pending
+/// spends, history and chain clock, plus the counts and tip frontier that bind it to the
+/// public stream. Read by [`read_checkpoint_private`] WITHOUT loading the leaf stream, the
+/// applied-nullifier set, the witness section or the subtree index (all public chain data,
+/// which the engine holds once for every wallet).
+#[derive(Clone)]
+pub struct CheckpointPrivate {
+    pub version: u8,
+    /// Absolute leaf count summarised by the base frontier.
+    pub base_size: u64,
+    /// Absolute tree size at the wallet's cursor.
+    pub size: u64,
+    /// Leaves the blob holds after the base (inline + v11-referenced).
+    pub leaf_count: u64,
+    /// v11: how many of those are referenced from the shared stream (0 otherwise).
+    pub shared_leaves: u64,
+    /// Applied nullifiers the blob holds (skipped, counted).
+    pub nullifier_count: u64,
+    pub notes: Vec<OwnedNote>,
+    /// The tip frontier at `size` (v4+). `None` for v3 or for a borrowing writer that had
+    /// nothing valid to record (empty tag with `size > 0`): a restore then marks its tree invalid.
+    pub tip: Option<FrontierState>,
+    pub history: Vec<HistoryEntry>,
+    pub pending: Vec<PendingSpend>,
+    pub last_daa: u64,
+    /// Bytes of the blob actually read; everything else was seeked past.
+    pub bytes_read: u64,
+}
+
+/// A bounded forward reader over a blob inside a seekable file. Reads are counted, skips
+/// are seeks, and nothing past `len` is ever touched.
+struct BlobReader<'a, R: std::io::Read + std::io::Seek> {
+    r: &'a mut R,
+    pos: u64,
+    len: u64,
+    read: u64,
+}
+
+impl<R: std::io::Read + std::io::Seek> BlobReader<'_, R> {
+    fn remaining(&self) -> u64 {
+        self.len - self.pos
+    }
+    fn take(&mut self, n: u64) -> Result<Vec<u8>, String> {
+        if n > self.remaining() {
+            return Err(format!("blob truncated: need {n} bytes at {}, {} left", self.pos, self.remaining()));
+        }
+        let mut v = vec![0u8; n as usize];
+        self.r.read_exact(&mut v).map_err(|e| format!("read: {e}"))?;
+        self.pos += n;
+        self.read += n;
+        Ok(v)
+    }
+    fn skip(&mut self, n: u64) -> Result<(), String> {
+        if n > self.remaining() {
+            return Err(format!("blob truncated: cannot skip {n} bytes at {}, {} left", self.pos, self.remaining()));
+        }
+        self.r.seek(std::io::SeekFrom::Current(n as i64)).map_err(|e| format!("seek: {e}"))?;
+        self.pos += n;
+        Ok(())
+    }
+    fn u8(&mut self) -> Result<u8, String> {
+        Ok(self.take(1)?[0])
+    }
+    fn u64(&mut self) -> Result<u64, String> {
+        Ok(u64::from_le_bytes(self.take(8)?.try_into().expect("8 bytes")))
+    }
+    /// A frontier exactly as [`read_frontier`] accepts it, as a portable [`FrontierState`]
+    /// (`leaf: None` = the empty tag).
+    fn frontier(&mut self, size: u64) -> Result<FrontierState, String> {
+        match self.u8()? {
+            0 => Ok(FrontierState { size: 0, leaf: None, ommers: Vec::new() }),
+            1 => {
+                let leaf: [u8; 32] = self.take(32)?.try_into().expect("32 bytes");
+                let n = self.u64()?;
+                if n > TREE_DEPTH as u64 {
+                    return Err(format!("frontier with {n} ommers"));
+                }
+                let raw = self.take(32 * n)?;
+                let ommers: Vec<[u8; 32]> = raw.chunks_exact(32).map(|c| c.try_into().expect("32 bytes")).collect();
+                let fs = FrontierState { size, leaf: Some(leaf), ommers };
+                GlobalTree::from_state(&fs).map_err(|_| "inconsistent frontier".to_string())?;
+                Ok(fs)
+            }
+            t => Err(format!("frontier tag {t}")),
+        }
+    }
+}
+
+/// One note record (position, nullifier, recipient, value, rho, rseed: 155 bytes), as the
+/// checkpoint writes it.
+pub(crate) const NOTE_RECORD_LEN: usize = 8 + 32 + 43 + 8 + 32 + 32;
+
+fn write_note(out: &mut Vec<u8>, n: &OwnedNote) {
+    out.extend_from_slice(&n.position.to_le_bytes());
+    out.extend_from_slice(&n.nullifier);
+    out.extend_from_slice(&n.note.recipient().to_raw_address_bytes());
+    out.extend_from_slice(&n.note.value().inner().to_le_bytes());
+    out.extend_from_slice(&n.note.rho().to_bytes());
+    out.extend_from_slice(n.note.rseed().as_bytes());
+}
+
+fn read_note(r: &mut Cursor<'_>) -> Option<OwnedNote> {
+    let position = r.u64()?;
+    let nullifier = r.arr::<32>()?;
+    let recipient = r.arr::<43>()?;
+    let value = r.u64()?;
+    let rho = Option::<Rho>::from(Rho::from_bytes(&r.arr()?))?;
+    let rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes(r.arr()?, &rho))?;
+    let addr = Option::<Address>::from(Address::from_raw_address_bytes(&recipient))?;
+    let note = Option::<Note>::from(Note::from_parts(addr, NoteValue::from_raw(value), rho, rseed, orchard::note::NoteVersion::V2))?;
+    Some(OwnedNote { note, position, nullifier })
+}
+
+/// Parse `n` consecutive note records from `raw`, in parallel above a small count (each record
+/// costs a note-commitment check inside `Note::from_parts`, ~0.2 ms: 275 K notes were 60 s on
+/// one core). Same per-record parse as the restore; `None` if any record is malformed.
+fn read_notes_par(raw: &[u8], n: usize) -> Option<Vec<OwnedNote>> {
+    if raw.len() != n * NOTE_RECORD_LEN {
+        return None;
+    }
+    let one = |c: &[u8]| read_note(&mut Cursor { buf: c, pos: 0 });
+    if n < 512 {
+        return raw.chunks_exact(NOTE_RECORD_LEN).map(one).collect();
+    }
+    use rayon::prelude::*;
+    raw.par_chunks_exact(NOTE_RECORD_LEN).map(one).collect()
+}
+
+/// Notes as `[n:u64] (record)*` — the checkpoint's note encoding, for the engine's per-wallet file.
+pub fn encode_notes(notes: &[OwnedNote]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8 + notes.len() * NOTE_RECORD_LEN);
+    out.extend_from_slice(&(notes.len() as u64).to_le_bytes());
+    for n in notes {
+        write_note(&mut out, n);
+    }
+    out
+}
+
+/// Inverse of [`encode_notes`]; `None` on any malformed record or trailing byte.
+pub fn decode_notes(buf: &[u8]) -> Option<Vec<OwnedNote>> {
+    let mut r = Cursor { buf, pos: 0 };
+    let n = r.u64()? as usize;
+    if n > r.remaining() / NOTE_RECORD_LEN {
+        return None;
+    }
+    let raw = r.take(n * NOTE_RECORD_LEN)?;
+    let out = read_notes_par(raw, n)?;
+    r.done().then_some(out)
+}
+
+/// [`encode_history_section`] for the engine's per-wallet file.
+pub fn encode_history(history: &[HistoryEntry]) -> Vec<u8> {
+    encode_history_section(history)
+}
+
+/// The current-format history parse (v9 flags + v10 credits); `None` = malformed.
+pub fn decode_history(buf: &[u8]) -> Option<Vec<HistoryEntry>> {
+    parse_history_section(buf, true, true)
+}
+
+/// [`encode_pending_section`] for the engine's per-wallet file.
+pub fn encode_pending(last_daa: u64, pending: &[PendingSpend]) -> Vec<u8> {
+    encode_pending_section(last_daa, pending)
+}
+
+/// Inverse of [`encode_pending`]; `None` = malformed.
+pub fn decode_pending(buf: &[u8]) -> Option<(u64, Vec<PendingSpend>)> {
+    parse_pending_section(buf)
+}
+
+/// Read the private sections of a checkpoint blob of `blob_len` bytes starting at the
+/// reader's current position, seeking past the public ones.
+///
+/// Accepts exactly the versions [`WalletDb::from_checkpoint`] accepts and parses every
+/// section it reads with the restore's own code (notes, history, pending, frontiers), so the
+/// notes, pending spends, history rows and clock are those a full restore would install.
+/// What it does NOT do is validate the skipped public data (each leaf's canonical encoding,
+/// the witness and subtree sections' internals): those are replaced by the engine's own
+/// shared stream, against which every note is checked separately. A blob a restore would
+/// refuse for a reason inside a skipped section can therefore read here; the opposite
+/// cannot happen for a well-formed file.
+pub fn read_checkpoint_private<R: std::io::Read + std::io::Seek>(r: &mut R, blob_len: u64) -> Result<CheckpointPrivate, String> {
+    let mut b = BlobReader { r, pos: 0, len: blob_len, read: 0 };
+    let version = b.u8()?;
+    if !(CHECKPOINT_VERSION_V3..=CHECKPOINT_VERSION_V11).contains(&version) {
+        return Err(format!("checkpoint version {version}"));
+    }
+    let base_size = b.u64()?;
+    let _base = b.frontier(base_size)?;
+    let size = b.u64()?;
+    let leaf_count = b.u64()?;
+    let shared_leaves = if version >= CHECKPOINT_VERSION_V11 {
+        let n = b.u64()?;
+        if n == 0 || n > leaf_count {
+            return Err("v11 shared range out of bounds".into());
+        }
+        n
+    } else {
+        0
+    };
+    let inline = leaf_count - shared_leaves;
+    if inline > b.remaining() / 32 {
+        return Err("leaf count exceeds the blob".into());
+    }
+    b.skip(inline * 32)?;
+    let n_notes = b.u64()?;
+    if n_notes > b.remaining() / NOTE_RECORD_LEN as u64 {
+        return Err("note count exceeds the blob".into());
+    }
+    let raw = b.take(n_notes * NOTE_RECORD_LEN as u64)?;
+    let notes = read_notes_par(&raw, n_notes as usize).ok_or("malformed note record")?;
+    let nullifier_count = b.u64()?;
+    if nullifier_count > b.remaining() / 32 {
+        return Err("nullifier count exceeds the blob".into());
+    }
+    b.skip(nullifier_count * 32)?;
+    let tip = if version >= CHECKPOINT_VERSION_V4 {
+        let fs = b.frontier(size)?;
+        if size > 0 && fs.leaf.is_none() { None } else { Some(fs) }
+    } else {
+        None
+    };
+    // Length-prefixed best-effort sections, in restore's order. A section whose length
+    // prefix is absent ends the blob there (restore reads `None` and finds `done()`).
+    let mut history = Vec::new();
+    let (mut last_daa, mut pending) = (0u64, Vec::new());
+    if version >= CHECKPOINT_VERSION_V5 && b.remaining() >= 8 {
+        let n = b.u64()?;
+        b.skip(n)?;
+    }
+    if version >= CHECKPOINT_VERSION_V6 && b.remaining() >= 8 {
+        let n = b.u64()?;
+        let buf = b.take(n)?;
+        history = parse_history_section(&buf, version >= CHECKPOINT_VERSION_V9, version >= CHECKPOINT_VERSION_V10).unwrap_or_default();
+    }
+    if version >= CHECKPOINT_VERSION_V7 && b.remaining() >= 8 {
+        let n = b.u64()?;
+        let buf = b.take(n)?;
+        if let Some((d, p)) = parse_pending_section(&buf) {
+            last_daa = d;
+            pending = p;
+        }
+    }
+    if version >= CHECKPOINT_VERSION_V8 && b.remaining() >= 8 {
+        let n = b.u64()?;
+        b.skip(n)?;
+    }
+    if b.remaining() != 0 {
+        return Err(format!("{} trailing bytes", b.remaining()));
+    }
+    Ok(CheckpointPrivate {
+        version,
+        base_size,
+        size,
+        leaf_count,
+        shared_leaves,
+        nullifier_count,
+        notes,
+        tip,
+        history,
+        pending,
+        last_daa,
+        bytes_read: b.read,
+    })
+}
+
+impl WalletDb {
+    /// A keyless leaves-only tree (the shared chain) rebuilt from persisted parts: the
+    /// commitment stream from genesis, the applied-nullifier set, and the tip frontier.
+    ///
+    /// No Sinsemilla work: the tip tree comes from the frontier, which must describe exactly
+    /// `leaves.len()` leaves and end in the last of them; anything else is refused. The
+    /// stream itself is trusted as the caller's durable copy (the engine store checks it
+    /// against the node and can refold it with [`Self::verify_stream_root`]).
+    pub fn leaves_only_from_parts(seed: [u8; 32], leaves: &[[u8; 32]], nullifiers: impl IntoIterator<Item = [u8; 32]>, tip: &FrontierState) -> Option<Self> {
+        if tip.size != leaves.len() as u64 {
+            return None;
+        }
+        if tip.leaf != leaves.last().copied() {
+            return None;
+        }
+        let mut db = Self::from_seed(seed)?;
+        db.leaves.reserve_exact(leaves.len());
+        for l in leaves {
+            db.leaves.push(Option::<MerkleHashOrchard>::from(MerkleHashOrchard::from_bytes(l))?);
+        }
+        db.size = tip.size;
+        if tip.size > 0 {
+            db.tree = CommitmentTree::from_frontier(GlobalTree::from_state(tip).ok()?.frontier());
+        }
+        for nf in nullifiers {
+            db.nf_insert(&nf);
+        }
+        db.leaves_only = true;
+        Some(db)
+    }
+
+    /// Refold the whole stream (O(N) Sinsemilla) and check it reaches the tip root.
+    /// The expensive, complete integrity check of a persisted shared tree.
+    pub fn verify_stream_root(&self) -> bool {
+        let mut t = CommitmentTree::from_frontier(&self.base_frontier);
+        for l in &self.leaves {
+            if t.append(*l).is_err() {
+                return false;
+            }
+        }
+        self.tree_valid && t.root() == self.tree.root()
+    }
+
+    /// The canonical bytes of the leaf at absolute `position`, if this stream holds it.
+    pub fn leaf_at(&self, position: u64) -> Option<[u8; 32]> {
+        let rel = usize::try_from(position.checked_sub(self.base_size)?).ok()?;
+        self.leaves.get(rel).map(|l| l.to_bytes())
     }
 }
 
@@ -4224,7 +4711,7 @@ const CREDITS_CAP: usize = 256;
 /// One [`Credit`] per note this transaction paid us, in ingest order — the
 /// breakdown a payer's single transaction to several of our diversified addresses
 /// needs in order to be reconciled per address.
-fn credits_from_received(received: &[ReceivedNote]) -> Vec<Credit> {
+pub(crate) fn credits_from_received(received: &[ReceivedNote]) -> Vec<Credit> {
     received
         .iter()
         .take(CREDITS_CAP)
@@ -4383,6 +4870,167 @@ mod tests {
 
     fn address_of(seed: [u8; 32]) -> [u8; 43] {
         crate::wallet::scan::address_bytes_from_seed(seed).unwrap()
+    }
+
+    // ---- per-action note bookkeeping (spec 10 B6) ----
+
+    /// A deterministic foreign action: random nullifier/epk/ciphertext and a canonical cmx
+    /// (top two bits cleared puts it below the Pallas base modulus), so it appends a leaf and
+    /// decrypts to nothing.
+    fn foreign_record(tag: u64, i: u64) -> CompactActionRecord {
+        let b = |k: u8| {
+            let mut st = blake2b_simd::Params::new().hash_length(32).personal(b"zkas-b6-bench-v1").to_state();
+            st.update(&tag.to_le_bytes());
+            st.update(&i.to_le_bytes());
+            st.update(&[k]);
+            let mut o = [0u8; 32];
+            o.copy_from_slice(st.finalize().as_bytes());
+            o
+        };
+        let mut cmx = b(1);
+        cmx[31] &= 0x3f;
+        let mut enc = [0u8; 52];
+        enc[..32].copy_from_slice(&b(3));
+        CompactActionRecord { nullifier: b(0), cmx, ephemeral_key: b(2), enc_ciphertext: enc }
+    }
+
+    /// `n` coinbase notes to `db`'s own address, ingested as blocks of up to 500 outputs.
+    fn give_coinbase_notes(db: &mut WalletDb, n: usize, value: u64) {
+        use rayon::prelude::*;
+        let addr = db.my_address_bytes();
+        for chunk in (0..n).collect::<Vec<_>>().chunks(500) {
+            let cb: Vec<(CoinbaseNoteDesc, u64, ExtractedNoteCommitment)> = chunk
+                .par_iter()
+                .map(|i| {
+                    let (desc, v) = coinbase_for(addr, &(*i as u64).to_le_bytes(), value);
+                    let cmx = crate::coinbase::coinbase_note_commitment(&desc, v).unwrap();
+                    (desc, v, cmx)
+                })
+                .collect();
+            db.ingest_block_compact_precomputed_with_meta(&cb, &[], None);
+        }
+    }
+
+    /// A record that SPENDS `nf` (one of ours) and is otherwise foreign.
+    fn spending(nf: [u8; 32], i: u64) -> CompactActionRecord {
+        let mut r = foreign_record(99, i);
+        r.nullifier = nf;
+        r
+    }
+
+    /// The owned-nullifier index may hold stale entries but never miss a held note, and ingest
+    /// must remove exactly the notes whose nullifiers appear: unspent ones from the balance,
+    /// parked ones for good (with their change), across a checkpoint round trip too.
+    #[test]
+    fn owned_nullifier_index_finds_every_spend_and_nothing_else() {
+        let mut db = WalletDb::from_seed([41u8; 32]).unwrap();
+        give_coinbase_notes(&mut db, 40, 1_000);
+        assert_eq!(db.notes().len(), 40);
+        db.assert_owned_nfs_cover_notes();
+        let nfs: Vec<[u8; 32]> = db.notes().iter().map(|n| n.nullifier).collect();
+        let pos: Vec<u64> = db.notes().iter().map(|n| n.position).collect();
+
+        // Park three notes as one in-flight send with change; reclaim none yet.
+        db.mark_spent(pos[0], [0xA1; 32], 10);
+        db.mark_spent(pos[1], [0xA1; 32], 10);
+        db.mark_spent(pos[2], [0xA2; 32], 10);
+        db.note_pending_outflow([0xA1; 32], 600);
+        db.assert_owned_nfs_cover_notes();
+        assert_eq!(db.balance(), 37 * 1_000);
+
+        // A block of foreign txs with spends of: an unspent note (3), a parked note (0) and,
+        // in the same tx, an unspent note (4). The rest of the actions are foreign.
+        let txs = vec![
+            vec![foreign_record(1, 0), foreign_record(1, 1)],
+            vec![spending(nfs[3], 2), foreign_record(1, 3)],
+            vec![spending(nfs[0], 4), spending(nfs[4], 5)],
+            vec![foreign_record(1, 6)],
+        ];
+        db.ingest_block_compact_precomputed_with_meta(&[], &txs, None);
+        assert!(!db.poisoned());
+        let held: HashSet<[u8; 32]> = db.notes().iter().map(|n| n.nullifier).collect();
+        assert!(!held.contains(&nfs[3]) && !held.contains(&nfs[4]), "spent unspent notes leave the balance");
+        assert_eq!(db.notes().len(), 40 - 3 - 2);
+        assert!(db.pending_spends.iter().all(|p| p.note.nullifier != nfs[0]), "a parked note seen on chain is gone for good");
+        assert_eq!(db.pending_spends.len(), 2, "its sibling stays parked until its own nullifier appears");
+        assert_eq!(db.balance(), 35 * 1_000);
+        db.assert_owned_nfs_cover_notes();
+
+        // Reclaiming the expired parked spends puts their notes back; spending one later still
+        // removes it (the index kept its nullifier through park and reclaim).
+        let back = db.reclaim_expired(10_000, 100);
+        assert_eq!(back.len(), 2);
+        assert_eq!(db.pending_change(), 0, "a reclaimed spend owes no change");
+        db.assert_owned_nfs_cover_notes();
+        db.ingest_block_compact_precomputed_with_meta(&[], &[vec![spending(nfs[1], 7)]], None);
+        assert!(db.notes().iter().all(|n| n.nullifier != nfs[1]));
+
+        // Round trip: the restored wallet rebuilds the index and still sees a spend.
+        let bytes = db.to_checkpoint();
+        let mut back = WalletDb::from_checkpoint([41u8; 32], &bytes).expect("restores");
+        back.assert_owned_nfs_cover_notes();
+        let before = back.notes().len();
+        back.ingest_block_compact_precomputed_with_meta(&[], &[vec![spending(nfs[10], 8)]], None);
+        assert_eq!(back.notes().len(), before - 1, "the restored index must cover restored notes");
+        assert!(back.notes().iter().all(|n| n.nullifier != nfs[10]));
+    }
+
+    /// Bookkeeping cost per foreign action as a function of how many notes the wallet holds
+    /// (spec 10 B6). Decryption is done by `predecrypt_page_cached` OUTSIDE the timed section,
+    /// as walletd does per page, so the timed ingest is tree append + nullifier set +
+    /// bookkeeping. Runs on the pre-fix code unchanged (public API only), for before/after.
+    ///
+    ///   B6_NOTES=0,1000,10000 B6_ACTIONS=20000 cargo test --release -p kaspa-shielded-core \
+    ///     bench_bookkeeping_per_action_by_note_count -- --ignored --nocapture
+    #[test]
+    #[ignore = "benchmark"]
+    fn bench_bookkeeping_per_action_by_note_count() {
+        let counts: Vec<usize> = std::env::var("B6_NOTES")
+            .unwrap_or_else(|_| "0,1000,10000".into())
+            .split(',')
+            .map(|x| x.trim().parse().unwrap())
+            .collect();
+        let actions: u64 = std::env::var("B6_ACTIONS").ok().and_then(|v| v.parse().ok()).unwrap_or(20_000);
+        // Measure the code, not the test-only per-action index check (if this build has one).
+        OWNED_NF_INDEX_CHECK.with(|c| c.set(false));
+        const PER_DAY: f64 = 77_104.0; // actions per chain-day [MEASURED spec 10 S1]
+        let mut base_us = None;
+        for n in counts {
+            let mut db = WalletDb::from_seed([42u8; 32]).unwrap();
+            give_coinbase_notes(&mut db, n, 1);
+            assert_eq!(db.notes().len(), n);
+            // Pages of 2,000 actions: 500 blocks of 2 txs of 2 actions.
+            let mut timed = std::time::Duration::ZERO;
+            let mut done = 0u64;
+            let mut page = 0u64;
+            while done < actions {
+                let blocks: Vec<Vec<Vec<CompactActionRecord>>> = (0..500)
+                    .map(|b| (0..2).map(|t| (0..2).map(|a| foreign_record(page, b * 4 + t * 2 + a)).collect()).collect())
+                    .collect();
+                let flat: Vec<CompactActionRecord> = blocks.iter().flatten().flatten().copied().collect();
+                db.predecrypt_page_cached(&flat, None);
+                let t = std::time::Instant::now();
+                for txs in &blocks {
+                    db.ingest_block_compact_precomputed_with_meta(&[], txs, None);
+                }
+                timed += t.elapsed();
+                db.end_page();
+                done += flat.len() as u64;
+                page += 1;
+            }
+            assert_eq!(db.notes().len(), n, "foreign actions spend nothing");
+            let us = timed.as_secs_f64() * 1e6 / done as f64;
+            let extra = base_us.map(|b: f64| us - b);
+            if base_us.is_none() {
+                base_us = Some(us);
+            }
+            println!(
+                "B6 notes {n:>7} actions {done} ingest {:.3} s = {us:.2} us/action -> {:.2} s per chain-day; over 0 notes: {}",
+                timed.as_secs_f64(),
+                us * PER_DAY / 1e6,
+                extra.map(|e| format!("{e:+.2} us/action = {:+.2} s/chain-day", e * PER_DAY / 1e6)).unwrap_or_else(|| "-".into())
+            );
+        }
     }
 
     /// A coinbase paid to a DIVERSIFIED address is ours too.

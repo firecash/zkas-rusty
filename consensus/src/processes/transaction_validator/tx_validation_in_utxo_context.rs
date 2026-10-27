@@ -36,11 +36,57 @@ fn verify_shielded_bundle(tx: &Transaction, network_domain: &[u8; 32], security_
     // this transaction (ctx), so a valid bundle cannot be replayed onto another
     // network or lifted into a different transaction.
     let sighash = kaspa_shielded_core::verify::sighash(&bundle, network_domain, &ctx);
+    kaspa_shielded_core::verify::verify_bundle(&bundle, &sighash).map_err(map_bundle_verify_error)
+}
+
+/// The error a failed bundle check maps to, shared by the single and the batched paths.
+#[cfg(feature = "shielded-circuit")]
+fn map_bundle_verify_error(e: kaspa_shielded_core::verify::BundleVerifyError) -> TxRuleError {
     use kaspa_shielded_core::verify::BundleVerifyError as E;
-    kaspa_shielded_core::verify::verify_bundle(&bundle, &sighash).map_err(|e| match e {
+    match e {
         E::ProofInvalid | E::BindingSigInvalid | E::SpendAuthSigInvalid(_) => TxRuleError::InvalidShieldedProof(format!("{e:?}")),
         other => TxRuleError::InvalidShieldedBundle(format!("{other:?}")),
-    })
+    }
+}
+
+/// One batched verification pass over shielded transactions (N1, spec 08 R1.3): batches of at most
+/// 16 bundles / 160 actions. Transactions whose payload does not parse are not part of the pass
+/// (`proven = false`; the per-transaction path rejects them while parsing, before any proof work).
+/// Returns `(proven, first_failure)` in the shape of `verify_bundles_pass`, indexed like `txs`.
+#[cfg(feature = "shielded-circuit")]
+fn shielded_batch_pass(
+    txs: &[&Transaction],
+    network_domain: &[u8; 32],
+    security_fork_active: bool,
+    mode: kaspa_shielded_core::verify::BatchPassMode,
+) -> (Vec<bool>, Option<(usize, TxRuleError)>) {
+    let mut index = Vec::with_capacity(txs.len());
+    let mut parsed = Vec::with_capacity(txs.len());
+    for (i, tx) in txs.iter().enumerate() {
+        if let Ok(bundle) = ShieldedBundle::from_bytes_at(&tx.payload, security_fork_active) {
+            let sighash = kaspa_shielded_core::verify::sighash(&bundle, network_domain, &tx.shielded_sighash_context());
+            index.push(i);
+            parsed.push((bundle, sighash));
+        }
+    }
+    let items: Vec<(&ShieldedBundle, [u8; 32])> = parsed.iter().map(|(b, s)| (b, *s)).collect();
+    let pass = kaspa_shielded_core::verify::verify_bundles_pass(&items, mode);
+    let mut proven = vec![false; txs.len()];
+    for (k, ok) in pass.proven.into_iter().enumerate() {
+        proven[index[k]] = ok;
+    }
+    (proven, pass.first_failure.map(|(k, e)| (index[k], map_bundle_verify_error(e))))
+}
+
+#[cfg(not(feature = "shielded-circuit"))]
+fn shielded_batch_pass(
+    txs: &[&Transaction],
+    _network_domain: &[u8; 32],
+    _security_fork_active: bool,
+    _mode: kaspa_shielded_core::verify::BatchPassMode,
+) -> (Vec<bool>, Option<(usize, TxRuleError)>) {
+    // Nothing can be proven without the circuit; the per-transaction path rejects shielded txs.
+    (vec![false; txs.len()], None)
 }
 
 /// A build without the `shielded-circuit` feature cannot verify Halo 2 proofs, so
@@ -76,6 +122,58 @@ impl TransactionValidator {
     /// the format of `daa_score` (the virtual's). See `ConsensusApi::preverify_shielded_transaction`.
     pub fn preverify_shielded_bundle(&self, tx: &Transaction, daa_score: u64) -> TxResult<()> {
         self.verify_shielded_bundle_cached(tx, daa_score)
+    }
+
+    /// The shielded transactions of `txs` whose verdict is not cached yet, by index.
+    fn uncached_shielded(&self, txs: &[&Transaction]) -> Vec<usize> {
+        (0..txs.len()).filter(|&i| txs[i].is_shielded() && !self.is_shielded_verdict_cached(&txs[i].id())).collect()
+    }
+
+    /// Run one batched pass over the uncached shielded transactions of `txs` in the bundle format
+    /// of `daa_score`, cache every success, and return the first failure (StopAtFirstFailure only).
+    fn shielded_pass_and_cache(
+        &self,
+        txs: &[&Transaction],
+        daa_score: u64,
+        mode: kaspa_shielded_core::verify::BatchPassMode,
+    ) -> Option<(kaspa_consensus_core::tx::TransactionId, TxRuleError)> {
+        let todo = self.uncached_shielded(txs);
+        if todo.is_empty() {
+            return None;
+        }
+        let batch: Vec<&Transaction> = todo.iter().map(|&i| txs[i]).collect();
+        let (proven, failure) =
+            shielded_batch_pass(&batch, &self.shielded_network_domain, self.security_fork_activation.is_active(daa_score), mode);
+        for (k, ok) in proven.into_iter().enumerate() {
+            if ok {
+                self.shielded_verify_cache.insert(batch[k].id(), 1);
+            }
+        }
+        failure.map(|(k, e)| (batch[k].id(), e))
+    }
+
+    /// Block-body accelerator (N1, spec 08 R1.3.1): batch-verify the block's shielded transactions
+    /// in the format of the block's own DAA score and cache the ones a passing batch proves, so the
+    /// virtual processor's per-transaction check (still the only authority, and still the place
+    /// where a failing transaction is dropped) is a cache hit. A failed batch changes nothing: its
+    /// transactions are verified one by one later, exactly as today.
+    pub fn accelerate_shielded_block_verification(&self, txs: &[&Transaction], daa_score: u64) {
+        let _ = self.shielded_pass_and_cache(txs, daa_score, kaspa_shielded_core::verify::BatchPassMode::Accelerate);
+    }
+
+    /// One peer's relayed batch (N1, spec 08 R1.3.5/R1.3.6), in the format of `daa_score` (the
+    /// virtual's): `Err((txid, error))` names the first transaction whose bundle fails, after
+    /// which nothing more of the batch was verified; every success up to there is cached.
+    pub fn preverify_shielded_batch(&self, txs: &[&Transaction], daa_score: u64) -> Result<(), (kaspa_consensus_core::tx::TransactionId, TxRuleError)> {
+        match self.shielded_pass_and_cache(txs, daa_score, kaspa_shielded_core::verify::BatchPassMode::StopAtFirstFailure) {
+            None => Ok(()),
+            Some(f) => Err(f),
+        }
+    }
+
+    /// Whether this transaction's bundle is recorded as verified (tests and metrics).
+    pub fn is_shielded_verdict_cached(&self, id: &kaspa_consensus_core::tx::TransactionId) -> bool {
+        self.shielded_verify_cache.get(id).is_some_and(|ok| ok == 1)
     }
 
     fn verify_shielded_bundle_cached(&self, tx: &Transaction, block_daa_score: u64) -> TxResult<()> {

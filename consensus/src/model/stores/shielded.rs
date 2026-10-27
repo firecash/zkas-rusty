@@ -57,6 +57,32 @@ impl fmt::Display for NullifierKey {
 
 // ----------------------------- Nullifier set -----------------------------
 
+/// Note-tree era (spec 08 R4.2 "tree epochs", renamed "tree era" in 15 A8.2) a spend anchored in.
+/// The chain has one era today: the tree rolls over only after a future hard fork, so every spend
+/// so far, and every spend this build validates, anchors in era 0.
+pub type TreeEra = u8;
+
+/// The era every spend is anchored in today (see [`TreeEra`]).
+pub const CURRENT_TREE_ERA: TreeEra = 0;
+
+/// The value byte stored for a spent nullifier: `1 + era` (spec 08 R5.1). Tagging each nullifier
+/// with the era of the anchor its spend used keeps a later era sunset possible (delete one era's
+/// nullifiers once its final root stops being an admissible anchor) without a rescan of the set.
+///
+/// Era 0 maps to `1`, the marker every earlier build wrote, so existing databases are already
+/// correctly tagged and nothing is migrated; `0` stays unused. This is node-local and consensus-
+/// neutral: membership is the key's presence, and the committed MuHash is over the 32-byte
+/// nullifier only.
+pub const fn nullifier_era_tag(era: TreeEra) -> u8 {
+    assert!(era < u8::MAX, "era 255 has no tag");
+    era + 1
+}
+
+/// The era a stored value byte names (`None` for a value no build writes).
+pub const fn nullifier_era_from_tag(tag: u8) -> Option<TreeEra> {
+    if tag == 0 { None } else { Some(tag - 1) }
+}
+
 pub trait NullifierSetStoreReader {
     /// Whether this nullifier has already been spent (is in the global set).
     fn contains(&self, nullifier: &[u8; 32]) -> StoreResult<bool>;
@@ -107,9 +133,32 @@ impl DbNullifierSetStore {
         })
     }
 
-    /// Number of spent nullifiers in the global set (for export progress / sizing).
+    /// Number of spent nullifiers in the global set (for export progress / sizing). O(set) walk;
+    /// the maintained per-block count is `ShieldedStateManager::nullifier_count_at` (N1, 08 R3.7).
     pub fn count(&self) -> usize {
         self.access.iterator().count()
+    }
+
+    /// Stage a delete of the whole set as one range tombstone over the store prefix (N1, spec 08
+    /// R3.2d), and forget the cache.
+    pub fn delete_all_batch(&self, batch: &mut WriteBatch) -> StoreResult<()> {
+        self.access.delete_all(BatchDbWriter::new(batch))
+    }
+
+    /// Insert a spent nullifier tagged with the tree era its spend anchored in (spec 08 R5.1).
+    pub fn insert_batch_in_era(&self, batch: &mut WriteBatch, nullifier: [u8; 32], era: TreeEra) -> StoreResult<()> {
+        self.access.write(BatchDbWriter::new(batch), NullifierKey(nullifier), nullifier_era_tag(era))
+    }
+
+    /// The tree era a spent nullifier is tagged with, `None` if it is not in the set.
+    pub fn era_of(&self, nullifier: &[u8; 32]) -> StoreResult<Option<TreeEra>> {
+        match self.access.read(NullifierKey(*nullifier)) {
+            Ok(tag) => nullifier_era_from_tag(tag)
+                .map(Some)
+                .ok_or_else(|| StoreError::DataInconsistency(format!("nullifier value byte {tag} names no tree era"))),
+            Err(StoreError::KeyNotFound(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -120,8 +169,9 @@ impl NullifierSetStoreReader for DbNullifierSetStore {
 }
 
 impl NullifierSetStore for DbNullifierSetStore {
+    /// Every spend this build applies anchors in [`CURRENT_TREE_ERA`].
     fn insert_batch(&self, batch: &mut WriteBatch, nullifier: [u8; 32]) -> StoreResult<()> {
-        self.access.write(BatchDbWriter::new(batch), NullifierKey(nullifier), 1u8)
+        self.insert_batch_in_era(batch, nullifier, CURRENT_TREE_ERA)
     }
 
     fn delete_batch(&self, batch: &mut WriteBatch, nullifier: [u8; 32]) -> StoreResult<()> {
@@ -711,6 +761,50 @@ impl ShieldedBurnStoreReader for DbShieldedBurnStore {
     }
 }
 
+// ------------------------ Nullifier-set size per chain block (N1) ------------------------
+
+/// The size of the global spent-nullifier set as of each chain block (08 R3.7, the `nullifierCount`
+/// measurement). Kept per block exactly like the MuHash accumulator, so it is intrinsic to the block
+/// and needs no reorg handling: `count(block) = count(selected_parent) + |block's new nullifiers|`.
+/// A block whose selected parent has no count (a database an older build wrote, before the one-time
+/// backfill at the cursor) has none either; readers get `None`, never a guess.
+#[derive(Clone)]
+pub struct DbShieldedNullifierCountStore {
+    db: Arc<DB>,
+    access: CachedDbAccess<Hash, u64, BlockHasher>,
+}
+
+impl DbShieldedNullifierCountStore {
+    pub fn new(db: Arc<DB>, cache_policy: CachePolicy) -> Self {
+        Self { db: Arc::clone(&db), access: CachedDbAccess::new(db, cache_policy, DatabaseStorePrefixes::ShieldedNullifierCount.into()) }
+    }
+
+    pub fn clear_cache(&self) {
+        self.access.clear_cache();
+    }
+
+    pub fn clone_with_new_cache(&self, cache_policy: CachePolicy) -> Self {
+        Self::new(Arc::clone(&self.db), cache_policy)
+    }
+
+    /// The count at `block`, `None` if this node never recorded one.
+    pub fn get(&self, block: Hash) -> StoreResult<Option<u64>> {
+        match self.access.read(block) {
+            Ok(c) => Ok(Some(c)),
+            Err(StoreError::KeyNotFound(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub fn set_batch(&self, batch: &mut WriteBatch, block: Hash, count: u64) -> StoreResult<()> {
+        self.access.write(BatchDbWriter::new(batch), block, count)
+    }
+
+    pub fn delete_batch(&self, batch: &mut WriteBatch, block: Hash) -> StoreResult<()> {
+        self.access.delete(BatchDbWriter::new(batch), block)
+    }
+}
+
 // ------------------------ Nullifier MuHash accumulator ------------------------
 
 pub trait ShieldedNullifierMuHashStoreReader {
@@ -1275,6 +1369,33 @@ mod tests {
     use super::*;
     use kaspa_database::create_temp_db;
     use kaspa_database::prelude::ConnBuilder;
+
+    /// R5.1 (N1): a spent nullifier carries the era of its spend's anchor; era 0 is the byte every
+    /// earlier build wrote (`1`), so an old database reads back as era 0 with no migration, and
+    /// membership is unchanged.
+    #[test]
+    fn nullifiers_are_tagged_with_their_tree_era_and_old_rows_read_as_era_0() {
+        let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
+        let store = DbNullifierSetStore::new(db.clone(), CachePolicy::Count(16));
+        let mut batch = WriteBatch::default();
+        // A row exactly as a pre-N1 build wrote it: bincode(1u8).
+        let legacy: CachedDbAccess<NullifierKey, u8> = CachedDbAccess::new(db.clone(), CachePolicy::Empty, DatabaseStorePrefixes::ShieldedNullifiers.into());
+        legacy.write(BatchDbWriter::new(&mut batch), NullifierKey([1u8; 32]), 1u8).unwrap();
+        store.insert_batch(&mut batch, [2u8; 32]).unwrap();
+        store.insert_batch_in_era(&mut batch, [3u8; 32], 7).unwrap();
+        db.write(batch).unwrap();
+        store.clear_cache();
+        assert_eq!(store.era_of(&[1u8; 32]).unwrap(), Some(CURRENT_TREE_ERA), "a legacy row is era 0");
+        assert_eq!(store.era_of(&[2u8; 32]).unwrap(), Some(CURRENT_TREE_ERA));
+        assert_eq!(store.era_of(&[3u8; 32]).unwrap(), Some(7));
+        assert_eq!(store.era_of(&[4u8; 32]).unwrap(), None);
+        for nf in [[1u8; 32], [2u8; 32], [3u8; 32]] {
+            assert!(store.contains(&nf).unwrap(), "membership is unchanged by the tag");
+        }
+        assert_eq!(nullifier_era_tag(CURRENT_TREE_ERA), 1);
+        assert_eq!(nullifier_era_from_tag(0), None);
+        assert_eq!(nullifier_era_from_tag(nullifier_era_tag(254)), Some(254));
+    }
 
     /// The repair for that incompatibility: one reader, both layouts.
     ///

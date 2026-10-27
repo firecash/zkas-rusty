@@ -1,0 +1,209 @@
+# ZKas node CI on GitLab (moved from GitHub Actions when the GitHub account was
+# suspended, 2026-10-23).
+#
+#   check / test / lints / no-std / wasm : every push to main and every merge request
+#   release:*                            : tags `zkas-v*` — builds the release archives
+#                                          and attaches them to the tag's GitLab release
+#
+# Runners: Linux jobs run on GitLab's shared runners or a project runner tagged
+# `zkas-142` (the build box). Windows uses GitLab's hosted Windows runner. macOS
+# hosted runners need a paid GitLab tier, so the macOS release jobs are manual.
+
+variables:
+  CARGO_HOME: "$CI_PROJECT_DIR/.cargo-home"
+  CARGO_TERM_COLOR: always
+  RUST_IMAGE: "rust:1-bookworm"
+
+stages: [check, test, release]
+
+workflow:
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^zkas-v/
+    - if: $CI_PIPELINE_SOURCE == "web"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+.rust:
+  image: $RUST_IMAGE
+  cache:
+    key: "cargo-$CI_JOB_NAME_SLUG"
+    paths: [.cargo-home/registry/, .cargo-home/git/, target/]
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq protobuf-compiler clang libclang-dev > /dev/null
+    - rustc --version && cargo --version
+
+check:
+  extends: .rust
+  stage: check
+  rules:
+    - if: $CI_COMMIT_TAG == null
+  script:
+    - RUSTFLAGS="-D duplicate_macro_attributes" cargo check --tests --workspace --benches
+
+test:
+  extends: .rust
+  stage: test
+  timeout: 3h
+  rules:
+    - if: $CI_COMMIT_TAG == null
+  script:
+    - cargo install --locked cargo-nextest
+    - cargo build --features devnet-prealloc --workspace --all --tests --benches
+    - cargo nextest run --workspace
+    # shielded-core's `build` module (prepare_payment, prepare_multiparty, finalize_payment
+    # and all their tests) is behind the non-default `circuit` feature. A plain workspace run
+    # compiles and tests none of the payment-construction path and still exits 0, so it gets
+    # its own run: the most security-critical code in the tree.
+    - cargo nextest run -p kaspa-shielded-core --features circuit
+    - cargo test --doc --workspace
+    - cargo nextest run -p kaspa-hashes --features=no-asm --benches
+    - cargo test --doc -p kaspa-hashes --features=no-asm
+    - cargo doc --no-deps --workspace
+    - cargo run --example kip-10
+
+lints:
+  extends: .rust
+  stage: check
+  rules:
+    - if: $CI_COMMIT_TAG == null
+  script:
+    - rustup component add rustfmt clippy
+    - cargo fmt --all -- --check
+    - cargo clippy --workspace --tests --benches --examples -- -D warnings
+
+check-no-std:
+  extends: .rust
+  stage: check
+  rules:
+    - if: $CI_COMMIT_TAG == null
+  script:
+    - rustup target add thumbv7em-none-eabi
+    - cargo check --target thumbv7em-none-eabi --no-default-features -p kaspa-addresses -p kaspa-hashes -p kaspa-merkle -p kaspa-smt -p kaspa-seq-commit
+
+check-wasm32:
+  extends: .rust
+  stage: check
+  rules:
+    - if: $CI_COMMIT_TAG == null
+  script:
+    - rustup target add wasm32-unknown-unknown
+    - rustup component add clippy
+    - cargo clippy -p kaspa-wrpc-wasm --target wasm32-unknown-unknown
+    - cargo clippy -p kaspa-wallet-cli-wasm --target wasm32-unknown-unknown
+    - cargo clippy -p kaspa-wasm --target wasm32-unknown-unknown
+
+# ---------- release archives (tag zkas-v*) ----------
+# Archive names and layout match what the desktop wallet pins
+# (src-tauri/src/services.rs in zkas-wallet): zkas-<tag>-<platform>.zip with bin/<binaries>.
+.release_bins: &release_bins kaspad zkas-miner zkas-walletd zkas-api shielded-pay stratum-bridge
+
+release:linux-amd64:
+  extends: .rust
+  stage: release
+  image: ubuntu:22.04        # glibc 2.35 baseline, so the archive runs on 22.04 and newer
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^zkas-v/
+  variables: { BINS: *release_bins }
+  before_script:
+    - export DEBIAN_FRONTEND=noninteractive
+    - apt-get update -qq && apt-get install -y -qq curl git build-essential pkg-config libssl-dev protobuf-compiler clang libclang-dev zip > /dev/null
+    - curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal
+    - source "$HOME/.cargo/env"
+  script:
+    - for b in $BINS; do cargo build --locked --release --bin "$b"; done
+    - mkdir -p bin && for b in $BINS; do cp "target/release/$b" bin/; done
+    - cp docs/RELEASE_README.txt bin/README.txt
+    - ARCHIVE="zkas-${CI_COMMIT_TAG}-linux-amd64.zip"
+    - zip -r "$ARCHIVE" ./bin/*
+    - sha256sum "$ARCHIVE" | tee "$ARCHIVE.sha256"
+  artifacts: { paths: ["zkas-*.zip", "zkas-*.zip.sha256"], expire_in: 30 days }
+
+release:win64:
+  stage: release
+  tags: [saas-windows-medium-amd64]
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^zkas-v/
+  allow_failure: true
+  before_script:
+    - $ProgressPreference = 'SilentlyContinue'
+    - git config --global core.autocrlf false
+    - Invoke-WebRequest "https://github.com/protocolbuffers/protobuf/releases/download/v27.3/protoc-27.3-win64.zip" -OutFile protoc.zip
+    - Expand-Archive protoc.zip -DestinationPath C:\protoc
+    - $env:PATH = "C:\protoc\bin;$env:PATH"
+    - Invoke-WebRequest https://win.rustup.rs/x86_64 -OutFile rustup-init.exe
+    - .\rustup-init.exe -y --profile minimal
+    - $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
+  script:
+    - |
+      foreach ($b in "kaspad","zkas-miner","zkas-walletd","zkas-api","shielded-pay","stratum-bridge") { cargo build --locked --release --bin $b; if ($LASTEXITCODE -ne 0) { throw "build failed: $b" } }
+    - New-Item -ItemType Directory -Force bin | Out-Null
+    - foreach ($b in "kaspad","zkas-miner","zkas-walletd","zkas-api","shielded-pay","stratum-bridge") { Copy-Item "target\release\$b.exe" bin\ }
+    - Copy-Item docs\RELEASE_README.txt bin\README.txt
+    - $archive = "zkas-$env:CI_COMMIT_TAG-win64.zip"
+    - Compress-Archive bin\* $archive
+    - (Get-FileHash $archive -Algorithm SHA256).Hash.ToLower() + "  $archive" | Out-File -Encoding ascii "$archive.sha256"
+  artifacts: { paths: ["zkas-*.zip", "zkas-*.zip.sha256"], expire_in: 30 days }
+
+.release_macos:
+  stage: release
+  tags: [saas-macos-medium-m1]   # GitLab hosted macOS runners: paid tier only
+  image: macos-14-xcode-15
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^zkas-v/
+      when: manual
+  allow_failure: true
+  variables: { BINS: *release_bins }
+  before_script:
+    - brew install protobuf
+    - curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --target "$TARGET"
+    - source "$HOME/.cargo/env"
+  script:
+    # 10.13 on Intel covers essentially every Intel Mac still running; arm64 cannot go
+    # below 11.0 because Apple Silicon did not exist before it.
+    - for b in $BINS; do cargo build --locked --release --target "$TARGET" --bin "$b"; done
+    - mkdir -p bin && for b in $BINS; do cp "target/$TARGET/release/$b" bin/; done
+    - cp docs/RELEASE_README.txt bin/README.txt
+    - ARCHIVE="zkas-${CI_COMMIT_TAG}-osx-${ARCH}.zip"
+    - zip -r "$ARCHIVE" ./bin/*
+    - shasum -a 256 "$ARCHIVE" | tee "$ARCHIVE.sha256"
+  artifacts: { paths: ["zkas-*.zip", "zkas-*.zip.sha256"], expire_in: 30 days }
+
+release:osx-arm64:
+  extends: .release_macos
+  variables: { TARGET: aarch64-apple-darwin, ARCH: arm64, MACOSX_DEPLOYMENT_TARGET: "11.0" }
+
+release:osx-x86_64:
+  extends: .release_macos
+  variables: { TARGET: x86_64-apple-darwin, ARCH: x86_64, MACOSX_DEPLOYMENT_TARGET: "10.13" }
+
+# Attach every archive that was built to the tag's GitLab release (generic package +
+# release asset link), creating the release if it does not exist yet.
+release:publish:
+  stage: release
+  image: alpine:3.20
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^zkas-v/
+  needs:
+    - { job: "release:linux-amd64", artifacts: true, optional: true }
+    - { job: "release:win64", artifacts: true, optional: true }
+    - { job: "release:osx-arm64", artifacts: true, optional: true }
+    - { job: "release:osx-x86_64", artifacts: true, optional: true }
+  before_script:
+    - apk add --no-cache curl
+  script:
+    - VERSION="${CI_COMMIT_TAG#zkas-v}"
+    - API="$CI_API_V4_URL/projects/$CI_PROJECT_ID"
+    - |
+      curl -fsS -H "JOB-TOKEN: $CI_JOB_TOKEN" "$API/releases/$CI_COMMIT_TAG" >/dev/null 2>&1 ||
+        curl -fsS -H "JOB-TOKEN: $CI_JOB_TOKEN" -X POST "$API/releases" --data-urlencode "tag_name=$CI_COMMIT_TAG" \
+          --data-urlencode "name=ZKas node $CI_COMMIT_TAG" --data-urlencode "description=Node release archives." >/dev/null || true
+    - |
+      for f in zkas-*.zip zkas-*.zip.sha256; do
+        [ -f "$f" ] || continue
+        curl -fsS -H "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file "$f" "$API/packages/generic/zkas-node/$VERSION/$f" >/dev/null
+        curl -fsS -H "JOB-TOKEN: $CI_JOB_TOKEN" -X POST "$API/releases/$CI_COMMIT_TAG/assets/links" \
+          --data-urlencode "name=$f" \
+          --data-urlencode "url=$CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/generic/zkas-node/$VERSION/$f" \
+          -d link_type=package >/dev/null || true
+        echo "attached $f"
+      done

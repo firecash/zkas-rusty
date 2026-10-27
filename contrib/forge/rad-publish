@@ -1,0 +1,23 @@
+#!/bin/bash
+# rad-publish <repo> [<branch>]  — publish what a box pushed to refs/heads/incoming/<branch>
+# into the Radicle repo: fast-forward only, then sign + announce to the seeds.
+# Usage from any box:
+#   git push ssh://root@207.241.172.71/root/repos/<repo> HEAD:refs/heads/incoming/<branch>
+#   ssh root@207.241.172.71 /root/bin/rad-publish <repo> <branch>
+set -euo pipefail
+repo=$1; br=${2:-}
+export PATH=/root/.radicle/bin:$PATH RAD_PASSPHRASE="$(cat /root/.radicle-passphrase)"
+cd /root/repos/$repo
+[ -n "$br" ] || br=$(git symbolic-ref --short HEAD)
+in=refs/heads/incoming/$br
+git rev-parse -q --verify $in >/dev/null || { echo "nothing at $in"; exit 1; }
+new=$(git rev-parse $in)
+if git rev-parse -q --verify refs/heads/$br >/dev/null; then
+  old=$(git rev-parse refs/heads/$br)
+  git merge-base --is-ancestor $old $new || { echo "REFUSED: $br $old -> $new is not a fast-forward"; exit 2; }
+fi
+if [ "$(git symbolic-ref --short HEAD)" = "$br" ]; then git merge -q --ff-only $new; else git branch -f $br $new; fi
+git push -q rad $br
+git update-ref -d $in
+rad sync --announce 2>&1 | tail -1
+echo "published $repo $br = ${new:0:8}"

@@ -672,6 +672,51 @@ impl ConsensusSessionOwned {
         self.consensus.import_pruning_point_shielded(new_pruning_point, metadata, expected_state_root, nullifier_batches)
     }
 
+    /// [`ConsensusApi::begin_pruning_point_shielded_import`] (N1).
+    pub async fn async_begin_pruning_point_shielded_import(
+        &self,
+        new_pruning_point: Hash,
+        metadata: kaspa_consensus_core::api::ShieldedExportMetadata,
+        expected_state_root: Option<[u8; 32]>,
+    ) -> PruningImportResult<Vec<kaspa_consensus_core::api::ShieldedImportRange>> {
+        self.clone().spawn_blocking(move |c| c.begin_pruning_point_shielded_import(new_pruning_point, metadata, expected_state_root)).await
+    }
+
+    /// Synchronous passthrough to [`ConsensusApi::stage_pruning_point_shielded_nullifiers`], fed from
+    /// a channel; meant to run inside `spawn_blocking` while the flow streams chunks into `rx` (N1).
+    pub fn stage_pruning_point_shielded_nullifiers(
+        &self,
+        pruning_point: Hash,
+        scope: kaspa_consensus_core::api::ShieldedStreamScope,
+        mut rx: tokio::sync::mpsc::Receiver<Vec<[u8; 32]>>,
+    ) -> PruningImportResult<u64> {
+        let nullifier_batches: kaspa_consensus_core::api::ShieldedNullifierBatchIterator = &mut std::iter::from_fn(move || rx.blocking_recv());
+        self.consensus.stage_pruning_point_shielded_nullifiers(pruning_point, scope, nullifier_batches)
+    }
+
+    /// [`ConsensusApi::get_pruning_point_shielded_import_ranges`] (N1).
+    pub async fn async_get_pruning_point_shielded_import_ranges(
+        &self,
+        pruning_point: Hash,
+    ) -> Option<Vec<kaspa_consensus_core::api::ShieldedImportRange>> {
+        self.clone().spawn_blocking(move |c| c.get_pruning_point_shielded_import_ranges(pruning_point)).await
+    }
+
+    /// [`ConsensusApi::complete_pruning_point_shielded_range`] (N1).
+    pub async fn async_complete_pruning_point_shielded_range(&self, pruning_point: Hash, range: usize) -> PruningImportResult<()> {
+        self.clone().spawn_blocking(move |c| c.complete_pruning_point_shielded_range(pruning_point, range)).await
+    }
+
+    /// [`ConsensusApi::finish_pruning_point_shielded_import`] (N1).
+    pub async fn async_finish_pruning_point_shielded_import(
+        &self,
+        new_pruning_point: Hash,
+        metadata: kaspa_consensus_core::api::ShieldedExportMetadata,
+        expected_state_root: Option<[u8; 32]>,
+    ) -> PruningImportResult<()> {
+        self.clone().spawn_blocking(move |c| c.finish_pruning_point_shielded_import(new_pruning_point, metadata, expected_state_root)).await
+    }
+
     /// The locally held shielded state root as of `block` (F-02/F-15 import
     /// short-circuit check).
     pub async fn async_get_shielded_state_root(&self, block: Hash) -> ConsensusResult<[u8; 32]> {
@@ -681,6 +726,29 @@ impl ConsensusSessionOwned {
     /// The shielded state root of the empty state (F-02 empty-metadata binding).
     pub async fn async_empty_shielded_state_root(&self) -> [u8; 32] {
         self.clone().spawn_blocking(|c| c.empty_shielded_state_root()).await
+    }
+
+    /// Server side: stream the spent-nullifier set at the pruning point, restricted to
+    /// `[from, before)`, to `sink`, driven from `spawn_blocking` (N1, spec 08 R3.3).
+    pub fn stream_pruning_point_shielded_nullifiers(
+        &self,
+        expected_pp: Hash,
+        from: Option<[u8; 32]>,
+        before: Option<[u8; 32]>,
+        chunk_size: usize,
+        sink: &mut dyn FnMut(Vec<[u8; 32]>) -> bool,
+    ) -> ConsensusResult<u64> {
+        self.consensus.stream_pruning_point_shielded_nullifiers(expected_pp, from, before, chunk_size, sink)
+    }
+
+    /// Drop a staged, interrupted shielded import (N1).
+    pub async fn async_discard_shielded_import_staging(&self) {
+        self.clone().spawn_blocking(|c| c.discard_shielded_import_staging()).await
+    }
+
+    /// Size of the spent-nullifier set as of `block` (N1, spec 08 R3.7), `None` when unknown.
+    pub async fn async_get_shielded_nullifier_count(&self, block: Hash) -> ConsensusResult<Option<u64>> {
+        self.clone().spawn_blocking(move |c| c.get_shielded_nullifier_count(block)).await
     }
 
     /// Server side: open a streaming iterator over the whole spent-nullifier set at

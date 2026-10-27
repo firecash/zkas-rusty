@@ -63,6 +63,10 @@ pub enum KaspadMessagePayloadType {
     AuthRequest,
     AuthResponse,
     ShieldedConflict,
+    RequestPruningPointProofChunks,
+    PruningPointProofChunk,
+    RequestNextPruningPointProofChunk,
+    RequestPruningPointShieldedChunkFrom,
 }
 
 impl From<&KaspadMessagePayload> for KaspadMessagePayloadType {
@@ -136,6 +140,12 @@ impl From<&KaspadMessagePayload> for KaspadMessagePayloadType {
             KaspadMessagePayload::AuthRequest(_) => KaspadMessagePayloadType::AuthRequest,
             KaspadMessagePayload::AuthResponse(_) => KaspadMessagePayloadType::AuthResponse,
             KaspadMessagePayload::ShieldedConflict(_) => KaspadMessagePayloadType::ShieldedConflict,
+            KaspadMessagePayload::RequestPruningPointProofChunks(_) => KaspadMessagePayloadType::RequestPruningPointProofChunks,
+            KaspadMessagePayload::PruningPointProofChunk(_) => KaspadMessagePayloadType::PruningPointProofChunk,
+            KaspadMessagePayload::RequestNextPruningPointProofChunk(_) => KaspadMessagePayloadType::RequestNextPruningPointProofChunk,
+            KaspadMessagePayload::RequestPruningPointShieldedChunkFrom(_) => {
+                KaspadMessagePayloadType::RequestPruningPointShieldedChunkFrom
+            }
         }
     }
 }

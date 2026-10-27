@@ -116,6 +116,16 @@ pub enum PruningImportError {
 
     #[error("shielded pruning-point state import error: {0}")]
     ShieldedStateError(String),
+
+    /// The nullifier stream ended before the declared count (the peer stalled or disconnected).
+    /// What arrived is staged; the next attempt resumes after it (N1, spec 08 R3.3).
+    #[error("shielded nullifier stream ended at {received} of {declared}; staged for resumption")]
+    ShieldedImportIncomplete { received: u64, declared: u64 },
+
+    /// The peer streamed nullifiers out of ascending order or repeated one. No honest peer of any
+    /// version does this: every exporter iterates the nullifier store in key order (N1, spec 08 R3.3).
+    #[error("shielded nullifier stream is not strictly ascending at element {0}")]
+    ShieldedStreamNotAscending(u64),
 }
 
 #[derive(Error, Debug, Clone)]

@@ -290,14 +290,43 @@ message PruningPointsMessage {
 }
 
 message RequestPruningPointProofMessage {
+  // N1 (spec 13 L1): ask for the deduplicated form. An older server ignores the field and answers
+  // with `headers`, which every requester still accepts.
+  bool dedupHeaders = 1;
 }
 
 message PruningPointProofMessage {
   repeated PruningPointProofHeaderArray headers = 1;
+  // N1 (spec 13 L1), sent only when the request set dedupHeaders (then `headers` is empty): each
+  // distinct header once, and per proof level the indices into it, in the level's order. The
+  // levels share most headers, so this is ~35 MB instead of ~215 MB on mainnet.
+  repeated BlockHeader distinctHeaders = 2;
+  repeated PruningPointProofLevelIndices levels = 3;
+}
+
+message PruningPointProofLevelIndices {
+  repeated uint32 indices = 1;
 }
 
 message PruningPointProofHeaderArray {
   repeated BlockHeader headers = 1;
+}
+
+// Chunked pruning-point proof (ZKas). The legacy PruningPointProofMessage carries the whole proof
+// (~221 MB on mainnet) in one message; this carries it as a stream of chunks of one level each, so
+// the transport decode cap can drop below the proof size. Rules: see protocol/p2p/src/pp_proof_chunks.rs.
+message RequestPruningPointProofChunksMessage {
+}
+
+message PruningPointProofChunkMessage {
+  uint32 levelCount = 1;            // levels in the whole proof; identical in every chunk
+  uint32 level = 2;                 // the level all `headers` belong to; never decreases
+  repeated BlockHeader headers = 3; // in level order, continuing the previous chunk of this level
+  bool done = 4;                    // set on the final chunk only
+  uint32 seq = 5;                   // 0 for the first chunk, +1 for each next one
+}
+
+message RequestNextPruningPointProofChunkMessage {
 }
 
 message ReadyMessage {
@@ -356,6 +385,20 @@ message ShieldedNullifierChunkMessage {
 }
 
 message RequestNextPruningPointShieldedChunkMessage {
+}
+
+// N1 (spec 08 R3.3/R3.4.1): one key range of the pruning-point nullifier set, [fromKey, beforeKey)
+// (each 32 bytes; empty = unbounded). Sent only to peers advertising SERVICE_NF_SORTED_STREAM.
+// Reply: if withMetadata, first the same ShieldedMetadataMessage as the full request
+// (nullifierCount = the WHOLE set's size); then ShieldedNullifierChunkMessages with the range's
+// nullifiers in ascending order; then ONE EMPTY ShieldedNullifierChunkMessage, which ends the range.
+// Flow control: after every SMT_FLOW_CONTROL_WINDOW-th non-empty chunk the server waits for a
+// RequestNextPruningPointShieldedChunk, and the requester always sends it at that point.
+message RequestPruningPointShieldedChunkFromMessage {
+  Hash pruningPointHash = 1;
+  bytes fromKey = 2;
+  bytes beforeKey = 3;
+  bool withMetadata = 4;
 }
 
 // ---- Shielded history backfill (ZKas) ----

@@ -40,7 +40,7 @@ use crate::model::stores::shielded::{
     DbNullifierCursorStore, DbNullifierDiffStore, DbNullifierSetStore, DbShieldedAnchorSourceScoreStore, DbShieldedBurnStore,
     DbShieldedDevAccruedStore,
     DbShieldedMinerAccrualStore,
-    DbShieldedNullifierMuHashStore,
+    DbShieldedNullifierCountStore, DbShieldedNullifierMuHashStore,
     DbShieldedScanBlockStore, DbShieldedSupplyStore, DbShieldedTreeStore, NullifierDiffStoreReader, NullifierSetStore,
     NullifierSetStoreReader, ShieldedBurnStoreReader, ShieldedNullifierMuHashStoreReader, ShieldedScanBlockData,
     ShieldedScanBlockStoreReader, ShieldedSupplyStoreReader, ShieldedTreeStoreReader, SupplyTotals,
@@ -75,6 +75,9 @@ pub struct ComputedBlockShielded {
     /// The MuHash accumulator over the whole spent-nullifier set after this block
     /// (its selected parent's accumulator with this block's new nullifiers added).
     pub nullifier_muhash: MuHash,
+    /// Size of the spent-nullifier set after this block: the selected parent's count plus this
+    /// block's new nullifiers. `None` when the selected parent has no recorded count (08 R3.7).
+    pub nullifier_count: Option<u64>,
     /// Conflict-resolution outcome: surviving txs, new nullifiers, new anchor.
     pub outcome: BlockShieldedOutcome,
     /// The bridge burn accumulator after this block (selected parent's snapshot plus any exit
@@ -535,7 +538,7 @@ impl NullifierSet for LayeredNullifierSet<'_> {
 // The external anchor-override mechanism was removed (2026-09): the multi-producer anchor
 // resolution (`anchor_producer_blocks`, active on mainnet) makes the last-write-wins index
 // order-independent, so no external pin is needed; and bulk-pinning a dump was measured to
-// corrupt shielded state (the index is time-dependent). See GitHub issue #11.
+// corrupt shielded state (the index is time-dependent). See issue #11 on the former GitHub repository (now offline).
 
 /// Why one shielded transaction was kept or dropped.
 ///
@@ -568,6 +571,9 @@ impl PartitionOutcome {
 /// Drives and persists the shielded state transition, reorg-safely.
 #[derive(Clone)]
 pub struct ShieldedStateManager {
+    /// The consensus database itself, for the few writes that are not staged by a caller (the
+    /// count backfill) and for the streamed nullifier import/export (N1, 08 R3).
+    db: Arc<DB>,
     nullifiers: DbNullifierSetStore,
     nullifier_diffs: DbNullifierDiffStore,
     /// Which chain block `nullifiers` reflects; see [`DbNullifierCursorStore`].
@@ -577,6 +583,8 @@ pub struct ShieldedStateManager {
     dev_accrued_store: DbShieldedDevAccruedStore,
     miner_accrual_store: DbShieldedMinerAccrualStore,
     nullifier_muhash: DbShieldedNullifierMuHashStore,
+    /// Size of the global set as of each chain block (08 R3.7).
+    nullifier_count: DbShieldedNullifierCountStore,
     anchor_block: DbAnchorBlockStore,
     /// Deferred age-based GC queue for the two anchor indexes; see [`Self::gc_aged_anchors`].
     anchor_gc: DbAnchorGcQueueStore,
@@ -597,6 +605,7 @@ impl ShieldedStateManager {
     /// and blue-score data; this manager only records the anchor→block index.
     pub fn new(db: Arc<DB>, cache_policy: CachePolicy) -> Self {
         Self {
+            db: Arc::clone(&db),
             nullifiers: DbNullifierSetStore::new(Arc::clone(&db), cache_policy),
             nullifier_diffs: DbNullifierDiffStore::new(Arc::clone(&db), cache_policy),
             nullifier_cursor: DbNullifierCursorStore::new(Arc::clone(&db), cache_policy),
@@ -605,6 +614,7 @@ impl ShieldedStateManager {
             dev_accrued_store: DbShieldedDevAccruedStore::new(Arc::clone(&db), cache_policy),
             miner_accrual_store: DbShieldedMinerAccrualStore::new(Arc::clone(&db), cache_policy),
             nullifier_muhash: DbShieldedNullifierMuHashStore::new(Arc::clone(&db), cache_policy),
+            nullifier_count: DbShieldedNullifierCountStore::new(Arc::clone(&db), cache_policy),
             anchor_block: DbAnchorBlockStore::new(Arc::clone(&db), cache_policy),
             anchor_gc: DbAnchorGcQueueStore::new(Arc::clone(&db), cache_policy),
             anchor_producers: DbAnchorProducersStore::new(Arc::clone(&db), cache_policy),
@@ -904,6 +914,7 @@ impl ShieldedStateManager {
         self.dev_accrued_store.clear_cache();
         self.miner_accrual_store.clear_cache();
         self.nullifier_muhash.clear_cache();
+        self.nullifier_count.clear_cache();
         self.anchor_block.clear_cache();
         self.anchor_gc.clear_cache();
         self.anchor_producers.clear_cache();
@@ -1128,6 +1139,7 @@ impl ShieldedStateManager {
         }
         self.supply_store.delete_batch(batch, block)?;
         self.nullifier_muhash.delete_batch(batch, block)?;
+        self.nullifier_count.delete_batch(batch, block)?;
         self.burn_store.delete_batch(batch, block)?;
         self.dev_accrued_store.delete_batch(batch, block)?;
         self.miner_accrual_store.delete_batch(batch, block)?;
@@ -1260,6 +1272,41 @@ impl ShieldedStateManager {
     }
 
     /// The nullifier-set accumulator committed (through the state root) as of `block`.
+    /// Size of the global spent-nullifier set as of chain block `block` (08 R3.7), `None` when this
+    /// node holds no count for it (a block validated by an older build, before the one-time backfill;
+    /// or a pruned block). A block whose accumulator is empty has spent nothing: count 0.
+    pub fn nullifier_count_at(&self, block: Hash) -> StoreResult<Option<u64>> {
+        let muhash = self.load_nullifier_muhash(block)?;
+        self.nullifier_count_given_muhash(block, &muhash)
+    }
+
+    fn nullifier_count_given_muhash(&self, block: Hash, muhash: &MuHash) -> StoreResult<Option<u64>> {
+        if muhash.clone().finalize() == kaspa_muhash::EMPTY_MUHASH {
+            return Ok(Some(0));
+        }
+        self.nullifier_count.get(block)
+    }
+
+    /// One-time backfill for a database an older build wrote: record the size of the global set as
+    /// the count of the chain block the set reflects (its cursor), so every later block chains from
+    /// it. O(set size) key iteration, no hashing. Does nothing when the cursor already has a count or
+    /// the database records no cursor. Returns the count written, if any.
+    pub fn backfill_nullifier_count_at_cursor(&self) -> StoreResult<Option<(Hash, u64)>> {
+        let Some(cursor) = self.nullifier_cursor.get()? else { return Ok(None) };
+        if self.nullifier_count_at(cursor)?.is_some() {
+            return Ok(None);
+        }
+        let mut n = 0u64;
+        for nf in self.nullifiers.iter_all() {
+            nf?;
+            n += 1;
+        }
+        let mut batch = WriteBatch::default();
+        self.nullifier_count.set_batch(&mut batch, cursor, n)?;
+        self.db.write(batch).map_err(StoreError::DbError)?;
+        Ok(Some((cursor, n)))
+    }
+
     pub fn nullifier_muhash_at(&self, block: Hash) -> StoreResult<MuHash> {
         self.load_nullifier_muhash(block)
     }
@@ -1313,9 +1360,11 @@ impl ShieldedStateManager {
         // this matches the set regardless of validation order and needs no separate
         // reorg handling (a reorg recomputes from the selected parent's snapshot).
         let mut nullifier_muhash = self.load_nullifier_muhash(selected_parent)?;
+        let parent_count = self.nullifier_count_given_muhash(selected_parent, &nullifier_muhash)?;
         for nf in &outcome.new_nullifiers {
             nullifier_muhash.add_element(nf);
         }
+        let nullifier_count = parent_count.map(|c| c + outcome.new_nullifiers.len() as u64);
         Ok(ComputedBlockShielded {
             frontier_state: tree.to_state(),
             supply_totals: SupplyTotals {
@@ -1323,6 +1372,7 @@ impl ShieldedStateManager {
                 cumulative_fees: supply.cumulative_fees(),
             },
             nullifier_muhash,
+            nullifier_count,
             burns: BurnReceipts::from_accumulator(&burns),
             outcome,
             // Attached by the virtual processor from the block-time applied set
@@ -1367,6 +1417,10 @@ impl ShieldedStateManager {
         // accumulator is add-only along a chain, so once non-empty it stays so.
         if computed.nullifier_muhash.clone().finalize() != kaspa_muhash::EMPTY_MUHASH {
             self.nullifier_muhash.set_batch(batch, block, computed.nullifier_muhash.clone())?;
+        }
+        // The set size, alongside the accumulator (an empty accumulator reads back as count 0).
+        if let Some(count) = computed.nullifier_count.filter(|c| *c > 0) {
+            self.nullifier_count.set_batch(batch, block, count)?;
         }
         // Compact scan archive (PLAN §2.9): persist the block-time applied effects in
         // the same commit batch, so `GetShieldedBlocks` serves this exact record —
@@ -1454,6 +1508,110 @@ impl ShieldedStateManager {
         self.nullifiers.iter_all().collect()
     }
 
+    /// Stream the spent-nullifier set as of a pruning point without materialising it (N1, spec 08
+    /// R3.3): one RocksDB snapshot iterator over the nullifier store, in ascending key order, over
+    /// `[from, before)`, skipping every nullifier added by `post_blocks` (the selected-chain
+    /// blocks above the pruning point, whose diffs are the only in-memory structure). `sink` receives
+    /// chunks of at most `chunk_size` and returns `false` to stop.
+    ///
+    /// When `verify_against` is `Some(acc)` (an unbounded stream), the streamed elements are
+    /// folded into MuHash and the LAST chunk is released only after the fold equals `acc`: a view torn
+    /// by a concurrent reorg walk (the snapshot and the tip read are not atomic with a walk's batches)
+    /// then never reaches the requester as a complete stream. Returns `(streamed, completed)`.
+    pub fn stream_nullifier_set_snapshot(
+        &self,
+        from: Option<[u8; 32]>,
+        before: Option<[u8; 32]>,
+        post_blocks: impl FnOnce() -> Vec<Hash>,
+        chunk_size: usize,
+        verify_against: Option<&MuHash>,
+        sink: &mut dyn FnMut(Vec<[u8; 32]>) -> bool,
+    ) -> StoreResult<(u64, bool)> {
+        use rayon::prelude::*;
+        // Snapshot FIRST, then read the tip and the post-PP diffs (`post_blocks` runs after the
+        // snapshot): a block committed in between has its diff subtracted although its nullifiers
+        // are not in the snapshot, which removes nothing.
+        let snapshot = self.db.snapshot();
+        let mut post: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+        for block in post_blocks() {
+            post.extend(self.nullifier_diffs.get(block)?);
+        }
+        let prefix: u8 = kaspa_database::registry::DatabaseStorePrefixes::ShieldedNullifiers.into();
+        let mut start = vec![prefix];
+        if let Some(a) = from {
+            start.extend_from_slice(&a);
+        }
+        let mut read_opts = rocksdb::ReadOptions::default();
+        match before {
+            Some(b) => {
+                let mut end = vec![prefix];
+                end.extend_from_slice(&b);
+                read_opts.set_iterate_range(start.clone()..end);
+            }
+            None => read_opts.set_iterate_range(rocksdb::PrefixRange(vec![prefix])),
+        }
+        let iter = snapshot.iterator_opt(rocksdb::IteratorMode::From(&start[..], rocksdb::Direction::Forward), read_opts);
+        let fold = |chunk: &[[u8; 32]]| {
+            chunk
+                .par_chunks(256)
+                .map(|p| {
+                    let mut m = MuHash::new();
+                    for nf in p {
+                        m.add_element(nf);
+                    }
+                    m
+                })
+                .reduce(MuHash::new, |mut a, b| {
+                    a.combine(&b);
+                    a
+                })
+        };
+        let mut acc = MuHash::new();
+        let mut held: Vec<[u8; 32]> = Vec::with_capacity(chunk_size);
+        let mut streamed = 0u64;
+        for item in iter {
+            let (key, _) = item.map_err(StoreError::DbError)?;
+            if key.len() != 33 {
+                return Err(StoreError::DataInconsistency(format!("nullifier key of {} bytes", key.len())));
+            }
+            let mut nf = [0u8; 32];
+            nf.copy_from_slice(&key[1..]);
+            if from.is_some_and(|a| nf < a) || before.is_some_and(|b| nf >= b) || post.contains(&nf) {
+                continue;
+            }
+            if held.len() == chunk_size {
+                // A full chunk is released only once a further element exists, so the final chunk
+                // is always held back for the integrity check below.
+                if verify_against.is_some() {
+                    acc.combine(&fold(&held));
+                }
+                let full = std::mem::replace(&mut held, Vec::with_capacity(chunk_size));
+                streamed += full.len() as u64;
+                if !sink(full) {
+                    return Ok((streamed, false));
+                }
+            }
+            held.push(nf);
+        }
+        if let Some(expected) = verify_against {
+            acc.combine(&fold(&held));
+            if acc.finalize() != expected.clone().finalize() {
+                return Err(StoreError::DataInconsistency(
+                    "pruning-point nullifier stream does not reproduce the committed accumulator (view torn by a reorg walk); \
+                     not completing it"
+                        .to_string(),
+                ));
+            }
+        }
+        if !held.is_empty() {
+            streamed += held.len() as u64;
+            if !sink(held) {
+                return Ok((streamed, false));
+            }
+        }
+        Ok((streamed, true))
+    }
+
     /// Subtract from `set` the nullifiers added by `post_blocks` (read from the
     /// per-block diff store). Recovers the PP-time nullifier set from the tip-time
     /// global set (audit finding F-03): the global set is append-only and tracks the
@@ -1486,6 +1644,51 @@ impl ShieldedStateManager {
     where
         I: IntoIterator<Item = &'a [u8; 32]>,
     {
+        Self::precheck_pruning_point_metadata(md)?;
+        let mut acc = MuHash::new();
+        let mut count = 0u64;
+        for nf in nullifiers {
+            acc.add_element(nf);
+            count += 1;
+        }
+        Self::verify_pruning_point_shielded_folded(md, count, acc).map(|n| n as usize)
+    }
+
+    /// [`Self::verify_pruning_point_shielded`] for a set that was folded while it streamed (N1, 08
+    /// R3.2b): the caller hands over the element count and the MuHash accumulator it built, and never
+    /// holds the set. Same checks, same order of rejection after the structural prechecks.
+    pub fn verify_pruning_point_shielded_folded(md: &PruningPointShieldedMetadata, count: u64, acc: MuHash) -> Result<u64, String> {
+        Self::precheck_pruning_point_metadata(md)?;
+        let mut acc = acc;
+        // 1. The streamed set must reproduce the committed accumulator (MuHash is a
+        //    multiset hash, so transfer order does not matter).
+        if acc.finalize() != md.nullifier_muhash.clone().finalize() {
+            return Err(format!("streamed nullifier set ({count}) does not reproduce the committed accumulator"));
+        }
+        // A spent nullifier always corresponds to a note that was created, so the set can never be
+        // larger than the number of leaves in the note-commitment tree. Since N1 this is the only
+        // bound on the count (the 2^26 transfer cap is gone, 08 R3.1); it comes from the metadata
+        // the peer committed to, which the caller has already bound to the PoW-committed root.
+        if count > md.frontier.size {
+            return Err(format!(
+                "streamed nullifier set ({count}) exceeds the committed note count ({}); a spend implies a note",
+                md.frontier.size
+            ));
+        }
+        // 2. The declared state root must be consistent with the transferred parts.
+        //    The frontier is peer-controlled: propagate a rebuild failure as an Err
+        //    rather than panicking (audit finding F-17).
+        let recomputed = PruningPointShieldedMetadata::recompute_state_root(&md.frontier, &md.supply, &md.nullifier_muhash, &md.burns)
+            .map_err(|e| format!("malformed shielded frontier in pruning-point metadata: {e:?}"))?;
+        if recomputed != md.state_root {
+            return Err("declared shielded state root is inconsistent with (frontier, supply, nullifier_muhash, burns)".to_string());
+        }
+        Ok(count)
+    }
+
+    /// The structural checks on pruning-point metadata that come before any work proportional to the
+    /// nullifier set (steps 0 and 0b of [`Self::verify_pruning_point_shielded`]).
+    pub fn precheck_pruning_point_metadata(md: &PruningPointShieldedMetadata) -> Result<(), String> {
         // 0. The accumulator must arrive in NORMALIZED form (denominator == 1).
         //
         //    `MuHash` derives `Deserialize` straight over its (numerator, denominator) pair with no
@@ -1535,37 +1738,7 @@ impl ShieldedStateManager {
                 md.burns.receipts.len()
             ));
         }
-        // 1. The streamed set must reproduce the committed accumulator (MuHash is a
-        //    multiset hash, so transfer order does not matter).
-        let mut acc = MuHash::new();
-        let mut count = 0usize;
-        for nf in nullifiers {
-            acc.add_element(nf);
-            count += 1;
-        }
-        if acc.finalize() != md.nullifier_muhash.clone().finalize() {
-            return Err(format!("streamed nullifier set ({count}) does not reproduce the committed accumulator"));
-        }
-        // A spent nullifier always corresponds to a note that was created, so the set can never be
-        // larger than the number of leaves in the note-commitment tree. The transfer-side cap
-        // (`MAX_SHIELDED_NULLIFIER_IMPORT_COUNT`, 2^26 ≈ 2 GiB of raw nullifiers) is far above the
-        // memory of the machines this runs on, while this bound is free and comes from the metadata
-        // the peer already committed to.
-        if count as u64 > md.frontier.size {
-            return Err(format!(
-                "streamed nullifier set ({count}) exceeds the committed note count ({}); a spend implies a note",
-                md.frontier.size
-            ));
-        }
-        // 2. The declared state root must be consistent with the transferred parts.
-        //    The frontier is peer-controlled: propagate a rebuild failure as an Err
-        //    rather than panicking (audit finding F-17).
-        let recomputed = PruningPointShieldedMetadata::recompute_state_root(&md.frontier, &md.supply, &md.nullifier_muhash, &md.burns)
-            .map_err(|e| format!("malformed shielded frontier in pruning-point metadata: {e:?}"))?;
-        if recomputed != md.state_root {
-            return Err("declared shielded state root is inconsistent with (frontier, supply, nullifier_muhash, burns)".to_string());
-        }
-        Ok(count)
+        Ok(())
     }
 
     /// Seed the shielded stores at the pruning point from verified imported state,
@@ -1672,10 +1845,24 @@ impl ShieldedStateManager {
             self.miner_accrual_store.set_batch(batch, block, md.miner_accrual.clone())?;
         }
         // The whole append-only global membership set (unbounded, PLAN §2.9).
+        let mut count = 0u64;
         for nf in nullifiers {
             self.nullifiers.insert_batch(batch, *nf)?;
+            count += 1;
         }
-        // The seeded set is the set as of the pruning point, and it says so in the same write.
+        self.seed_nullifier_set_bookkeeping(batch, block, count)
+    }
+
+    /// The part of a pruning-point seed that describes the nullifier set without holding it: the
+    /// cursor (the seeded set is the set as of the pruning point, and it says so in the same write)
+    /// and the set size (08 R3.7). The streamed import (N1, 08 R3.2) ingests the set itself from
+    /// sorted files and calls this for the rest.
+    pub fn seed_nullifier_set_bookkeeping(&self, batch: &mut WriteBatch, block: Hash, count: u64) -> StoreResult<()> {
+        if count > 0 {
+            self.nullifier_count.set_batch(batch, block, count)?;
+        } else {
+            self.nullifier_count.delete_batch(batch, block)?;
+        }
         self.nullifier_cursor.set_batch(batch, block)?;
         Ok(())
     }
@@ -1732,10 +1919,24 @@ impl ShieldedStateManager {
         for nf in self.nullifiers.iter_all() {
             self.nullifiers.delete_batch(batch, nf?)?;
         }
+        self.clear_for_pruning_reimport_except_set(batch, pruning_point)
+    }
+
+    /// [`Self::clear_for_pruning_reimport`] with the global set deleted by ONE range tombstone over
+    /// the store prefix (N1, spec 08 R3.2d): no walk of the set and no per-key delete in the batch.
+    /// The streamed import ingests the new set from sorted files after this batch is written; the
+    /// ingested keys carry newer sequence numbers than the tombstone, so they are visible.
+    pub fn clear_for_pruning_reimport_by_range(&self, batch: &mut WriteBatch, pruning_point: Hash) -> StoreResult<()> {
+        self.nullifiers.delete_all_batch(batch)?;
+        self.clear_for_pruning_reimport_except_set(batch, pruning_point)
+    }
+
+    fn clear_for_pruning_reimport_except_set(&self, batch: &mut WriteBatch, pruning_point: Hash) -> StoreResult<()> {
         // Per-block snapshots at the pruning point (absent keys are no-op deletes).
         self.tree_store.delete_batch(batch, pruning_point)?;
         self.supply_store.delete_batch(batch, pruning_point)?;
         self.nullifier_muhash.delete_batch(batch, pruning_point)?;
+        self.nullifier_count.delete_batch(batch, pruning_point)?;
         self.burn_store.delete_batch(batch, pruning_point)?;
         // The dev-fee accrual too. Leaving it behind meant a stale non-zero accrual survived the very
         // path built to clear state, and since the accrual is outside the PoW-committed state root

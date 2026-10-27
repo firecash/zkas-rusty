@@ -65,6 +65,13 @@ message KaspadMessage {
     ShieldedHistoryChunkMessage shieldedHistoryChunk = 71;
     RequestNextShieldedHistoryChunkMessage requestNextShieldedHistoryChunk = 72;
     RequestNextPruningPointShieldedChunkMessage requestNextPruningPointShieldedChunk = 67;
+    // N1: one range of the sorted nullifier set. Sent only to peers advertising SERVICE_NF_SORTED_STREAM.
+    RequestPruningPointShieldedChunkFromMessage requestPruningPointShieldedChunkFrom = 73;
+    // Chunked pruning-point proof (ZKas). Only sent to peers advertising
+    // SERVICE_PRUNING_PROOF_CHUNKS in VersionMessage.services.
+    RequestPruningPointProofChunksMessage requestPruningPointProofChunks = 90;
+    PruningPointProofChunkMessage pruningPointProofChunk = 91;
+    RequestNextPruningPointProofChunkMessage requestNextPruningPointProofChunk = 92;
     // Protocol v11 (spec 06 H-7; ids per 16 A8.12). Sent only to peers that negotiated v11 and
     // advertise the matching service bit, so a v10 peer never receives them.
     StemTransactionMessage stemTransaction = 80;

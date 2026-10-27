@@ -46,6 +46,8 @@ use std::sync::Arc;
 
 pub mod selfhost;
 pub use selfhost::{SelfHostConfig, run_selfhost};
+mod engine_host;
+pub use engine_host::{EngineConfig, serve_engine};
 
 use axum::{
     Json, Router,
@@ -329,6 +331,9 @@ const ANCHOR_SLACK: u64 = 30;
 /// Compatibility seam while payment preparation moves into the engine. Inputs
 /// have already been validated by the HTTP boundary; an arithmetic failure is
 /// represented as no selectable notes and becomes the existing conflict error.
+mod uniform;
+pub use uniform::{UniformPolicy, set_uniform_policy, uniform_policy};
+
 fn select_spend_count(values: &[u64], amount: u64, base_fee: u64, max_per: usize) -> (usize, u64) {
     engine_select_spend_count(values, amount, base_fee, max_per).unwrap_or((0, chunk_fee(base_fee, 1)))
 }
@@ -451,6 +456,14 @@ pub struct ResourceLimits {
     /// blob cannot be read by a build that predates it, so enabling it is a one-way door for
     /// every wallet it rewrites. See `CHECKPOINT_VERSION_V11` and [`shared_leaf_upto`].
     pub shared_leaf_store: bool,
+    /// `--shared-scan-engine` (task E1, phase 1 of `02-multitenant-engine.md`): wallets that
+    /// ingest the same decoded page share ONE multi-key trial-decryption pass
+    /// ([`kaspa_shielded_core::engine::detect`]) instead of each decrypting the page alone.
+    /// The ephemeral-key preparation is paid once per action for the whole cohort and each
+    /// wallet receives exactly the page memo its own `predecrypt_page_cached` would have
+    /// computed (orchard decides every candidate). OFF by default; nothing else changes.
+    /// Bypassed while a GPU backend is installed (the device path keeps its own batching).
+    pub shared_scan_engine: bool,
     /// Keep the N most recently active wallets resident and fully prepared, exempt from
     /// BOTH eviction rules. 0 = off (the old behaviour exactly).
     ///
@@ -531,6 +544,7 @@ impl Default for ResourceLimits {
             hard_max_resident_wallets: 0,
             resident_budget_mb: Some(0),
             shared_leaf_store: false,
+            shared_scan_engine: false,
             warm_always: 0,
             warm_budget_pct: 60,
             subtree_free_floor_mb: 1_200,
@@ -2569,7 +2583,7 @@ fn parse_scan_bytes_why(
         }
     }
     let ring_len = u32::from_le_bytes(take(&mut pos, 4)?.try_into().ok()?) as usize;
-    let mut boundaries = VecDeque::with_capacity(ring_len.min(MATURED_RING));
+    let mut boundaries = VecDeque::with_capacity(ring_len.min(matured_ring()));
     for _ in 0..ring_len {
         let blue = u64::from_le_bytes(take(&mut pos, 8)?.try_into().ok()?);
         let leaves = u64::from_le_bytes(take(&mut pos, 8)?.try_into().ok()?);
@@ -2878,6 +2892,13 @@ struct DecodedPage {
     /// plus shared epks), paid once by whichever wallet fetched it. Reported in `scan_stats`.
     rpc_ns: u64,
     decode_ns: u64,
+    /// The request this page answers (`GetShieldedBlocks(low, limit)`), so the shared scan
+    /// engine can tell which resident wallets ride it.
+    low: RpcHash,
+    limit: u64,
+    /// `--shared-scan-engine`: the page memo per viewing key (`IvkKey` id), filled by the
+    /// first wallet of a cohort to reach the page for every wallet registered at this cursor.
+    cohort: std::sync::Mutex<HashMap<[u8; 64], Arc<Vec<kaspa_shielded_core::wallet::ReceivedNote>>>>,
 }
 
 /// Whether to trust a node-supplied coinbase commitment verbatim instead of
@@ -2997,6 +3018,7 @@ fn decode_block(b: &kaspa_rpc_core::RpcShieldedChainBlock) -> Result<DecodedBloc
         compact.push(records);
         txids.push(b.accepted_txids.get(i).map(|h| h.as_bytes()).unwrap_or([0u8; 32]));
     }
+    uniform::note_block_txs(b.blue_score, b.timestamp, b.accepted_actions.len());
     Ok(DecodedBlock {
         hash: b.hash,
         blue_score: b.blue_score,
@@ -3074,11 +3096,157 @@ async fn fetch_bundle_for_tx(client: &GrpcClient, chain: RpcHash, txid: &[u8; 32
     None
 }
 
+/// The detector kernel for `--shared-scan-engine`: `ZKAS_ENGINE_KERNEL=comb|ladder`. Default
+/// comb (auto width, ladder below `COMB_MIN_KEYS` keys): experiment M-A measured it 1.7x
+/// cheaper than the per-wallet path at 64 keys and 2.8x at 1,024-4,096, with identical hits
+/// (08-engine-phase1.md §3).
+fn engine_kernel_from_env() -> Box<dyn kaspa_shielded_core::engine::AgreeKernel> {
+    match std::env::var("ZKAS_ENGINE_KERNEL").as_deref() {
+        Ok("ladder") => Box::new(kaspa_shielded_core::engine::LadderKernel),
+        _ => Box::new(kaspa_shielded_core::engine::CombKernel { w: None }),
+    }
+}
+
+/// `--shared-scan-engine`: this wallet's page memo, computed once for the cohort.
+///
+/// Registers (or refreshes) the wallet's key at the page's cursor, then takes the page's memo
+/// lock: the first wallet in runs ONE [`kaspa_shielded_core::engine::detect`] over every key
+/// registered at this cursor that the memo does not hold yet, and stores each key's result;
+/// later wallets of the cohort only clone theirs. `None` (engine off, GPU installed, a page
+/// shape the engine does not cover) means the caller decrypts the page itself, as before.
+/// The result is the same set `WalletDb::predecrypt_page_cached` computes: `detect` hands a
+/// superset of candidates to orchard and orchard decides each (asserted by the
+/// `engine_shadow_tests` and the core `engine::tests`).
+fn engine_cohort_memo(
+    state: &Arc<AppState>,
+    page: &DecodedPage,
+    token: &str,
+    db: &WalletDb,
+    actions: &[CompactActionRecord],
+    epks: &[Option<kaspa_shielded_core::pasta_curves::pallas::Point>],
+) -> Option<(Vec<kaspa_shielded_core::wallet::ReceivedNote>, u128)> {
+    let kernel = state.engine_kernel.as_ref()?;
+    if kaspa_shielded_core::wallet::gpu_enabled() || kaspa_shielded_core::wallet::gpu_filter_enabled() {
+        return None;
+    }
+    cohort_memo_with(kernel.as_ref(), &state.engine_cohort, (page.low, page.limit), &page.cohort, token, db, actions, epks)
+}
+
+/// The registry key of one page request.
+type PageReq = (RpcHash, u64);
+
+/// [`engine_cohort_memo`] without the daemon around it (testable): `registry` is
+/// `AppState::engine_cohort`, `req` and `memo` are the page's request and memo.
+#[allow(clippy::too_many_arguments)]
+fn cohort_memo_with(
+    kernel: &dyn kaspa_shielded_core::engine::AgreeKernel,
+    registry: &std::sync::Mutex<HashMap<String, (Arc<kaspa_shielded_core::engine::IvkKey>, RpcHash, u64)>>,
+    req: PageReq,
+    memo: &std::sync::Mutex<HashMap<[u8; 64], Arc<Vec<kaspa_shielded_core::wallet::ReceivedNote>>>>,
+    token: &str,
+    db: &WalletDb,
+    actions: &[CompactActionRecord],
+    epks: &[Option<kaspa_shielded_core::pasta_curves::pallas::Point>],
+) -> Option<(Vec<kaspa_shielded_core::wallet::ReceivedNote>, u128)> {
+    use kaspa_shielded_core::engine::{IvkKey, detect};
+    if epks.len() != actions.len() {
+        return None;
+    }
+    let t = std::time::Instant::now();
+    let ivk = db.incoming_viewing_key();
+    let id = ivk.to_bytes();
+    let key: Arc<IvkKey> = {
+        let mut reg = registry.lock().ok()?;
+        let key = match reg.get(token) {
+            Some((k, _, _)) if k_id(k) == id => k.clone(),
+            _ => Arc::new(IvkKey::from_ivk(ivk)?),
+        };
+        reg.insert(token.to_string(), (key.clone(), req.0, req.1));
+        key
+    };
+    let mut memo = memo.lock().ok()?;
+    if let Some(found) = memo.get(&id) {
+        return Some(((**found).clone(), t.elapsed().as_nanos()));
+    }
+    let cohort: Vec<Arc<IvkKey>> = {
+        let reg = registry.lock().ok()?;
+        let mut seen: HashSet<[u8; 64]> = HashSet::new();
+        let mut v: Vec<Arc<IvkKey>> = vec![key.clone()];
+        seen.insert(id);
+        for (k, low, limit) in reg.values() {
+            if (*low, *limit) == req && !memo.contains_key(&k_id(k)) && seen.insert(k_id(k)) {
+                v.push(k.clone());
+            }
+        }
+        v
+    };
+    let refs: Vec<&IvkKey> = cohort.iter().map(|k| k.as_ref()).collect();
+    // `block_in_place` needs a multi-threaded runtime; outside one (tests) just run it.
+    let run = || detect(kernel, &refs, actions, epks);
+    let found = if tokio::runtime::Handle::try_current().is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread) {
+        tokio::task::block_in_place(run)
+    } else {
+        run()
+    };
+    let n = cohort.len() as u128;
+    for (k, f) in cohort.iter().zip(found) {
+        memo.insert(k_id(k), Arc::new(f));
+    }
+    let mine = memo.get(&id)?.as_ref().clone();
+    // Charge this wallet its share of the pass; the rest of the cohort pays nothing later.
+    Some((mine, t.elapsed().as_nanos() / n.max(1)))
+}
+
+fn k_id(k: &kaspa_shielded_core::engine::IvkKey) -> [u8; 64] {
+    k.id()
+}
+
 fn decode_compact_actions(bytes: &[u8]) -> Option<Vec<CompactActionRecord>> {
     if bytes.len() % CompactActionRecord::SERIALIZED_LEN != 0 {
         return None;
     }
     bytes.chunks_exact(CompactActionRecord::SERIALIZED_LEN).map(CompactActionRecord::from_bytes).collect()
+}
+
+/// What the node's DAA birthday locator (`GetShieldedTreeState` with `below_daa_score`) said.
+enum BirthdayPlacement {
+    /// A retained frontier strictly below the birthday: start there.
+    Placed((RpcHash, u64, u64, RpcHash, Vec<RpcHash>)),
+    /// The node understood the request and has no frontier it will start a wallet from below
+    /// this birthday (its `get_shielded_tree_state_call` refusal, rpc/service `service.rs`).
+    NoneBelow,
+    /// No answer that decides it: a node without the locator (it answers with its finality
+    /// point), a timeout, or a transport error. The metadata walks may still find a start.
+    Unknown,
+}
+
+impl BirthdayPlacement {
+    /// The locator's refusal text. Matched on the stable prefix the node has sent since the
+    /// locator shipped; anything else is `Unknown`, so a changed message only costs the walk.
+    const REFUSAL: &'static str = "no chain block with a retained shielded frontier below daa";
+
+    fn from_refusal(err: &str) -> Self {
+        if err.contains(Self::REFUSAL) { Self::NoneBelow } else { Self::Unknown }
+    }
+}
+
+#[cfg(test)]
+mod birthday_placement_tests {
+    use super::BirthdayPlacement;
+
+    /// The refusal walletd keys on must be the one the node sends. Read from the node's
+    /// source in this workspace, so a reworded message fails here instead of silently
+    /// bringing back the futile walk.
+    #[test]
+    fn the_refusal_matches_the_node_message_and_nothing_else_skips_the_walk() {
+        let node = include_str!("../../rpc/service/src/service.rs");
+        assert!(node.contains(BirthdayPlacement::REFUSAL), "rpc/service no longer sends the locator refusal walletd matches");
+        let sent = format!("General error: {} 3000000", BirthdayPlacement::REFUSAL);
+        assert!(matches!(BirthdayPlacement::from_refusal(&sent), BirthdayPlacement::NoneBelow));
+        for other in ["connection reset", "timeout", "shielded history below the pruning point is not verified yet", ""] {
+            assert!(matches!(BirthdayPlacement::from_refusal(other), BirthdayPlacement::Unknown), "{other:?} must not skip the walk");
+        }
+    }
 }
 
 struct PageCache {
@@ -3124,6 +3292,9 @@ struct PageCache {
     hits: u64,
     dedup_hits: u64,
     misses: u64,
+    /// What a scouted page boundary costs against what a page fetch costs, measured on the
+    /// node this daemon talks to. `deep_prefetch` scouts only while scouting can pay.
+    scout: ScoutCost,
     /// Fetches that found the page already cached but EXPIRED — pure waste, and
     /// indistinguishable from a first fetch in `misses` alone. Without this nobody can say
     /// how much of the miss rate is the cache giving up on pages it still had.
@@ -3148,7 +3319,98 @@ impl PageCache {
             hits: 0,
             dedup_hits: 0,
             misses: 0,
+            scout: ScoutCost::default(),
             expired_refetch: 0,
+        }
+    }
+}
+
+/// Whether `deep_prefetch` may scout page boundaries with `metadata_only` pages.
+///
+/// Scouting buys concurrency: a boundary known in advance lets that page's fetch run
+/// alongside the others instead of after its predecessor. What it can save per boundary is
+/// therefore at most one page fetch's latency, and only when the loop is fetch-bound. What it
+/// costs is node time on the same connection, ahead of the real pages. Spec 10 measured the
+/// shipped node at 0.9–1.65 s per 2,000-block scout (two boundaries) against 80–257 ms for a
+/// whole page, because it read every full header and GHOSTDAG record to return three integers
+/// (`rpc/service` `metadata_only`): a 1-day restore with 4 pages in flight scanned in 4.75 s
+/// and then waited 18.1 s for its scouts. The phone runs `prefetch_depth = 8`, so it paid that.
+///
+/// The rule: keep an EWMA of both costs as this daemon observes them, and scout only while a
+/// boundary costs at most `MAX_FRACTION` of a page fetch. Above that, scouting is switched off
+/// for `BACKOFF` and the read-ahead falls back to the chained fetch (`chain_ahead`), which
+/// needs no boundary it does not already hold. After the backoff one scout is measured
+/// afresh, so a node that was busy, or has since been upgraded to answer `metadata_only` from
+/// compact headers (task S), turns scouting back on by itself.
+#[derive(Default, Debug)]
+struct ScoutCost {
+    /// EWMA of node wall time per scouted boundary, ns (one 2,000-block call / 2).
+    boundary_ns: Option<f64>,
+    /// EWMA of node wall time of one full `SHIELDED_PAGE` fetch, ns.
+    page_ns: Option<f64>,
+    /// Scouting is off until this instant.
+    off_until: Option<std::time::Instant>,
+}
+
+impl ScoutCost {
+    const ALPHA: f64 = 0.3;
+    /// Half a page: with less margin a scout and the page it unblocks cost more node time
+    /// than the serial fetch it replaces, and the scout sits on the critical path first.
+    const MAX_FRACTION: f64 = 0.5;
+    const BACKOFF: std::time::Duration = std::time::Duration::from_secs(600);
+
+    fn ewma(slot: &mut Option<f64>, x: f64) {
+        *slot = Some(match *slot {
+            Some(v) => v + Self::ALPHA * (x - v),
+            None => x,
+        });
+    }
+
+    fn record_page(&mut self, rpc_ns: u64) {
+        Self::ewma(&mut self.page_ns, rpc_ns as f64);
+    }
+
+    /// May the read-ahead scout now? An expired backoff forgets the old scout cost, so the
+    /// next scout is judged on its own.
+    fn allowed(&mut self, now: std::time::Instant) -> bool {
+        match self.off_until {
+            Some(t) if now < t => false,
+            Some(_) => {
+                self.off_until = None;
+                self.boundary_ns = None;
+                true
+            }
+            None => true,
+        }
+    }
+
+    /// Record one scout. Returns true when this measurement switched scouting off.
+    fn record_scout(&mut self, ns_per_boundary: f64, now: std::time::Instant) -> bool {
+        Self::ewma(&mut self.boundary_ns, ns_per_boundary);
+        let (Some(b), Some(p)) = (self.boundary_ns, self.page_ns) else { return false };
+        if b > Self::MAX_FRACTION * p && self.off_until.is_none() {
+            self.off_until = Some(now + Self::BACKOFF);
+            return true;
+        }
+        false
+    }
+}
+
+/// Read-ahead without scouting: fetch the page at `anchor`, take its last block as the next
+/// cursor, and repeat, up to `remaining` pages. Each fetch goes through the shared cache, so it
+/// dedups against the sync loop's own fetch and its one-page prefetch. This keeps the node busy
+/// back to back while the loop ingests, at the cost of one fetch in flight at a time; it never
+/// spends node time on anything but pages the loop will read.
+async fn chain_ahead(state: std::sync::Arc<AppState>, client: GrpcClient, mut anchor: RpcHash, mut remaining: usize) {
+    while remaining > 0 {
+        let fetched = tokio::time::timeout(SYNC_RPC_TIMEOUT, fetch_shielded_page(&client, &state.page_cache, anchor, SHIELDED_PAGE)).await;
+        match fetched {
+            Ok(Ok(page)) if !page.reorged && page.blocks.len() as u64 == SHIELDED_PAGE => {
+                anchor = page.blocks.last().map(|b| b.hash).unwrap_or(anchor);
+                remaining -= 1;
+            }
+            // Error, reorg, or a short page (the tip): nothing further to read ahead.
+            _ => return,
         }
     }
 }
@@ -3206,6 +3468,15 @@ async fn deep_prefetch(state: std::sync::Arc<AppState>, client: GrpcClient, star
         }
     }
     while warmed < depth {
+        let now = std::time::Instant::now();
+        if !state.page_cache.lock().await.scout.allowed(now) {
+            // Scouting costs more than it saves on this node: read ahead along the chain of
+            // pages instead. `anchor`'s page is already warming (or known); the chain starts
+            // there and covers the rest of the depth.
+            chain_ahead(state.clone(), client.clone(), anchor, depth - warmed + 1).await;
+            return;
+        }
+        let t_scout = std::time::Instant::now();
         let meta = match tokio::time::timeout(
             SYNC_RPC_TIMEOUT,
             client.get_shielded_block_metadata(anchor, 2 * SHIELDED_PAGE),
@@ -3217,6 +3488,21 @@ async fn deep_prefetch(state: std::sync::Arc<AppState>, client: GrpcClient, star
             // covers `start`; the next chunk retries the read-ahead.
             _ => break,
         };
+        // Two boundaries per full call. A short call reached the tip, and then there is
+        // nothing left to save, so only full calls are measured.
+        if meta.blocks.len() as u64 == 2 * SHIELDED_PAGE {
+            let per_boundary = t_scout.elapsed().as_nanos() as f64 / 2.0;
+            let mut c = state.page_cache.lock().await;
+            if c.scout.record_scout(per_boundary, std::time::Instant::now()) {
+                log::info!(
+                    "read-ahead: a scouted page boundary costs {:.0} ms against {:.0} ms for a page on this node; \
+                     scouting off for {} s, reading ahead page by page instead",
+                    c.scout.boundary_ns.unwrap_or(0.0) / 1e6,
+                    c.scout.page_ns.unwrap_or(0.0) / 1e6,
+                    ScoutCost::BACKOFF.as_secs()
+                );
+            }
+        }
         // The 1000th and 2000th block after `anchor` are the exclusive cursors of the
         // next two full pages.
         for boundary in [page - 1, 2 * page - 1] {
@@ -3365,7 +3651,17 @@ async fn fetch_shielded_page_traced(
     });
     let decode_ns = t_decode.elapsed().as_nanos() as u64;
     let decoded =
-        Arc::new(DecodedPage { reorged: raw.reorged, sink_blue_score: raw.sink_blue_score, blocks, epks, rpc_ns, decode_ns });
+        Arc::new(DecodedPage {
+            reorged: raw.reorged,
+            sink_blue_score: raw.sink_blue_score,
+            blocks,
+            epks,
+            rpc_ns,
+            decode_ns,
+            low,
+            limit,
+            cohort: std::sync::Mutex::new(HashMap::new()),
+        });
     let mut c = cache.lock().await;
     // Re-inserting a key must not leave a second copy in the eviction queue. A page
     // refetched after its TTL used to be pushed again while `map` still held one
@@ -3384,6 +3680,9 @@ async fn fetch_shielded_page_traced(
     // more. A short page is at the frontier and keeps the configured TTL, which is the only
     // place the freshness argument holds.
     let page_ttl = if decoded.blocks.len() as u64 >= limit { FINAL_PAGE_TTL } else { c.ttl };
+    if limit == SHIELDED_PAGE && decoded.blocks.len() as u64 == limit {
+        c.scout.record_page(rpc_ns);
+    }
     if c.map.insert(key, (std::time::Instant::now(), page_ttl, decoded.clone())).is_some() {
         if let Some(pos) = c.order.iter().position(|k| *k == key) {
             c.order.remove(pos);
@@ -3603,6 +3902,11 @@ struct WalletEntry {
     /// the time), so status can NAME the floor — "history available from block N" — rather
     /// than only flag it. Not persisted: 0 after a restart, and status then omits it.
     blind_from_daa: u64,
+    /// Notes held by a scheduled Stage W transaction (built, waiting for its release time) or by
+    /// a uniform `/prepare` session awaiting signatures: position -> when the hold lapses. No
+    /// spend path selects them meanwhile (see [`spend_candidates`]). Not persisted: after a
+    /// restart the scheduled sends are gone too, so the notes are free again.
+    reserved: HashMap<u64, std::time::Instant>,
 }
 
 /// One block's contribution to the rolling unsettled preview (see
@@ -3618,7 +3922,21 @@ struct PreviewRollEntry {
 /// How many chain-block→leaf boundaries [`WalletEntry`] keeps. Anchor maturity is
 /// measured in *blue score*, which advances at least one per chain block, so
 /// `depth + slack` entries always reach the cutoff, with room to spare.
-const MATURED_RING: usize = (DEFAULT_ANCHOR_DEPTH + ANCHOR_SLACK) as usize + 64;
+///
+/// Plus one anchor epoch (`zkas_wallet_engine::uniform::ANCHOR_EPOCH`, 120) and its opener's
+/// parent: a Stage W spend anchors at the newest matured epoch OPENER, which sits up to 119
+/// blue below the cutoff, and the opener predicate needs the block before it. Older
+/// checkpoints simply hold a shorter ring (`ring_len.min(MATURED_RING)` on load).
+const MATURED_RING: usize = (DEFAULT_ANCHOR_DEPTH + ANCHOR_SLACK) as usize + 64 + 128;
+
+/// The ring length in force: [`MATURED_RING`] on a 1-BPS network (mainnet), scaled with the
+/// network's consensus anchor depth elsewhere (set in `serve`). A 10-BPS network's depth is 6,000
+/// blue, which a fixed 822-entry ring can never reach, so no matured anchor would ever be found.
+static MATURED_RING_RT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(MATURED_RING);
+
+fn matured_ring() -> usize {
+    MATURED_RING_RT.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// How close (in DAA/blue score) the wallet's latest ingested block must be to the
 /// node tip to report `synced: true`. On a live ~1-block/s chain the strict
@@ -3701,6 +4019,7 @@ impl WalletEntry {
             force_checkpoint: false,
             blind_below: 0,
             blind_from_daa: 0,
+            reserved: HashMap::new(),
         }
     }
 
@@ -4093,7 +4412,13 @@ impl WalletEntry {
                         // then decompresses for itself rather than indexing into the
                         // wrong page.
                         let shared = (resp.epks.len() == page_actions.len()).then_some(resp.epks.as_slice());
-                        tokio::task::block_in_place(|| self.db.predecrypt_page_cached(&page_actions, shared));
+                        // `--shared-scan-engine`: one multi-key pass for the cohort riding this
+                        // page; this wallet gets exactly the memo its own call would compute.
+                        let from_engine = shared.and_then(|e| engine_cohort_memo(state, &resp, token, &self.db, &page_actions, e));
+                        match from_engine {
+                            Some((found, ns)) => self.db.install_predecrypted(&page_actions, found, ns),
+                            None => tokio::task::block_in_place(|| self.db.predecrypt_page_cached(&page_actions, shared)),
+                        }
                     }
                 }
                 for (i, b) in resp.blocks.iter().enumerate() {
@@ -4211,7 +4536,7 @@ impl WalletEntry {
                     // that mints nothing (miner reward accrued) leaves it unchanged, and keying by it
                     // overwrote an old boundary's block with a much younger one.
                     self.boundary_blocks.insert(b.blue_score, b.hash.as_bytes());
-                    if self.boundaries.len() > MATURED_RING {
+                    if self.boundaries.len() > matured_ring() {
                         self.boundaries.pop_front();
                         if let Some(&(oldest_blue, _)) = self.boundaries.front() {
                             self.boundary_blocks.retain(|blue, _| *blue >= oldest_blue);
@@ -4784,6 +5109,22 @@ impl WalletEntry {
             .rev()
             .find(|(bs, leaves)| *bs <= cutoff_blue && *leaves == matured)
             .map(|&(bs, _)| bs);
+        self.anchor_block_at_blue(anchor_blue)
+    }
+
+    /// The checks of [`Self::send_anchor_block`] for an anchor chosen by blue score (the Stage W
+    /// epoch-opener rule chooses it that way): wallet healthy and connected, anchor young enough,
+    /// security-fork holds, and the anchor's block hash.
+    fn anchor_block_at_blue(&self, anchor_blue: Option<u64>) -> Result<Option<[u8; 32]>, (StatusCode, Json<serde_json::Value>)> {
+        if self.db.poisoned() || self.audit_retire {
+            return Err(err(
+                StatusCode::CONFLICT,
+                "this wallet received inconsistent data from its node and is halted or being rebuilt; it resumes after the rebuild",
+            ));
+        }
+        if !self.sink_live {
+            return Err(err(StatusCode::CONFLICT, "wallet is reconnecting to its node; retry in a few seconds"));
+        }
         let budget = MAX_ANCHOR_AGE.load(std::sync::atomic::Ordering::Relaxed).saturating_sub(ANCHOR_AGE_HEADROOM);
         if anchor_blue.is_none_or(|bs| self.sink_blue.saturating_sub(bs) > budget) {
             return Err(err(
@@ -5451,6 +5792,13 @@ struct AppState {
     /// [`Config::allow_custodial`] and [`require_custodial`].
     allow_custodial: bool,
     resources: ResourceLimits,
+    /// `--shared-scan-engine`: the multi-key detector kernel (`None` = engine off).
+    engine_kernel: Option<Box<dyn kaspa_shielded_core::engine::AgreeKernel>>,
+    /// `--shared-scan-engine`: every syncing wallet's prepared key and the page request it
+    /// is ingesting (token -> (key, low, limit)). The first wallet of a cohort to reach a
+    /// page decrypts it for every key registered at that cursor. A std mutex held only for
+    /// an insert, a remove or a snapshot.
+    engine_cohort: std::sync::Mutex<HashMap<String, (Arc<kaspa_shielded_core::engine::IvkKey>, RpcHash, u64)>>,
 }
 
 /// Build a status snapshot from a locked wallet entry. Shared by the sync loop and the
@@ -6026,14 +6374,30 @@ impl AppState {
             // strictly below the birthday and serves the nearest retained frontier at-or-before
             // it. A node without the locator answers with the finality point instead, which
             // `frontier_below_daa` rejects, and the walks below take over.
-            let mut w = self.frontier_below_daa(birthday).await;
-            if w.is_none() {
+            let placement = self.frontier_below_daa(birthday).await;
+            let refused = matches!(placement, BirthdayPlacement::NoneBelow);
+            let mut w = match placement {
+                BirthdayPlacement::Placed(s) => Some(s),
+                _ => None,
+            };
+            if refused {
+                // The node HAS the locator and says no frontier it will vouch for lies below
+                // this birthday: older than its history base, or inside history it took from a
+                // peer (whose split of leaves between blocks nothing binds, so no frontier there
+                // may start a wallet). Both walks below can only end at that same refusal, the
+                // genesis one after up to WALK_PAGES_ARCHIVE pages read through the archive.
+                // Go straight to the full scan, which sees every leaf.
+                log::info!(
+                    "wallet birthday {birthday}: the node serves no frontier below it (older than the history it vouches for); full scan without the futile walk"
+                );
+            }
+            if w.is_none() && !refused {
                 let pp = self.request_client().await?.get_block_dag_info().await.ok().map(|i| i.pruning_point_hash);
                 if let Some(pp) = pp {
                     w = self.birthday_start(pp, birthday, WALK_PAGES_HEADERS).await;
                 }
             }
-            if w.is_none() {
+            if w.is_none() && !refused {
                 // Bounded: a page costs ~0.3 s and the import/open request blocks for the
                 // whole walk, so past this budget a full scan (which runs in the background
                 // and survives restarts) is the better experience than a hung "Opening".
@@ -6119,17 +6483,19 @@ impl AppState {
     /// that predates the field ignores it and answers with its finality point — which, in the
     /// only branch that calls this, lies at-or-past the birthday — so the `< birthday` check
     /// tells the two apart and never lets an overshooting frontier skip the birthday's notes.
-    async fn frontier_below_daa(&self, birthday: u64) -> Option<(RpcHash, u64, u64, RpcHash, Vec<RpcHash>)> {
+    async fn frontier_below_daa(&self, birthday: u64) -> BirthdayPlacement {
         let req = kaspa_rpc_core::GetShieldedTreeStateRequest { block_hash: None, below_daa_score: Some(birthday) };
-        let ts = tokio::time::timeout(std::time::Duration::from_secs(30), self.request_client().await?.get_shielded_tree_state_call(None, req))
-            .await
-            .ok()?
-            .ok()?;
+        let Some(client) = self.request_client().await else { return BirthdayPlacement::Unknown };
+        let ts = match tokio::time::timeout(std::time::Duration::from_secs(30), client.get_shielded_tree_state_call(None, req)).await {
+            Ok(Ok(ts)) => ts,
+            Ok(Err(e)) => return BirthdayPlacement::from_refusal(&e.to_string()),
+            Err(_) => return BirthdayPlacement::Unknown,
+        };
         if ts.daa_score >= birthday {
-            return None;
+            return BirthdayPlacement::Unknown;
         }
         log::info!("node placed birthday {birthday} at frontier daa {} (block {}) in one call", ts.daa_score, ts.block_hash);
-        Some((ts.block_hash, ts.daa_score, ts.size, ts.leaf, ts.ommers))
+        BirthdayPlacement::Placed((ts.block_hash, ts.daa_score, ts.size, ts.leaf, ts.ommers))
     }
 
     async fn birthday_start(&self, from: RpcHash, birthday: u64, max_pages: u32) -> Option<(RpcHash, u64, u64, RpcHash, Vec<RpcHash>)> {
@@ -7308,6 +7674,11 @@ async fn mempool_loop(state: Arc<AppState>) {
 /// lets the fast-sync base roll forward past the spent notes, shortening every later
 /// witness rebuild.
 async fn consolidate_loop(state: Arc<AppState>) {
+    // Stage W (operator opt-in `--uniform-merge`): Poisson 4 -> 1 merges above 8 notes replace the
+    // 500-note / 38-at-a-time / 60-s-cooldown loop below, whose cadence is visible on chain.
+    if uniform_policy().merge {
+        return uniform::merge_loop(state).await;
+    }
     let Some(ceiling) = state.auto_consolidate else { return };
     log::info!(
         "auto-consolidate: ON — custodial wallets are kept under {ceiling} notes \
@@ -8288,6 +8659,9 @@ async fn evict_wallet(state: &Arc<AppState>, token: &str, why: &str) -> bool {
     let mut map = state.wallets.lock().await;
     if map.get(token).map(|cur| Arc::ptr_eq(cur, &w)).unwrap_or(false) {
         map.remove(token);
+        if let Ok(mut c) = state.engine_cohort.lock() {
+            c.remove(token);
+        }
         log::info!("evicted {why} wallet '{token_p}' (checkpoint on disk; it reloads on its next request)", token_p = log_pseudonym(&token));
         return true;
     }
@@ -8789,24 +9163,14 @@ struct StatusResp {
     blocks_behind: u64,
 }
 
-async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Json<StatusResp> {
-    let token = token_from(&headers, state.allow_default_token).ok();
-    // Do NOT call the node here. The gRPC client is shared with the background sync loop,
-    // whose block fetches make a fresh get_block_dag_info queue for seconds — which made
-    // every status call take ~4s. The sync loop already refreshes `node_tip` every pass,
-    // and a dedicated ticker keeps it current even with no wallets loaded, so status reads
-    // the cached tip instantly. `node_connected` follows whether the tip is fresh.
-    let (node_connected, daa_score) = {
-        let (tip, at) = *state.node_tip.lock().await;
-        (at.elapsed() < std::time::Duration::from_secs(30), tip)
-    };
-
-    let mut resp = StatusResp {
+/// The `/api/status` answer before any wallet is consulted (shared with `engine_host`).
+fn status_base(network: &str, node_connected: bool, daa_score: u64) -> StatusResp {
+    StatusResp {
         has_wallet: false,
         address: None,
         birthday: None,
         private_sends: false,
-        network: state.network.clone(),
+        network: network.to_string(),
         node_connected,
         daa_score,
         synced: false,
@@ -8838,7 +9202,22 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Json<
         missing_history: false,
         history_from_daa: None,
         watch_only: false,
+    }
+}
+
+async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Json<StatusResp> {
+    let token = token_from(&headers, state.allow_default_token).ok();
+    // Do NOT call the node here. The gRPC client is shared with the background sync loop,
+    // whose block fetches make a fresh get_block_dag_info queue for seconds — which made
+    // every status call take ~4s. The sync loop already refreshes `node_tip` every pass,
+    // and a dedicated ticker keeps it current even with no wallets loaded, so status reads
+    // the cached tip instantly. `node_connected` follows whether the tip is fresh.
+    let (node_connected, daa_score) = {
+        let (tip, at) = *state.node_tip.lock().await;
+        (at.elapsed() < std::time::Duration::from_secs(30), tip)
     };
+
+    let mut resp = status_base(&state.network, node_connected, daa_score);
 
     if let Some(token) = token {
         // NEVER load on the request path. A wallet load makes node RPCs and rebuilds a
@@ -9312,6 +9691,12 @@ async fn wallet_balance(
     let w = state.get_wallet(&token).await.ok_or_else(|| err(StatusCode::NOT_FOUND, "no wallet loaded"))?;
     let e = w.lock().await;
     let want_notes = matches!(query.notes.as_deref(), Some("1" | "true" | "yes"));
+    Ok(Json(balance_resp(state.prefix, &e, want_notes)))
+}
+
+/// `/api/wallet/balance` for one wallet entry. Shared by the per-wallet daemon and the
+/// multi-wallet engine (`engine_host`), so both render byte-identical answers from equal state.
+fn balance_resp(prefix: Prefix, e: &WalletEntry, want_notes: bool) -> BalanceResp {
     let note_count = e.db.notes().len();
     let notes = want_notes.then(|| {
         e.db.notes()
@@ -9319,11 +9704,11 @@ async fn wallet_balance(
             .map(|n| NoteInfo {
                 position: n.position,
                 value: n.value(),
-                recipient: String::from(&Address::new(state.prefix, Version::ShieldedOrchard, &n.note.recipient().to_raw_address_bytes())),
+                recipient: String::from(&Address::new(prefix, Version::ShieldedOrchard, &n.note.recipient().to_raw_address_bytes())),
             })
             .collect()
     });
-    Ok(Json(BalanceResp {
+    BalanceResp {
         balance_sompi: e.db.balance().to_string(),
         balance_fc: fmt_fc(e.db.balance()),
         // Same `tip > 0` guard `status` carries: an unknown tip is NOT evidence of being
@@ -9340,7 +9725,7 @@ async fn wallet_balance(
         note_count,
         updated_unix: e.updated_unix,
         error: e.error.clone(),
-    }))
+    }
 }
 
 #[derive(Deserialize)]
@@ -9546,8 +9931,13 @@ async fn wallet_history(
     let token = token_from(&headers, state.allow_default_token)?;
     let w = state.get_wallet(&token).await.ok_or_else(|| err(StatusCode::NOT_FOUND, "no wallet loaded"))?;
     let e = w.lock().await;
-    let history_page = query.limit.unwrap_or(500).clamp(1, 5_000);
-    let offset = query.offset.unwrap_or(0);
+    Ok(Json(history_json(state.prefix, &e, query.limit, query.offset)))
+}
+
+/// `/api/wallet/history` for one wallet entry (see [`balance_resp`]).
+fn history_json(prefix: Prefix, e: &WalletEntry, limit: Option<usize>, offset: Option<usize>) -> serde_json::Value {
+    let history_page = limit.unwrap_or(500).clamp(1, 5_000);
+    let offset = offset.unwrap_or(0);
     let rows: Vec<serde_json::Value> =
         e.db.history()
             .iter()
@@ -9571,7 +9961,7 @@ async fn wallet_history(
                     "feeSompi": h.fee,
                     "feeSompiExact": h.fee.to_string(),
                     "feeKnown": h.fee_known,
-                    "recipient": h.recipient.map(|r| String::from(&Address::new(state.prefix, Version::ShieldedOrchard, &r))),
+                    "recipient": h.recipient.map(|r| String::from(&Address::new(prefix, Version::ShieldedOrchard, &r))),
                     "memo": (!h.memo.is_empty()).then(|| String::from_utf8_lossy(&h.memo).into_owned()),
                     // Per-output breakdown. `recipient`/`amountSompi` stay exactly
                     // as they were for every existing client; a caller that must
@@ -9580,7 +9970,7 @@ async fn wallet_history(
                     // means no breakdown was recorded (coinbase, compact-only, or a
                     // row written before this daemon version) — not zero received.
                     "credits": h.credits.iter().map(|c| serde_json::json!({
-                        "recipient": String::from(&Address::new(state.prefix, Version::ShieldedOrchard, &c.recipient)),
+                        "recipient": String::from(&Address::new(prefix, Version::ShieldedOrchard, &c.recipient)),
                         "amountSompi": c.value,
                         "amountSompiExact": c.value.to_string(),
                         "amountZkas": c.value as f64 / SOMPI_PER_ZKAS as f64,
@@ -9604,14 +9994,14 @@ async fn wallet_history(
                 })
             })
             .collect();
-    Ok(Json(serde_json::json!({
+    serde_json::json!({
         "recoverableHistory": e.recoverable_history,
         "total": e.db.history().len(),
         "offset": offset,
         "limit": history_page,
         "rows": rows,
         "pendingOutgoing": pending,
-    })))
+    })
 }
 
 #[derive(Deserialize)]
@@ -9957,6 +10347,18 @@ fn sort_candidates_for_spend<T: std::borrow::Borrow<OwnedNote>>(candidates: &mut
     candidates.sort_unstable_by_key(|n| spend_order_key(n.borrow().value(), target));
 }
 
+/// [`matured_candidates`] minus the notes a scheduled Stage W transaction or a uniform prepare
+/// session holds (lapsed holds are ignored). Every spend path selects through this, so a held
+/// note cannot be spent twice by a payment built while it waits for its release time.
+fn spend_candidates(e: &WalletEntry, matured: u64) -> Result<(Vec<&OwnedNote>, u64), (StatusCode, Json<serde_json::Value>)> {
+    let (mut c, stranded) = matured_candidates(&e.db, matured)?;
+    if !e.reserved.is_empty() {
+        let now = std::time::Instant::now();
+        c.retain(|n| e.reserved.get(&n.position).is_none_or(|until| *until <= now));
+    }
+    Ok((c, stranded))
+}
+
 fn matured_candidates(db: &WalletDb, matured: u64) -> Result<(Vec<&OwnedNote>, u64), (StatusCode, Json<serde_json::Value>)> {
     let stranded = db.stranded_notes();
     let stranded_value = sum_note_values(stranded.iter().map(|n| n.value()))?;
@@ -10235,6 +10637,11 @@ async fn wallet_send(
     headers: HeaderMap,
     Json(req): Json<SendReq>,
 ) -> Result<Json<SendResp>, (StatusCode, Json<serde_json::Value>)> {
+    // Stage W (operator opt-in `--uniform-v1`): uniform shape, scheduled independent release of
+    // siblings instead of the group-submit burst below (spec 02 §2.2a).
+    if uniform_policy().enabled {
+        return uniform::legacy_send(state, headers, req).await;
+    }
     require_custodial(&state)?;
     let token = token_from(&headers, state.allow_default_token)?;
     let w = state.get_wallet(&token).await.ok_or_else(|| err(StatusCode::NOT_FOUND, "no wallet loaded"))?;
@@ -10352,7 +10759,7 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
         fork_now = security_fork_active(e.chain_len.max(e.scanned as u64));
         if let Some(matured) = e.boundaries.iter().rev().find(|(bs, _)| *bs <= cutoff_blue).map(|&(_, lc)| lc) {
             anchor_block = e.send_anchor_block(matured)?;
-            let (mut candidates, stranded_value) = matured_candidates(&e.db, matured)?;
+            let (mut candidates, stranded_value) = spend_candidates(&e, matured)?;
             sort_candidates_for_spend(&mut candidates, amount, fee);
             let values: Vec<u64> = candidates.iter().map(|n| n.value()).collect();
             let have = sum_note_values(values.iter().copied())?;
@@ -10638,6 +11045,10 @@ async fn wallet_send_many(
     headers: HeaderMap,
     Json(req): Json<SendManyReq>,
 ) -> Result<Json<SendManyResp>, (StatusCode, Json<serde_json::Value>)> {
+    // Stage W: one payee per transaction at i.i.d. times over the desk window (W10).
+    if uniform_policy().enabled {
+        return uniform::legacy_send_many(state, headers, req).await;
+    }
     require_custodial(&state)?;
     let token = token_from(&headers, state.allow_default_token)?;
     let w = state.get_wallet(&token).await.ok_or_else(|| err(StatusCode::NOT_FOUND, "no wallet loaded"))?;
@@ -10720,7 +11131,7 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
         tokio::task::block_in_place(|| e.advance_spend_witnesses_bounded(shared_covers, shared_base));
         let matured = e.matured_leaves().ok_or_else(|| err(StatusCode::CONFLICT, "wallet has no matured anchor yet"))?;
         anchor_block = e.send_anchor_block(matured)?;
-        let (mut candidates, stranded) = matured_candidates(&e.db, matured)?;
+        let (mut candidates, stranded) = spend_candidates(&e, matured)?;
         sort_candidates_for_spend(&mut candidates, requested, base_fee);
         let have = sum_note_values(candidates.iter().map(|n| n.value()))?;
 
@@ -10930,6 +11341,9 @@ async fn wallet_consolidate(
     headers: HeaderMap,
     body: Option<Json<ConsolidateReq>>,
 ) -> Result<Json<ConsolidateResp>, (StatusCode, Json<serde_json::Value>)> {
+    if uniform_policy().enabled {
+        return uniform::legacy_consolidate(&state, &headers).await.map(Json);
+    }
     require_custodial(&state)?;
     let token = token_from(&headers, state.allow_default_token)?;
     let w = state.get_wallet(&token).await.ok_or_else(|| err(StatusCode::NOT_FOUND, "no wallet loaded"))?;
@@ -10986,7 +11400,7 @@ async fn consolidate_once(
             return Err(err(StatusCode::CONFLICT, "wallet is still syncing the maturity window; try again shortly"));
         };
         let anchor_block = e.send_anchor_block(matured)?;
-        let (mut candidates, _stranded) = matured_candidates(&e.db, matured)?;
+        let (mut candidates, _stranded) = spend_candidates(&e, matured)?;
         if heal {
             // Oldest first: spending the lowest-position notes lets the fast-sync base
             // roll forward past them (`advance_base_capped`), shortening every later
@@ -11109,6 +11523,15 @@ struct PrepareReq {
     /// transaction can spend. The response's `remaining_sompi` is what is still owed;
     /// the caller repeats prepare/submit until it reaches 0.
     allow_partial: Option<bool>,
+    /// Stage W (spec 02): build the uniform shape (4 actions, exact fee F_V1, anchor at the
+    /// newest matured epoch opener). Opt-in per request: the client must then accept a fee of
+    /// exactly F and hold/re-prepare per the returned `uniform` block. A payment needing more
+    /// than 4 notes returns its first sibling only (requires `allow_partial`); the client
+    /// schedules the rest itself (`uniform.split_window_ms`).
+    uniform: Option<bool>,
+    /// Drop this earlier, unsubmitted session first and free the notes it held: a client that
+    /// held a uniform payment past an anchor-epoch roll re-prepares it this way (W5).
+    replace_session: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -11156,6 +11579,11 @@ struct PrepareResp {
     /// a long chain — so the client can warn the user about the wait instead of
     /// looking hung (and fix the token↔FVK mismatch that usually causes it).
     fast_path: bool,
+    /// Stage W facts for a `uniform: true` prepare: anchor epoch and the blue score until which
+    /// consensus accepts it (hold at most until then, else re-prepare), sibling count, split
+    /// window, λ̂. Absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    uniform: Option<serde_json::Value>,
 }
 
 /// [`kaspa_shielded_core::wallet::build::ActionDisclosure`] over the wire.
@@ -11179,6 +11607,15 @@ async fn wallet_prepare(
     let fvk_bytes = unhex(&req.fvk_hex)
         .and_then(|b| <[u8; FVK_LEN]>::try_from(b.as_slice()).ok())
         .ok_or_else(|| err(StatusCode::BAD_REQUEST, "fvk_hex must be 96 bytes of hex"))?;
+
+    if let Some(old) = req.replace_session.as_deref() {
+        let dropped = state.prepared.lock().await.remove(old);
+        if let Some(PreparedSession { token: Some(t), positions, .. }) = dropped {
+            if let Some(w) = state.get_wallet(&t).await {
+                uniform::unreserve(&mut *w.lock().await, &positions);
+            }
+        }
+    }
 
     // Is this wallet paying ITSELF? Decided from the viewing key and the recipient,
     // both cheap to derive, so it is known before anything is reserved.
@@ -11253,6 +11690,8 @@ async fn wallet_prepare(
     // class of bug as the missing `mark_spent`. Callers that don't ask still get the
     // explicit "send in smaller chunks" error.
     let allow_partial = req.allow_partial.unwrap_or(false);
+    let uniform_req = req.uniform.unwrap_or(false);
+    let mut uniform_info: Option<serde_json::Value> = None;
     let mut amount = requested;
     // The caller's fee (or the flat default) is a FLOOR: the actual fee is raised
     // to the node's byte-proportional minimum once the input count is known
@@ -11342,10 +11781,69 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
                     climb,
                     if climb == 0 { "WARM — background pre-advance kept up" } else { "COLD — witnesses were behind" },
                 );
+                if uniform_req {
+                    // Stage W: the newest matured epoch opener, the uniform planner, exactly F.
+                    let choice = match uniform::pick_anchor(&e) {
+                        Ok(c) => c,
+                        Err(uniform::PickErr::Wait(b)) => {
+                            return Err(err(StatusCode::SERVICE_UNAVAILABLE, format!("the anchor epoch changes in about {b} s; prepare again then")));
+                        }
+                        Err(uniform::PickErr::Fail(x)) => return Err(x),
+                    };
+                    anchor_block = Some(choice.block);
+                    let (mut cands, _stranded) = spend_candidates(&e, choice.leaves)?;
+                    cands.retain(|n| n.value() > 0);
+                    have_total = Some(sum_note_values(cands.iter().map(|n| n.value()))?);
+                    let target = zkas_wallet_engine::uniform::uniform_single_note_target(amount);
+                    cands.sort_unstable_by_key(|n| spend_order_key(n.value(), target));
+                    let plan = match zkas_wallet_engine::uniform::plan_uniform_payment(cands.iter().map(|n| n.value()).collect(), amount) {
+                        Ok(p) => p,
+                        Err(zkas_wallet_engine::uniform::UniformPlanError::NeedsConsolidation { siblings }) => {
+                            return Err((
+                                StatusCode::CONFLICT,
+                                Json(serde_json::json!({
+                                    "error": zkas_wallet_engine::uniform::UniformPlanError::NeedsConsolidation { siblings }.to_string(),
+                                    "needs_consolidation": true, "siblings": siblings,
+                                })),
+                            ));
+                        }
+                        Err(e) => return Err(err(StatusCode::CONFLICT, format!("{e} (funds must be ~10 min old to spend)"))),
+                    };
+                    let k = plan.siblings.len();
+                    if k > 1 && !allow_partial {
+                        return Err(err(
+                            StatusCode::CONFLICT,
+                            format!("this payment needs {k} uniform transactions; pass allow_partial and send the rest as scheduled siblings"),
+                        ));
+                    }
+                    let first = &plan.siblings[0];
+                    amount = first.amount;
+                    fee = zkas_wallet_engine::UNIFORM_FEE_V1;
+                    need = amount.saturating_add(fee);
+                    let positions: Vec<u64> = first.notes.iter().map(|&i| cands[i].position).collect();
+                    let inputs_u = uniform_witness(&state, &e, &positions, choice.leaves)?;
+                    for (n, _) in &inputs_u {
+                        selected += n.value().inner();
+                    }
+                    inputs = inputs_u;
+                    spent_positions = positions.clone();
+                    session_token = Some(token.clone());
+                    fast_path = true;
+                    let info = uniform::anchor_info_of(&e, &choice);
+                    let w_ms = zkas_wallet_engine::schedule::split_window_ms(k, info.lambda_per_s, 0);
+                    uniform_info = Some(serde_json::json!({
+                        "anchor_blue": info.anchor_blue, "anchor_epoch": info.anchor_epoch,
+                        "valid_until_blue": info.valid_until_blue, "sink_blue": info.sink_blue,
+                        "lambda_per_s": info.lambda_per_s, "siblings": k, "split_window_ms": w_ms,
+                        "fee_sompi": fee,
+                    }));
+                    // Hold the notes while the device signs and holds (W11), up to the session TTL.
+                    uniform_reserve(&mut e, &positions, PREPARED_TTL);
+                } else {
                 let cutoff_blue = e.sink_blue.saturating_sub(DEFAULT_ANCHOR_DEPTH + ANCHOR_SLACK);
                 if let Some(matured) = e.boundaries.iter().rev().find(|(bs, _)| *bs <= cutoff_blue).map(|&(_, lc)| lc) {
                     anchor_block = e.send_anchor_block(matured)?;
-                    let (mut candidates, _stranded) = matured_candidates(&e.db, matured)?;
+                    let (mut candidates, _stranded) = spend_candidates(&e, matured)?;
                     sort_candidates_for_spend(&mut candidates, amount, base_fee);
                     have_total = Some(sum_note_values(candidates.iter().map(|n| n.value()))?);
                     fast_path = true;
@@ -11406,10 +11904,17 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
                     }
                     session_token = Some(token.clone());
                 }
+                }
             }
         }
     }
 
+    if uniform_req && have_total.is_none() {
+        return Err(err(
+            StatusCode::CONFLICT,
+            "a uniform prepare needs a wallet this daemon tracks: register the key (watch) and send its token",
+        ));
+    }
     // Slow path (no token, unsynced wallet, or a key we don't track): recover the note
     // set from the FVK alone over the settled matured chain prefix, so every witness
     // still roots at a matured canonical anchor.
@@ -11639,7 +12144,8 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
     let t_proof = std::time::Instant::now();
     let payment = tokio::task::spawn_blocking(move || {
         let _proving = ProvingGuard::new();
-        kaspa_shielded_core::wallet::build::prepare_payment_anchored(
+        let shape = if uniform_req { uniform_policy_shape() } else { kaspa_shielded_core::wallet::build::SendShape::LEGACY };
+        kaspa_shielded_core::wallet::build::prepare_payment_shaped(
             &fvk,
             inputs,
             recipient,
@@ -11650,12 +12156,18 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
             recoverable,
             memo,
             anchor_block,
+            shape,
+            &mut rand10::rng(),
         )
     })
     .await
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("proof task failed: {e}")))?
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to prepare payment: {e:?}")))?;
     log::info!("prepare: Halo2 proof took {:.1?}", t_proof.elapsed());
+    if uniform_req {
+        zkas_wallet_engine::check_uniform_effects(&payment.effects)
+            .map_err(|v| err(StatusCode::INTERNAL_SERVER_ERROR, format!("prepared payment is not uniform: {v}")))?;
+    }
 
     let spend_auth: Vec<SpendAuthReq> =
         payment.spend_auth_requests.iter().map(|(i, alpha)| SpendAuthReq { index: *i, alpha: hex(alpha) }).collect();
@@ -11735,7 +12247,31 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
         disclosure,
         prepared_payment,
         fast_path,
+        uniform: uniform_info,
     }))
+}
+
+/// The shape a uniform prepare builds under the operator's policy (internal change or not).
+fn uniform_policy_shape() -> kaspa_shielded_core::wallet::build::SendShape {
+    if uniform_policy().internal_change {
+        kaspa_shielded_core::wallet::build::SendShape::UNIFORM_INTERNAL
+    } else {
+        kaspa_shielded_core::wallet::build::SendShape::UNIFORM
+    }
+}
+
+/// Witnesses for a uniform prepare (shared tree first).
+fn uniform_witness(
+    state: &AppState,
+    e: &WalletEntry,
+    positions: &[u64],
+    leaves: u64,
+) -> Result<Vec<(kaspa_shielded_core::Note, kaspa_shielded_core::MerklePath)>, (StatusCode, Json<serde_json::Value>)> {
+    uniform::witness_inputs_pub(state, e, positions, leaves)
+}
+
+fn uniform_reserve(e: &mut WalletEntry, positions: &[u64], for_how_long: std::time::Duration) {
+    uniform::reserve_pub(e, positions, for_how_long)
 }
 
 #[derive(Deserialize)]
@@ -11836,6 +12372,7 @@ async fn wallet_submit(
                     for p in &positions {
                         e.db.mark_spent(*p, accepted.as_bytes(), now_daa);
                     }
+                    uniform::unreserve(&mut e, &positions);
                     // The parked notes are worth more than amount + fee: the rest is
                     // CHANGE, and until the block carrying it is previewed nothing else
                     // in the status carries it — a one-note wallet read "0" for the
@@ -12786,6 +13323,73 @@ async fn warm_sweep_loop(state: Arc<AppState>) {
 }
 
 #[cfg(test)]
+mod scout_cost_tests {
+    use super::ScoutCost;
+    use std::time::{Duration, Instant};
+
+    const MS: f64 = 1e6;
+
+    /// Spec 10's measured shipped-node figures: a page 80–257 ms, a 2,000-block scout
+    /// 0.9–1.65 s, i.e. 450–825 ms per boundary. Scouting must switch off on the first full
+    /// scout, at either end of both ranges.
+    #[test]
+    fn the_shipped_node_scout_cost_switches_scouting_off() {
+        for (page, boundary) in [(80.0, 450.0), (257.0, 450.0), (80.0, 825.0), (257.0, 825.0)] {
+            let mut s = ScoutCost::default();
+            let now = Instant::now();
+            s.record_page((page * MS) as u64);
+            assert!(s.allowed(now));
+            assert!(s.record_scout(boundary * MS, now), "page {page} ms, boundary {boundary} ms must stop scouting");
+            assert!(!s.allowed(now + Duration::from_secs(1)));
+            assert!(!s.allowed(now + ScoutCost::BACKOFF - Duration::from_secs(1)));
+            // Switched off once: a later scout does not re-arm (or extend) the backoff.
+            assert!(!s.record_scout(boundary * MS, now));
+        }
+    }
+
+    /// A node that answers `metadata_only` from compact headers keeps scouting on, and a
+    /// node with no page measured yet is never judged.
+    #[test]
+    fn a_cheap_scout_keeps_scouting_on_and_no_page_means_no_verdict() {
+        let mut s = ScoutCost::default();
+        let now = Instant::now();
+        assert!(!s.record_scout(5_000.0 * MS, now), "no page cost yet: no verdict");
+        assert!(s.allowed(now));
+        let mut s = ScoutCost::default();
+        s.record_page((130.0 * MS) as u64);
+        for _ in 0..50 {
+            assert!(!s.record_scout(6.0 * MS, now));
+        }
+        assert!(s.allowed(now));
+        // The boundary between: exactly half a page is still allowed, just above is not.
+        let mut s = ScoutCost::default();
+        s.record_page((100.0 * MS) as u64);
+        assert!(!s.record_scout(50.0 * MS, now));
+        assert!(s.record_scout(50.0 * MS + 2.0 * 50.0 * MS, now));
+    }
+
+    /// After the backoff the old verdict is forgotten: one cheap scout keeps scouting on
+    /// (an upgraded or quieter node), one expensive scout switches it off again.
+    #[test]
+    fn after_the_backoff_one_scout_is_judged_afresh() {
+        let mut s = ScoutCost::default();
+        let now = Instant::now();
+        s.record_page((130.0 * MS) as u64);
+        assert!(s.record_scout(600.0 * MS, now));
+        let later = now + ScoutCost::BACKOFF + Duration::from_secs(1);
+        assert!(s.allowed(later));
+        assert!(!s.record_scout(5.0 * MS, later), "a cheap scout after the backoff is judged on its own");
+        assert!(s.allowed(later));
+        let mut s2 = ScoutCost::default();
+        s2.record_page((130.0 * MS) as u64);
+        assert!(s2.record_scout(600.0 * MS, now));
+        assert!(s2.allowed(later));
+        assert!(s2.record_scout(600.0 * MS, later), "still expensive: off again");
+        assert!(!s2.allowed(later + Duration::from_secs(1)));
+    }
+}
+
+#[cfg(test)]
 mod warm_overlap_tests {
     use super::{warm_overlap_allowed, WARM_OVERLAP_MAX_BEHIND};
 
@@ -13187,6 +13791,15 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
         _ => kaspa_consensus_core::config::params::Params::from(state_prefix_network(&cfg.network)).max_shielded_anchor_age(),
     };
     MAX_ANCHOR_AGE.store(max_anchor_age, std::sync::atomic::Ordering::Relaxed);
+    // Stage W's anchor-epoch rule and the ring that serves it follow this network's consensus
+    // anchor depth (600 x BPS): unchanged on mainnet, x10 on the 10-BPS devnet.
+    let anchor_depth = kaspa_consensus_core::config::params::Params::from(state_prefix_network(&cfg.network)).shielded_anchor_depth();
+    let rule = zkas_wallet_engine::uniform::AnchorRule::for_depth(anchor_depth);
+    uniform::set_anchor_rule(rule);
+    MATURED_RING_RT.store(
+        MATURED_RING.max((rule.depth + rule.slack + rule.epoch) as usize + 64 + 8),
+        std::sync::atomic::Ordering::Relaxed,
+    );
 
     let resources = cfg.resources.clone();
     log::info!("wallet resource limits: {:?}", resources);
@@ -13247,8 +13860,17 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
         auto_consolidate: cfg.auto_consolidate,
         build_shared_tree: cfg.build_shared_tree,
         allow_custodial: cfg.allow_custodial,
+        engine_kernel: resources.shared_scan_engine.then(engine_kernel_from_env),
+        engine_cohort: std::sync::Mutex::new(HashMap::new()),
         resources,
     });
+    if let Some(k) = &state.engine_kernel {
+        log::info!(
+            "shared scan engine: ON (kernel {}): wallets on the same page share one multi-key trial-decryption pass{}",
+            k.name(),
+            if kaspa_shielded_core::wallet::gpu_enabled() || kaspa_shielded_core::wallet::gpu_filter_enabled() { "; bypassed while the GPU backend is installed" } else { "" }
+        );
+    }
     // Publish a weak handle so an embedder (Android onTrimMemory) can reclaim memory
     // without owning the daemon. See `release_memory`.
     if let Ok(mut g) = LIVE_STATE.lock() {
@@ -13430,6 +14052,11 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
         .route("/api/wallet/send", post(wallet_send))
         .route("/api/wallet/send_many", post(wallet_send_many))
         .route("/api/wallet/consolidate", post(wallet_consolidate))
+        .route("/api/wallet/uniform/send", post(uniform::send))
+        .route("/api/wallet/uniform/send_many", post(uniform::send_many))
+        .route("/api/wallet/uniform/consolidate", post(uniform::consolidate))
+        .route("/api/wallet/uniform/scheduled", get(uniform::scheduled))
+        .route("/api/uniform/anchor", get(uniform::anchor_info))
         .route("/api/wallet/prepare", post(wallet_prepare))
         .route("/api/wallet/submit", post(wallet_submit))
         .route("/api/wallet/sign", post(wallet_sign))
@@ -15305,11 +15932,11 @@ mod day_diff_tests {
     use std::time::{Duration, Instant};
     use zcash_note_encryption::Domain;
 
-    fn env_u64(k: &str, d: u64) -> u64 {
+    pub(super) fn env_u64(k: &str, d: u64) -> u64 {
         std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
     }
 
-    fn h32(parts: &[&[u8]]) -> [u8; 32] {
+    pub(super) fn h32(parts: &[&[u8]]) -> [u8; 32] {
         let mut st = blake2b_simd::Params::new().hash_length(32).personal(b"zkas-daydiff-t03").to_state();
         for p in parts {
             st.update(p);
@@ -15320,20 +15947,20 @@ mod day_diff_tests {
     }
 
     /// Deterministic stream (splitmix64), so the asm and portable runs plant identically.
-    struct Det(u64);
+    pub(super) struct Det(u64);
     impl Det {
-        fn from(parts: &[&[u8]]) -> Self {
+        pub(super) fn from(parts: &[&[u8]]) -> Self {
             let b = h32(parts);
             Det(u64::from_le_bytes(b[..8].try_into().unwrap()))
         }
-        fn next(&mut self) -> u64 {
+        pub(super) fn next(&mut self) -> u64 {
             self.0 = self.0.wrapping_add(0x9e3779b97f4a7c15);
             let mut z = self.0;
             z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
             z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
             z ^ (z >> 31)
         }
-        fn b32(&mut self) -> [u8; 32] {
+        pub(super) fn b32(&mut self) -> [u8; 32] {
             let mut o = [0u8; 32];
             for c in o.chunks_mut(8) {
                 c.copy_from_slice(&self.next().to_le_bytes());
@@ -15343,7 +15970,7 @@ mod day_diff_tests {
     }
 
     /// The coinbase leaf exactly as it was derived before the change: two NoteCommits.
-    fn old_coinbase_cmx(desc: &CoinbaseNoteDesc, value: u64) -> Option<ExtractedNoteCommitment> {
+    pub(super) fn old_coinbase_cmx(desc: &CoinbaseNoteDesc, value: u64) -> Option<ExtractedNoteCommitment> {
         let recipient: OAddr = Option::from(OAddr::from_raw_address_bytes(&desc.recipient))?;
         let rho: Rho = Option::from(Rho::from_bytes(&desc.rho))?;
         let rseed: RandomSeed = Option::from(RandomSeed::from_bytes(desc.rseed, &rho))?;
@@ -15369,7 +15996,7 @@ mod day_diff_tests {
 
     /// A compact record carrying a real note to `addr` (nf doubles as the note's rho, as
     /// `for_compact_action` reads it). `None` on the rare non-canonical draw.
-    fn plant(addr: OAddr, value: u64, rng: &mut Det) -> Option<CompactActionRecord> {
+    pub(super) fn plant(addr: OAddr, value: u64, rng: &mut Det) -> Option<CompactActionRecord> {
         let mut nf = rng.b32();
         nf[31] &= 0x3f;
         let rho: Rho = Option::from(Rho::from_bytes(&nf))?;
@@ -15388,11 +16015,11 @@ mod day_diff_tests {
         })
     }
 
-    fn plant_retry(addr: OAddr, value: u64, rng: &mut Det) -> CompactActionRecord {
+    pub(super) fn plant_retry(addr: OAddr, value: u64, rng: &mut Det) -> CompactActionRecord {
         (0..64).find_map(|_| plant(addr, value, rng)).expect("a canonical draw within 64 tries")
     }
 
-    fn seed_wallet(tag: &[u8], i: u64) -> (WalletDb, [u8; 32]) {
+    pub(super) fn seed_wallet(tag: &[u8], i: u64) -> (WalletDb, [u8; 32]) {
         let mut k = 0u64;
         loop {
             let s = h32(&[b"throwaway-key", tag, &i.to_le_bytes(), &k.to_le_bytes()]);
@@ -15403,7 +16030,7 @@ mod day_diff_tests {
         }
     }
 
-    async fn connect(rpc: &str) -> GrpcClient {
+    pub(super) async fn connect(rpc: &str) -> GrpcClient {
         GrpcClient::connect_with_args(
             NotificationMode::Direct,
             format!("grpc://{rpc}"),
@@ -15418,21 +16045,21 @@ mod day_diff_tests {
         .expect("connect to DAYDIFF_RPC")
     }
 
-    fn frontier(ts: &kaspa_rpc_core::GetShieldedTreeStateResponse) -> FrontierState {
+    pub(super) fn frontier(ts: &kaspa_rpc_core::GetShieldedTreeStateResponse) -> FrontierState {
         FrontierState { size: ts.size, leaf: (ts.size > 0).then(|| ts.leaf.as_bytes()), ommers: ts.ommers.iter().map(|h| h.as_bytes()).collect() }
     }
 
-    fn hex32(b: &[u8; 32]) -> String {
+    pub(super) fn hex32(b: &[u8; 32]) -> String {
         b.iter().map(|x| format!("{x:02x}")).collect()
     }
 
-    fn parse_hash(s: &str) -> RpcHash {
+    pub(super) fn parse_hash(s: &str) -> RpcHash {
         let v = hex::decode(s.trim()).expect("hex block hash");
         RpcHash::from_bytes(v.try_into().expect("32 bytes"))
     }
 
     /// Start block for the run: explicit, or saved by an earlier run, or chosen now.
-    async fn start_block(client: &GrpcClient, out: &str, span: u64) -> kaspa_rpc_core::GetShieldedTreeStateResponse {
+    pub(super) async fn start_block(client: &GrpcClient, out: &str, span: u64) -> kaspa_rpc_core::GetShieldedTreeStateResponse {
         let saved = std::env::var("DAYDIFF_START").ok().or_else(|| std::fs::read_to_string(format!("{out}.start")).ok());
         if let Some(h) = saved {
             let h = parse_hash(&h);
@@ -15814,6 +16441,668 @@ mod day_diff_tests {
         }
         use std::io::Write as _;
         let mut f = std::fs::OpenOptions::new().create(true).append(true).open(format!("{out}.ivk")).expect("out");
+        for l in lines {
+            writeln!(f, "{l}").unwrap();
+        }
+    }
+}
+
+/// `--shared-scan-engine`'s cohort memo (`cohort_memo_with`), without a daemon: one pass for
+/// every key at the page cursor, each wallet's memo equal to its own `predecrypt` result,
+/// other cursors excluded, late keys computed on their own, twins share.
+#[cfg(test)]
+mod engine_cohort_tests {
+    use super::day_diff_tests::{Det, plant_retry, seed_wallet};
+    use super::*;
+    use kaspa_shielded_core::engine::{CombKernel, IvkKey, LadderKernel};
+    use kaspa_shielded_core::wallet::{decompress_epk, scan_compact_auto_cached};
+    use orchard::Address as OAddr;
+
+    #[test]
+    fn a_cohort_shares_one_pass_and_each_wallet_gets_its_own_memo() {
+        let mut r = Det::from(&[b"cohort-test"]);
+        let dbs: Vec<WalletDb> = (0..5).map(|i| seed_wallet(b"cohort", i).0).collect();
+        let twin = seed_wallet(b"cohort", 0).0;
+        let stranger = OAddr::from_raw_address_bytes(&seed_wallet(b"cohort-stranger", 0).0.address_bytes_at(3)).unwrap();
+        let mut actions: Vec<CompactActionRecord> = (0..300).map(|_| plant_retry(stranger, 1, &mut r)).collect();
+        for (w, db) in dbs.iter().enumerate() {
+            for j in 0..3u32 {
+                let to = OAddr::from_raw_address_bytes(&db.address_bytes_at(j * 7 + w as u32)).unwrap();
+                let at = (r.next() % (actions.len() as u64 + 1)) as usize;
+                actions.insert(at, plant_retry(to, 100 + w as u64, &mut r));
+            }
+        }
+        actions[17].ephemeral_key = [0u8; 32];
+        let epks: Vec<_> = actions.iter().map(|a| decompress_epk(&a.ephemeral_key)).collect();
+        let want = |db: &WalletDb| -> Vec<(usize, u64)> {
+            let ivk = db.incoming_viewing_key();
+            let sc = kaspa_shielded_core::wallet::ivk_agreement_scalar(ivk).unwrap();
+            scan_compact_auto_cached(&ivk.prepare(), Some(&sc), &actions, Some(&epks)).iter().map(|n| (n.action_index, n.note.value().inner())).collect()
+        };
+        let got = |v: &[kaspa_shielded_core::wallet::ReceivedNote]| -> Vec<(usize, u64)> { v.iter().map(|n| (n.action_index, n.note.value().inner())).collect() };
+        for kernel in [&LadderKernel as &dyn kaspa_shielded_core::engine::AgreeKernel, &CombKernel { w: Some(4) }] {
+            let registry = std::sync::Mutex::new(HashMap::new());
+            let memo = std::sync::Mutex::new(HashMap::new());
+            let here = (RpcHash::from_bytes([1u8; 32]), SHIELDED_PAGE);
+            let elsewhere = (RpcHash::from_bytes([2u8; 32]), SHIELDED_PAGE);
+            // Wallets 0..3 and the twin are at this page's cursor; wallet 3 is elsewhere.
+            for (i, db) in dbs.iter().enumerate().take(4) {
+                let req = if i == 3 { elsewhere } else { here };
+                let key = Arc::new(IvkKey::from_ivk(db.incoming_viewing_key()).unwrap());
+                registry.lock().unwrap().insert(format!("tok{i}"), (key, req.0, req.1));
+            }
+            let tw = Arc::new(IvkKey::from_ivk(twin.incoming_viewing_key()).unwrap());
+            registry.lock().unwrap().insert("twin".into(), (tw, here.0, here.1));
+            // First wallet in: one pass covers wallets 0, 1, 2 (and the twin's key = wallet 0's).
+            let (m0, _) = cohort_memo_with(kernel, &registry, here, &memo, "tok0", &dbs[0], &actions, &epks).unwrap();
+            assert_eq!(got(&m0), want(&dbs[0]), "{}: wallet 0", kernel.name());
+            assert!(!got(&m0).is_empty(), "planted notes must be found");
+            assert_eq!(memo.lock().unwrap().len(), 3, "{}: one pass for the three distinct keys at this cursor", kernel.name());
+            for (i, db) in dbs.iter().enumerate().take(3).skip(1) {
+                let (m, _) = cohort_memo_with(kernel, &registry, here, &memo, &format!("tok{i}"), db, &actions, &epks).unwrap();
+                assert_eq!(got(&m), want(db), "{}: wallet {i}", kernel.name());
+            }
+            let (mt, _) = cohort_memo_with(kernel, &registry, here, &memo, "twin", &twin, &actions, &epks).unwrap();
+            assert_eq!(got(&mt), want(&dbs[0]), "{}: twin", kernel.name());
+            assert_eq!(memo.lock().unwrap().len(), 3, "{}: served from the memo", kernel.name());
+            // Wallet 4 arrives late (not registered when the pass ran): computed on its own.
+            let (m4, _) = cohort_memo_with(kernel, &registry, here, &memo, "tok4", &dbs[4], &actions, &epks).unwrap();
+            assert_eq!(got(&m4), want(&dbs[4]), "{}: late wallet", kernel.name());
+            assert_eq!(memo.lock().unwrap().len(), 4);
+            // Wallet 3 reaches this page later: its cursor moved here, so it is recomputed, correctly.
+            let (m3, _) = cohort_memo_with(kernel, &registry, here, &memo, "tok3", &dbs[3], &actions, &epks).unwrap();
+            assert_eq!(got(&m3), want(&dbs[3]), "{}: wallet from another cursor", kernel.name());
+            // A misaligned epk cache is refused, never indexed.
+            assert!(cohort_memo_with(kernel, &registry, here, &memo, "tok0", &dbs[0], &actions, &epks[1..]).is_none());
+        }
+    }
+}
+
+/// Task E1 — the shadow-mode harness for the multi-wallet scan engine, and experiment M-A.
+///
+/// `real_days_shared_engine_equals_per_wallet` runs the shared engine
+/// (`kaspa_shielded_core::engine::ScanEngine`: one decode, one multi-key detection pass, one
+/// tree, per-wallet state = own notes) ALONGSIDE today's per-wallet path (N `WalletDb`s, each
+/// `predecrypt_page_cached` + `ingest_block_compact_precomputed_with_meta`, exactly what
+/// `sync_chunk` calls) over real mainnet days from the node, for throwaway wallets (plus a
+/// twin), and asserts after every page: identical notes (position, value, nullifier,
+/// commitment), balance, pending spends and pending change, history rows, chain clock,
+/// poison flag, tree size, anchor and applied-nullifier count; at the end identical witnesses
+/// for every note and (unplanted) the node's own root. Planted mode (default) inserts
+/// receipts to diversified addresses, coinbase rewards, spends of held notes (half of them
+/// first parked with `mark_spent`), lost sends that `reclaim_expired` must hand back, and
+/// hostile encodings, so the comparison is not vacuous. `SHADOW_MODE=old|new` runs one side
+/// only, for CPU/RAM measurement.
+///
+/// Env: `SHADOW_RPC` (or `DAYDIFF_RPC`), `SHADOW_OUT`, `SHADOW_START` / saved `{out}.start`,
+/// `SHADOW_SPAN` (DAA, default 86400), `SHADOW_WALLETS` (default 8), `SHADOW_PLANT` (default 1),
+/// `SHADOW_MODE` (both), `SHADOW_KERNEL` (comb|ladder, default comb).
+#[cfg(test)]
+mod engine_shadow_tests {
+    use super::day_diff_tests::{Det, connect, env_u64, frontier, h32, hex32, plant_retry, seed_wallet};
+    use super::*;
+    use kaspa_shielded_core::ExtractedNoteCommitment;
+    use kaspa_shielded_core::engine::{AgreeKernel, CombKernel, IvkKey, LadderKernel, ScanEngine, SharedBlock, SharedChain, SharedPage, WalletId, detect};
+    use kaspa_shielded_core::wallet::{decompress_epk, scan_compact_auto_cached};
+    use kaspa_shielded_core::walletdb::PendingSpend;
+    use orchard::Address as OAddr;
+    use orchard::keys::{FullViewingKey, Scope, SpendingKey};
+    use rayon::prelude::*;
+    use sha2::{Digest, Sha256};
+    use std::time::Instant;
+
+    /// Process CPU seconds (user + system), from /proc/self/stat at 100 Hz.
+    fn cpu_secs() -> f64 {
+        let s = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
+        let f: Vec<&str> = s.rsplit_once(") ").map(|x| x.1).unwrap_or("").split_whitespace().collect();
+        let g = |i: usize| f.get(i).and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
+        (g(11) + g(12)) / 100.0
+    }
+
+    fn status_kb(key: &str) -> u64 {
+        std::fs::read_to_string("/proc/self/status")
+            .unwrap_or_default()
+            .lines()
+            .find(|l| l.starts_with(key))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    }
+
+    fn kernel(name: &str) -> Box<dyn AgreeKernel> {
+        match name {
+            "ladder" => Box::new(LadderKernel),
+            _ => Box::new(CombKernel { w: None }),
+        }
+    }
+
+    /// The engine's block from the daemon's own decoded block, with `sync_chunk`'s meta rule.
+    fn shared_block(b: &DecodedBlock) -> SharedBlock {
+        SharedBlock {
+            hash: b.hash.as_bytes(),
+            blue_score: b.blue_score,
+            daa_score: b.daa_score,
+            coinbase: b.coinbase.clone(),
+            txs: b.compact.clone(),
+            meta: (b.timestamp > 0 && b.txids.len() == b.compact.len()).then(|| BlockMeta {
+                coinbase_txid: b.coinbase_txid,
+                txids: b.txids.clone(),
+                timestamp_ms: b.timestamp,
+                daa_score: b.daa_score,
+            }),
+        }
+    }
+
+    fn note_key(n: &OwnedNote) -> (u64, u64, [u8; 32], [u8; 32]) {
+        (n.position, n.value(), n.nullifier(), ExtractedNoteCommitment::from(n.note.commitment()).to_bytes())
+    }
+
+    fn compare(db: &WalletDb, eng: &ScanEngine, id: WalletId, ctx: &str) {
+        let w = eng.wallet(id);
+        assert_eq!(db.notes().iter().map(note_key).collect::<Vec<_>>(), w.notes().iter().map(note_key).collect::<Vec<_>>(), "{ctx}: notes");
+        assert_eq!(db.balance(), w.balance(), "{ctx}: balance");
+        let pk = |p: &PendingSpend| (note_key(&p.note), p.txid, p.submitted_daa);
+        assert_eq!(db.pending_spends().iter().map(pk).collect::<Vec<_>>(), w.pending_spends().iter().map(pk).collect::<Vec<_>>(), "{ctx}: pending");
+        assert_eq!(db.pending_change(), w.pending_change(), "{ctx}: pending change");
+        assert_eq!(format!("{:?}", db.history()), format!("{:?}", w.history()), "{ctx}: history");
+        assert_eq!(db.last_daa(), w.last_daa(), "{ctx}: chain clock");
+        assert_eq!(db.poisoned(), w.poisoned(), "{ctx}: poisoned");
+        assert_eq!(db.size(), eng.chain().size(), "{ctx}: tree size");
+        assert_eq!(db.anchor(), eng.chain().anchor(), "{ctx}: anchor");
+        assert_eq!(db.nf_len(), eng.chain().nf_len(), "{ctx}: applied nullifiers");
+        for n in db.notes() {
+            assert!(!eng.chain().nf_seen(&n.nullifier()), "{ctx}: an unspent note's nullifier is applied");
+        }
+    }
+
+    fn fold_digest(h: &mut Sha256, notes: &[OwnedNote], pending: &[PendingSpend], history: &[kaspa_shielded_core::walletdb::HistoryEntry], balance: u128) {
+        for n in notes {
+            let (p, v, nf, cm) = note_key(n);
+            h.update(p.to_le_bytes());
+            h.update(v.to_le_bytes());
+            h.update(nf);
+            h.update(cm);
+        }
+        for p in pending {
+            h.update(p.note.nullifier());
+            h.update(p.txid);
+        }
+        h.update(format!("{history:?}").as_bytes());
+        h.update(balance.to_le_bytes());
+    }
+
+    #[test]
+    #[ignore = "needs a node: SHADOW_RPC=127.0.0.1:16810"]
+    fn real_days_shared_engine_equals_per_wallet() {
+        let rpc = std::env::var("SHADOW_RPC").or_else(|_| std::env::var("DAYDIFF_RPC")).expect("SHADOW_RPC");
+        let out = std::env::var("SHADOW_OUT").unwrap_or_else(|_| "/tmp/shadow".into());
+        let span = env_u64("SHADOW_SPAN", 86_400);
+        let n = env_u64("SHADOW_WALLETS", 8) as usize;
+        let plant_mode = env_u64("SHADOW_PLANT", 1) == 1;
+        let mode = std::env::var("SHADOW_MODE").unwrap_or_else(|_| "both".into());
+        let kname = std::env::var("SHADOW_KERNEL").unwrap_or_else(|_| "comb".into());
+        let (run_old, run_new) = (mode != "new", mode != "old");
+        COINBASE_SEED_ACTIVATION_DAA.store(
+            kaspa_consensus_core::config::params::MAINNET_PARAMS.shielded_coinbase_seed_activation.daa_score(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        rt.block_on(async move {
+            let client = connect(&rpc).await;
+            let ts0 = {
+                let saved = std::env::var("SHADOW_START").ok().or_else(|| std::fs::read_to_string(format!("{out}.start")).ok());
+                if let Some(h) = saved {
+                    let h = super::day_diff_tests::parse_hash(&h);
+                    client.get_shielded_tree_state(Some(h)).await.expect("tree state at start")
+                } else {
+                    super::day_diff_tests::start_block(&client, &out, span).await
+                }
+            };
+            let end_daa = ts0.daa_score + span;
+            let fs0 = frontier(&ts0);
+            let tag = ts0.block_hash.as_bytes();
+            // n throwaway wallets plus a twin of wallet 0 (same key, second token).
+            let total = n + usize::from(n >= 2);
+            let mut old: Vec<WalletDb> = Vec::new();
+            let mut fvks: Vec<FullViewingKey> = Vec::new();
+            let mut addrs: Vec<Vec<[u8; 43]>> = Vec::new();
+            for i in 0..total {
+                let src = if i == n { 0 } else { i as u64 };
+                let (mut db, seed) = seed_wallet(&tag, src);
+                db.apply_frontier(&fs0).expect("frontier");
+                addrs.push((0..300u32).map(|j| db.address_bytes_at(j)).collect());
+                fvks.push(FullViewingKey::from(&Option::<SpendingKey>::from(SpendingKey::from_bytes(seed)).expect("seed")));
+                if run_old {
+                    old.push(db);
+                }
+            }
+            // `--shared-scan-engine` itself: per-wallet WalletDbs fed by one cohort pass
+            // (`install_predecrypted`), exactly as `engine_cohort_memo` does in `sync_chunk`.
+            let run_cohort = run_old && run_new && env_u64("SHADOW_COHORT", 1) == 1;
+            let mut coh: Vec<WalletDb> = Vec::new();
+            if run_cohort {
+                for i in 0..total {
+                    let src = if i == n { 0 } else { i as u64 };
+                    let (mut db, _) = seed_wallet(&tag, src);
+                    db.apply_frontier(&fs0).expect("frontier");
+                    coh.push(db);
+                }
+            }
+            let eng_kernel = kernel(&kname);
+            let coh_keys: Vec<IvkKey> = coh.iter().map(|d| IvkKey::from_ivk(d.incoming_viewing_key()).expect("key")).collect();
+            let mut eng = ScanEngine::new(SharedChain::from_frontier(&fs0).expect("frontier"), kernel(&kname));
+            let ids: Vec<WalletId> = if run_new { fvks.iter().map(|f| eng.register(f.clone()).expect("register")).collect() } else { Vec::new() };
+            let stranger = OAddr::from_raw_address_bytes(&seed_wallet(b"stranger", 0).0.address_bytes_at(7)).unwrap();
+            let mut planted_spends: HashSet<[u8; 32]> = HashSet::new();
+            let (mut n_pages, mut n_blocks, mut n_act, mut n_planted, mut n_parked, mut n_reclaimed) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+            let (mut cpu_old, mut cpu_new, mut wall_old, mut wall_new, mut cpu_shared, mut wall_shared) = (0f64, 0f64, 0f64, 0f64, 0f64, 0f64);
+            let mut low = ts0.block_hash;
+            let mut last = ts0.block_hash;
+            let mut last_daa = ts0.daa_score;
+            let t_all = Instant::now();
+            loop {
+                let resp = client.get_shielded_blocks(low, SHIELDED_PAGE).await.expect("get_shielded_blocks");
+                assert!(!resp.reorged, "start block reorged off the chain");
+                let mut blocks: Vec<RpcShieldedChainBlock> = resp.blocks.into_iter().take_while(|b| b.daa_score < end_daa).collect();
+                if blocks.is_empty() {
+                    break;
+                }
+                let page_done = blocks.len() < SHIELDED_PAGE as usize;
+                n_pages += 1;
+                if plant_mode {
+                    // Held notes (wallet, position, nf, unspent?) from whichever side runs; both
+                    // sides are asserted equal, so the plan is the same either way.
+                    let mut held: Vec<(usize, u64, [u8; 32], bool)> = Vec::new();
+                    for w in 0..total {
+                        let (notes, pend): (Vec<(u64, [u8; 32])>, Vec<(u64, [u8; 32])>) = if run_old {
+                            (old[w].notes().iter().map(|x| (x.position, x.nullifier())).collect(), old[w].pending_spends().iter().map(|p| (p.note.position, p.note.nullifier())).collect())
+                        } else {
+                            let lw = eng.wallet(ids[w]);
+                            (lw.notes().iter().map(|x| (x.position, x.nullifier())).collect(), lw.pending_spends().iter().map(|p| (p.note.position, p.note.nullifier())).collect())
+                        };
+                        held.extend(notes.into_iter().map(|(p, nf)| (w, p, nf, true)));
+                        held.extend(pend.into_iter().map(|(p, nf)| (w, p, nf, false)));
+                    }
+                    held.retain(|h| !planted_spends.contains(&h.2));
+                    for b in blocks.iter_mut() {
+                        let mut r = Det::from(&[b"shadow-plant", &tag, &b.hash.as_bytes()]);
+                        let mut txs: Vec<Vec<CompactActionRecord>> = Vec::new();
+                        if !held.is_empty() && r.next() % 25 == 0 {
+                            let (w, pos, nf, unspent) = held.swap_remove((r.next() % held.len() as u64) as usize);
+                            planted_spends.insert(nf);
+                            // Half of the spends are first parked as our own submitted send.
+                            if unspent && r.next() % 2 == 0 {
+                                let txid = r.b32();
+                                let outflow = 1 + r.next() % 1000;
+                                if run_old {
+                                    old[w].mark_spent(pos, txid, b.daa_score);
+                                    old[w].note_pending_outflow(txid, outflow);
+                                }
+                                if run_cohort {
+                                    coh[w].mark_spent(pos, txid, b.daa_score);
+                                    coh[w].note_pending_outflow(txid, outflow);
+                                }
+                                if run_new {
+                                    eng.mark_spent(ids[w], pos, txid, b.daa_score);
+                                    eng.note_pending_outflow(ids[w], txid, outflow);
+                                }
+                                n_parked += 1;
+                            }
+                            let mut rec = plant_retry(stranger, 5, &mut r);
+                            rec.nullifier = nf;
+                            let mut tx = vec![rec];
+                            if r.next() % 2 == 0 {
+                                // Change back to the spender.
+                                let to = OAddr::from_raw_address_bytes(&addrs[w][(r.next() % 300) as usize]).unwrap();
+                                tx.push(plant_retry(to, 1 + r.next() % 1_000_000, &mut r));
+                            }
+                            txs.push(tx);
+                        } else if !held.is_empty() && r.next() % 90 == 0 {
+                            // A send that never lands: parked, never spent on chain.
+                            let k = (r.next() % held.len() as u64) as usize;
+                            let (w, pos, nf, unspent) = held[k];
+                            if unspent {
+                                held.swap_remove(k);
+                                planted_spends.insert(nf);
+                                let txid = r.b32();
+                                if run_old {
+                                    old[w].mark_spent(pos, txid, b.daa_score);
+                                }
+                                if run_cohort {
+                                    coh[w].mark_spent(pos, txid, b.daa_score);
+                                }
+                                if run_new {
+                                    eng.mark_spent(ids[w], pos, txid, b.daa_score);
+                                }
+                                n_parked += 1;
+                            }
+                        }
+                        if r.next() % 30 == 0 {
+                            let w = (r.next() % total as u64) as usize;
+                            let to = OAddr::from_raw_address_bytes(&addrs[w][(r.next() % 300) as usize]).unwrap();
+                            let mut tx = vec![plant_retry(stranger, 1 + r.next() % 1_000_000, &mut r), plant_retry(to, 1 + r.next() % 1_000_000_000, &mut r)];
+                            if r.next() % 3 == 0 {
+                                // A second output to another of our wallets in the same tx.
+                                let w2 = (r.next() % total as u64) as usize;
+                                let to2 = OAddr::from_raw_address_bytes(&addrs[w2][(r.next() % 300) as usize]).unwrap();
+                                tx.push(plant_retry(to2, 1 + r.next() % 1_000_000, &mut r));
+                            }
+                            if r.next() % 4 == 0 {
+                                let mut bad = plant_retry(stranger, 9, &mut r);
+                                match r.next() % 3 {
+                                    0 => bad.ephemeral_key = [0u8; 32],
+                                    1 => bad.ephemeral_key = [0xff; 32],
+                                    _ => bad.cmx = [0xff; 32],
+                                }
+                                tx.push(bad);
+                            }
+                            if r.next() % 2 == 0 {
+                                tx.reverse();
+                            }
+                            txs.push(tx);
+                        }
+                        if r.next() % 50 == 0 {
+                            let w = (r.next() % total as u64) as usize;
+                            let j = (r.next() % 256) as usize;
+                            let i = b.coinbase_outputs.len();
+                            let value = 1 + r.next() % 50_000_000_000;
+                            let desc = derive_coinbase_note_desc(addrs[w][j], &coinbase_note_seed(&b.hash, b.daa_score, &b.coinbase_txid, i));
+                            let cm = super::day_diff_tests::old_coinbase_cmx(&desc, value).expect("planted coinbase derives");
+                            b.coinbase_outputs.push(kaspa_rpc_core::RpcShieldedCoinbaseOutput { script_public_key: addrs[w][j].to_vec(), value, commitment: Some(cm.to_bytes()) });
+                            n_planted += 1;
+                        }
+                        for tx in txs {
+                            n_planted += 1;
+                            let pos = (r.next() % (b.accepted_actions.len() as u64 + 1)) as usize;
+                            let bytes: Vec<u8> = tx.iter().flat_map(|a| a.to_bytes()).collect();
+                            b.accepted_actions.insert(pos, bytes);
+                            if !b.accepted_txids.is_empty() {
+                                b.accepted_txids.insert(pos, RpcHash::from_bytes(r.b32()));
+                            }
+                        }
+                    }
+                }
+                // The shared half both paths get from the daemon's page cache: decode once,
+                // epks once.
+                let (c0, t0) = (cpu_secs(), Instant::now());
+                let decoded: Vec<DecodedBlock> = blocks.par_iter().map(decode_block).collect::<Result<_, _>>().expect("decode_block");
+                let flat: Vec<CompactActionRecord> = decoded.iter().flat_map(|b| b.compact.iter().flatten().copied()).collect();
+                let epks: Vec<_> = flat.par_iter().map(|r| decompress_epk(&r.ephemeral_key)).collect();
+                cpu_shared += cpu_secs() - c0;
+                wall_shared += t0.elapsed().as_secs_f64();
+                n_act += flat.len() as u64;
+                // OLD: today's per-wallet path, wallet by wallet.
+                if run_old {
+                    let (c0, t0) = (cpu_secs(), Instant::now());
+                    for db in old.iter_mut() {
+                        if !flat.is_empty() {
+                            db.predecrypt_page_cached(&flat, Some(epks.as_slice()));
+                        }
+                        for b in &decoded {
+                            let meta = (b.timestamp > 0 && b.txids.len() == b.compact.len()).then(|| BlockMeta {
+                                coinbase_txid: b.coinbase_txid,
+                                txids: b.txids.clone(),
+                                timestamp_ms: b.timestamp,
+                                daa_score: b.daa_score,
+                            });
+                            db.ingest_block_compact_precomputed_with_meta(&b.coinbase, &b.compact, meta.as_ref());
+                        }
+                        db.end_page();
+                    }
+                    cpu_old += cpu_secs() - c0;
+                    wall_old += t0.elapsed().as_secs_f64();
+                }
+                // The daemon flag path: one detection for the cohort, installed per wallet.
+                if run_cohort {
+                    let refs: Vec<&IvkKey> = coh_keys.iter().collect();
+                    let found = if flat.is_empty() { vec![Vec::new(); refs.len()] } else { detect(eng_kernel.as_ref(), &refs, &flat, &epks) };
+                    for (db, f) in coh.iter_mut().zip(found) {
+                        if !flat.is_empty() {
+                            db.install_predecrypted(&flat, f, 0);
+                        }
+                        for b in &decoded {
+                            let meta = (b.timestamp > 0 && b.txids.len() == b.compact.len()).then(|| BlockMeta {
+                                coinbase_txid: b.coinbase_txid,
+                                txids: b.txids.clone(),
+                                timestamp_ms: b.timestamp,
+                                daa_score: b.daa_score,
+                            });
+                            db.ingest_block_compact_precomputed_with_meta(&b.coinbase, &b.compact, meta.as_ref());
+                        }
+                        db.end_page();
+                    }
+                }
+                // NEW: one engine pass for every wallet.
+                if run_new {
+                    let (c0, t0) = (cpu_secs(), Instant::now());
+                    let page = SharedPage::with_epks(decoded.iter().map(shared_block).collect(), epks.clone());
+                    eng.ingest_page(&page);
+                    cpu_new += cpu_secs() - c0;
+                    wall_new += t0.elapsed().as_secs_f64();
+                }
+                last_daa = decoded.last().map(|b| b.daa_score).unwrap_or(last_daa);
+                // Lost sends come back after the expiry window, identically.
+                if plant_mode {
+                    for w in 0..total {
+                        let a = if run_old { old[w].reclaim_expired(last_daa, PENDING_SPEND_EXPIRY_DAA) } else { Vec::new() };
+                        let b = if run_new { eng.reclaim_expired(ids[w], last_daa, PENDING_SPEND_EXPIRY_DAA) } else { Vec::new() };
+                        if run_old && run_new {
+                            assert_eq!(a, b, "page {n_pages} wallet {w}: reclaimed");
+                        }
+                        if run_cohort {
+                            assert_eq!(a, coh[w].reclaim_expired(last_daa, PENDING_SPEND_EXPIRY_DAA), "page {n_pages} cohort wallet {w}: reclaimed");
+                        }
+                        n_reclaimed += a.len().max(b.len()) as u64;
+                    }
+                }
+                if run_old && run_new {
+                    for w in 0..total {
+                        compare(&old[w], &eng, ids[w], &format!("page {n_pages} wallet {w}"));
+                    }
+                }
+                if run_cohort {
+                    for w in 0..total {
+                        let ctx = format!("page {n_pages} cohort wallet {w}");
+                        assert_eq!(old[w].notes().iter().map(note_key).collect::<Vec<_>>(), coh[w].notes().iter().map(note_key).collect::<Vec<_>>(), "{ctx}: notes");
+                        assert_eq!(format!("{:?}", old[w].history()), format!("{:?}", coh[w].history()), "{ctx}: history");
+                        let pk = |p: &PendingSpend| (note_key(&p.note), p.txid, p.submitted_daa);
+                        assert_eq!(old[w].pending_spends().iter().map(pk).collect::<Vec<_>>(), coh[w].pending_spends().iter().map(pk).collect::<Vec<_>>(), "{ctx}: pending");
+                        assert_eq!((old[w].size(), old[w].anchor(), old[w].nf_len(), old[w].pending_change()), (coh[w].size(), coh[w].anchor(), coh[w].nf_len(), coh[w].pending_change()), "{ctx}: tree");
+                    }
+                }
+                n_blocks += blocks.len() as u64;
+                last = blocks.last().unwrap().hash;
+                low = last;
+                if page_done {
+                    break;
+                }
+            }
+            let wall = t_all.elapsed().as_secs_f64();
+            // Witnesses for every note, from each wallet's own stream and from the one shared tree.
+            let mut n_witness = 0usize;
+            let mut found = 0usize;
+            let mut h = Sha256::new();
+            for w in 0..total {
+                if run_old && run_new {
+                    let pos: Vec<u64> = old[w].notes().iter().map(|x| x.position).chain(old[w].pending_spends().iter().map(|p| p.note.position)).collect();
+                    let size = eng.chain().size();
+                    let a = old[w].witness_paths_at(&pos, size);
+                    let b = eng.witness_paths_at(&pos, size);
+                    for ((pa, pb), p) in a.iter().zip(&b).zip(&pos) {
+                        let pa = pa.as_ref().expect("own witness");
+                        let pb = pb.as_ref().expect("shared witness");
+                        assert_eq!(format!("{pa:?}"), format!("{pb:?}"), "wallet {w}: witness at {p}");
+                        n_witness += 1;
+                    }
+                }
+                if run_new {
+                    let lw = eng.wallet(ids[w]);
+                    fold_digest(&mut h, lw.notes(), lw.pending_spends(), lw.history(), lw.balance());
+                    found += lw.notes().len() + lw.pending_spends().len();
+                } else {
+                    fold_digest(&mut h, old[w].notes(), old[w].pending_spends(), old[w].history(), old[w].balance());
+                    found += old[w].notes().len() + old[w].pending_spends().len();
+                }
+            }
+            let (size, anchor) = if run_new { (eng.chain().size(), eng.chain().anchor()) } else { (old[0].size(), old[0].anchor()) };
+            h.update(size.to_le_bytes());
+            h.update(anchor);
+            let digest: [u8; 32] = h.finalize().as_slice().try_into().unwrap();
+            if plant_mode {
+                assert!(found > 0 && n_parked > 0, "planted mode must find and park notes ({found} found, {n_parked} parked)");
+            }
+            let root_check = if plant_mode {
+                "skipped (planted)".to_string()
+            } else {
+                let ts1 = client.get_shielded_tree_state(Some(last)).await.expect("tree state at end");
+                let node_root = GlobalTree::from_state(&frontier(&ts1)).expect("node frontier").anchor().to_bytes();
+                assert_eq!(size, ts1.size, "leaf count vs node at {last}");
+                assert_eq!(anchor, node_root, "root vs node at {last}");
+                format!("node root {} at size {} == {}", hex32(&node_root), ts1.size, mode)
+            };
+            let heap_old: usize = old.iter().map(|d| d.approx_heap_bytes()).sum();
+            let (heap_chain, heap_wallets) = if run_new { eng.approx_heap_bytes() } else { (0, 0) };
+            let st = eng.stats();
+            let line = format!(
+                "label={} mode={mode} kernel={} digest={} start={} end={} span_daa={span} pages={n_pages} blocks={n_blocks} actions={n_act} wallets={total} keys={} cohort_path={run_cohort} planted={n_planted} parked={n_parked} reclaimed={n_reclaimed} found={found} witnesses_compared={n_witness} root_check=[{root_check}] \
+                 wall_s={wall:.1} shared_decode_cpu_s={cpu_shared:.2} shared_decode_wall_s={wall_shared:.2} old_cpu_s={cpu_old:.2} old_wall_s={wall_old:.2} new_cpu_s={cpu_new:.2} new_wall_s={wall_new:.2} \
+                 new_detect_s={:.2} new_fold_s={:.3} new_tree_s={:.2} engine_hits={} engine_cb_hits={} engine_folds={} \
+                 heap_old_mib={:.1} heap_new_chain_mib={:.1} heap_new_wallets_mib={:.3} vmhwm_mib={:.0} rayon_threads={}",
+                if cfg!(feature = "pasta-asm") { "asm" } else { "portable" },
+                eng.kernel_name(),
+                hex32(&digest),
+                hex32(&ts0.block_hash.as_bytes()),
+                hex32(&last.as_bytes()),
+                eng.key_count(),
+                st.detect_ns as f64 / 1e9,
+                st.fold_ns as f64 / 1e9,
+                st.tree_ns as f64 / 1e9,
+                st.hits,
+                st.coinbase_hits,
+                st.folds,
+                heap_old as f64 / 1048576.0,
+                heap_chain as f64 / 1048576.0,
+                heap_wallets as f64 / 1048576.0,
+                status_kb("VmHWM:") as f64 / 1024.0,
+                rayon::current_num_threads(),
+            );
+            println!("SHADOW {line}");
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&out).expect("SHADOW_OUT");
+            writeln!(f, "{line}").unwrap();
+        });
+    }
+
+    /// Experiment M-A (02 §4.3): cost per (action, key) of today's per-wallet CPU path
+    /// (`scan_compact_auto_cached` with the page's shared epks, one call per wallet — what
+    /// `predecrypt_page_cached` runs), the shared-table ladder kernel and the fixed-base comb,
+    /// at `MA_IVKS` (default 1,64,1024,4096) throwaway keys over `MA_PAGES` (default 2) real
+    /// pages plus two planted notes. Hit sets must be identical. Reports wall and process-CPU
+    /// microseconds per pair. `MA_WIDTHS` (comma list) adds fixed-width comb runs.
+    #[test]
+    #[ignore = "needs a node: SHADOW_RPC=127.0.0.1:16810"]
+    fn ma_comb_vs_ladder_vs_current() {
+        let rpc = std::env::var("SHADOW_RPC").or_else(|_| std::env::var("DAYDIFF_RPC")).expect("SHADOW_RPC");
+        let out = std::env::var("SHADOW_OUT").unwrap_or_else(|_| "/tmp/shadow".into());
+        let pages = env_u64("MA_PAGES", 2);
+        let ns: Vec<usize> = std::env::var("MA_IVKS").unwrap_or_else(|_| "1,64,1024,4096".into()).split(',').filter_map(|s| s.trim().parse().ok()).collect();
+        let widths: Vec<u32> = std::env::var("MA_WIDTHS").unwrap_or_default().split(',').filter_map(|s| s.trim().parse().ok()).collect();
+        let skip_current_above = env_u64("MA_CURRENT_MAX", u64::MAX) as usize;
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let (mut actions, tag) = rt.block_on(async {
+            let client = connect(&rpc).await;
+            let saved = std::env::var("SHADOW_START").ok().or_else(|| std::fs::read_to_string(format!("{out}.start")).ok());
+            let ts0 = match saved {
+                Some(h) => client.get_shielded_tree_state(Some(super::day_diff_tests::parse_hash(&h))).await.expect("tree state"),
+                None => super::day_diff_tests::start_block(&client, &out, 86_400).await,
+            };
+            let mut low = ts0.block_hash;
+            let mut acts: Vec<CompactActionRecord> = Vec::new();
+            for _ in 0..pages {
+                let resp = client.get_shielded_blocks(low, SHIELDED_PAGE).await.expect("page");
+                let Some(l) = resp.blocks.last() else { break };
+                low = l.hash;
+                for b in &resp.blocks {
+                    for bytes in &b.accepted_actions {
+                        acts.extend(decode_compact_actions(bytes).expect("whole records"));
+                    }
+                }
+            }
+            (acts, ts0.block_hash.as_bytes())
+        });
+        let nmax = ns.iter().copied().max().unwrap_or(1);
+        let t = Instant::now();
+        let keys: Vec<(FullViewingKey, IvkKey)> = (0..nmax as u64)
+            .into_par_iter()
+            .map(|i| {
+                let mut k = 0u64;
+                loop {
+                    let s = h32(&[b"ma-key", &tag, &i.to_le_bytes(), &k.to_le_bytes()]);
+                    if let Some(sk) = Option::<SpendingKey>::from(SpendingKey::from_bytes(s)) {
+                        let fvk = FullViewingKey::from(&sk);
+                        let key = IvkKey::from_fvk(&fvk).expect("key");
+                        return (fvk, key);
+                    }
+                    k += 1;
+                }
+            })
+            .collect();
+        let t_keys = t.elapsed().as_secs_f64();
+        let mut r = Det::from(&[b"ma-plant", &tag]);
+        for who in [0usize, nmax - 1] {
+            let to = keys[who].0.address_at((r.next() % 1000) as u32, Scope::External);
+            let rec = plant_retry(to, 4242 + who as u64, &mut r);
+            let pos = (r.next() % (actions.len() as u64 + 1)) as usize;
+            actions.insert(pos, rec);
+        }
+        let epks: Vec<_> = actions.par_iter().map(|a| decompress_epk(&a.ephemeral_key)).collect();
+        let hits = |v: &[Vec<kaspa_shielded_core::wallet::ReceivedNote>]| -> Vec<Vec<(usize, u64)>> {
+            v.iter().map(|x| x.iter().map(|n| (n.action_index, n.note.value().inner())).collect()).collect()
+        };
+        let mut lines = Vec::new();
+        for &n in &ns {
+            let refs: Vec<&IvkKey> = keys[..n].iter().map(|(_, k)| k).collect();
+            let pairs = (actions.len() * n) as f64;
+            let mut runs: Vec<(String, f64, f64, Vec<Vec<(usize, u64)>>)> = Vec::new();
+            if n <= skip_current_above {
+                let (c0, t0) = (cpu_secs(), Instant::now());
+                let v: Vec<_> = refs.iter().map(|k| scan_compact_auto_cached(k.prepared(), Some(k.scalar()), &actions, Some(&epks))).collect();
+                runs.push(("current".into(), t0.elapsed().as_secs_f64(), cpu_secs() - c0, hits(&v)));
+            }
+            let mut kernels: Vec<(String, Box<dyn AgreeKernel>)> = vec![("ladder".into(), Box::new(LadderKernel)), ("comb-auto".into(), Box::new(CombKernel { w: None }))];
+            for &w in &widths {
+                kernels.push((format!("comb-w{w}"), Box::new(CombKernel { w: Some(w) })));
+            }
+            for (name, k) in &kernels {
+                let (c0, t0) = (cpu_secs(), Instant::now());
+                let v = detect(k.as_ref(), &refs, &actions, &epks);
+                runs.push((name.clone(), t0.elapsed().as_secs_f64(), cpu_secs() - c0, hits(&v)));
+            }
+            let want = runs[0].3.clone();
+            let total_hits: usize = want.iter().map(|v| v.len()).sum();
+            assert!(total_hits >= 1, "planted notes not found at N={n}");
+            for (name, _, _, got) in &runs {
+                assert_eq!(got, &want, "hit sets differ at N={n}: {name} vs {}", runs[0].0);
+            }
+            let auto_w = CombKernel { w: None }.width_for(n);
+            for (name, wall, cpu, _) in &runs {
+                let line = format!(
+                    "label={} N={n} actions={} hits={total_hits} run={name}{} wall_s={wall:.3} cpu_s={cpu:.2} wall_us_per_pair={:.3} cpu_us_per_pair={:.3} rayon_threads={} load1={}",
+                    if cfg!(feature = "pasta-asm") { "asm" } else { "portable" },
+                    actions.len(),
+                    if name == "comb-auto" { format!("(w={auto_w})") } else { String::new() },
+                    wall * 1e6 / pairs,
+                    cpu * 1e6 / pairs,
+                    rayon::current_num_threads(),
+                    std::fs::read_to_string("/proc/loadavg").unwrap_or_default().split_whitespace().next().unwrap_or("?"),
+                );
+                println!("MA {line}");
+                lines.push(line);
+            }
+        }
+        println!("MA keys={nmax} key_setup_s={t_keys:.2}");
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(format!("{out}.ma")).expect("out");
         for l in lines {
             writeln!(f, "{l}").unwrap();
         }

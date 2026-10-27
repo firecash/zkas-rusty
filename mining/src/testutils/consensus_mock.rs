@@ -31,6 +31,10 @@ pub(crate) struct ConsensusMock {
     utxos: RwLock<UtxoCollection>,
     dev_fee_spk: Option<ScriptPublicKey>,
     red_reward: bool,
+    /// How many times the batched shielded pre-verification ran (N1 tests).
+    pub(crate) preverify_calls: std::sync::atomic::AtomicUsize,
+    /// How many times a mempool transaction was validated in consensus (N1 tests).
+    pub(crate) validate_calls: std::sync::atomic::AtomicUsize,
 }
 
 impl ConsensusMock {
@@ -41,6 +45,8 @@ impl ConsensusMock {
             utxos: RwLock::new(HashMap::default()),
             dev_fee_spk: None,
             red_reward: false,
+            preverify_calls: Default::default(),
+            validate_calls: Default::default(),
         }
     }
 
@@ -98,6 +104,22 @@ impl ConsensusMock {
 }
 
 impl ConsensusApi for ConsensusMock {
+    /// Mirrors the real batched pre-verification's contract: the first shielded transaction whose
+    /// registered status is a failed bundle (proof or encoding) stops the pass.
+    fn preverify_shielded_batch(
+        &self,
+        transactions: &[&Transaction],
+    ) -> Result<(), (kaspa_consensus_core::tx::TransactionId, TxRuleError)> {
+        self.preverify_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let statuses = self.statuses.read();
+        for tx in transactions.iter().filter(|t| t.is_shielded()) {
+            if let Some(Err(e @ (TxRuleError::InvalidShieldedProof(_) | TxRuleError::InvalidShieldedBundle(_)))) = statuses.get(&tx.id()) {
+                return Err((tx.id(), e.clone()));
+            }
+        }
+        Ok(())
+    }
+
     fn dev_fee_spk(&self) -> Option<ScriptPublicKey> {
         self.dev_fee_spk.clone()
     }
@@ -138,6 +160,7 @@ impl ConsensusApi for ConsensusMock {
     }
 
     fn validate_mempool_transaction(&self, mutable_tx: &mut MutableTransaction, _: &TransactionValidationArgs) -> TxResult<()> {
+        self.validate_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         // If a predefined status was registered to simulate an error, return it right away
         if let Some(status) = self.statuses.read().get(&mutable_tx.id())
             && status.is_err()

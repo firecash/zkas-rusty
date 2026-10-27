@@ -174,12 +174,39 @@ pub struct ShieldedExportMetadata {
     pub nullifier_count: u64,
 }
 
-/// Upper bound on [`ShieldedExportMetadata::nullifier_count`] accepted on import
-/// (audit finding F-08). The count is declared by an untrusted sync peer; the cap
-/// bounds the memory/CPU the import can be made to spend (2^26 ≈ 67M entries ≈
-/// 2 GiB of raw nullifiers) while still far exceeding any realistic near-term
-/// shielded pool.
+/// Former upper bound on [`ShieldedExportMetadata::nullifier_count`] accepted on import (audit
+/// finding F-08), when the importer buffered the whole set in memory.
+///
+/// N1 (spec 08 R3.1): NO LONGER ENFORCED. The import streams the set to sorted files on disk, so its
+/// memory does not depend on the count, and the honest set will pass 2^26 (organically ~Nov 2027 at
+/// the worst projected rate; a fee-free miner could get there in ~11 days, spec 15 A7) — at which
+/// point this cap halted every fresh pruned sync. The only count bound is now the committed note
+/// count (`frontier.size`, checked after the PoW binding and before the stream: a spend implies a
+/// note). Kept, unused, as a reference value for code paths that would still buffer; none do.
 pub const MAX_SHIELDED_NULLIFIER_IMPORT_COUNT: u64 = 1 << 26;
+
+/// One key range of a staged pruning-point nullifier import and where it stands (N1, spec 08
+/// R3.3/R3.4.1). The key space is split into 16 fixed ranges by the top nibble of the first byte.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShieldedImportRange {
+    pub range: usize,
+    /// First nullifier still missing (inclusive); `None` when the range is complete.
+    pub from: Option<[u8; 32]>,
+    /// First nullifier above the range (exclusive); `None` for the last range.
+    pub before: Option<[u8; 32]>,
+    /// Nullifiers of this range already staged.
+    pub received: u64,
+    pub complete: bool,
+}
+
+/// Which part of the nullifier set one staged stream carries (N1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShieldedStreamScope {
+    /// The whole set in one ascending stream (an older peer's export).
+    Full,
+    /// One range (see [`ShieldedImportRange`]), continuing after what is staged.
+    Range(usize),
+}
 
 /// Batches of spent nullifiers (each 32 bytes) streamed during pruning-point
 /// shielded-state import, mirroring [`ImportLaneBatchIterator`].
@@ -489,8 +516,86 @@ pub trait ConsensusApi: Send + Sync {
         unimplemented!()
     }
 
+    /// Stream the spent-nullifier set at the pruning point in ascending order, restricted to
+    /// `[from, before)` (either bound open when `None`), in chunks of at most `chunk_size`, to `sink`
+    /// (which returns `false` to stop). Returns how many were streamed. The set is never
+    /// materialised (N1, spec 08 R3.3); an unbounded stream is checked against the pruning point's
+    /// committed accumulator before its last chunk is released.
+    fn stream_pruning_point_shielded_nullifiers(
+        &self,
+        _expected_pruning_point: Hash,
+        _from: Option<[u8; 32]>,
+        _before: Option<[u8; 32]>,
+        _chunk_size: usize,
+        _sink: &mut dyn FnMut(Vec<[u8; 32]>) -> bool,
+    ) -> ConsensusResult<u64> {
+        unimplemented!()
+    }
+
+    /// Begin (or resume) a streamed import of the pruning point's nullifier set (N1, spec 08 R3):
+    /// bind the metadata to the PoW-committed root and bound the declared count by the committed
+    /// note count BEFORE any nullifier is accepted, then open the on-disk staging. A staging of the
+    /// same set (same pruning point, accumulator and count), also one an earlier process left, is
+    /// kept. Returns where each key range stands.
+    fn begin_pruning_point_shielded_import(
+        &self,
+        _new_pruning_point: Hash,
+        _metadata: ShieldedExportMetadata,
+        _expected_state_root: Option<[u8; 32]>,
+    ) -> PruningImportResult<Vec<ShieldedImportRange>> {
+        unimplemented!()
+    }
+
+    /// Stage one stream of nullifiers into the begun import. Several streams of different ranges may
+    /// run at once. A stream that ends early is not an error (what arrived is staged); a refused
+    /// chunk (out of order, out of range, over the declared count) discards the staging. Returns how
+    /// many this stream staged.
+    fn stage_pruning_point_shielded_nullifiers(
+        &self,
+        _pruning_point: Hash,
+        _scope: ShieldedStreamScope,
+        _nullifier_batches: ShieldedNullifierBatchIterator<'_>,
+    ) -> PruningImportResult<u64> {
+        unimplemented!()
+    }
+
+    /// Where each range of the begun import of `pruning_point` stands (`None`: no such import).
+    fn get_pruning_point_shielded_import_ranges(&self, _pruning_point: Hash) -> Option<Vec<ShieldedImportRange>> {
+        None
+    }
+
+    /// Record that a range's source signalled the end of the range.
+    fn complete_pruning_point_shielded_range(&self, _pruning_point: Hash, _range: usize) -> PruningImportResult<()> {
+        unimplemented!()
+    }
+
+    /// Finish the import once every declared nullifier is staged: check the fold against the
+    /// committed accumulator (a failure discards the staging) and swap the live state.
+    /// `ShieldedImportIncomplete` while nullifiers are missing.
+    fn finish_pruning_point_shielded_import(
+        &self,
+        _new_pruning_point: Hash,
+        _metadata: ShieldedExportMetadata,
+        _expected_state_root: Option<[u8; 32]>,
+    ) -> PruningImportResult<()> {
+        unimplemented!()
+    }
+
+    /// Size of the global spent-nullifier set as of chain block `block` (N1, spec 08 R3.7, the
+    /// `nullifierCount` measurement). `None` when this node holds no count for the block.
+    fn get_shielded_nullifier_count(&self, _block: Hash) -> ConsensusResult<Option<u64>> {
+        Ok(None)
+    }
+
+    /// Drop any staged, interrupted shielded import (after a failed integrity check, or when the
+    /// pruning point moved).
+    fn discard_shielded_import_staging(&self) {}
+
     /// Open a streaming iterator over the whole spent-nullifier set at the pruning
     /// point (server side of shielded-state IBD sync).
+    ///
+    /// Since N1 this collects the set in memory and is kept for diagnostics and tests only; the IBD
+    /// server uses [`Self::stream_pruning_point_shielded_nullifiers`].
     fn open_pruning_point_shielded_nullifier_stream(
         &self,
         _expected_pruning_point: Hash,
@@ -561,6 +666,20 @@ pub trait ConsensusApi: Send + Sync {
         Ok(())
     }
 
+    /// [`Self::preverify_shielded_transaction`] for one peer's relayed batch (N1, spec 08 R1.3.5),
+    /// batch-verified (at most 16 bundles / 160 actions per batch) and stopping at the first failure:
+    /// `Err((txid, error))` names the first transaction whose bundle fails
+    /// (`TxRuleError::InvalidShieldedProof` for a proof or signature, `InvalidShieldedBundle` for an
+    /// encoding rule); nothing after the verification wave that held it was verified. Successes are
+    /// cached, so the per-transaction checks that follow are cache hits. Non-shielded transactions
+    /// and payloads that do not parse are skipped (the per-transaction path judges them).
+    fn preverify_shielded_batch(
+        &self,
+        _transactions: &[&Transaction],
+    ) -> Result<(), (crate::tx::TransactionId, crate::errors::tx::TxRuleError)> {
+        Ok(())
+    }
+
     /// The shielded turnstile totals as of `block`, as raw parts
     /// `(cumulative_coinbase, cumulative_fees, cumulative_burns)` in sompi — the
     /// public form of the PLAN §2.7 invariant `pool = minted - fees - burns`. Raw
@@ -613,6 +732,26 @@ pub trait ConsensusApi: Send + Sync {
     /// the retained index (older than this node's history base), or no frontier within reach.
     fn get_shielded_frontier_block_below_daa(&self, _daa: u64) -> ConsensusResult<Option<Hash>> {
         unimplemented!()
+    }
+
+    /// `(blue_score, daa_score, timestamp)` of a selected-chain block: everything a
+    /// `metadata_only` `GetShieldedBlocks` page carries. Wallets read these pages to discover
+    /// page boundaries and to place birthdays, so this is called for up to 2,000 blocks per
+    /// request.
+    ///
+    /// The default reads the full header and the full GHOSTDAG record, which is correct for any
+    /// implementation but is the slow path: a mainnet header is ~2.6 KB with 48 parent levels and
+    /// the GHOSTDAG record carries the whole mergeset, all to read three integers. Implementations
+    /// with a compact header store should answer from it (see `Consensus`). Below the pruning
+    /// point, where headers are gone, the retained scan record carries the same three values.
+    fn get_shielded_chain_block_meta(&self, block: Hash) -> ConsensusResult<(u64, u64, u64)> {
+        match (self.get_header(block), self.get_ghostdag_data(block)) {
+            (Ok(header), Ok(gd)) => Ok((gd.blue_score, header.daa_score, header.timestamp)),
+            _ => {
+                let d = self.get_shielded_chain_block_data(block)?;
+                Ok((d.blue_score, d.daa_score, d.timestamp))
+            }
+        }
     }
 
     /// Serve a shielded-history backfill request: this node's scan records for the chain blocks

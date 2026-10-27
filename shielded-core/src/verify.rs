@@ -47,6 +47,55 @@ use crate::bundle::ShieldedBundle;
 /// Personalization for the shielded-transaction sighash (must be 16 bytes).
 const SIGHASH_PERSONALIZATION: &[u8; 16] = b"zkas_tx_sighash0";
 
+/// The Orchard flags byte of a wire bundle, after the ZKas encoding checks on the flags byte.
+///
+/// This is the ONE place the flags byte is interpreted for verification; the single path
+/// ([`verify_bundle_with_vk`]) and the batched path ([`verify_bundles_batched`]) both call it.
+/// Orchard flag bits: bit 0 = spends enabled, bit 1 = outputs enabled. The only other bit this
+/// verifier admits is the ZKas anchor-block extension ([`crate::bundle::BUNDLE_FLAG_ANCHOR_BLOCK`]),
+/// which is not an Orchard flag and is masked off before Orchard sees the byte; its presence must
+/// match the `anchor_block` field exactly. WHEN the extension is allowed (only from the security
+/// fork) is a consensus-context rule, enforced by the transaction validator, not here.
+///
+/// The batched path used to hand the raw byte to Orchard, so every post-fork bundle (flags `0x0b`)
+/// failed it with `NonCanonicalFlags` while the single path accepted it.
+pub fn canonical_orchard_flags_byte(bundle: &ShieldedBundle) -> Result<u8, BundleVerifyError> {
+    let ext = crate::bundle::BUNDLE_FLAG_ANCHOR_BLOCK;
+    if bundle.flags & !(0b11 | ext) != 0 || ((bundle.flags & ext) != 0) != bundle.anchor_block.is_some() {
+        return Err(BundleVerifyError::NonCanonicalFlags);
+    }
+    Ok(bundle.flags & 0b11)
+}
+
+/// Most bundles in one batched verification (08 R1.3.3). A full block today is at most ~40 bundles,
+/// so a block forms 1-3 batches that verify in parallel, while the batch still amortises the
+/// ~16 ms per-bundle fixed cost (measured gain 5.2x at 10 two-action bundles).
+pub const MAX_BATCH_BUNDLES: usize = 16;
+/// Most actions in one batched verification (08 R1.3.3).
+pub const MAX_BATCH_ACTIONS: usize = 160;
+
+/// Split items with the given action counts, in order, into consecutive ranges of at most
+/// [`MAX_BATCH_BUNDLES`] items and [`MAX_BATCH_ACTIONS`] actions. An item larger than the action
+/// cap on its own forms its own range. Every index is covered exactly once.
+pub fn plan_verify_batches(action_counts: &[usize]) -> Vec<std::ops::Range<usize>> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut actions = 0usize;
+    for (i, &n) in action_counts.iter().enumerate() {
+        let len = i - start;
+        if len > 0 && (len >= MAX_BATCH_BUNDLES || actions + n > MAX_BATCH_ACTIONS) {
+            out.push(start..i);
+            start = i;
+            actions = 0;
+        }
+        actions += n;
+    }
+    if start < action_counts.len() {
+        out.push(start..action_counts.len());
+    }
+    out
+}
+
 /// Why a shielded bundle failed cryptographic verification. Any of these makes
 /// the carrying transaction invalid.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -178,25 +227,31 @@ mod circuit_verify {
         verify_bundle_with_vk(bundle, sighash, verifying_key())
     }
 
-    /// As [`verify_bundle`], but with a caller-provided verifying key (e.g. for
-    /// batching across many bundles without re-fetching the static).
-    pub fn verify_bundle_with_vk(bundle: &ShieldedBundle, sighash: &[u8; 32], vk: &VerifyingKey) -> Result<(), BundleVerifyError> {
+    /// Orchard `Flags` of a wire bundle via the shared mask ([`super::canonical_orchard_flags_byte`]).
+    fn orchard_flags(bundle: &ShieldedBundle) -> Result<Flags, BundleVerifyError> {
+        let byte = super::canonical_orchard_flags_byte(bundle)?;
+        Flags::from_byte(byte, crate::verify::BUNDLE_VERSION).ok_or(BundleVerifyError::NonCanonicalFlags)
+    }
+
+    /// The decoded public parts of a bundle that passed every encoding rule.
+    struct CheckedParts {
+        instances: Vec<Instance>,
+        rks: Vec<VerificationKey<SpendAuth>>,
+        cv_sum: ValueCommitment,
+    }
+
+    /// Every encoding rule of a bundle, in one function shared by the single and the batched path
+    /// (08 R1.2.1/R1.2.2): non-empty, canonical anchor and flags, canonical per-action fields,
+    /// non-identity `rk` and `epk`, and the canonical proof length. The batched path runs it before
+    /// handing the bundle to Orchard's `BatchValidator`, so both paths reject exactly the same
+    /// encodings.
+    fn checked_parts(bundle: &ShieldedBundle) -> Result<CheckedParts, BundleVerifyError> {
         if bundle.actions.is_empty() {
             return Err(BundleVerifyError::NoActions);
         }
 
         let anchor: Anchor = Option::from(Anchor::from_bytes(bundle.anchor)).ok_or(BundleVerifyError::NonCanonicalField("anchor"))?;
-        // Orchard flag bits: bit 0 = spends enabled, bit 1 = outputs enabled. The only other bit
-        // this verifier admits is the ZKas anchor-block extension, which is not an Orchard flag and
-        // is masked off before Orchard sees the byte. Its presence must match the field exactly.
-        // WHEN it is allowed (only from the security fork) is a consensus-context rule, enforced
-        // by the transaction validator, not here.
-        let ext = crate::bundle::BUNDLE_FLAG_ANCHOR_BLOCK;
-        if bundle.flags & !(0b11 | ext) != 0 || ((bundle.flags & ext) != 0) != bundle.anchor_block.is_some() {
-            return Err(BundleVerifyError::NonCanonicalFlags);
-        }
-        let flags =
-            Flags::from_byte(bundle.flags & 0b11, crate::verify::BUNDLE_VERSION).ok_or(BundleVerifyError::NonCanonicalFlags)?;
+        let flags = orchard_flags(bundle)?;
 
         let mut instances = Vec::with_capacity(bundle.actions.len());
         let mut rks = Vec::with_capacity(bundle.actions.len());
@@ -235,18 +290,26 @@ mod circuit_verify {
             rks.push(rk);
         }
 
-        // --- Check 2: the Halo 2 proof. Reject non-canonical (padded) proofs first. ---
+        // Reject non-canonical (padded / truncated) proofs before any proof work.
         let expected = Proof::expected_proof_size(bundle.actions.len());
         if bundle.proof.len() != expected {
             return Err(BundleVerifyError::BadProofLength { expected, got: bundle.proof.len() });
         }
+        Ok(CheckedParts { instances, rks, cv_sum: cv_sum.expect("actions are non-empty") })
+    }
+
+    /// As [`verify_bundle`], but with a caller-provided verifying key (e.g. for
+    /// batching across many bundles without re-fetching the static).
+    pub fn verify_bundle_with_vk(bundle: &ShieldedBundle, sighash: &[u8; 32], vk: &VerifyingKey) -> Result<(), BundleVerifyError> {
+        let CheckedParts { instances, rks, cv_sum } = checked_parts(bundle)?;
+
+        // --- Check 2: the Halo 2 proof (length already checked in `checked_parts`). ---
         let proof = Proof::new(bundle.proof.clone());
         proof.verify(vk, &instances).map_err(|_| BundleVerifyError::ProofInvalid)?;
 
         // --- Check 1: balance via the binding signature. ---
         // bvk = Σ cv_net − ValueCommit(value_balance, 0), reinterpreted as a
         // RedPallas verification key (this is exactly Orchard's into_bvk).
-        let cv_sum = cv_sum.expect("actions are non-empty");
         let vb_commit = crate::turnstile::commit(bundle.value_balance, crate::turnstile::zero_trapdoor());
         let bvk_point = cv_sum - vb_commit;
         let bvk = VerificationKey::<Binding>::try_from(bvk_point.to_bytes()).map_err(|_| BundleVerifyError::BindingSigInvalid)?;
@@ -267,8 +330,13 @@ mod circuit_verify {
     /// constructors: `Action::from_parts` rejects identity `rk`/`epk`, and
     /// `try_from_parts` (Strict) rejects non-canonical proof lengths.
     fn to_orchard_bundle(wire: &ShieldedBundle) -> Result<Bundle<Authorized, i64>, BundleVerifyError> {
+        if wire.actions.is_empty() {
+            return Err(BundleVerifyError::NoActions);
+        }
         let anchor: Anchor = Option::from(Anchor::from_bytes(wire.anchor)).ok_or(BundleVerifyError::NonCanonicalField("anchor"))?;
-        let flags = Flags::from_byte(wire.flags, crate::verify::BUNDLE_VERSION).ok_or(BundleVerifyError::NonCanonicalFlags)?;
+        // The shared mask (was `Flags::from_byte(wire.flags, ..)`, which rejected every post-fork
+        // bundle: their byte carries the anchor-block bit).
+        let flags = orchard_flags(wire)?;
 
         let mut actions = Vec::with_capacity(wire.actions.len());
         for a in &wire.actions {
@@ -313,15 +381,121 @@ mod circuit_verify {
     ) -> Result<(), BundleVerifyError> {
         let mut batch = BatchValidator::new(verifying_key());
         for (wire, sighash) in items {
+            // Same encoding rules as the single path, by the same function.
+            checked_parts(wire)?;
             let bundle = to_orchard_bundle(wire)?;
             batch.add_bundle(&bundle, *sighash).map_err(|_| BundleVerifyError::ProofInvalid)?;
         }
         if batch.validate(rng) { Ok(()) } else { Err(BundleVerifyError::ProofInvalid) }
     }
+
+    /// Per-item verdicts for many bundles, verified in batches of at most
+    /// [`super::MAX_BATCH_BUNDLES`] bundles / [`super::MAX_BATCH_ACTIONS`] actions, the batches in
+    /// parallel (08 R1.3.1/R1.3.3).
+    ///
+    /// A batch that verifies proves every bundle in it valid. A batch that fails is re-verified one
+    /// bundle at a time with [`verify_bundle`], so the returned verdict of every item is exactly what
+    /// [`verify_bundle`] would return for it (up to the batch's negligible soundness error). The
+    /// batch randomness is the thread-local CSPRNG seeded from the OS, never derived from the
+    /// bundles, which an attacker chooses (R1.2.3).
+    pub fn verify_bundles_in_batches(items: &[(&ShieldedBundle, [u8; 32])]) -> Vec<Result<(), BundleVerifyError>> {
+        use rayon::prelude::*;
+        let counts: Vec<usize> = items.iter().map(|(b, _)| b.actions.len()).collect();
+        let plan = super::plan_verify_batches(&counts);
+        let per_batch: Vec<Vec<Result<(), BundleVerifyError>>> = plan
+            .into_par_iter()
+            .map(|range| {
+                let chunk = &items[range];
+                if verify_bundles_batched(chunk, rand::rng()).is_ok() {
+                    vec![Ok(()); chunk.len()]
+                } else {
+                    chunk.iter().map(|(b, s)| verify_bundle(b, s)).collect()
+                }
+            })
+            .collect();
+        per_batch.into_iter().flatten().collect()
+    }
+
+    /// One batched pass over many bundles for a caller that does NOT need a verdict for every
+    /// failing item (N1, spec 08 R1.3), in one of two modes:
+    ///
+    /// - [`super::BatchPassMode::Accelerate`] (block bodies, before the virtual processor's
+    ///   per-transaction check, which stays the authority): every batch runs, in parallel; a failed
+    ///   batch is NOT re-verified, its items are just "not proven". Isolation: one bad bundle costs
+    ///   only its own batch's speed-up; the other batches are still proven. A garbage block therefore
+    ///   costs about one batched pass more than today, not one more full per-bundle pass.
+    /// - [`super::BatchPassMode::StopAtFirstFailure`] (one peer's relayed batch, which is discarded
+    ///   whole on any failure): batches run in waves of the pool's width; after a wave with a failed
+    ///   batch, nothing later is verified, and the first failed batch is re-verified bundle by bundle
+    ///   only up to its first failing bundle, which is reported. The cost of a junk batch is one wave
+    ///   plus at most one batch of single checks, whatever the peer sent.
+    ///
+    /// `proven[i]` is true only for items whose validity this pass established (a passed batch, or an
+    /// individual check). Randomness: the thread CSPRNG, never derived from attacker data (R1.2.3).
+    pub fn verify_bundles_pass(items: &[(&ShieldedBundle, [u8; 32])], mode: super::BatchPassMode) -> super::BatchPass {
+        use rayon::prelude::*;
+        let counts: Vec<usize> = items.iter().map(|(b, _)| b.actions.len()).collect();
+        let plan = super::plan_verify_batches(&counts);
+        let mut proven = vec![false; items.len()];
+        match mode {
+            super::BatchPassMode::Accelerate => {
+                let oks: Vec<bool> = plan.par_iter().map(|r| verify_bundles_batched(&items[r.clone()], rand::rng()).is_ok()).collect();
+                for (r, ok) in plan.iter().zip(oks) {
+                    if ok {
+                        proven[r.clone()].iter_mut().for_each(|p| *p = true);
+                    }
+                }
+                super::BatchPass { proven, first_failure: None }
+            }
+            super::BatchPassMode::StopAtFirstFailure => {
+                let wave = rayon::current_num_threads().max(1);
+                for batches in plan.chunks(wave) {
+                    let oks: Vec<bool> =
+                        batches.par_iter().map(|r| verify_bundles_batched(&items[r.clone()], rand::rng()).is_ok()).collect();
+                    for (r, ok) in batches.iter().zip(&oks) {
+                        if *ok {
+                            proven[r.clone()].iter_mut().for_each(|p| *p = true);
+                        }
+                    }
+                    if let Some(bad) = batches.iter().zip(&oks).find(|(_, ok)| !**ok).map(|(r, _)| r.clone()) {
+                        for i in bad {
+                            match verify_bundle(items[i].0, &items[i].1) {
+                                Ok(()) => proven[i] = true,
+                                Err(e) => return super::BatchPass { proven, first_failure: Some((i, e)) },
+                            }
+                        }
+                        // Every member verified alone: the batch failure was the batch's negligible
+                        // soundness slack (or a transient), not a bad bundle. Keep going.
+                    }
+                }
+                super::BatchPass { proven, first_failure: None }
+            }
+        }
+    }
 }
 
 #[cfg(feature = "circuit")]
-pub use circuit_verify::{verify_bundle, verify_bundle_with_vk, verify_bundles_batched, verifying_key};
+pub use circuit_verify::{
+    verify_bundle, verify_bundle_with_vk, verify_bundles_batched, verify_bundles_in_batches, verify_bundles_pass, verifying_key,
+};
+
+/// How [`verify_bundles_pass`] treats a failed batch (N1, spec 08 R1.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BatchPassMode {
+    /// Run every batch; a failed batch's items are left unproven (no per-bundle fallback).
+    Accelerate,
+    /// Stop after the first wave with a failed batch and name the first failing bundle.
+    StopAtFirstFailure,
+}
+
+/// Result of [`verify_bundles_pass`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BatchPass {
+    /// Per item: validity established by this pass.
+    pub proven: Vec<bool>,
+    /// [`BatchPassMode::StopAtFirstFailure`] only: the first failing item and why.
+    pub first_failure: Option<(usize, BundleVerifyError)>,
+}
 
 /// Gold-standard end-to-end validation of the cryptographic verifier: build a
 /// *real* Orchard bundle (real Halo 2 proof + real RedPallas signatures over our
@@ -527,6 +701,169 @@ mod e2e {
         super::verify_bundles_batched(&[(&wire, msg), (&wire, msg)], rand::rng()).expect("batch of valid bundles verifies");
         assert!(super::verify_bundles_batched(&[(&wire, msg), (&bad_proof, msg)], rand::rng()).is_err());
     }
+
+    /// 08 R1.2 / T1: the batched path and the single path agree on REAL post-fork bundles (flags
+    /// `0x0b`, a named anchor block, a positive fee), on output-only bundles (negative and zero
+    /// value balance), and on every mutation class below. Before the shared flag mask the batched
+    /// path rejected every post-fork bundle with `NonCanonicalFlags` (verify.rs:271 at d8301eca).
+    #[test]
+    fn batched_and_single_verification_agree_on_post_fork_bundles() {
+        use crate::wallet::{address_bytes_from_seed, build::build_singleleaf_coinbase_spend_anchored};
+        let net = [0x5au8; 32];
+        let ctx: &[u8] = b"n1-t1-differential";
+        let recipient = address_bytes_from_seed([6u8; 32]).unwrap();
+
+        // Three real anchored spends (distinct notes => distinct proofs), fee = note - output.
+        let mut real: Vec<(ShieldedBundle, [u8; 32])> = Vec::new();
+        for (i, (note, out)) in [(10_000u64, 8_000u64), (50_000, 1), (3_000_000, 0)].into_iter().enumerate() {
+            let bytes = build_singleleaf_coinbase_spend_anchored(
+                [5u8; 32],
+                [9u8 + i as u8; 32],
+                0,
+                note,
+                recipient,
+                out,
+                &net,
+                ctx,
+                Some([0xabu8 + i as u8; 32]),
+            )
+            .expect("anchored spend builds");
+            let wire = ShieldedBundle::from_bytes_at(&bytes, true).expect("post-fork bundle decodes");
+            assert_eq!(wire.flags, 0x0b, "a post-fork payment carries the anchor-block bit");
+            assert!(wire.value_balance > 0, "a spend pays a positive fee");
+            let msg = sighash(&wire, &net, ctx);
+            assert_eq!(verify_bundle(&wire, &msg), Ok(()), "the real bundle verifies on the single path");
+            real.push((wire, msg));
+        }
+
+        // Output-only bundles: negative and zero value balance, pre-fork flags 0x03.
+        let pk = ProvingKey::build(crate::verify::CIRCUIT_VERSION);
+        let sk: SpendingKey = Option::from(SpendingKey::from_bytes([7u8; 32])).unwrap();
+        let addr = FullViewingKey::from(&sk).address_at(0u32, Scope::External);
+        for value in [5_000u64, 0] {
+            let mut rng = rand::rng();
+            let mut b = Builder::new(BundleType::DEFAULT, crate::verify::BUNDLE_VERSION, orchard::bundle::Flags::ENABLED, Anchor::empty_tree())
+                .unwrap();
+            b.add_output(None, addr, NoteValue::from_raw(value), [0u8; 512]).unwrap();
+            let (unauth, _) = b.build::<i64>(&mut rng).unwrap().unwrap();
+            let proven = unauth.create_proof(&pk, &mut rng).unwrap();
+            let msg = sighash(&build_wire(&proven, |_| [0u8; 64], Vec::new(), [0u8; 64]), &[0x5a; 32], ctx);
+            let authorized: Bundle<Authorized, i64> = proven.apply_signatures(&mut rng, msg, &[]).unwrap();
+            let wire = build_wire(
+                &authorized,
+                |a| <[u8; 64]>::from(a.authorization()),
+                authorized.authorization().proof().as_ref().to_vec(),
+                <[u8; 64]>::from(authorized.authorization().binding_signature()),
+            );
+            assert_eq!(wire.value_balance, -(value as i64));
+            assert_eq!(verify_bundle(&wire, &msg), Ok(()));
+            real.push((wire, msg));
+        }
+
+        // Mutation classes (each applied to a copy of a real bundle; the sighash is recomputed where
+        // the mutated field is covered by it, so the signatures, not just the digest, are tested).
+        let mut cases: Vec<(String, ShieldedBundle, [u8; 32])> = Vec::new();
+        for (k, (w, m)) in real.iter().enumerate() {
+            cases.push((format!("real#{k}"), w.clone(), *m));
+            for flags in [0x03u8, 0x0b, 0x07, 0x0f, 0x13, 0x08, 0x00, 0x01, 0x02, 0x83] {
+                let mut b = w.clone();
+                b.flags = flags;
+                cases.push((format!("flags {flags:#04x} on #{k}"), b, *m));
+            }
+            let mut b = w.clone();
+            b.anchor_block = if b.anchor_block.is_some() { None } else { Some([1u8; 32]) };
+            cases.push((format!("anchor_block presence flipped on #{k}"), b, *m));
+            let mut b = w.clone();
+            b.actions[0].rk = [0u8; 32]; // identity encoding
+            cases.push((format!("identity rk on #{k}"), b, *m));
+            let mut b = w.clone();
+            b.actions[0].ephemeral_key = [0u8; 32];
+            cases.push((format!("identity epk on #{k}"), b, *m));
+            let mut b = w.clone();
+            b.actions[0].ephemeral_key = [0xffu8; 32]; // not a point
+            cases.push((format!("non-canonical epk on #{k}"), b, *m));
+            let mut b = w.clone();
+            b.proof.pop();
+            cases.push((format!("short proof on #{k}"), b, *m));
+            let mut b = w.clone();
+            b.proof.push(0);
+            cases.push((format!("long proof on #{k}"), b, *m));
+            let mut b = w.clone();
+            b.proof[10] ^= 1;
+            cases.push((format!("flipped proof byte on #{k}"), b, *m));
+            let mut b = w.clone();
+            b.binding_sig[3] ^= 1;
+            cases.push((format!("flipped binding sig on #{k}"), b, *m));
+            let mut b = w.clone();
+            b.actions[1].spend_auth_sig[5] ^= 1;
+            cases.push((format!("flipped spend-auth sig on #{k}"), b, *m));
+            for vb in [0i64, 1, -1, i64::MAX, i64::MIN, w.value_balance + 1] {
+                let mut b = w.clone();
+                b.value_balance = vb;
+                let s = sighash(&b, &net, ctx);
+                cases.push((format!("value_balance {vb} on #{k}"), b, s));
+            }
+            let mut b = w.clone();
+            b.actions.clear();
+            cases.push((format!("no actions on #{k}"), b, *m));
+            cases.push((format!("wrong sighash on #{k}"), w.clone(), [0x11u8; 32]));
+        }
+
+        // (1) Batch of one == single, for every case.
+        let mut valid = 0;
+        for (name, b, s) in &cases {
+            let single = verify_bundle(b, s);
+            let batched = super::verify_bundles_batched(&[(b, *s)], rand::rng());
+            assert_eq!(single.is_ok(), batched.is_ok(), "{name}: single {single:?} vs batched {batched:?}");
+            if single.is_ok() {
+                valid += 1;
+            }
+        }
+        // Valid: each real bundle, its unchanged copy in the flags sweep (0x0b for the spends, 0x03
+        // for the output-only bundles), and the zero-value bundle's "value_balance 0" copy, which
+        // is byte-identical to it. Every other mutation must fail on both paths.
+        assert_eq!(valid, real.len() * 2 + 1, "exactly the unmutated bundles verify");
+        for (name, b, s) in &cases {
+            if name.starts_with("real#") {
+                assert_eq!(verify_bundle(b, s), Ok(()), "{name}");
+            }
+        }
+
+        // (2) Mixed batches of 16: a batch verifies iff every member verifies alone, and the
+        // per-item batched API returns exactly the single verdicts.
+        let items: Vec<(&ShieldedBundle, [u8; 32])> = cases.iter().map(|(_, b, s)| (b, *s)).collect();
+        let singles: Vec<bool> = items.iter().map(|(b, s)| verify_bundle(b, s).is_ok()).collect();
+        for (c, chunk) in items.chunks(16).enumerate() {
+            let all_ok = singles[c * 16..c * 16 + chunk.len()].iter().all(|x| *x);
+            assert_eq!(super::verify_bundles_batched(chunk, rand::rng()).is_ok(), all_ok, "mixed batch {c}");
+        }
+        let all_valid: Vec<(&ShieldedBundle, [u8; 32])> = real.iter().map(|(b, s)| (b, *s)).cycle().take(16).collect();
+        super::verify_bundles_batched(&all_valid, rand::rng()).expect("16 valid post-fork + output-only bundles batch-verify");
+        let per_item = super::verify_bundles_in_batches(&items);
+        assert_eq!(per_item.iter().map(|r| r.is_ok()).collect::<Vec<_>>(), singles, "per-item batched verdicts == single verdicts");
+
+        // (3) The two pass modes (N1). Accelerate proves exactly the items of batches whose members
+        // are all valid and never claims an invalid item; StopAtFirstFailure names the FIRST invalid
+        // item and verifies nothing after the wave that held it.
+        let acc = super::verify_bundles_pass(&items, super::BatchPassMode::Accelerate);
+        assert_eq!(acc.first_failure, None);
+        let counts: Vec<usize> = items.iter().map(|(b, _)| b.actions.len()).collect();
+        for r in super::plan_verify_batches(&counts) {
+            let all_ok = singles[r.clone()].iter().all(|x| *x);
+            for i in r {
+                assert_eq!(acc.proven[i], all_ok, "accelerate: item {i} proven iff its whole batch is valid");
+                assert!(!acc.proven[i] || singles[i], "accelerate never proves an invalid item");
+            }
+        }
+        let stop = super::verify_bundles_pass(&items, super::BatchPassMode::StopAtFirstFailure);
+        let first_bad = singles.iter().position(|ok| !*ok).expect("the case list holds invalid items");
+        let (idx, _) = stop.first_failure.clone().expect("a failure is reported");
+        assert_eq!(idx, first_bad, "the reported failure is the first invalid item");
+        assert!(stop.proven.iter().enumerate().all(|(i, p)| !*p || singles[i]), "stop mode never proves an invalid item");
+        let all_good = super::verify_bundles_pass(&all_valid, super::BatchPassMode::StopAtFirstFailure);
+        assert_eq!(all_good.first_failure, None);
+        assert!(all_good.proven.iter().all(|p| *p), "an all-valid batch is proven whole");
+    }
 }
 
 #[cfg(test)]
@@ -617,6 +954,64 @@ mod tests {
         // Changing the network domain changes the sighash (replay protection):
         // the same bundle+context signed for network A is not valid for network B.
         assert_ne!(sighash(&b, &NET_B, b"ctx"), s1);
+    }
+
+    /// The one flag mask both verification paths use: post-fork `0x0b` (with its anchor block) maps
+    /// to Orchard `0b11`; every other bit, and a presence mismatch, is non-canonical.
+    #[test]
+    fn shared_flag_mask_accepts_post_fork_and_rejects_the_rest() {
+        let mut b = bundle(2);
+        for byte in 0u8..=255 {
+            for has_block in [false, true] {
+                b.flags = byte;
+                b.anchor_block = has_block.then_some([3u8; 32]);
+                let ext = crate::bundle::BUNDLE_FLAG_ANCHOR_BLOCK;
+                let canonical = byte & !(0b11 | ext) == 0 && ((byte & ext) != 0) == has_block;
+                match canonical_orchard_flags_byte(&b) {
+                    Ok(o) => {
+                        assert!(canonical, "{byte:#04x}/{has_block} must be rejected");
+                        assert_eq!(o, byte & 0b11);
+                    }
+                    Err(e) => {
+                        assert!(!canonical, "{byte:#04x}/{has_block} must be accepted");
+                        assert_eq!(e, BundleVerifyError::NonCanonicalFlags);
+                    }
+                }
+            }
+        }
+        b.flags = 0x0b;
+        b.anchor_block = Some([1u8; 32]);
+        assert_eq!(canonical_orchard_flags_byte(&b), Ok(0b11), "every live bundle's byte");
+    }
+
+    #[test]
+    fn verify_batch_plan_covers_every_item_within_both_caps() {
+        let cases: Vec<Vec<usize>> = vec![
+            vec![],
+            vec![2],
+            vec![2; 40],
+            vec![38, 38],
+            vec![1; 100],
+            vec![200, 2, 2],
+            vec![2, 200, 2],
+            (0..97).map(|i| 1 + (i * 7) % 39).collect(),
+        ];
+        for counts in cases {
+            let plan = plan_verify_batches(&counts);
+            let mut next = 0;
+            for r in &plan {
+                assert_eq!(r.start, next, "contiguous, in order");
+                assert!(!r.is_empty());
+                assert!(r.len() <= MAX_BATCH_BUNDLES);
+                let actions: usize = counts[r.clone()].iter().sum();
+                assert!(actions <= MAX_BATCH_ACTIONS || r.len() == 1, "{counts:?}: {r:?} has {actions} actions");
+                next = r.end;
+            }
+            assert_eq!(next, counts.len(), "every item covered");
+        }
+        // A full block today (2 x 38 actions) is one batch; 40 two-action bundles are three.
+        assert_eq!(plan_verify_batches(&[38, 38]).len(), 1);
+        assert_eq!(plan_verify_batches(&[2; 40]).len(), 3);
     }
 
     /// The spend-auth signature is excluded from the sighash (it signs it), so

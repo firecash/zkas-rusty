@@ -921,7 +921,19 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         // make to anchor a scan, so a wallet learns the node's floor at the moment it decides
         // where to start — rather than discovering it as a wrong balance later.
         let (history_from_daa_score, history_complete) = session.async_get_shielded_history_status().await?;
-        Ok(GetShieldedTreeStateResponse { block_hash, daa_score, size, leaf, ommers, history_from_daa_score, history_complete })
+        // N1 (spec 08 R3.7): the maintained set size at the served block. A count that cannot be
+        // read is reported as absent, never guessed.
+        let nullifier_count = session.async_get_shielded_nullifier_count(block_hash).await.ok().flatten();
+        Ok(GetShieldedTreeStateResponse {
+            block_hash,
+            daa_score,
+            size,
+            leaf,
+            ommers,
+            history_from_daa_score,
+            history_complete,
+            nullifier_count,
+        })
     }
 
     async fn get_shielded_blocks_call(
@@ -986,13 +998,10 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
                             // the same hash/blue/daa/timestamp, so a birthday walk can continue
                             // from genesis instead of dying at the first pruned block. Only the
                             // metadata is sent; the record's action payload stays here.
-                            let (blue_score, daa_score, timestamp) = match (c.get_header(hash), c.get_ghostdag_data(hash)) {
-                                (Ok(header), Ok(gd)) => (gd.blue_score, header.daa_score, header.timestamp),
-                                _ => {
-                                    let d = c.get_shielded_chain_block_data(hash)?;
-                                    (d.blue_score, d.daa_score, d.timestamp)
-                                }
-                            };
+                            //
+                            // Read from the compact header row, not the full header + GHOSTDAG
+                            // record: a scout asks for 2,000 blocks and only these three integers.
+                            let (blue_score, daa_score, timestamp) = c.get_shielded_chain_block_meta(hash)?;
                             out.push(RpcShieldedChainBlock {
                                 hash,
                                 blue_score,

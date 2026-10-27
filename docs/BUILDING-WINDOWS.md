@@ -6,8 +6,8 @@ the setup below is ever removed.
 
 ## Two ways to build for Windows
 
-1. **GitHub Actions (preferred).** `.github/workflows/deploy.yaml` fires when a
-   GitHub release is published and builds natively on `windows-latest` with the
+1. **GitLab CI (preferred).** The `release:win64` job in `.gitlab-ci.yml` runs on
+   every `zkas-v*` tag and builds natively on GitLab's hosted Windows runner with the
    MSVC toolchain (`x86_64-pc-windows-msvc`). MSVC links against the Windows
    C++ runtime, so the entire libstdc++ problem below does not exist there.
 2. **Local cross-compile from Linux (what v0.3.0 shipped).** Used when CI is

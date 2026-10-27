@@ -1,0 +1,11 @@
+[Unit]
+Description=Radicle node (ZKas seed)
+After=network-online.target
+Wants=network-online.target
+[Service]
+Environment=RAD_HOME=/root/.radicle
+ExecStart=/bin/sh -c "RAD_PASSPHRASE=$(cat /root/.radicle-passphrase) exec /root/.radicle/bin/radicle-node --listen 0.0.0.0:8776"
+Restart=always
+RestartSec=5
+[Install]
+WantedBy=multi-user.target

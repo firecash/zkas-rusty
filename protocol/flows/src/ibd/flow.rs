@@ -23,7 +23,7 @@ use kaspa_muhash::MuHash;
 use kaspa_p2p_lib::{
     PeerKey,
     IncomingRoute, Router,
-    common::ProtocolError,
+    common::{DEFAULT_TIMEOUT, ProtocolError},
     convert::{
         header::{HeaderFormat, Versioned},
         model::trusted::TrustedDataPackage,
@@ -31,9 +31,10 @@ use kaspa_p2p_lib::{
     dequeue_with_timeout, make_message, make_request,
     pb::{
         RequestAntipastMessage, RequestBlockBodiesMessage, RequestHeadersMessage, RequestIbdBlocksMessage,
-        RequestPruningPointAndItsAnticoneMessage, RequestPruningPointProofMessage, RequestPruningPointUtxoSetMessage,
-        kaspad_message::Payload,
+        RequestNextPruningPointProofChunkMessage, RequestPruningPointAndItsAnticoneMessage, RequestPruningPointProofChunksMessage,
+        RequestPruningPointProofMessage, RequestPruningPointUtxoSetMessage, kaspad_message::Payload,
     },
+    pp_proof_chunks::{ProofAssembler, ProofChunkLimits, requests_next_after},
 };
 use kaspa_utils::channel::JobReceiver;
 use std::{
@@ -48,6 +49,18 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 type BlockBody = Vec<Transaction>;
+
+/// Removes a flow's range-helper registration when the flow ends.
+struct HelperRegistration {
+    ctx: FlowContext,
+    key: PeerKey,
+}
+
+impl Drop for HelperRegistration {
+    fn drop(&mut self) {
+        self.ctx.unregister_shielded_range_helper(&self.key);
+    }
+}
 
 /// Flow for managing IBD - Initial Block Download
 pub struct IbdFlow {
@@ -105,9 +118,13 @@ const MAX_HISTORY_CHUNK_RECORDS: usize = 8_000;
 /// record dominate memory.
 const MAX_HISTORY_RECORD_BYTES: usize = 32 * 1024 * 1024;
 
-/// One history chunk's serialized records in total, checked before any is decoded. Kept under the
-/// p2p transport cap (`P2P_MAX_MESSAGE_SIZE`, 256 MB) with room for protobuf framing, so an
-/// oversized chunk fails with this protocol error rather than as an opaque transport decode error.
+/// One history chunk's serialized records in total, checked before any is decoded. A server of
+/// this version stops a chunk at 24 MiB plus one record (`HISTORY_CHUNK_MAX_BYTES` in consensus),
+/// and one record is at most [`MAX_HISTORY_RECORD_BYTES`], so an honest chunk is below the sum.
+/// Servers before this version (every mainnet node at v1.0.11) stop at a 128 MiB backstop plus one
+/// record, so the ceiling stays at 192 MiB while they are the only history servers: refusing their
+/// chunks would leave a fresh node with no peer able to backfill a shielded-heavy range. Lower it to
+/// `24 MiB + MAX_HISTORY_RECORD_BYTES` once old servers are retired.
 const MAX_HISTORY_CHUNK_BYTES: usize = 192 * 1024 * 1024;
 
 /// A chunk that is not the last may be short in RECORDS if it is long in BYTES: a server that
@@ -123,6 +140,14 @@ const MIN_HISTORY_CHUNK_RECORDS: usize = 1_000;
 /// The whole backfill, fetch and verification together. Mainnet takes 10-60 minutes; a peer that
 /// stretches it past this is dropped and the next one is asked.
 const MAX_HISTORY_BACKFILL_DURATION: std::time::Duration = std::time::Duration::from_secs(4 * 3600);
+
+/// How long a requester waits for the first reply to a pruning-point proof request, legacy or
+/// chunked: the server may have to build the proof first, which takes minutes.
+const PRUNING_PROOF_FIRST_REPLY_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// The whole chunked proof transfer. ~221 MB in 30 minutes is ~120 KB/s, below any link an IBD can
+/// use anyway; a peer that is slower than that is dropped and the IBD starts over with another.
+const PRUNING_PROOF_CHUNKS_MAX_DURATION: Duration = Duration::from_secs(30 * 60);
 
 pub enum IbdType {
     Sync {
@@ -164,16 +189,34 @@ impl IbdFlow {
         // refused forever) never IBDs again, so it never asked. Ask here too, once the node is
         // synced and the history is still incomplete; same peer budget, same one-ask-per-peer.
         self.backfill_if_synced_and_incomplete().await;
-        while let Ok(relay_block) = self.relay_receiver.recv().await {
-            if let Some(_guard) = self.ctx.try_set_ibd_running(self.router.key(), relay_block.header.daa_score) {
-                info!("IBD started with peer {}", self.router);
+        // N1 (spec 08 R3.4.1): while idle, this flow can serve one key range of a pruning-point
+        // nullifier import that another peer's IBD coordinates, if this peer serves ranged streams.
+        let (job_tx, mut job_rx) = tokio::sync::mpsc::channel::<super::ShieldedRangeJob>(1);
+        let _helper = if self.router.properties().services & kaspa_p2p_lib::common::SERVICE_NF_SORTED_STREAM != 0 {
+            self.ctx.register_shielded_range_helper(self.router.key(), job_tx);
+            Some(HelperRegistration { ctx: self.ctx.clone(), key: self.router.key() })
+        } else {
+            drop(job_tx);
+            None
+        };
+        loop {
+            tokio::select! {
+                relay = self.relay_receiver.recv() => {
+                    let Ok(relay_block) = relay else { break };
+                    if let Some(_guard) = self.ctx.try_set_ibd_running(self.router.key(), relay_block.header.daa_score) {
+                        info!("IBD started with peer {}", self.router);
 
-                match self.ibd(relay_block).await {
-                    Ok(_) => info!("IBD with peer {} completed successfully", self.router),
-                    Err(e) => {
-                        info!("IBD with peer {} completed with error: {}", self.router, e);
-                        return Err(e);
+                        match self.ibd(relay_block).await {
+                            Ok(_) => info!("IBD with peer {} completed successfully", self.router),
+                            Err(e) => {
+                                info!("IBD with peer {} completed with error: {}", self.router, e);
+                                return Err(e);
+                            }
+                        }
                     }
+                }
+                Some(job) = job_rx.recv() => {
+                    super::shielded_import::serve_range_job(&self.router, &mut self.incoming_route, job).await;
                 }
             }
         }
@@ -633,6 +676,43 @@ impl IbdFlow {
         Ok(())
     }
 
+    /// Receives the pruning-point proof as `PruningPointProofChunk`s (see
+    /// `kaspa_p2p_lib::pp_proof_chunks`). Every chunk is checked against the level, header and byte
+    /// ceilings before any of its headers is converted, and the window ask is sent before the chunk
+    /// is converted so the server's next window overlaps this one's conversion.
+    async fn receive_pruning_proof_chunks(&mut self) -> Result<PruningPointProof, ProtocolError> {
+        self.router.enqueue(make_message!(Payload::RequestPruningPointProofChunks, RequestPruningPointProofChunksMessage {})).await?;
+        let started = Instant::now();
+        let max_levels = self.ctx.config.max_block_level as usize + 1;
+        let mut assembler = ProofAssembler::new(self.header_format, ProofChunkLimits::new(max_levels));
+        loop {
+            // The first chunk may wait for the server to build the proof; later ones only for the
+            // transfer of one chunk. The whole stream is bounded too, so a peer dripping one header
+            // per chunk just inside the per-chunk timeout cannot hold the IBD for days.
+            let per_chunk = if assembler.chunks() == 0 { PRUNING_PROOF_FIRST_REPLY_TIMEOUT } else { DEFAULT_TIMEOUT };
+            let Some(left) = PRUNING_PROOF_CHUNKS_MAX_DURATION.checked_sub(started.elapsed()) else {
+                return Err(ProtocolError::Timeout(PRUNING_PROOF_CHUNKS_MAX_DURATION));
+            };
+            let msg = dequeue_with_timeout!(self.incoming_route, Payload::PruningPointProofChunk, per_chunk.min(left))?;
+            if requests_next_after(assembler.chunks() + 1, msg.done) {
+                self.router
+                    .enqueue(make_message!(Payload::RequestNextPruningPointProofChunk, RequestNextPruningPointProofChunkMessage {}))
+                    .await?;
+            }
+            if assembler.push(msg)? {
+                break;
+            }
+        }
+        debug!(
+            "received the pruning point proof from {} in {} chunks, {} bytes, {:.1}s",
+            self.router,
+            assembler.chunks(),
+            assembler.total_bytes(),
+            started.elapsed().as_secs_f64()
+        );
+        assembler.finish()
+    }
+
     async fn sync_and_validate_pruning_proof(&mut self, staging: &ConsensusProxy, relay_block: &Block) -> Result<Hash, ProtocolError> {
         // [Toccata] Guard IBD from outdated nodes. P2P flow registration does not protect
         // fresh IBD peers, and the relay block is usually the syncer sink, so reject an unexpected
@@ -649,15 +729,37 @@ impl IbdFlow {
             )));
         }
 
-        self.router.enqueue(make_message!(Payload::RequestPruningPointProof, RequestPruningPointProofMessage {})).await?;
-
-        // Pruning proof generation and communication might take several minutes, so we allow a long 10 minute timeout
-        let msg = dequeue_with_timeout!(self.incoming_route, Payload::PruningPointProof, Duration::from_secs(600))?;
-        let proof: PruningPointProof = Versioned(self.header_format, msg).try_into()?;
+        // A peer advertising the chunked form sends the proof in pieces (`pp_proof_chunks`); any other
+        // peer is asked for the single message in the deduplicated form (N1, spec 13 L1). An older
+        // server ignores that field and sends the full form, which is still accepted.
+        let (proof, wire_bytes, form): (PruningPointProof, Option<usize>, &str) = if self.router.properties().serves_pruning_proof_chunks() {
+            (self.receive_pruning_proof_chunks().await?, None, "chunked")
+        } else {
+            self.router
+                .enqueue(make_message!(Payload::RequestPruningPointProof, RequestPruningPointProofMessage { dedup_headers: true }))
+                .await?;
+            // Pruning proof generation and communication might take several minutes, so we allow a long 10 minute timeout
+            let msg = dequeue_with_timeout!(self.incoming_route, Payload::PruningPointProof, PRUNING_PROOF_FIRST_REPLY_TIMEOUT)?;
+            let wire_bytes = prost::Message::encoded_len(&msg);
+            let dedup = !msg.levels.is_empty();
+            let proof: PruningPointProof = if dedup {
+                let params = &self.ctx.config.params;
+                let max_levels = params.max_block_level as usize + 1;
+                // Spec 13 R-1.2(c): (max_block_level + 1) x 4 x pruning_proof_m slots at most (~904K on
+                // mainnet; an honest proof has ~79K).
+                let max_refs = max_levels.saturating_mul(4).saturating_mul(params.pruning_proof_m as usize);
+                kaspa_p2p_lib::convert::pruning::undedup_pruning_point_proof(self.header_format, msg, max_levels, max_refs)?
+            } else {
+                Versioned(self.header_format, msg).try_into()?
+            };
+            (proof, Some(wire_bytes), if dedup { "deduplicated" } else { "full" })
+        };
         info!(
-            "Received headers proof with overall {} headers ({} unique)",
+            "Received headers proof with overall {} headers ({} unique), {} wire bytes ({})",
             proof.iter().map(|l| l.len()).sum::<usize>(),
-            proof.iter().flatten().unique_by(|h| h.hash).count()
+            proof.iter().flatten().unique_by(|h| h.hash).count(),
+            wire_bytes.map_or_else(|| "chunk-counted".to_string(), |b| b.to_string()),
+            form
         );
 
         let proof_metadata = PruningProofMetadata::new(relay_block.header.blue_work);
@@ -1347,6 +1449,13 @@ impl IbdFlow {
         // mid-transfer leaves the local state exactly as it was. Only the verified-empty path
         // below clears on its own.
 
+        // N1 (spec 08 R3.3-R3.5): a peer that serves ranged, sorted streams gets the range-split,
+        // resumable import. An older peer would close the connection on that message, so it gets the
+        // full stream below (staged the same way, but not resumable).
+        if self.router.properties().services & kaspa_p2p_lib::common::SERVICE_NF_SORTED_STREAM != 0 {
+            return self.sync_shielded_state_ranged(consensus, pruning_point, child, committed).await;
+        }
+
         info!("downloading the pruning point shielded state from {}", self.router);
 
         self.router
@@ -1388,8 +1497,9 @@ impl IbdFlow {
         // before anything is seeded; on mismatch the import fails and this peer can be dropped).
         let expected_state_root = binding.map(|(_, committed)| committed);
 
-        // One chunk in flight + one being processed by the importer is enough headroom.
-        let (tx, rx) = tokio::sync::mpsc::channel::<Vec<[u8; 32]>>(2);
+        // The importer stages and folds each chunk as it arrives (N1); a deeper buffer keeps that
+        // work from throttling the peer's stream.
+        let (tx, rx) = tokio::sync::mpsc::channel::<Vec<[u8; 32]>>(super::shielded_import::STAGING_CHANNEL_CHUNKS);
 
         let consensus_for_import = consensus.clone();
         let builder_handle = tokio::task::spawn_blocking(move || {
@@ -1873,7 +1983,7 @@ fn validate_pruning_point_freshness_for_toccata(
 /// in that situation matches the committed root (the import is skipped), so reaching the import means
 /// the local state is corrupt AND has validated descendants — no in-place re-import can repair that, and
 /// clearing would trade a detectable wedge for silent state loss.
-async fn refuse_if_validated_above(consensus: &ConsensusProxy, child: Hash, pruning_point: Hash) -> Result<(), ProtocolError> {
+pub(super) async fn refuse_if_validated_above(consensus: &ConsensusProxy, child: Hash, pruning_point: Hash) -> Result<(), ProtocolError> {
     use kaspa_consensus_core::blockstatus::BlockStatus;
     if consensus.async_get_block_status(child).await.is_some_and(|s| s == BlockStatus::StatusUTXOValid) {
         return Err(ProtocolError::OtherOwned(format!(

@@ -5,7 +5,7 @@ Tested on **Ubuntu 24.04 (x86-64)**. Any recent Linux with a Rust toolchain work
 ## Do you need to build?
 
 Prebuilt Linux x86-64 binaries are on the
-[Releases](https://github.com/firecash/zkas-rusty/releases) page. They are built on Ubuntu
+[Releases](https://gitlab.com/zkas-group/zkas-rusty/-/releases) page. They are built on Ubuntu
 24.04 and therefore need **glibc ≥ 2.38**, so they run on Ubuntu 24.04+ and other current
 distros. On anything older — Ubuntu 22.04 (glibc 2.35), Debian 12 — they fail with
 `GLIBC_2.38 not found`. Build from source there; it works on any recent Linux.
@@ -35,7 +35,7 @@ on first build. Don't override it.
 ## 3. Clone and compile
 
 ```bash
-git clone https://github.com/firecash/zkas-rusty.git
+git clone https://gitlab.com/zkas-group/zkas-rusty.git
 cd zkas-rusty
 
 # node-side binaries only:

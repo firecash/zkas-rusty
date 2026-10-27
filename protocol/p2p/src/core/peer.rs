@@ -6,13 +6,22 @@ use std::{fmt::Display, net::SocketAddr, sync::Arc, time::Instant};
 #[derive(Debug, Clone, Default)]
 pub struct PeerProperties {
     pub user_agent: String,
-    /// `Version.services` as the peer advertised it (spec 06 H-4)
+    /// `Version.services` as the peer advertised it (spec 06 H-4): v11 bits in
+    /// `convert::model::version::services`, plus `common::SERVICE_NF_SORTED_STREAM` (1 << 6) and
+    /// `pp_proof_chunks::SERVICE_PRUNING_PROOF_CHUNKS` (1 << 40).
     pub services: u64,
     pub advertised_protocol_version: u32,
     pub protocol_version: u32,
     pub disable_relay_tx: bool,
     pub subnetwork_id: Option<SubnetworkId>,
     pub time_offset: i64,
+}
+
+impl PeerProperties {
+    /// Whether the peer serves the chunked pruning-point proof.
+    pub fn serves_pruning_proof_chunks(&self) -> bool {
+        self.services & crate::pp_proof_chunks::SERVICE_PRUNING_PROOF_CHUNKS != 0
+    }
 }
 
 #[derive(Debug)]

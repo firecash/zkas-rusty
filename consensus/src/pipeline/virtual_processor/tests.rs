@@ -2085,6 +2085,48 @@ async fn shielded_chain_range_is_fully_servable_from_the_retained_archive() {
     assert!(minting >= 3, "expected several minting blocks in the range, got {minting}");
 }
 
+/// `metadata_only` pages (wallet scouts and birthday walks) are answered from the compact header
+/// row instead of the full header + GHOSTDAG record. That is only a speed change if the three values
+/// are the same ones the old read produced, for every chain block, and if a block the node does not
+/// hold is still an error rather than zeros.
+#[tokio::test]
+async fn shielded_chain_block_meta_equals_the_header_and_ghostdag_read_it_replaces() {
+    let mut params = MAINNET_PARAMS.clone();
+    params.shielded_coinbase = true;
+    params.toccata_activation = ForkActivation::always();
+    let config = ConfigBuilder::new(params).skip_proof_of_work().build();
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+    let recipient = kaspa_shielded_core::wallet::address_bytes_from_seed([9u8; 32]).expect("valid orchard address");
+    ctx.miner_data = MinerData::new(ScriptPublicKey::new(0, ScriptVec::from_slice(&recipient)), vec![]);
+    for _ in 0..4 {
+        ctx.build_block_template_row(0..1).validate_and_insert_row().await;
+    }
+    // A merge, so blue scores and DAA scores of chain blocks diverge from their heights.
+    ctx.build_block_template_row(0..3).validate_and_insert_row().await;
+    for _ in 0..3 {
+        ctx.build_block_template_row(0..1).validate_and_insert_row().await;
+    }
+    let range = ctx.consensus.get_shielded_chain_range(config.genesis.hash, 1000).unwrap().expect("genesis is on chain");
+    assert!(range.len() >= 8, "expected the whole chain, got {}", range.len());
+    let mut chain = vec![config.genesis.hash];
+    chain.extend(range);
+    for hash in &chain {
+        let header = ctx.consensus.get_header(*hash).unwrap();
+        let gd = ctx.consensus.get_ghostdag_data(*hash).unwrap();
+        let old = (gd.blue_score, header.daa_score, header.timestamp);
+        assert_eq!(ctx.consensus.get_shielded_chain_block_meta(*hash).unwrap(), old, "compact read differs at {hash}");
+        if *hash != config.genesis.hash {
+            // And it agrees with the scan record that serves the same block once the header is pruned.
+            let d = ctx.consensus.get_shielded_chain_block_data(*hash).unwrap();
+            assert_eq!((d.blue_score, d.daa_score, d.timestamp), old, "archive record differs at {hash}");
+        }
+    }
+    assert!(
+        ctx.consensus.get_shielded_chain_block_meta(Hash::from_bytes([0xcd; 32])).is_err(),
+        "an unknown block must be an error, never a zero row a wallet would take for a page boundary"
+    );
+}
+
 /// AUDIT 2026-10-05 B-1 / F-1 (ZK-01), ported from the lead auditor's proof of concept and
 /// extended. The import must refuse peer anchor pairs whose source is not a provable window
 /// block (future block, block that never existed), must not take the peer's blue score, and
@@ -3968,3 +4010,183 @@ async fn combined_reimport_is_idempotent() {
     node.shutdown(wait);
 }
 
+
+/// N1 (spec 08 R3/R3.7/R5.1) over a REAL chain with a real spend: the ranged exporter's union is the
+/// full export; a range-split import staged in reverse range order, interrupted, "restarted" (the
+/// in-memory staging handle dropped, so only the on-disk manifest survives) and resumed, lands on
+/// exactly the committed state; a source that streams a nullifier outside its range is refused at
+/// once and discards the staging; and the maintained `nullifierCount` follows the spend.
+#[tokio::test]
+async fn n1_range_split_import_survives_a_restart_and_refuses_out_of_range_data() {
+    use kaspa_consensus_core::api::{ConsensusApi, ShieldedStreamScope};
+    use kaspa_consensus_core::subnets::SUBNETWORK_ID_NATIVE;
+    use kaspa_consensus_core::tx::TX_VERSION_SHIELDED;
+
+    let mut params = MAINNET_PARAMS.clone();
+    params.shielded_coinbase = true;
+    params.dev_fee_recipient = None;
+    params.security_fork_activation = ForkActivation::always();
+    params.miner_accrual_payout_interval = 1;
+    let config = ConfigBuilder::new(params)
+        .edit_consensus_params(|p| {
+            p.genesis.bits = 0x207fffff;
+            p.blockrate.finality_depth = 5;
+            p.blockrate.shielded_anchor_depth = 5;
+        })
+        .build();
+    let net = config.genesis.hash.as_bytes();
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+    let miner_seed = [7u8; 32];
+    let miner_addr = kaspa_shielded_core::wallet::address_bytes_from_seed(miner_seed).expect("orchard address");
+    ctx.miner_data = MinerData::new(ScriptPublicKey::new(0, ScriptVec::from_slice(&miner_addr)), vec![]);
+    let mut chain = vec![config.genesis.hash];
+    let mut block1 = None;
+    for _ in 0..8 {
+        let b = ctx.mine_real_pow_block();
+        chain.push(b.header.hash);
+        ctx.consensus.validate_and_insert_block(b.clone()).virtual_state_task.await.unwrap();
+        if chain.len() == 3 {
+            block1 = Some(b);
+        }
+    }
+    let block1 = block1.unwrap();
+    let cb = &block1.transactions[0];
+    let (cb_txid, note_value) = (cb.id(), cb.outputs[0].value);
+    let recipient_addr = kaspa_shielded_core::wallet::address_bytes_from_seed([9u8; 32]).unwrap();
+    let mut tx = Transaction::new(TX_VERSION_SHIELDED, vec![], vec![], 0, SUBNETWORK_ID_NATIVE, 0, vec![]);
+    let tx_ctx = tx.shielded_sighash_context();
+    tx.payload = kaspa_shielded_core::wallet::build::build_singleleaf_coinbase_spend_anchored(
+        miner_seed,
+        cb_txid.as_bytes(),
+        0,
+        note_value,
+        recipient_addr,
+        note_value - 2_000,
+        &net,
+        &tx_ctx,
+        Some(block1.header.hash.as_bytes()),
+    )
+    .expect("wallet builds a real spend bundle");
+    tx.finalize();
+    let b = ctx.mine_real_pow_block_with(vec![tx]);
+    chain.push(b.header.hash);
+    ctx.consensus.validate_and_insert_block(b).virtual_state_task.await.expect("valid");
+    for _ in 0..4 {
+        let b = ctx.mine_real_pow_block();
+        chain.push(b.header.hash);
+        ctx.consensus.validate_and_insert_block(b).virtual_state_task.await.unwrap();
+    }
+    let vp = ctx.consensus.virtual_processor();
+    let tip = *chain.last().unwrap();
+    // R3.7: the maintained count, per chain block.
+    assert_eq!(ctx.consensus.get_shielded_nullifier_count(chain[3]).unwrap(), Some(0), "before the spend");
+    let at_tip = ctx.consensus.get_shielded_nullifier_count(tip).unwrap().expect("a count is recorded");
+    assert!(at_tip >= 1, "the spend's nullifiers are counted: {at_tip}");
+    assert_eq!(at_tip as usize, vp.shielded_state_manager_ref().nullifiers().count(), "the counter equals an O(N) walk");
+
+    let pp = chain[chain.len() - 2];
+    let committed = vp.shielded_state_root_at(pp).unwrap();
+    let wire = vp.export_pruning_point_shielded(pp).unwrap().expect("exports");
+    let full: Vec<[u8; 32]> = vp.collect_pruning_point_nullifiers(pp).unwrap().to_vec();
+    assert_eq!(full.len() as u64, wire.nullifier_count);
+    assert!(full.windows(2).all(|w| w[0] < w[1]), "the exporter streams in strictly ascending order");
+    assert_eq!(full.len() as u64, at_tip, "no spend above the pruning point");
+    // R5.1: every stored nullifier is tagged with the current era.
+    for nf in &full {
+        assert_eq!(vp.shielded_state_manager_ref().nullifiers().era_of(nf).unwrap(), Some(crate::model::stores::shielded::CURRENT_TREE_ERA));
+    }
+
+    // The ranged exporter: the union of the 16 ranges is the full export, in order.
+    let range = |i: usize| {
+        let (from, before) = (crate::processes::shielded_import::range_start(i), crate::processes::shielded_import::range_end(i));
+        let mut out = Vec::new();
+        vp.stream_pruning_point_nullifiers(pp, Some(from), before, 3, &mut |c| {
+            out.extend(c);
+            true
+        })
+        .unwrap();
+        out
+    };
+    let union: Vec<[u8; 32]> = (0..crate::processes::shielded_import::RANGE_COUNT).flat_map(range).collect();
+    assert_eq!(union, full, "ranged exports partition the set");
+
+    let (node, wait) = combined_header_only_node(&config, &ctx.consensus, &chain).await;
+    let c = node.consensus_clone();
+    // 1. A source that streams a nullifier outside its range is refused at the first chunk, and the
+    //    staging is gone.
+    c.begin_pruning_point_shielded_import(pp, wire.clone(), Some(committed)).expect("binds");
+    let wrong_range = (0..16).find(|i| *i != crate::processes::shielded_import::range_of(&full[0])).unwrap();
+    let mut lie = std::iter::once(vec![full[0]]);
+    assert!(c.stage_pruning_point_shielded_nullifiers(pp, ShieldedStreamScope::Range(wrong_range), &mut lie).is_err());
+    assert!(c.get_pruning_point_shielded_import_ranges(pp).is_none(), "the refused staging is discarded");
+
+    // 2. Range-split, reverse order, interrupted after half the ranges, then a "restart".
+    let ranges = c.begin_pruning_point_shielded_import(pp, wire.clone(), Some(committed)).expect("binds");
+    assert_eq!(ranges.len(), 16);
+    for i in (8..16).rev() {
+        let mut it = std::iter::once(range(i)).filter(|v| !v.is_empty());
+        c.stage_pruning_point_shielded_nullifiers(pp, ShieldedStreamScope::Range(i), &mut it).unwrap();
+        c.complete_pruning_point_shielded_range(pp, i).unwrap();
+    }
+    assert!(matches!(
+        c.finish_pruning_point_shielded_import(pp, wire.clone(), Some(committed)),
+        Err(kaspa_consensus_core::errors::pruning::PruningImportError::ShieldedImportIncomplete { .. })
+    ) || (0..8).all(|i| range(i).is_empty()));
+    node.forget_shielded_import_staging_handle();
+    let resumed = c.begin_pruning_point_shielded_import(pp, wire.clone(), Some(committed)).expect("rebinds and reloads");
+    for r in &resumed {
+        assert_eq!(r.complete, r.range >= 8, "range {} resumes as it was left", r.range);
+    }
+    for i in 0..8 {
+        let mut it = std::iter::once(range(i)).filter(|v| !v.is_empty());
+        c.stage_pruning_point_shielded_nullifiers(pp, ShieldedStreamScope::Range(i), &mut it).unwrap();
+        c.complete_pruning_point_shielded_range(pp, i).unwrap();
+    }
+    c.finish_pruning_point_shielded_import(pp, wire.clone(), Some(committed)).expect("the resumed import completes");
+    let nvp = node.virtual_processor();
+    assert_eq!(nvp.shielded_state_root_at(pp).unwrap(), committed, "exactly the committed state");
+    let imported: Vec<[u8; 32]> = nvp.shielded_state_manager_ref().nullifiers().iter_all().map(|r| r.unwrap()).collect();
+    assert_eq!(imported, full, "the live set is the exported set");
+    assert_eq!(node.get_shielded_nullifier_count(pp).unwrap(), Some(full.len() as u64), "the seeded count");
+    node.shutdown(wait);
+}
+
+/// N1 (spec 08 R3.1): the only bound on a declared nullifier count is the PoW-bound committed note
+/// count. One above it is refused before a single chunk is read; the count itself is the bound,
+/// not the former 2^26 cap.
+#[tokio::test]
+async fn n1_declared_count_above_the_committed_note_count_is_refused() {
+    let config = combined_config(ForkActivation::always(), 8);
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+    ctx.miner_data = shielded_miner();
+    let mut chain = vec![config.genesis.hash];
+    for _ in 0..14 {
+        let b = ctx.mine_real_pow_block();
+        chain.push(b.header.hash);
+        ctx.consensus.validate_and_insert_block(b).virtual_state_task.await.unwrap();
+    }
+    let vp = ctx.consensus.virtual_processor();
+    let pp = chain[10];
+    let committed = vp.shielded_state_root_at(pp).unwrap();
+    let wire = vp.export_pruning_point_shielded(pp).unwrap().expect("exports");
+    let md = crate::processes::shielded::PruningPointShieldedMetadata::from_wire_bytes(&wire.data).unwrap();
+    let (node, wait) = combined_header_only_node(&config, &ctx.consensus, &chain).await;
+    for declared in [md.frontier.size + 1, (1u64 << 26) + 1, u64::MAX] {
+        if declared <= md.frontier.size {
+            continue;
+        }
+        let lie = kaspa_consensus_core::api::ShieldedExportMetadata { data: wire.data.clone(), nullifier_count: declared };
+        let polled = std::sync::atomic::AtomicBool::new(false);
+        let mut batches = std::iter::from_fn(|| {
+            polled.store(true, std::sync::atomic::Ordering::SeqCst);
+            None
+        });
+        let err = node.consensus_clone().import_pruning_point_shielded(pp, lie, Some(committed), &mut batches).unwrap_err();
+        assert!(format!("{err}").contains("committed note count"), "declared {declared}: {err}");
+        assert!(!polled.load(std::sync::atomic::Ordering::SeqCst), "declared {declared}: no chunk read");
+    }
+    // The honest count imports.
+    let mut batches = std::iter::once(vp.collect_pruning_point_nullifiers(pp).unwrap().to_vec()).filter(|v| !v.is_empty());
+    node.consensus_clone().import_pruning_point_shielded(pp, wire, Some(committed), &mut batches).expect("honest import");
+    node.shutdown(wait);
+}

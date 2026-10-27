@@ -20,7 +20,22 @@ impl BlockBodyProcessor {
     pub fn validate_body_in_context(self: &Arc<Self>, block: &Block) -> BlockProcessResult<()> {
         self.check_parent_bodies_exist(block)?;
         self.check_coinbase_blue_score_and_subsidy(block)?;
-        self.check_block_transactions_in_context(block)
+        self.check_block_transactions_in_context(block)?;
+        self.check_shielded_proofs(block)
+    }
+
+    /// Batched verification of the block's shielded bundles (N1, spec 08 R1.3.1), as an
+    /// ACCELERATOR only: every bundle a passing batch proves lands in the verdict cache, so the
+    /// virtual processor's per-transaction check (still the authority, and still the place where a
+    /// failing transaction is dropped) is a cache hit. Never fails the block: making an invalid proof
+    /// block-fatal is NU-A's soft fork (R1.5), not part of this release.
+    pub(super) fn check_shielded_proofs(self: &Arc<Self>, block: &Block) -> BlockProcessResult<()> {
+        let shielded: Vec<&kaspa_consensus_core::tx::Transaction> =
+            block.transactions.iter().skip(1).filter(|tx| tx.is_shielded()).collect();
+        if !shielded.is_empty() {
+            self.transaction_validator.accelerate_shielded_block_verification(&shielded, block.header.daa_score);
+        }
+        Ok(())
     }
 
     pub fn validate_trusted_body_in_context(self: &Arc<Self>, block: &Block) -> BlockProcessResult<()> {

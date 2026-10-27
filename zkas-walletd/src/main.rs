@@ -77,6 +77,25 @@ struct Cli {
     /// receive, and a note-heavy wallet's payments get slower without bound.
     #[arg(long, default_value_t = false)]
     no_auto_consolidate: bool,
+    /// Stage W of uniform transactions (spec 02), opt-in: every send, payout and merge this daemon
+    /// builds has one public shape (4 actions, exact fee 0.031178 ZKAS, anchor at the epoch
+    /// opener) and is released at a scheduled random time: interactive sends after a hold
+    /// (`--uniform-hold`), large payments as <= 8 independently released siblings, payouts one
+    /// payee per transaction over a 300 s window. Changes fees and latency of the legacy
+    /// endpoints; the `/api/wallet/uniform/*` endpoints work without it.
+    #[arg(long, default_value_t = false)]
+    uniform_v1: bool,
+    /// With --uniform-v1: send change to the wallet's internal address. Only when every client
+    /// that holds these seeds/viewing keys runs the internal-key trigger scan of this release.
+    #[arg(long, default_value_t = false)]
+    uniform_internal_change: bool,
+    /// Default interactive hold under Stage W: immediate | standard (U[0,120 s]) | private (U[0,30 min]).
+    #[arg(long, default_value = "standard")]
+    uniform_hold: String,
+    /// Stage W background merges (W9): custodial wallets above 8 notes merge 4 -> 1 at Poisson
+    /// times. Replaces the --auto-consolidate merger. Spends those wallets' fees.
+    #[arg(long, default_value_t = false)]
+    uniform_merge: bool,
     /// Cap the CPU threads Halo2 proving may use. Default: every core.
     ///
     /// This is a THROTTLE, not a tuning knob — lowering it makes payments slower, and
@@ -195,6 +214,38 @@ struct Cli {
     /// cannot read those checkpoints, so this is a one-way door for every wallet it rewrites.
     #[arg(long)]
     shared_leaf_store: bool,
+    /// Phase 1 of the multi-wallet scan engine: wallets ingesting the same page share one
+    /// multi-key trial-decryption pass (identical results; ephemeral-key work paid once per
+    /// action for the cohort). Off by default. Kernel: ZKAS_ENGINE_KERNEL=comb|ladder (default comb).
+    #[arg(long)]
+    shared_scan_engine: bool,
+    /// Phase 2 of the multi-wallet scan engine (with `--shared-scan-engine`): run THIS process
+    /// as the engine instead of the per-wallet daemon. One follower stores the chain once in
+    /// DIR; the wallets of `--wallet-dir` are migrated from their checkpoints without a rescan
+    /// (never writing to `--wallet-dir`); `/api/*` READS are served from the engine (no sends).
+    #[arg(long, value_name = "DIR")]
+    engine_dir: Option<String>,
+    /// Engine mode: compare each wallet with the LIVE daemon's checkpoints in DIR whenever one
+    /// is rewritten (reads headers and private sections only; never writes there).
+    #[arg(long, value_name = "DIR")]
+    engine_compare_live: Option<String>,
+    /// Engine mode: ingest no block above this DAA score (experiments).
+    #[arg(long, value_name = "DAA")]
+    engine_stop_at_daa: Option<u64>,
+    /// Engine mode: snapshot every wallet file when the follower passes tip minus each of these
+    /// many seconds (comma-separated), for dormant catch-up measurements.
+    #[arg(long, value_name = "SECS,...", value_delimiter = ',')]
+    engine_dormant_marks: Vec<u64>,
+    /// Engine mode: do not keep the compact block archive (fixed when the store is created).
+    #[arg(long)]
+    engine_no_archive: bool,
+    /// Engine mode: old-path twins (a per-wallet `WalletDb` per migrated wallet, fed the same
+    /// blocks and compared with the engine) within this total memory estimate (MB; 0 = none).
+    #[arg(long, value_name = "MB", default_value_t = 0)]
+    engine_twin_max_mb: u64,
+    /// Engine mode: pause the follower below this much free space (MB).
+    #[arg(long, value_name = "MB", default_value_t = 4096)]
+    engine_min_free_mb: u64,
     /// Defer optional subtree-index builds below this MemAvailable value.
     #[arg(long, value_name = "MIB")]
     subtree_free_floor_mb: Option<u64>,
@@ -245,6 +296,25 @@ struct Cli {
 fn main() {
     kaspa_core::log::try_init_logger("info");
     let cli = Cli::parse();
+    let Some(uniform_hold) = zkas_wallet_engine::HoldMode::parse(&cli.uniform_hold) else {
+        eprintln!("--uniform-hold must be immediate, standard or private, not {:?}", cli.uniform_hold);
+        std::process::exit(2);
+    };
+    zkas_walletd::set_uniform_policy(zkas_walletd::UniformPolicy {
+        enabled: cli.uniform_v1,
+        internal_change: cli.uniform_v1 && cli.uniform_internal_change,
+        hold: uniform_hold,
+        merge: cli.uniform_merge,
+    });
+    if cli.uniform_v1 || cli.uniform_merge {
+        log::info!(
+            "uniform transactions (Stage W): send path {}, internal change {}, hold {:?}, background merges {}",
+            if cli.uniform_v1 { "ON" } else { "off" },
+            if cli.uniform_v1 && cli.uniform_internal_change { "ON" } else { "off" },
+            uniform_hold,
+            if cli.uniform_merge { "ON" } else { "off" }
+        );
+    }
     let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
     let runtime_threads = cli.runtime_threads.filter(|n| *n > 0).unwrap_or_else(|| cores.saturating_mul(2).max(2));
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -323,6 +393,7 @@ async fn run(cli: Cli) {
         resources.resident_budget_mb = None;
     }
     resources.shared_leaf_store = cli.shared_leaf_store;
+    resources.shared_scan_engine = cli.shared_scan_engine;
     if let Some(v) = cli.subtree_free_floor_mb {
         resources.subtree_free_floor_mb = v;
     }
@@ -456,6 +527,28 @@ async fn run(cli: Cli) {
             listen
         );
         std::process::exit(1);
+    }
+
+    if let (true, Some(dir)) = (cli.shared_scan_engine, cli.engine_dir.clone()) {
+        let ecfg = zkas_walletd::EngineConfig {
+            rpc_server: cli.rpc_server,
+            listen,
+            wallet_dir,
+            engine_dir: std::path::PathBuf::from(dir),
+            network: cli.network,
+            wallet_secret,
+            compare_live_dir: cli.engine_compare_live,
+            stop_at_daa: cli.engine_stop_at_daa,
+            dormant_marks: cli.engine_dormant_marks,
+            archive: !cli.engine_no_archive,
+            twin_max_mb: cli.engine_twin_max_mb,
+            min_free_mb: cli.engine_min_free_mb,
+        };
+        if let Err(e) = zkas_walletd::serve_engine(ecfg, shutdown_rx).await {
+            log::error!("{e}");
+            std::process::exit(1);
+        }
+        return;
     }
 
     let cfg = Config {
