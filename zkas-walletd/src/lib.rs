@@ -324,6 +324,61 @@ const CURSOR_GONE_MARKERS: [&str; 4] = [
 fn cursor_gone(err: &str) -> bool {
     CURSOR_GONE_MARKERS.iter().any(|m| err.contains(m))
 }
+
+/// What to do with a checkpoint whose cursor the node refused to serve a frontier for
+/// (`get_shielded_tree_state` at the cursor failed), once the node is known to have REACHED
+/// the cursor (see [`node_reaches`]).
+#[derive(Debug, PartialEq, Eq)]
+enum UnservableCursor {
+    /// Set the checkpoint aside (`.scan.stale-<ts>`) and rebuild from the birthday.
+    Rebuild,
+    /// Keep the checkpoint and do not open the wallet: the node cannot serve the history a
+    /// rebuild would need yet, and a rebuild now would show a partial balance as the whole.
+    WaitForHistory,
+    /// Possibly transient, or the node's history status is unknown: keep it and retry.
+    KeepRetrying,
+}
+
+/// The node's refusal for a cursor below the lowest block it indexed itself.
+const PEER_SUPPLIED_HISTORY: &str = "lies in peer-supplied history";
+
+/// Classify a refused checkpoint cursor (`err` is the frontier request's error).
+///
+/// - `cannot find header` / `header not found`: the cursor is not on the node's chain;
+///   retrying cannot change that, so [`UnservableCursor::Rebuild`].
+/// - [`PEER_SUPPLIED_HISTORY`]: the node fast-synced past the cursor and never serves a
+///   frontier in history it got from peers (a peer-derived leaf count can start a wallet past
+///   its own note); its error says "scan from genesis". That is only an honest instruction on a
+///   node that can serve shielded history back to genesis (`node_history_complete`, from the
+///   same RPC's `history_complete`): there the rebuild scans from genesis and is exact. On a
+///   node still backfilling, the rebuild could only start at the pruning point and would show
+///   the wallet a partial balance, so wait instead, as the "history floor above the cursor"
+///   case beside this one does. Unknown status keeps retrying.
+///
+/// Before this was matched, walletd retried the peer-supplied refusal forever ("cannot verify
+/// checkpoint cursor against selected chain"), so every wallet checkpointed before its node
+/// fast-synced stayed stuck on "opening" until a manual rescan (reported after v1.0.11).
+fn unservable_cursor_action(err: &str, node_history_complete: Option<bool>) -> UnservableCursor {
+    let e = err.to_ascii_lowercase();
+    if e.contains(PEER_SUPPLIED_HISTORY) {
+        return match node_history_complete {
+            Some(true) => UnservableCursor::Rebuild,
+            Some(false) => UnservableCursor::WaitForHistory,
+            None => UnservableCursor::KeepRetrying,
+        };
+    }
+    if e.contains("cannot find header") || e.contains("header not found") {
+        return UnservableCursor::Rebuild;
+    }
+    UnservableCursor::KeepRetrying
+}
+
+/// Whether `err` is a refusal [`unservable_cursor_action`] may act on (as opposed to an error
+/// that is always retried), so the caller only spends the reachability check on those.
+fn checkpoint_cursor_unservable(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    e.contains("cannot find header") || e.contains("header not found") || e.contains(PEER_SUPPLIED_HISTORY)
+}
 /// Extra blue-score slack under the consensus anchor-maturity depth when picking
 /// the anchor a spend roots at, so it stays matured while the tx awaits merging.
 const ANCHOR_SLACK: u64 = 30;
@@ -7235,25 +7290,44 @@ impl AppState {
                         // sweep loads every wallet on disk at startup — so a walletd
                         // restarted against a behind node quarantined every synced
                         // checkpoint with no user action (desktop "Chain source" switch).
-                        let absent = detail.to_ascii_lowercase().contains("cannot find header")
-                            || detail.to_ascii_lowercase().contains("header not found");
-                        let permanent = absent
+                        let refused = checkpoint_cursor_unservable(&detail)
                             && match node_reaches(&c, cursor_daa, std::time::Duration::from_secs(8)).await {
                                 Ok(()) => true,
                                 Err(why) => {
                                     log::warn!(
-                                        "checkpoint cursor {cursor} is absent on the node ({detail}) but the node has not reached it ({why}); keeping checkpoint and retrying"
+                                        "checkpoint cursor {cursor} is unservable on the node ({detail}) but the node has not reached it ({why}); keeping checkpoint and retrying"
                                     );
                                     return None;
                                 }
                             };
-                        if permanent {
+                        // The node's history status decides the peer-supplied case only, so it is
+                        // fetched only then (the finality point always has a frontier of the node's
+                        // own, and the reply carries `history_complete`).
+                        let (history_complete, history_from) = if refused && detail.to_ascii_lowercase().contains(PEER_SUPPLIED_HISTORY) {
+                            match tokio::time::timeout(std::time::Duration::from_secs(8), c.get_shielded_tree_state(None)).await {
+                                Ok(Ok(ts)) => (Some(ts.history_complete), ts.history_from_daa_score),
+                                _ => (None, 0),
+                            }
+                        } else {
+                            (None, 0)
+                        };
+                        let action = if refused { unservable_cursor_action(&detail, history_complete) } else { UnservableCursor::KeepRetrying };
+                        if action == UnservableCursor::WaitForHistory {
+                            // Same rule and wording as the "history floor above the cursor" case
+                            // above: never rebuild into a partial balance; keep the checkpoint.
+                            let msg = format!(
+                                "This node holds shielded history only from block {history_from}, but this wallet was last synced at block {cursor_daa}, in history the node got from peers. Rebuilding here would show only part of the balance, so the wallet is paused with its progress kept. Wait for the node to finish filling in shielded history (its log says \"shielded history: VERIFIED\"), or connect to a node with complete history."
+                            );
+                            log::warn!("wallet {token_p}: {msg}", token_p = log_pseudonym(&token));
+                            return None;
+                        }
+                        if action == UnservableCursor::Rebuild {
                             let scan = scan_path(&self.wallet_dir, token);
                             let quarantine = format!("{scan}.stale-{}", now_unix());
                             if std::fs::copy(&scan, &quarantine).is_ok() {
                                 let _ = std::fs::remove_file(&scan);
                                 log::warn!(
-                                    "checkpoint cursor {cursor} (DAA {cursor_daa}) is not on the selected chain of a synced node that has passed it ({detail}); quarantined as {quarantine_p} and rebuilding", quarantine_p = log_wallet_path(&quarantine));
+                                    "checkpoint cursor {cursor} (DAA {cursor_daa}) cannot be resumed on a synced node that has passed it ({detail}); quarantined as {quarantine_p} and rebuilding", quarantine_p = log_wallet_path(&quarantine));
                                 abandoned_checkpoint = true;
                                 None
                             } else {
@@ -17326,5 +17400,75 @@ mod memtest_t03 {
         }
         println!("MEMTEST label={} copies={n} rss_growth_per_wallet_mib={per}", std::env::var("MEMTEST_LABEL").unwrap_or_else(|_| "?".into()));
         drop(held);
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_cursor_tests {
+    use super::{UnservableCursor, checkpoint_cursor_unservable, unservable_cursor_action};
+
+    const BLOCK: &str = "9f1c0d4e2b7a6c5d8e3f1a0b2c4d6e8f0a1b3c5d7e9f1a2b4c6d8e0f2a4b6c8d";
+
+    fn peer_refusal() -> String {
+        format!("{BLOCK} lies in peer-supplied history; this node serves no frontier there (scan from genesis)")
+    }
+
+    /// The exact load failure that kept wallets retrying forever after the v1.0.11 update. On a
+    /// node with complete history it must now rebuild, bare or wrapped by the RPC layer.
+    #[test]
+    fn peer_supplied_refusal_rebuilds_on_a_complete_history_node() {
+        let node = peer_refusal();
+        let wrapped = format!("RPC Server (remote error) -> Rpc Server error: General error: {node}");
+        for e in [node.as_str(), wrapped.as_str()] {
+            assert!(checkpoint_cursor_unservable(e));
+            assert_eq!(unservable_cursor_action(e, Some(true)), UnservableCursor::Rebuild);
+        }
+    }
+
+    /// On a node still filling in history a rebuild would show a partial balance as the whole:
+    /// wait, keep the checkpoint. Unknown status never rebuilds either.
+    #[test]
+    fn peer_supplied_refusal_waits_when_history_is_incomplete_or_unknown() {
+        assert_eq!(unservable_cursor_action(&peer_refusal(), Some(false)), UnservableCursor::WaitForHistory);
+        assert_eq!(unservable_cursor_action(&peer_refusal(), None), UnservableCursor::KeepRetrying);
+    }
+
+    /// An absent header is off the node's chain whatever its history: rebuild (unchanged).
+    #[test]
+    fn absent_header_rebuilds_regardless_of_history() {
+        for e in ["cannot find header 1234", "Header not found"] {
+            assert!(checkpoint_cursor_unservable(e));
+            for h in [Some(true), Some(false), None] {
+                assert_eq!(unservable_cursor_action(e, h), UnservableCursor::Rebuild, "{e:?} {h:?}");
+            }
+        }
+    }
+
+    /// Anything that might pass with a retry must keep the checkpoint: retiring one forces a rescan.
+    #[test]
+    fn transient_failures_keep_the_checkpoint() {
+        for e in [
+            "deadline has elapsed",
+            "transport error",
+            "connection refused",
+            "RPC Server (remote error) -> node is not synced",
+            "abc is not on the selected chain",
+            "",
+        ] {
+            assert!(!checkpoint_cursor_unservable(e), "{e:?} must not be acted on");
+            for h in [Some(true), Some(false), None] {
+                assert_eq!(unservable_cursor_action(e, h), UnservableCursor::KeepRetrying, "{e:?} {h:?}");
+            }
+        }
+    }
+
+    /// Drift guard: the node's wording is matched by text, so pin it to the node's source. If the
+    /// refusal is reworded there, this fails instead of wallets silently going back to retrying
+    /// forever.
+    #[test]
+    fn marker_matches_the_node_source() {
+        let node_src = include_str!("../../consensus/src/consensus/mod.rs");
+        assert!(node_src.contains("lies in peer-supplied history; this node serves no frontier there"));
+        assert!(node_src.contains(super::PEER_SUPPLIED_HISTORY));
     }
 }
