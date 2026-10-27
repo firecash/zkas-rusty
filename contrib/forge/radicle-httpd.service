@@ -1,0 +1,12 @@
+[Unit]
+Description=Radicle HTTP API (ZKas)
+After=radicle-node.service
+Requires=radicle-node.service
+[Service]
+Environment=RAD_HOME=/root/.radicle
+Environment=RUST_LOG=warn
+ExecStart=/root/.radicle/bin/radicle-httpd --listen 127.0.0.1:8080 --alias zkas-rusty rad:z3MBmXeT1vhMFUSxYr3pxgM6FNyrN --alias zkas-wallet rad:z41vzQPLBQxtZ6jcfW8PSHyiviznx --alias zkas-signer rad:z2X4T6h8LJeD6uAz5UG52UQkSRxVF --alias zkas-explorer rad:z257JUrqBDZURKzpUUM3rWLvJN83x --alias zkas-sdk rad:z2t1b2Xpfc6woLfM8PUj4mkt2NhGJ --alias zkas-payment-gateway rad:z25WhAmtVQHWuAqU3vMWKe4cBKfRA --alias zkas-website rad:z2WcsTzLedHXMXZfoiSnwc31bPUa7 --alias zkas-blog rad:z4SiuN2GVfnV5JhH727JLRGXC5NUN --alias zkas-paper-wallet rad:z2KjfnHJT5rY7BjV8CGHRCZGWWZ7a --alias vprogs-zkas rad:zNWQMYQn4Gt4VtwJmKoAY7AkSstF --alias solo-dual-mode rad:z3Xa3QtWthKf1frJxRttjCtmNcJ9b
+Restart=always
+RestartSec=5
+[Install]
+WantedBy=multi-user.target
