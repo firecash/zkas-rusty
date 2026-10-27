@@ -109,10 +109,11 @@ const MAX_HISTORY_RECORD_BYTES: usize = 32 * 1024 * 1024;
 /// One history chunk's serialized records in total, checked before any is decoded. A server of
 /// this version stops a chunk at 24 MiB plus one record (`HISTORY_CHUNK_MAX_BYTES` in consensus),
 /// and one record is at most [`MAX_HISTORY_RECORD_BYTES`], so an honest chunk is below the sum.
-/// Older servers had a 128 MiB backstop; a chunk of theirs above this ceiling needs records that
-/// average over ~56 KB (fewer than 1,000 of them), and refusing it only moves the backfill to
-/// another peer.
-const MAX_HISTORY_CHUNK_BYTES: usize = 24 * 1024 * 1024 + MAX_HISTORY_RECORD_BYTES;
+/// Servers before this version (every mainnet node at v1.0.11) stop at a 128 MiB backstop plus one
+/// record, so the ceiling stays at 192 MiB while they are the only history servers: refusing their
+/// chunks would leave a fresh node with no peer able to backfill a shielded-heavy range. Lower it to
+/// `24 MiB + MAX_HISTORY_RECORD_BYTES` once old servers are retired.
+const MAX_HISTORY_CHUNK_BYTES: usize = 192 * 1024 * 1024;
 
 /// A chunk that is not the last may be short in RECORDS if it is long in BYTES: a server that
 /// stopped on its own byte budget is doing the right thing, and refusing it as a drip feed would
