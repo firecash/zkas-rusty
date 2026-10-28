@@ -16,7 +16,7 @@ The bridge can run against:
 
 ### Running from a release
 
-If you are running from a release archive (https://gitlab.com/zkas-group/zkas-rusty/-/releases, without `cargo run`):
+If you are running from a release archive (https://zkas.info/downloads/node/, without `cargo run`):
 
 1. Download and extract the release archive for your OS.
 2. Prepare a config file (for example `bridge/config.yaml` from this repository).

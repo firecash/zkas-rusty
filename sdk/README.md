@@ -12,7 +12,7 @@ language packages are bindings around the same reviewed code.
 - `core/` — public `zkas-sdk` facade, BlockDAG sync API, stores, addresses,
   prepared-payment format, and examples.
 - `bindings/` — pointers to out-of-tree bindings; the TypeScript package lives
-  at <https://gitlab.com/zkas-group/zkas-sdk>.
+  at <https://zkas.info/code/sdk>.
 - `docs/ARCHITECTURE.md` — target architecture and phased implementation plan.
 - `docs/RESEARCH.md` — external SDK and wallet designs reviewed for this work.
 - `docs/USAGE.md` — integration and security guide.

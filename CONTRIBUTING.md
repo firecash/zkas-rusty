@@ -10,7 +10,7 @@ Follow along the R&D Telegram group [@kasparnd](https://t.me/kasparnd).
 
 ## Quick summary
 
-- Open a GitLab issue or merge request (https://gitlab.com/zkas-group/zkas-rusty/-/issues) to start any discussion. Use Issues for design or spec discussions and PRs when you have code to share.
+- Open a GitLab issue or merge request (https://zkas.info/code/rusty/issues) to start any discussion. Use Issues for design or spec discussions and PRs when you have code to share.
 - Look for `good first issue` if you're getting started; these are intentionally approachable.
 - Write detailed pull requests descriptions: explain what you changed, why, design decisions, and any trade-offs.
 - **Anyone** willing to contribute is encouraged to review pull requests and ask questions. Your approval and review counts!

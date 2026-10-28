@@ -40,7 +40,7 @@ low-difficulty mining, not competitive hashrate.
   - Web:    https://wallet.zkas.info   (also has on-device "Local" tools)
   - Paper:  https://zkas.info/paper-wallet.html  — an OFFLINE,
             single-file cold-storage wallet. Save it, go offline, generate.
-            Source: https://gitlab.com/zkas-group/zkas-paper-wallet
+            Source: https://zkas.info/code/paper-wallet
 
 Quick start:
   ./kaspad --utxoindex
