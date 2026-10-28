@@ -55,6 +55,14 @@ thiserror.workspace = true
 wasm-bindgen.workspace = true
 workflow-wasm.workspace = true
 
+# risc0-zkvm-platform (via the risc0 crates above) always compiles `sys_alloc_words`, which calls
+# `sys_alloc_aligned`, but defines `sys_alloc_aligned` outside a zkVM guest only with
+# `export-syscalls` (a stub that panics if ever called; host code never calls it). ELF and Mach-O
+# linkers ignore the dangling reference; every MSVC linker rejects it ("undefined symbol:
+# sys_alloc_aligned" linking kaspa-wrpc-server), so without this a Windows build of the node fails.
+[target.'cfg(windows)'.dependencies]
+risc0-zkvm-platform = { version = "2.2.2", features = ["export-syscalls"] }
+
 [dev-dependencies]
 bytemuck.workspace = true
 criterion.workspace = true
