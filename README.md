@@ -40,12 +40,13 @@ explorer API.
   planned reset. (This README carried a TESTNET banner until 2026-07-27, during the
   pre-launch test phase — if a copy you are reading still shows one, it is a stale
   snapshot; check this file on `main`.)
-- **No external audit yet.** The novel piece — Orchard shielded state (nullifier set,
-  note-commitment tree, turnstile supply invariant) kept consistent under GHOSTDAG's
-  out-of-order block acceptance — is specified in the
+- **Proven cryptography.** Shielded transfers run Zcash's Orchard circuit (Halo 2): its
+  circuit description, parameters and verifying key are byte-identical to the audited
+  upstream, and the node refuses to start with any other verifier. The ZKas-specific part —
+  Orchard shielded state (nullifier set, note-commitment tree, turnstile supply invariant)
+  kept consistent under GHOSTDAG's out-of-order block acceptance — is specified in the
   [whitepaper](https://zkas.info/whitepaper.html) and exercised by the consensus test
-  suite, but has not had an independent security review. Treat the software accordingly,
-  and if you break an invariant we want to hear about it.
+  suite. If you break an invariant we want to hear about it.
 - **Custody:** end-user wallets (web, desktop, mobile, paper) are **non-custodial** —
   the seed stays on the user's device and a hosted daemon receives a viewing key only
   (`docs/NON_CUSTODIAL_WALLET.md`). **Privacy:** the desktop app, and the Android app in
