@@ -1,12 +1,17 @@
-# macOS node release archives (Apple Silicon + Intel) on Codemagic.
+# Node release archives built natively on Codemagic: macOS (Apple Silicon + Intel) and Windows
+# (x86_64, MSVC). The Windows workflow is the GitLab `release:win64` job (.gitlab-ci.yml), which
+# replaced GitHub Actions: same steps, same toolchain (MSVC, protoc 27.3, rustup minimal), same
+# archive. Linux builds on the 142 box (contrib/build/build-node-linux.sh), which is the
+# `release:linux-amd64` job's Ubuntu 22.04 baseline. GitHub and GitLab both blocked the account
+# in October 2026.
 #
-# Codemagic adds a repository by plain git URL (Add application -> Other ->
-# https://zkas.info/code/rusty.git, our Radicle node) and gives free macOS minutes. A repository
-# added by URL sends no webhooks: start a build from the Codemagic UI or the API, workflow
-# "macOS node", on a zkas-v* tag.
+# Codemagic adds a repository by plain git URL (https://zkas.info/code/rusty.git, our Radicle
+# node) and sends no webhooks: start a build from the UI or the API on branch main with the
+# environment variable RELEASE_TAG=zkas-v<version>. The workflow builds THAT TAG: it checks it out
+# after this file is read, so the binaries are exactly the tagged source.
 #
-# Linux and Windows build on the 142 box (contrib/build/build-node-linux.sh,
-# build-node-windows.sh). GitHub and GitLab both blocked the account in October 2026.
+# Every binary is checked before it is packaged: it may link only system libraries (no Homebrew
+# dylib, no DLL a Windows user would have to install), and it must start on the build machine.
 
 workflows:
   macos-node:
@@ -14,6 +19,13 @@ workflows:
     instance_type: mac_mini_m2
     max_build_duration: 120
     scripts:
+      - name: Release tag
+        script: |
+          set -eu
+          [ -n "${RELEASE_TAG:-}" ] || { echo "set RELEASE_TAG=zkas-v<version>" >&2; exit 3; }
+          git fetch -q --tags origin
+          git checkout -q "refs/tags/$RELEASE_TAG"
+          echo "building $RELEASE_TAG = $(git rev-parse HEAD)"
       - name: Toolchain
         script: |
           set -eu
@@ -24,29 +36,105 @@ workflows:
           . "$HOME/.cargo/env"
           rustup target add aarch64-apple-darwin x86_64-apple-darwin
           rustc -V; protoc --version
-      - name: Build both architectures
+      - name: Build, check and package both architectures
         script: |
           set -eu
           . "$HOME/.cargo/env"
-          TAG="${CM_TAG:-zkas-v0-$(git rev-parse --short HEAD)}"
+          VER="${RELEASE_TAG#zkas-v}"
           mkdir -p out
           for pair in "osx-arm64:aarch64-apple-darwin:11.0" "osx-x86_64:x86_64-apple-darwin:10.13"; do
             NAME="${pair%%:*}"; rest="${pair#*:}"; TRIPLE="${rest%%:*}"; export MACOSX_DEPLOYMENT_TARGET="${rest##*:}"
             rm -rf "pkg-$NAME" && mkdir -p "pkg-$NAME/bin"
-            for pb in kaspad:kaspad kaspa-shielded-pay:shielded-pay kaspa-stratum-bridge:stratum-bridge zkas-api:zkas-api kaspa-miner:zkas-miner zkas-walletd:zkas-walletd; do
-              cargo build --locked --release --target "$TRIPLE" -p "${pb%%:*}" --bin "${pb##*:}"
-              cp "target/$TRIPLE/release/${pb##*:}" "pkg-$NAME/bin/"
+            for b in kaspad zkas-miner zkas-walletd zkas-api shielded-pay stratum-bridge; do
+              cargo build --locked --release --target "$TRIPLE" --bin "$b"
+              cp "target/$TRIPLE/release/$b" "pkg-$NAME/bin/"
             done
-            if [ "$NAME" = osx-arm64 ] && [ -n "${CM_TAG:-}" ]; then
-              KV="$("pkg-$NAME/bin/kaspad" --version || true)"; echo "$KV"
-              case "$KV" in *"($CM_TAG)"*) ;; *) echo "kaspad reports $KV, not $CM_TAG" >&2; exit 5 ;; esac
-            fi
             cp docs/RELEASE_README.txt "pkg-$NAME/bin/README.txt"
-            # Ad-hoc signatures (Apple Silicon refuses unsigned binaries); notarization needs an
-            # Apple Developer account.
-            for b in "pkg-$NAME"/bin/*; do [ "${b##*.}" = txt ] || codesign --force -s - "$b"; done
-            ( cd "pkg-$NAME" && zip -q -r -X "../out/zkas-$TAG-$NAME.zip" bin )
+            for b in "pkg-$NAME"/bin/*; do
+              [ "${b##*.}" = txt ] && continue
+              # Only system libraries: a Homebrew or other non-system dylib would be missing on a
+              # user's Mac and the binary would not start.
+              BAD="$(otool -L "$b" | tail -n +2 | awk '{print $1}' | grep -v -E '^(/usr/lib/|/System/Library/)' || true)"
+              [ -z "$BAD" ] || { echo "$b links non-system libraries:"; echo "$BAD"; exit 4; }
+              # Ad-hoc signature: Apple Silicon refuses unsigned binaries (notarization needs an
+              # Apple Developer account).
+              codesign --force -s - "$b"
+              # Must start (dyld aborts here on a missing library). x86_64 runs under Rosetta.
+              if [ "$NAME" = osx-arm64 ] || /usr/bin/pgrep -q oahd || arch -x86_64 /usr/bin/true 2>/dev/null; then
+                out="$("$b" --help 2>&1 | head -3 || true)"
+                case "$out" in *"Library not loaded"*|*"image not found"*) echo "$b does not start: $out"; exit 4;; esac
+              fi
+            done
+            KV="$("pkg-$NAME/bin/kaspad" --version 2>&1 || true)"; echo "$NAME: $KV"
+            case "$KV" in *"(zkas-v$VER)"*) ;; *) echo "kaspad reports $KV, not zkas-v$VER" >&2; exit 5 ;; esac
+            ( cd "pkg-$NAME" && zip -q -r -X "../out/zkas-$RELEASE_TAG-$NAME.zip" bin )
           done
           ( cd out && shasum -a 256 *.zip | tee SHA256SUMS-macos )
+    artifacts:
+      - out/*
+
+  windows-node:
+    name: Windows node
+    instance_type: windows_x2
+    max_build_duration: 120
+    scripts:
+      - name: Release tag
+        script: |
+          if (-not $env:RELEASE_TAG) { throw "set RELEASE_TAG=zkas-v<version>" }
+          git config --global core.autocrlf false
+          git fetch -q --tags origin
+          git checkout -q "refs/tags/$env:RELEASE_TAG"
+          if ($LASTEXITCODE -ne 0) { throw "cannot check out $env:RELEASE_TAG" }
+          Write-Host "building $env:RELEASE_TAG = $(git rev-parse HEAD)"
+      - name: Toolchain (as the GitLab release:win64 job)
+        script: |
+          $ProgressPreference = 'SilentlyContinue'
+          Invoke-WebRequest "https://github.com/protocolbuffers/protobuf/releases/download/v27.3/protoc-27.3-win64.zip" -OutFile protoc.zip
+          Expand-Archive protoc.zip -DestinationPath C:\protoc -Force
+          if (-not (Get-Command rustup -ErrorAction SilentlyContinue)) {
+            Invoke-WebRequest https://win.rustup.rs/x86_64 -OutFile rustup-init.exe
+            .\rustup-init.exe -y --profile minimal
+          }
+          $env:PATH = "C:\protoc\bin;$env:USERPROFILE\.cargo\bin;$env:PATH"
+          rustup component add llvm-tools
+          rustc -V; protoc --version
+      - name: Build, check and package
+        script: |
+          $env:PATH = "C:\protoc\bin;$env:USERPROFILE\.cargo\bin;$env:PATH"
+          $bins = "kaspad","zkas-miner","zkas-walletd","zkas-api","shielded-pay","stratum-bridge"
+          foreach ($b in $bins) { cargo build --locked --release --bin $b; if ($LASTEXITCODE -ne 0) { throw "build failed: $b" } }
+          New-Item -ItemType Directory -Force bin | Out-Null
+          foreach ($b in $bins) { Copy-Item "target\release\$b.exe" bin\ }
+          Copy-Item docs\RELEASE_README.txt bin\README.txt
+          # Every exe may import only Windows system DLLs (no MinGW runtime, no VC++ redistributable:
+          # .cargo/config.toml builds with +crt-static), and must start on this machine.
+          $readobj = Get-ChildItem "$env:USERPROFILE\.rustup\toolchains" -Recurse -Filter llvm-readobj.exe | Select-Object -First 1
+          $ok = '^(kernel32|user32|gdi32|advapi32|shell32|ole32|oleaut32|ws2_32|ntdll|bcrypt|bcryptprimitives|crypt32|secur32|userenv|shlwapi|version|winmm|iphlpapi|setupapi|cfgmgr32|dbghelp|powrprof|psapi|rpcrt4|wininet|winhttp|dnsapi|ncrypt|mswsock|credui|msimg32|opengl32|winspool|comdlg32|api-ms-win-[a-z0-9-]+)\.dll$'
+          foreach ($b in $bins) {
+            $dlls = & $readobj.FullName --coff-imports "bin\$b.exe" | Select-String '^\s*Name: (.+)$' | ForEach-Object { $_.Matches[0].Groups[1].Value.ToLower() } | Sort-Object -Unique
+            $bad = $dlls | Where-Object { $_ -notmatch $ok }
+            if ($bad) { throw "$b.exe imports non-system DLLs: $($bad -join ', ')" }
+            Write-Host "$b.exe imports: $($dlls -join ' ')"
+            $p = Start-Process -FilePath "bin\$b.exe" -ArgumentList "--help" -NoNewWindow -Wait -PassThru -RedirectStandardOutput "help-$b.txt" -RedirectStandardError "help-$b.err"
+            # 0xC0000135 = a DLL was not found, 0xC000007B = bad image: the exe could not start.
+            if ($p.ExitCode -eq -1073741515 -or $p.ExitCode -eq -1073741701) { throw "$b.exe does not start (exit $($p.ExitCode))" }
+          }
+          $kv = (& bin\kaspad.exe --version 2>&1 | Out-String).Trim()
+          Write-Host "kaspad: $kv"
+          $ver = $env:RELEASE_TAG -replace '^zkas-v', ''
+          if ($kv -notmatch [regex]::Escape("(zkas-v$ver)")) { throw "kaspad reports '$kv', not zkas-v$ver" }
+          New-Item -ItemType Directory -Force out | Out-Null
+          $archive = "out\zkas-$env:RELEASE_TAG-win64.zip"
+          # Entries named bin/<file> with forward slashes, the layout of the Linux and macOS archives
+          # and what the desktop wallet's installer looks for (Compress-Archive on Windows
+          # PowerShell can write backslash names, which other unzippers and the installer reject).
+          Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
+          $zip = [System.IO.Compression.ZipFile]::Open((Join-Path (Get-Location) $archive), 'Create')
+          foreach ($f in Get-ChildItem bin -File) {
+            [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, $f.FullName, "bin/$($f.Name)", 'Optimal') | Out-Null
+          }
+          $zip.Dispose()
+          (Get-FileHash $archive -Algorithm SHA256).Hash.ToLower() + "  zkas-$env:RELEASE_TAG-win64.zip" | Out-File -Encoding ascii out\SHA256SUMS-win64
+          Get-Content out\SHA256SUMS-win64
     artifacts:
       - out/*

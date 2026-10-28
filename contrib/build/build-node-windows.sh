@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # Windows x86_64 node release archive, cross-compiled on the 142 build box from one exact commit.
 #
+# NOT the release path: releases build natively with MSVC on Codemagic (codemagic.yaml,
+# workflow "Windows node"), as the GitLab release:win64 job did. This cross-build currently stops at
+# the link step (risc0-zkvm-platform references sys_alloc_aligned, which only a zkVM guest defines);
+# kept for development.
+#
 #   contrib/build/build-node-windows.sh <tag> [<commit>]      e.g. zkas-v1.0.13
 #
 # Target x86_64-pc-windows-msvc through cargo-xwin (Microsoft's CRT and SDK headers, linked
