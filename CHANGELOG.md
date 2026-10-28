@@ -8,8 +8,8 @@ security fork activated at DAA 6,983,500 on 15 October 2026, and older nodes can
 ## zkas-v1.0.13 — 2026-10-28
 
 Commit `7d892c81`. No consensus change: runs alongside v1.0.11 and v1.0.12 nodes. Recommended for
-every node and wallet operator. **First release with Windows and macOS builds** (Linux x86_64,
-Windows x86_64, macOS Apple Silicon and Intel).
+every node and wallet operator. **Windows and macOS builds are back** (Linux x86_64, Windows
+x86_64, macOS Apple Silicon and Intel); the earlier ones were lost with the GitHub account.
 
 **Node**
 - Initial sync moves less data: a peer can serve the pruning-point proof deduplicated (on mainnet
