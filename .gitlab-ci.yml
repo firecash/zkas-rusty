@@ -1,6 +1,11 @@
 # ZKas node CI on GitLab (moved from GitHub Actions when the GitHub account was
 # suspended, 2026-10-23).
 #
+# NOT RUNNING: GitLab blocked the account on 2026-10-24; the code lives on Radicle
+# (https://zkas.info/code/rusty). Release archives now build with contrib/build/build-node-linux.sh
+# and build-node-windows.sh on the build box and codemagic.yaml (macOS), and are published at
+# https://zkas.info/downloads/node/. Kept as the reference definition of the checks and archives.
+#
 #   check / test / lints / no-std / wasm : every push to main and every merge request
 #   release:*                            : tags `zkas-v*` — builds the release archives
 #                                          and attaches them to the tag's GitLab release

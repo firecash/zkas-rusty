@@ -2,7 +2,8 @@
  ZKas — release binaries
 ===============================================================================
 
-This archive contains statically-linked ZKas binaries. ZKas is a
+This archive contains ZKas binaries for Linux x86_64, dynamically linked
+against glibc 2.34 or newer (Ubuntu 22.04+, Debian 12+). ZKas is a
 shielded-by-default (Orchard / Halo 2) fork of rusty-kaspa; kHeavyHash PoW,
 1 block/second, ticker $ZKAS. 1 ZKAS = 100,000,000 sompi.
 

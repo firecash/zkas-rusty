@@ -1,0 +1,48 @@
+# macOS node release archives (Apple Silicon + Intel) on Codemagic.
+#
+# Codemagic adds a repository by plain git URL (Add application -> Other ->
+# https://zkas.info/code/rusty.git, our Radicle node) and gives free macOS minutes. A repository
+# added by URL sends no webhooks: start a build from the Codemagic UI or the API, workflow
+# "macOS node", on a zkas-v* tag.
+#
+# Linux and Windows build on the 142 box (contrib/build/build-node-linux.sh,
+# build-node-windows.sh). GitHub and GitLab both blocked the account in October 2026.
+
+workflows:
+  macos-node:
+    name: macOS node
+    instance_type: mac_mini_m2
+    max_build_duration: 120
+    scripts:
+      - name: Toolchain
+        script: |
+          set -eu
+          brew list protobuf >/dev/null 2>&1 || brew install protobuf
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+          fi
+          . "$HOME/.cargo/env"
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          rustc -V; protoc --version
+      - name: Build both architectures
+        script: |
+          set -eu
+          . "$HOME/.cargo/env"
+          TAG="${CM_TAG:-zkas-v0-$(git rev-parse --short HEAD)}"
+          mkdir -p out
+          for pair in "osx-arm64:aarch64-apple-darwin:11.0" "osx-x86_64:x86_64-apple-darwin:10.13"; do
+            NAME="${pair%%:*}"; rest="${pair#*:}"; TRIPLE="${rest%%:*}"; export MACOSX_DEPLOYMENT_TARGET="${rest##*:}"
+            rm -rf "pkg-$NAME" && mkdir -p "pkg-$NAME/bin"
+            for pb in kaspad:kaspad kaspa-shielded-pay:shielded-pay kaspa-stratum-bridge:stratum-bridge zkas-api:zkas-api kaspa-miner:zkas-miner zkas-walletd:zkas-walletd; do
+              cargo build --locked --release --target "$TRIPLE" -p "${pb%%:*}" --bin "${pb##*:}"
+              cp "target/$TRIPLE/release/${pb##*:}" "pkg-$NAME/bin/"
+            done
+            cp docs/RELEASE_README.txt "pkg-$NAME/bin/README.txt"
+            # Ad-hoc signatures (Apple Silicon refuses unsigned binaries); notarization needs an
+            # Apple Developer account.
+            for b in "pkg-$NAME"/bin/*; do [ "${b##*.}" = txt ] || codesign --force -s - "$b"; done
+            ( cd "pkg-$NAME" && zip -q -r -X "../out/zkas-$TAG-$NAME.zip" bin )
+          done
+          ( cd out && shasum -a 256 *.zip | tee SHA256SUMS-macos )
+    artifacts:
+      - out/*

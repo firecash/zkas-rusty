@@ -24,10 +24,10 @@ If you are running from a release archive (https://zkas.info/downloads/node/, wi
 
 ```bash
 # Linux/macOS
-./stratum-bridge --config bridge/config.yaml --node-mode inprocess -- --utxoindex --rpclisten=127.0.0.1:16110
+./stratum-bridge --config bridge/config.yaml --node-mode inprocess -- --utxoindex --rpclisten=127.0.0.1:16810
 
 # Windows (PowerShell)
-.\stratum-bridge.exe --config bridge/config.yaml --node-mode inprocess -- --utxoindex --rpclisten=127.0.0.1:16110
+.\stratum-bridge.exe --config bridge/config.yaml --node-mode inprocess -- --utxoindex --rpclisten=127.0.0.1:16810
 ```
 
 Then run in external mode:
@@ -53,7 +53,7 @@ The sample configuration file is:
 `bridge/config.yaml`
 
 **Note:** If no config file is found, the bridge uses code defaults:
-- Default `kaspad_address`: `localhost:16110` (code default) or `127.0.0.1:16110` (as in `config.yaml`)
+- Default `kaspad_address`: `localhost:16810` (code default, the ZKas mainnet gRPC port) or `127.0.0.1:16810` (as in `config.yaml`)
 - Default `node_mode`: `inprocess` (if `--node-mode` is not specified)
 - Default `web_dashboard_port`: empty (dashboard disabled unless configured)
 
@@ -85,7 +85,7 @@ cargo run --bin stratum-bridge --release
 Run in-process with explicit config and kaspad args:
 
 ```bash
-cargo run -p kaspa-stratum-bridge --release --bin stratum-bridge -- --config bridge/config.yaml --node-mode inprocess -- --utxoindex --rpclisten=127.0.0.1:16110
+cargo run -p kaspa-stratum-bridge --release --bin stratum-bridge -- --config bridge/config.yaml --node-mode inprocess -- --utxoindex --rpclisten=127.0.0.1:16810
 ```
 
 **Important:** Use `--` separator before kaspad arguments. Arguments starting with hyphens must come after the `--` separator.
@@ -93,10 +93,10 @@ cargo run -p kaspa-stratum-bridge --release --bin stratum-bridge -- --config bri
 **Examples:**
 ```bash
 # ✓ Correct - bridge args first, then --, then kaspad args
-cargo run --release --bin stratum-bridge -- --config config.yaml --node-mode inprocess -- --utxoindex --rpclisten=127.0.0.1:16110
+cargo run --release --bin stratum-bridge -- --config config.yaml --node-mode inprocess -- --utxoindex --rpclisten=127.0.0.1:16810
 
 # ✗ Incorrect - will show error message
-cargo run --release --bin stratum-bridge -- --rpclisten=127.0.0.1:16110 --config config.yaml --node-mode inprocess
+cargo run --release --bin stratum-bridge -- --rpclisten=127.0.0.1:16810 --config config.yaml --node-mode inprocess
 # Error: tip: to pass '--rpclisten' as a value, use '-- --rpclisten'
 ```
 
@@ -105,7 +105,7 @@ cargo run --release --bin stratum-bridge -- --rpclisten=127.0.0.1:16110 --config
 If you want to override it, pass `--appdir` to the bridge (before the `--` separator):
 
 ```bash
-cargo run --release --bin stratum-bridge -- --config bridge/config.yaml --node-mode inprocess --appdir "C:\path\to\custom\datadir" -- --utxoindex --rpclisten=127.0.0.1:16110
+cargo run --release --bin stratum-bridge -- --config bridge/config.yaml --node-mode inprocess --appdir "C:\path\to\custom\datadir" -- --utxoindex --rpclisten=127.0.0.1:16810
 ```
 
 ### Run (external node)
@@ -113,7 +113,7 @@ cargo run --release --bin stratum-bridge -- --config bridge/config.yaml --node-m
 Terminal A (node):
 
 ```bash
-cargo run --release --bin kaspad -- --utxoindex --rpclisten=127.0.0.1:16110
+cargo run --release --bin kaspad -- --utxoindex --rpclisten=127.0.0.1:16810
 ```
 
 Terminal B (bridge):

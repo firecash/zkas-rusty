@@ -7,7 +7,7 @@
 # preserve comments. For production, consider keeping a backup or using
 # version control.
 
-kaspad_address: "127.0.0.1:16110"
+kaspad_address: "127.0.0.1:16810"  # ZKas mainnet gRPC (kaspad default; testnet 16820)
 block_wait_time: 1000
 print_stats: true
 log_to_file: true
