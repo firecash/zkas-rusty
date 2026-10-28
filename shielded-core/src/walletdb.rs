@@ -1141,10 +1141,11 @@ impl WalletDb {
     /// (one foreign note is proof enough, and each nullifier is a curve operation).
     /// `None` when there are no notes to bind with.
     pub fn notes_bound_to_key(&self, sample: usize) -> Option<bool> {
-        if self.notes.is_empty() {
-            return None;
-        }
-        Some(self.notes.iter().take(sample).all(|n| n.note.nullifier(&self.fvk).to_bytes() == n.nullifier))
+        // Pending spends' notes are checked too: a wallet whose every note is mid-spend has no
+        // unspent note left to tell its key by, but still holds those (ZKAS-WALLETD-2026-001).
+        let mut held = self.notes.iter().take(sample).chain(self.pending_spends.iter().map(|p| &p.note).take(sample)).peekable();
+        held.peek()?;
+        Some(held.all(|n| n.note.nullifier(&self.fvk).to_bytes() == n.nullifier))
     }
 
     /// Absolute position of the first leaf this wallet actually scanned: 0 for a

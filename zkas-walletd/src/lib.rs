@@ -332,6 +332,13 @@ fn cursor_gone(err: &str) -> bool {
 enum UnservableCursor {
     /// Set the checkpoint aside (`.scan.stale-<ts>`) and rebuild from the birthday.
     Rebuild,
+    /// Open the checkpoint without the node's frontier at its cursor: the node holds verified
+    /// history all the way to genesis and only declines to vouch for a frontier in the range it
+    /// got from peers. Syncing on from the cursor (`GetShieldedBlocks`) refuses a cursor that is
+    /// not on the node's chain (the cursor-gone path then retires it), a wallet whose tree
+    /// diverged fails closed at its first spend, and the bind applies again at the first
+    /// checkpoint past the node's own base.
+    ResumeWithoutBind,
     /// Keep the checkpoint and do not open the wallet: the node cannot serve the history a
     /// rebuild would need yet, and a rebuild now would show a partial balance as the whole.
     WaitForHistory,
@@ -347,13 +354,15 @@ const PEER_SUPPLIED_HISTORY: &str = "lies in peer-supplied history";
 /// - `cannot find header` / `header not found`: the cursor is not on the node's chain;
 ///   retrying cannot change that, so [`UnservableCursor::Rebuild`].
 /// - [`PEER_SUPPLIED_HISTORY`]: the node fast-synced past the cursor and never serves a
-///   frontier in history it got from peers (a peer-derived leaf count can start a wallet past
-///   its own note); its error says "scan from genesis". That is only an honest instruction on a
-///   node that can serve shielded history back to genesis (`node_history_complete`, from the
-///   same RPC's `history_complete`): there the rebuild scans from genesis and is exact. On a
-///   node still backfilling, the rebuild could only start at the pruning point and would show
-///   the wallet a partial balance, so wait instead, as the "history floor above the cursor"
-///   case beside this one does. Unknown status keeps retrying.
+///   frontier in history it got from peers (a peer-derived leaf count can START a new wallet
+///   past its own note); its error says "scan from genesis". On a node that holds verified
+///   history back to genesis (`node_history_complete`, from the same RPC's `history_complete`)
+///   an EXISTING checkpoint resumes without that frontier ([`UnservableCursor::ResumeWithoutBind`]).
+///   Rebuilding there was exact but could not keep its progress: the rebuild's own checkpoints
+///   sit in the same peer-supplied range, so an eviction or restart before the scan passed the
+///   node's base started it from genesis again, indefinitely. On a node still backfilling,
+///   resuming or rebuilding would show a partial balance, so wait instead, as the "history
+///   floor above the cursor" case beside this one does. Unknown status keeps retrying.
 ///
 /// Before this was matched, walletd retried the peer-supplied refusal forever ("cannot verify
 /// checkpoint cursor against selected chain"), so every wallet checkpointed before its node
@@ -362,7 +371,7 @@ fn unservable_cursor_action(err: &str, node_history_complete: Option<bool>) -> U
     let e = err.to_ascii_lowercase();
     if e.contains(PEER_SUPPLIED_HISTORY) {
         return match node_history_complete {
-            Some(true) => UnservableCursor::Rebuild,
+            Some(true) => UnservableCursor::ResumeWithoutBind,
             Some(false) => UnservableCursor::WaitForHistory,
             None => UnservableCursor::KeepRetrying,
         };
@@ -7087,8 +7096,12 @@ impl AppState {
         let tmp = format!("{live}.tmp");
         let fvk = key.fvk_bytes()?;
         std::fs::copy(&path, &tmp).ok()?;
-        let _ = std::fs::rename(&live, format!("{live}.replaced-{}", now_unix()));
-        place_checkpoint(&self.wallet_dir, token, &fvk, |to| std::fs::rename(&tmp, to))
+        // The live file is set aside inside the fence too: a load of a key the token has left
+        // must not move the new key's checkpoint out of the way (ZKAS-WALLETD-2026-001).
+        place_checkpoint(&self.wallet_dir, token, &fvk, |to| {
+            let _ = std::fs::rename(to, format!("{to}.replaced-{}", now_unix()));
+            std::fs::rename(&tmp, to)
+        })
             .inspect_err(|_| {
                 let _ = std::fs::remove_file(&tmp);
             })
@@ -7404,7 +7417,13 @@ impl AppState {
                             log::warn!("wallet {token_p}: {msg}", token_p = log_pseudonym(&token));
                             return None;
                         }
-                        if action == UnservableCursor::Rebuild {
+                        if action == UnservableCursor::ResumeWithoutBind {
+                            log::info!(
+                                "wallet {token_p}: checkpoint cursor {cursor} (DAA {cursor_daa}) lies in history this node got from peers; its history is complete and verified, so the checkpoint resumes without the node's frontier there",
+                                token_p = log_pseudonym(&token)
+                            );
+                            None
+                        } else if action == UnservableCursor::Rebuild {
                             let scan = scan_path(&self.wallet_dir, token);
                             let quarantine = format!("{scan}.stale-{}", now_unix());
                             if std::fs::copy(&scan, &quarantine).is_ok() {
@@ -17634,14 +17653,15 @@ mod checkpoint_cursor_tests {
     }
 
     /// The exact load failure that kept wallets retrying forever after the v1.0.11 update. On a
-    /// node with complete history it must now rebuild, bare or wrapped by the RPC layer.
+    /// node with complete history the checkpoint must now open (without the frontier bind), bare
+    /// or wrapped by the RPC layer: neither retried forever nor rebuilt from genesis.
     #[test]
-    fn peer_supplied_refusal_rebuilds_on_a_complete_history_node() {
+    fn peer_supplied_refusal_resumes_on_a_complete_history_node() {
         let node = peer_refusal();
         let wrapped = format!("RPC Server (remote error) -> Rpc Server error: General error: {node}");
         for e in [node.as_str(), wrapped.as_str()] {
             assert!(checkpoint_cursor_unservable(e));
-            assert_eq!(unservable_cursor_action(e, Some(true)), UnservableCursor::Rebuild);
+            assert_eq!(unservable_cursor_action(e, Some(true)), UnservableCursor::ResumeWithoutBind);
         }
     }
 

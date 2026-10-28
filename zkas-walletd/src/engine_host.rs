@@ -424,6 +424,12 @@ impl Host {
             if h.seq > c.seq || h.journal_off > c.journal_len {
                 return Err("w2 claims past the committed store; refusing".into());
             }
+            // `key16` names the TOKEN, not the viewing key: a token re-registered under another
+            // key would resume the old key's notes, history and memos (ZKAS-WALLETD-2026-001).
+            // Refuse unless every held note's nullifier derives under this key. Never deletes.
+            if s.notes.iter().chain(s.pending_spends.iter().map(|p| &p.note)).any(|n| n.note.nullifier(&fvk).to_bytes() != n.nullifier()) {
+                return Err("w2 holds notes this key does not derive (re-registered token); refused".into());
+            }
             let mut w = WalletLite::new(fvk, s, h.size, h.seq, h.key16);
             self.store.catch_up(&mut w, h.journal_off)?;
             w.advance_to(c.seq);

@@ -105,6 +105,9 @@ static RECENT_BLOCKS: std::sync::Mutex<std::collections::BTreeMap<u64, (u64, usi
 
 const LAMBDA_SPAN_MS: u64 = 3_600_000;
 
+/// Longest release window a caller may ask for (`release_window_s`): one day.
+const MAX_RELEASE_WINDOW_S: u64 = 86_400;
+
 /// Record a decoded chain block's accepted user transactions for λ̂ (W8). Keyed by blue score, so
 /// the same block decoded for many wallets counts once.
 pub(crate) fn note_block_txs(blue: u64, timestamp_ms: u64, txs: usize) {
@@ -113,10 +116,14 @@ pub(crate) fn note_block_txs(blue: u64, timestamp_ms: u64, txs: usize) {
     }
     let mut m = RECENT_BLOCKS.lock().unwrap_or_else(|e| e.into_inner());
     m.insert(blue, (timestamp_ms, txs));
-    let newest = m.values().map(|v| v.0).max().unwrap_or(0);
-    m.retain(|_, v| v.0 + LAMBDA_SPAN_MS >= newest);
-    while m.len() > 20_000 {
-        let first = *m.keys().next().unwrap();
+    // Blue-score order is time order, so the newest block is the last key and stale entries sit
+    // at the front: pop them, O(log n + stale) per call. A full max + retain over every entry
+    // here ran on every decoded block, under this mutex, and serialised mass-rescan decoding.
+    let newest = m.values().next_back().map_or(0, |v| v.0).max(timestamp_ms);
+    while let Some((&first, &(ts, _))) = m.iter().next() {
+        if ts.saturating_add(LAMBDA_SPAN_MS) >= newest && m.len() <= 20_000 {
+            break;
+        }
         m.remove(&first);
     }
 }
@@ -790,14 +797,14 @@ pub(crate) async fn send_many_core(
             }
         }
         // i.i.d. uniform times over the window, assigned in a random order: no tick gates a send.
-        let times = schedule::release_times(planned.len(), start, start + window_ms, &mut os_u64);
+        let times = schedule::release_times(planned.len(), start, start.saturating_add(window_ms), &mut os_u64);
         let mut slots: Vec<(u64, usize)> = (0..planned.len()).map(|i| (os_u64(), i)).collect();
         slots.sort_unstable();
         for (t, (_, i)) in times.into_iter().zip(slots) {
             planned[i].release_at_ms = t;
         }
         let positions: Vec<u64> = used.into_iter().collect();
-        reserve(&mut e, &positions, std::time::Duration::from_millis(window_ms + 3_600_000));
+        reserve(&mut e, &positions, std::time::Duration::from_millis(window_ms.saturating_add(3_600_000)));
         planned
     };
     let payee_of: Vec<usize> = planned.iter().map(|p| p.payee_index[0]).collect();
@@ -845,7 +852,9 @@ pub(crate) async fn send_many(
     headers: HeaderMap,
     Json(req): Json<USendManyReq>,
 ) -> Result<Json<USendManyResp>, (StatusCode, Json<serde_json::Value>)> {
-    let window = req.release_window_s.map(|s| s.saturating_mul(1_000)).unwrap_or(DESK_RELEASE_WINDOW_MS);
+    // Clamped: a caller-chosen window feeds `start + window_ms` and the reservation length, and
+    // release builds trap on overflow. A day is far beyond any payout schedule.
+    let window = req.release_window_s.map(|s| s.min(MAX_RELEASE_WINDOW_S).saturating_mul(1_000)).unwrap_or(DESK_RELEASE_WINDOW_MS);
     send_many_core(state, headers, req.payees, window, req.wait.unwrap_or(false)).await.map(|(r, _, _)| Json(r))
 }
 
