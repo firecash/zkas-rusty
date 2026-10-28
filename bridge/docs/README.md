@@ -1,8 +1,9 @@
 ## Stratum Bridge Beta
 
-This Stratum Bridge is currently in BETA. Support is available in the Kaspa Discord’s [#mining-and-hardware](https://discord.com/channels/599153230659846165/910178666099646584) channel.
-
-For bug reports or feature request, please open an issue at [`kaspanet/rusty-kaspa` issues](https://github.com/kaspanet/rusty-kaspa/issues) and prefix your issue title with `[Bridge]`.
+This Stratum Bridge is currently in BETA. It mines ZKas only (solo). For merged mining with
+Kaspa use the solo-dual-mode bridge (https://zkas.info/code/bridge, downloads at
+https://zkas.info/downloads/bridge/). Report bugs on Radicle (https://zkas.info/code/rusty) with
+`[Bridge]` in the title.
 
 This repository contains a standalone Stratum bridge binary at:
 
@@ -137,7 +138,7 @@ Recommended setup:
 Example (external bridge on `:3031` + Stratum `:16120`):
 
 ```bash
-cargo run -p kaspa-stratum-bridge --release --features rkstratum_cpu_miner --bin stratum-bridge -- --config config.yaml --web-dashboard-port :3031 --node-mode external --kaspad-address 127.0.0.1:16210 --instance "port=:16120,diff=1" --internal-cpu-miner --internal-cpu-miner-address "kaspatest:address" --internal-cpu-miner-threads 1
+cargo run -p kaspa-stratum-bridge --release --features rkstratum_cpu_miner --bin stratum-bridge -- --config config.yaml --web-dashboard-port :3031 --node-mode external --kaspad-address 127.0.0.1:16820 --instance "port=:16120,diff=1" --internal-cpu-miner --internal-cpu-miner-address "zkastest:YOUR_SHIELDED_ADDRESS" --internal-cpu-miner-threads 1
 ```
 
 Open:
@@ -147,7 +148,7 @@ Open:
 ### Miner / ASIC connection
 
 - **Pool URL:** `<your_pc_IPv4>:<stratum_port>` (e.g. `192.168.1.10:5555`)
-- **Username / wallet:** `kaspa:YOUR_WALLET_ADDRESS.WORKERNAME`
+- **Username / wallet:** `zkas:YOUR_SHIELDED_ADDRESS.WORKERNAME` (a block that does not pay a valid shielded `zkas:` address is rejected by consensus)
 
 #### Supported Miners
 
@@ -237,7 +238,7 @@ cargo build -p kaspa-stratum-bridge --release --features rkstratum_cpu_miner
 Run (external node mode + internal CPU miner enabled):
 
 ```bash
-cargo run -p kaspa-stratum-bridge --release --features rkstratum_cpu_miner --bin stratum-bridge -- --config bridge/config.yaml --node-mode external --internal-cpu-miner --internal-cpu-miner-address kaspa:YOUR_WALLET_ADDRESS --internal-cpu-miner-threads 1
+cargo run -p kaspa-stratum-bridge --release --features rkstratum_cpu_miner --bin stratum-bridge -- --config bridge/config.yaml --node-mode external --internal-cpu-miner --internal-cpu-miner-address zkas:YOUR_SHIELDED_ADDRESS --internal-cpu-miner-threads 1
 ```
 
 ### Testing

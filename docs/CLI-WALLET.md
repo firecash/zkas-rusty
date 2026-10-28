@@ -5,20 +5,27 @@ daemon ([WALLETD.md](WALLETD.md)) or the web/mobile wallet — this tool takes s
 single repeated byte (`[byte; 32]`) for test convenience and exists for testing and
 scripted checks, not for holding real balances.
 
+**Never put real funds on a `--seed-byte` wallet.** `--seed-byte N` builds the seed
+`[N; 32]`, which anyone can reproduce and spend from. It exists for tests only. Create a
+real wallet with `new`, keep the seed it prints secret, and pass it as `--seed-hex`.
+
 ```bash
-# Obtain your shielded address (this is what you give a sender or the miner's -a)
-./shielded-pay address --seed-byte 1 --network mainnet
-# -> zkas:pyfjy228l6gukj2vwztyq6q88eeyggjhvcuzf2jx8u4lvla42d6x0y3dsgp0w...
+# Create a wallet: a fresh random seed and its shielded address (give the address to a
+# sender or the miner's -a; keep the seed secret)
+./shielded-pay new --network mainnet
+
+# Obtain the address of an existing seed
+./shielded-pay address --seed-hex <your-64-hex-seed> --network mainnet
 
 # Check spendable balance + owned notes (scans the chain via the node RPC)
-./shielded-pay balance -s 127.0.0.1:16810 --seed-byte 1
+./shielded-pay balance -s 127.0.0.1:16810 --seed-hex <your-64-hex-seed>
 
 # Send a private payment (amount/fee in sompi; change returns to you)
-./shielded-pay send -s 127.0.0.1:16810 --owner-seed-byte 1 \
+./shielded-pay send -s 127.0.0.1:16810 --owner-seed-hex <your-64-hex-seed> \
   --to zkas:<recipient-address> --amount 500000000 --fee 3000000
 
 # Prove you control an address without spending (offline; discloses viewing key)
-./shielded-pay sign   --seed-byte 1 --network mainnet --message "gm"
+./shielded-pay sign   --seed-stdin --network mainnet --message "gm"
 ./shielded-pay verify --address zkas:<addr> --message "gm" --signature <hex>
 ```
 

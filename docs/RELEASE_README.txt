@@ -2,8 +2,8 @@
  ZKas — release binaries
 ===============================================================================
 
-This archive contains ZKas binaries for Linux x86_64, dynamically linked
-against glibc 2.34 or newer (Ubuntu 22.04+, Debian 12+). ZKas is a
+This archive contains ZKas release binaries. The Linux x86_64 build needs
+glibc 2.34 or newer (Ubuntu 22.04+, Debian 12+). ZKas is a
 shielded-by-default (Orchard / Halo 2) fork of rusty-kaspa; kHeavyHash PoW,
 1 block/second, ticker $ZKAS. 1 ZKAS = 100,000,000 sompi.
 
@@ -43,8 +43,16 @@ low-difficulty mining, not competitive hashrate.
             single-file cold-storage wallet. Save it, go offline, generate.
             Source: https://zkas.info/code/paper-wallet
 
+Mainnet needs zkas-v1.0.11 or newer: older nodes (v1.0.10 and before) stop at the
+security fork (DAA 6,983,500, 15 October 2026), and a merge-mining bridge talking to
+one gets "block has invalid proof-of-work" on every block. Releases and checksums:
+https://zkas.info/downloads/node/
+
 Quick start:
   ./kaspad --utxoindex
-  ./shielded-pay address --seed-byte 1 --network mainnet
+  ./shielded-pay new --network mainnet
+      # prints a NEW random seed and its zkas: address. Write the seed down and keep
+      # it secret: whoever has it controls the funds. Never mine to an address made
+      # with --seed-byte: that flag builds a test seed anyone can reproduce.
   ./zkas-miner -s 127.0.0.1:16810 -a zkas:<your-address> -t 4
 ===============================================================================

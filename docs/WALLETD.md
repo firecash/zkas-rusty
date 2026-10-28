@@ -96,7 +96,7 @@ lower `fee` does not save money — it just gets corrected.
 ```bash
 ./zkas-walletd \
   --network mainnet \
-  --rpc-server 127.0.0.1:16110 \
+  --rpc-server 127.0.0.1:16810 \
   --listen 127.0.0.1:8501 \
   --wallet-dir /var/lib/zkas/wallets \
   --wallet-secret "$ZKAS_WALLET_SECRET"
@@ -602,7 +602,7 @@ Also worth doing:
 ```bash
 zkas-walletd \
   --network mainnet \
-  --rpc-server 127.0.0.1:16110 \
+  --rpc-server 127.0.0.1:16810 \
   --listen 127.0.0.1:8501 \
   --wallet-dir /var/lib/zkas/wallets \
   --wallet-secret "$ZKAS_WALLET_SECRET" \
@@ -721,7 +721,7 @@ nothing is lost either way). Withdrawals: pay the customer's address like any ot
 ```bash
 zkas-walletd \
   --network mainnet \
-  --rpc-server 127.0.0.1:16110 \
+  --rpc-server 127.0.0.1:16810 \
   --listen 127.0.0.1:8501 \
   --wallet-dir /var/lib/zkas/wallets \
   --wallet-secret "$ZKAS_WALLET_SECRET" \   # MANDATORY: seeds are plaintext without it

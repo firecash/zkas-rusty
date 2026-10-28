@@ -60,14 +60,14 @@ Binaries: [Releases](https://zkas.info/downloads/node/) · to compile instead,
 see **[docs/BUILDING.md](docs/BUILDING.md)**.
 
 ```bash
-./kaspad --appdir=./zkas-node --rpclisten=127.0.0.1:16110 --utxoindex
+./kaspad --appdir=./zkas-node --rpclisten=127.0.0.1:16810 --utxoindex
 ```
 
 No peer list is needed: the node resolves the mainnet seeder `seed.zkas.info`, dials every
 address it returns on p2p port **16111**, and discovers the rest of the network through
 gossip. (`--connect=<ip>:16111` pins it to specific peers instead and skips the seeder.)
-Only outbound access to a peer's p2p **16111** is needed; keep the RPC on **16110** bound to
-loopback. Shielded note history is fetched and verified automatically after the first sync.
+Only outbound access to a peer's p2p **16111** is needed; keep the RPC on **16810** bound to
+loopback. Mainnet needs **zkas-v1.0.11 or newer** (security fork at DAA 6,983,500). Shielded note history is fetched and verified automatically after the first sync.
 
 **Node types — pruned (default), archival, and shielded-history — and every flag are
 documented in [docs/NODE.md](docs/NODE.md).** Which one you want depends on whether the
