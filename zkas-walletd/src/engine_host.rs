@@ -493,6 +493,14 @@ impl Host {
             self.wallets[i].binding = Some(b);
             return Err("checkpoint size does not match the shared tree at its cursor; left to the old path".into());
         }
+        // ZKAS-WALLETD-2026-001, engine side: a checkpoint holding a note whose nullifier this key
+        // does not derive is another wallet's (left by a re-key race, or spread by twin adoption).
+        // The old path refuses it at load (`load_checkpoint_why`); migrating it would serve the
+        // other wallet's notes, history and memos under this token. Refuse, never delete.
+        if b.nf_ok < b.notes {
+            self.wallets[i].binding = Some(b);
+            return Err("checkpoint holds notes this key does not derive; refused (left to the old path)".into());
+        }
         // Estimated final heap of an old-path twin: its own leaf stream from its base to the tip
         // (the per-wallet copy the old daemon keeps) plus its notes.
         let est = (self.tip_size_hint.saturating_sub(sp.p.base_size)) * 32 + sp.p.notes.len() as u64 * 300 + (64 << 20);
@@ -1546,6 +1554,34 @@ mod tests {
         let mut bad = bytes.clone();
         bad[4] = 9;
         assert_eq!(check(&bad), (false, false));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ZKAS-WALLETD-2026-001, engine side: the migration refuses a checkpoint unless every note's
+    /// nullifier derives under the registering key (`register_migrated`: `nf_ok < notes`). The
+    /// binding counts that per key: all of the writer's notes, none under another wallet's key.
+    #[test]
+    fn migration_binding_tells_a_foreign_checkpoint_apart() {
+        let genesis = RpcHash::from_bytes(GEN);
+        let dir = tmp("bind");
+        let (mut db, _) = seed_wallet(b"e2-bind-own", 0);
+        let (other, _) = seed_wallet(b"e2-bind-other", 0);
+        let fv = vec![db.fvk().clone()];
+        let mut r = Det::from(&[b"e2-bind"]);
+        let mut ring = VecDeque::new();
+        for b in blocks(&mut r, 40, 500, &fv, &mut Vec::new()) {
+            old_ingest(&mut db, &mut ring, &b);
+        }
+        assert!(!db.notes().is_empty());
+        let parts = checkpoint_bytes(0, &genesis, &RpcHash::from_bytes([4u8; 32]), 539, &db, &ring, 900, 77);
+        write_checkpoint_bytes(dir.to_str().unwrap(), "tok", &parts).unwrap();
+        let sp = read_scan_private(&PathBuf::from(scan_path(dir.to_str().unwrap(), "tok"))).unwrap();
+        let chain = SharedChain::from_tree(WalletDb::from_seed([7u8; 32]).unwrap());
+        let own = bind_to_chain(&sp, db.fvk(), &chain);
+        assert!(own.notes > 0 && own.nf_ok == own.notes, "the writer's key derives every nullifier");
+        let foreign = bind_to_chain(&sp, other.fvk(), &chain);
+        assert_eq!(foreign.notes, own.notes);
+        assert!(foreign.nf_ok < foreign.notes, "another key must fail the binding, so the migration refuses it");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
