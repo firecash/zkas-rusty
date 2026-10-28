@@ -5711,6 +5711,43 @@ async fn build_send_cache_off_lock(state: &Arc<AppState>, token: &str, w: &Walle
     }
 }
 
+/// The node's gRPC port for mainnet RPC.
+const ZKAS_RPC_PORT: u16 = 16110;
+
+/// `host` → `host:16110`, `[v6]` → `[v6]:16110`, a bare IPv6 → `[v6]:16110`; an address
+/// that already carries a port is returned unchanged.
+fn with_default_rpc_port(addr: &str) -> String {
+    let a = addr.trim().trim_end_matches('/');
+    let a = ["grpc://", "http://", "https://"].iter().find_map(|p| a.strip_prefix(p)).unwrap_or(a);
+    if a.starts_with('[') {
+        return if a.rsplit_once("]:").is_some_and(|(_, p)| p.parse::<u16>().is_ok()) { a.to_string() } else { format!("{a}:{ZKAS_RPC_PORT}") };
+    }
+    match a.matches(':').count() {
+        0 => format!("{a}:{ZKAS_RPC_PORT}"),
+        1 => if a.rsplit_once(':').is_some_and(|(_, p)| p.parse::<u16>().is_ok()) { a.to_string() } else { format!("{}:{ZKAS_RPC_PORT}", a.split(':').next().unwrap_or(a)) },
+        _ => format!("[{a}]:{ZKAS_RPC_PORT}"),
+    }
+}
+
+#[cfg(test)]
+mod rpc_port_tests {
+    use super::with_default_rpc_port as w;
+    #[test]
+    fn adds_the_port_only_when_missing() {
+        assert_eq!(w("seed.zkas.info"), "seed.zkas.info:16110");
+        assert_eq!(w("seed.zkas.info:16110"), "seed.zkas.info:16110");
+        assert_eq!(w("127.0.0.1:17110"), "127.0.0.1:17110");
+        assert_eq!(w("160.187.211.153"), "160.187.211.153:16110");
+        assert_eq!(w("2001:db8::1"), "[2001:db8::1]:16110");
+        assert_eq!(w("[2001:db8::1]"), "[2001:db8::1]:16110");
+        assert_eq!(w("[2001:db8::1]:17110"), "[2001:db8::1]:17110");
+        assert_eq!(w("grpc://seed.zkas.info/"), "seed.zkas.info:16110");
+        assert_eq!(w("https://seed.zkas.info"), "seed.zkas.info:16110");
+        assert_eq!(w(" seed.zkas.info:16110 "), "seed.zkas.info:16110");
+        assert_eq!(w("host.onion"), "host.onion:16110");
+    }
+}
+
 /// The two node channels, swapped together so a reconnect can never leave the
 /// request path talking to one connection and the sync loop to another.
 #[derive(Clone)]
@@ -9014,14 +9051,19 @@ async fn sync_loop(state: Arc<AppState>) {
             // one a user has open, and it must not be classed by how far behind it is.
             let watched: HashSet<String> = {
                 let now = std::time::Instant::now();
-                state
-                    .last_touch
-                    .lock()
-                    .await
-                    .iter()
-                    .filter(|(_, t)| now.duration_since(**t) < WATCHED_RECENTLY)
-                    .map(|(k, _)| k.clone())
-                    .collect()
+                let touch = state.last_touch.lock().await;
+                let recent = touch.iter().filter(|(_, t)| now.duration_since(**t) < WATCHED_RECENTLY);
+                if tip_slots <= 1 {
+                    // One tip slot (the phone profile): only the wallet opened LAST is the one
+                    // somebody is looking at. Counting every wallet touched in the last two
+                    // minutes as watched kept the wallet a user just switched AWAY from out of
+                    // the cold lane, so it held the only slot while it caught up (measured: a
+                    // wallet 1M blocks behind blocked a freshly opened one at the tip for the
+                    // whole 60 s test) and the wallet on screen did not sync at all.
+                    recent.max_by_key(|(_, t)| **t).map(|(k, _)| k.clone()).into_iter().collect()
+                } else {
+                    recent.map(|(k, _)| k.clone()).collect()
+                }
             };
             let mut wallet_tokens = wallet_tokens;
             {
@@ -9390,7 +9432,10 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Json<
     // the cached tip instantly. `node_connected` follows whether the tip is fresh.
     let (node_connected, daa_score) = {
         let (tip, at) = *state.node_tip.lock().await;
-        (at.elapsed() < std::time::Duration::from_secs(30), tip)
+        // The cache starts as (0, now): before any answer from the node, "fresh" meant
+        // nothing and status reported a connected node at height 0 for 30 s while the
+        // engine could not reach it at all.
+        (tip > 0 && at.elapsed() < std::time::Duration::from_secs(30), tip)
     };
 
     let mut resp = status_base(&state.network, node_connected, daa_score);
@@ -13861,6 +13906,11 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
     // so heavy sync traffic can't stall user wallet loads. Retry until the node is up —
     // but stay interruptible, so an embedder can cancel while the node is unreachable.
     async fn connect_node(rpc_server: &str, label: &str) -> GrpcClient {
+        // `grpc://host` with no port means port 80: the web server on the same host,
+        // which answers HTTP/1 and fails every call with an HTTP/2 FRAME_SIZE_ERROR.
+        // A node address without a port gets the node's gRPC port.
+        let rpc_server = with_default_rpc_port(rpc_server);
+        let rpc_server = rpc_server.as_str();
         loop {
             match GrpcClient::connect_with_args(
                 NotificationMode::Direct,
@@ -14154,7 +14204,23 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
                             // transport noticing. Three strikes keeps a blip from cycling it.
                             if failures >= 3 {
                                 log::warn!("node connection failed {failures} health probes ({e}); reconnecting");
-                                *state.clients.write().await = None;
+                                // The clients run with auto-reconnect, so each owns a monitor
+                                // task that keeps redialling until it is told to stop. Dropping
+                                // them without `disconnect` left every monitor running: two more
+                                // immortal connections per reconnect, which filled a public
+                                // node's 256 slots with tens of thousands from one address.
+                                let old = state.clients.write().await.take();
+                                if let Some(old) = old {
+                                    // Bounded: a shutdown that hangs must not freeze this loop,
+                                    // which is what drives the reconnect in the first place.
+                                    let stop = async {
+                                        let _ = old.request.disconnect().await;
+                                        let _ = old.sync.disconnect().await;
+                                    };
+                                    if tokio::time::timeout(std::time::Duration::from_secs(5), stop).await.is_err() {
+                                        log::warn!("old node connections did not shut down within 5s; replacing them anyway");
+                                    }
+                                }
                                 failures = 0;
                             }
                         }
