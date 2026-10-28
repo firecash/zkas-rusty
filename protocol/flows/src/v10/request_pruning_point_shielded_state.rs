@@ -15,6 +15,11 @@ use kaspa_consensus_core::{api::ShieldedExportMetadata, errors::consensus::Conse
 /// deliberate contrast to the history flow beside it, which documents exactly why it needs one. An
 /// honest syncer makes this request once, so the spacing costs it nothing.
 const SHIELDED_STATE_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Longest the server spends SENDING one flow-control window (`SMT_FLOW_CONTROL_WINDOW` chunks,
+/// about 1.3 MB), export slot held. A window takes an honest peer well under a second; a peer
+/// that reads slower than ~11 KB/s is holding a node-wide slot on purpose, and is dropped.
+const EXPORT_WINDOW_SEND_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
 use kaspa_core::{debug, info};
 use kaspa_hashes::Hash;
 use kaspa_p2p_lib::{
@@ -99,17 +104,28 @@ impl RequestPruningPointShieldedStateFlow {
                 }
             }
             last_served = Some(std::time::Instant::now());
-            // At most `MAX_CONCURRENT_SHIELDED_EXPORTS` exports per node (spec 08 R3.3). A requester
-            // that has to wait past its timeout tries another source, which is the "busy" answer an
-            // older requester also understands.
-            let permits = self.ctx.shielded_export_permits();
-            let _permit = permits.acquire_owned().await.map_err(|_| ProtocolError::Other("shielded export gate closed"))?;
+            // One export per peer address at a time: a host with several connections must not take
+            // several of the node-wide slots below.
+            let ip = self.router.net_address().ip();
+            let Some(_ip_claim) = self.ctx.claim_shielded_export_ip(ip) else {
+                return Err(ProtocolError::Other("a shielded export to this peer address is already running"));
+            };
             self.handle_request(request).await?
         }
     }
 
+    /// One of the node-wide export slots (`MAX_CONCURRENT_SHIELDED_EXPORTS`, spec 08 R3.3). A
+    /// requester that has to wait past its timeout tries another source, which is the "busy"
+    /// answer an older requester also understands.
+    async fn acquire_export_slot(&self) -> Result<tokio::sync::OwnedSemaphorePermit, ProtocolError> {
+        self.ctx.shielded_export_permits().acquire_owned().await.map_err(|_| ProtocolError::Other("shielded export gate closed"))
+    }
+
     async fn handle_request(&mut self, req: ExportRequest) -> Result<(), ProtocolError> {
         let ExportRequest { pp: expected_pp, from, before, with_metadata, ranged } = req;
+        // Held while this export reads and sends; released while it waits for the peer.
+        let mut slot = Some(self.acquire_export_slot().await?);
+        let mut window_started = std::time::Instant::now();
         let consensus = self.ctx.consensus();
         let mut nullifier_count: Option<u64> = None;
         if with_metadata {
@@ -164,17 +180,29 @@ impl RequestPruningPointShieldedStateFlow {
         while let Some(batch) = next {
             let nullifiers: Vec<Vec<u8>> = batch.into_iter().map(|nf| nf.to_vec()).collect();
             let chunk_len = nullifiers.len() as u64;
-            self.router
-                .enqueue_paced(make_message!(Payload::ShieldedNullifierChunk, ShieldedNullifierChunkMessage { nullifiers }))
-                .await?;
+            // Paced: waits while this peer's backlog drains. Bounded per window, so a peer that
+            // reads a trickle cannot hold the slot.
+            let budget = EXPORT_WINDOW_SEND_DEADLINE.saturating_sub(window_started.elapsed());
+            match tokio::time::timeout(
+                budget,
+                self.router.enqueue_paced(make_message!(Payload::ShieldedNullifierChunk, ShieldedNullifierChunkMessage { nullifiers })),
+            )
+            .await
+            {
+                Ok(sent_ok) => sent_ok?,
+                Err(_) => return Err(ProtocolError::Timeout(EXPORT_WINDOW_SEND_DEADLINE)),
+            }
 
             sent += chunk_len;
             chunks_sent += 1;
 
             next = rx.recv().await;
             if (next.is_some() || ranged) && chunks_sent.is_multiple_of(SMT_FLOW_CONTROL_WINDOW) {
-                // Bounded: see `EXPORT_NEXT_WINDOW_TIMEOUT`.
+                // Bounded: see `EXPORT_NEXT_WINDOW_TIMEOUT`. The slot is free while the peer imports.
+                drop(slot.take());
                 dequeue_with_timeout!(self.incoming_route, Payload::RequestNextPruningPointShieldedChunk, EXPORT_NEXT_WINDOW_TIMEOUT)?;
+                slot = Some(self.acquire_export_slot().await?);
+                window_started = std::time::Instant::now();
             }
         }
 

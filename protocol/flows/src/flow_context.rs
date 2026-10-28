@@ -80,9 +80,25 @@ pub(crate) fn advertises_newer_release_of_ours(user_agent: &str) -> bool {
 }
 
 /// Concurrent pruning-point nullifier exports one node serves (spec 08 R3.3). Each one walks the
-/// whole set from a database snapshot; a third requester waits (and past its timeout, tries another
-/// peer) instead of adding a third full read.
-pub const MAX_CONCURRENT_SHIELDED_EXPORTS: usize = 2;
+/// whole set from a database snapshot; a requester past the limit waits (and past its timeout,
+/// tries another peer) instead of adding another full read. A slot is held only while the export
+/// reads and sends, never while it waits for the peer, and one peer address holds at most one, so
+/// a host that asks and then stalls cannot keep every syncing node out (it could with 2 slots and
+/// no per-address limit: two connections, never ask for the next window, reconnect).
+pub const MAX_CONCURRENT_SHIELDED_EXPORTS: usize = 4;
+
+/// A running nullifier export's claim on its peer address (see
+/// [`FlowContext::claim_shielded_export_ip`]).
+pub struct ShieldedExportIpClaim {
+    ctx: FlowContext,
+    ip: std::net::IpAddr,
+}
+
+impl Drop for ShieldedExportIpClaim {
+    fn drop(&mut self) {
+        self.ctx.inner.shielded_export_ips.lock().remove(&self.ip);
+    }
+}
 
 /// See `check_orphan_resolution_range`
 const BASELINE_ORPHAN_RESOLUTION_RANGE: u32 = 5;
@@ -320,6 +336,9 @@ pub struct FlowContextInner {
     /// At most this many pruning-point nullifier exports at once (N1, spec 08 R3.3).
     shielded_export_permits: Arc<tokio::sync::Semaphore>,
 
+    /// Peer addresses with a nullifier export running: one per address at a time.
+    shielded_export_ips: Mutex<std::collections::HashSet<std::net::IpAddr>>,
+
     /// IBD flows of peers that serve ranged nullifier streams and are idle, by peer: a range-split
     /// import hands them one range at a time (N1, spec 08 R3.4.1).
     shielded_range_helpers: Mutex<HashMap<PeerKey, tokio::sync::mpsc::Sender<crate::ibd::ShieldedRangeJob>>>,
@@ -443,6 +462,7 @@ impl FlowContext {
                 auto_ban_budget: Default::default(),
                 proof_serve_gate: Default::default(),
                 shielded_export_permits: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SHIELDED_EXPORTS)),
+                shielded_export_ips: Default::default(),
                 shielded_range_helpers: Default::default(),
                 shielded_import_suspects: Default::default(),
                 verify_budget_params: crate::verify_budget::BudgetParams::for_cores(crate::verify_budget::default_verify_cores()),
@@ -496,6 +516,12 @@ impl FlowContext {
     /// The gate on concurrent pruning-point nullifier exports (N1, spec 08 R3.3).
     pub fn shielded_export_permits(&self) -> Arc<tokio::sync::Semaphore> {
         self.inner.shielded_export_permits.clone()
+    }
+
+    /// Claim the one export an address may run at a time; `None` if one is already running.
+    /// Released when the returned claim drops.
+    pub fn claim_shielded_export_ip(&self, ip: std::net::IpAddr) -> Option<ShieldedExportIpClaim> {
+        self.inner.shielded_export_ips.lock().insert(ip).then(|| ShieldedExportIpClaim { ctx: self.clone(), ip })
     }
 
     pub fn block_invs_channel_size(&self) -> usize {
