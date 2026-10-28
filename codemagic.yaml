@@ -73,6 +73,8 @@ workflows:
     artifacts:
       - out/*
 
+  # Needs a paid Codemagic plan (Windows machines are not on the free one); until then Windows
+  # builds with contrib/build/build-node-windows.sh on the build box.
   windows-node:
     name: Windows node
     instance_type: windows_x2
@@ -109,7 +111,7 @@ workflows:
           # Every exe may import only Windows system DLLs (no MinGW runtime, no VC++ redistributable:
           # .cargo/config.toml builds with +crt-static), and must start on this machine.
           $readobj = Get-ChildItem "$env:USERPROFILE\.rustup\toolchains" -Recurse -Filter llvm-readobj.exe | Select-Object -First 1
-          $ok = '^(kernel32|user32|gdi32|advapi32|shell32|ole32|oleaut32|ws2_32|ntdll|bcrypt|bcryptprimitives|crypt32|secur32|userenv|shlwapi|version|winmm|iphlpapi|setupapi|cfgmgr32|dbghelp|powrprof|psapi|rpcrt4|wininet|winhttp|dnsapi|ncrypt|mswsock|credui|msimg32|opengl32|winspool|comdlg32|api-ms-win-[a-z0-9-]+)\.dll$'
+          $ok = '^(kernel32|user32|gdi32|advapi32|shell32|ole32|oleaut32|ws2_32|ntdll|bcrypt|bcryptprimitives|crypt32|secur32|userenv|shlwapi|version|winmm|iphlpapi|setupapi|cfgmgr32|dbghelp|powrprof|psapi|pdh|rpcrt4|wininet|winhttp|dnsapi|ncrypt|mswsock|credui|msimg32|opengl32|winspool|comdlg32|api-ms-win-[a-z0-9-]+)\.dll$'
           foreach ($b in $bins) {
             $dlls = & $readobj.FullName --coff-imports "bin\$b.exe" | Select-String '^\s*Name: (.+)$' | ForEach-Object { $_.Matches[0].Groups[1].Value.ToLower() } | Sort-Object -Unique
             $bad = $dlls | Where-Object { $_ -notmatch $ok }

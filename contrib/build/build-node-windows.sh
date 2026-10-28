@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 # Windows x86_64 node release archive, cross-compiled on the 142 build box from one exact commit.
 #
-# NOT the release path: releases build natively with MSVC on Codemagic (codemagic.yaml,
-# workflow "Windows node"), as the GitLab release:win64 job did. This cross-build currently stops at
-# the link step (risc0-zkvm-platform references sys_alloc_aligned, which only a zkVM guest defines);
-# kept for development.
+# The release path while a native Windows runner is unavailable (Codemagic's "Windows node"
+# workflow in codemagic.yaml needs a paid plan). Same compiler, MSVC CRT (static) and Windows SDK
+# libraries as a native build; lld-link instead of link.exe.
 #
 #   contrib/build/build-node-windows.sh <tag> [<commit>]      e.g. zkas-v1.0.13
 #
@@ -55,10 +54,10 @@ SHA="$(git -C "$WORK" rev-parse HEAD)"
 echo "building $TAG = $SHA for $RUST_TARGET"
 
 cd "$WORK"
-for pb in "${BINS[@]}"; do
-  nice -n 19 cargo xwin build --locked --release -j "$JOBS" --target "$RUST_TARGET" \
-    -p "${pb%%:*}" --bin "${pb##*:}" --features kaspa-hashes/no-asm
-done
+# One invocation: `--features kaspa-hashes/no-asm` must name a selected package, and selecting
+# kaspa-hashes makes its pure-Rust keccak (identical output) apply to the whole graph.
+args=(-p kaspa-hashes); for pb in "${BINS[@]}"; do args+=(-p "${pb%%:*}" --bin "${pb##*:}"); done
+nice -n 19 cargo xwin build --locked --release -j "$JOBS" --target "$RUST_TARGET" "${args[@]}" --features kaspa-hashes/no-asm
 
 OUT="$CI_ROOT/out/node-$VER"
 PKG="$OUT/win64"
@@ -69,7 +68,7 @@ cp docs/RELEASE_README.txt "$PKG/bin/README.txt"
 # Every exe must import only system DLLs (and the MSVC runtime), nothing we would have to ship.
 for exe in "$PKG"/bin/*.exe; do
   DLLS="$(llvm-readobj --coff-imports "$exe" | sed -n 's/^ *Name: //p' | sort -u)"
-  BAD="$(echo "$DLLS" | grep -i -v -E '^(kernel32|user32|gdi32|advapi32|shell32|ole32|oleaut32|ws2_32|ntdll|bcrypt|bcryptprimitives|pdh|crypt32|secur32|userenv|shlwapi|version|winmm|iphlpapi|setupapi|cfgmgr32|dbghelp|powrprof|psapi|rpcrt4|wininet|winhttp|dnsapi|ncrypt|mswsock|api-ms-win-[a-z0-9-]+|vcruntime140(_1)?|msvcp140|ucrtbase)\.dll$' || true)"
+  BAD="$(echo "$DLLS" | grep -i -v -E '^(kernel32|user32|gdi32|advapi32|shell32|ole32|oleaut32|ws2_32|ntdll|bcrypt|bcryptprimitives|pdh|crypt32|secur32|userenv|shlwapi|version|winmm|iphlpapi|setupapi|cfgmgr32|dbghelp|powrprof|psapi|pdh|rpcrt4|wininet|winhttp|dnsapi|ncrypt|mswsock|api-ms-win-[a-z0-9-]+|vcruntime140(_1)?|msvcp140|ucrtbase)\.dll$' || true)"
   [ -z "$BAD" ] || { echo "UNEXPECTED DLL imports in $(basename "$exe"):"; echo "$BAD"; exit 4; }
   echo "$(basename "$exe"): $(echo "$DLLS" | tr '\n' ' ')"
 done
