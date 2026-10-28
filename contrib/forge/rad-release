@@ -1,0 +1,26 @@
+#!/bin/bash
+# rad-release <version> : Radicle release for zkas-wallet tag v<version> from /root/release-files/<version>
+set -euo pipefail
+V=$1; D=/root/release-files/$V; REV=v$V
+export PATH=/root/.radicle/bin:$PATH RAD_PASSPHRASE="$(cat /root/.radicle-passphrase)"
+cd /root/repos/zkas-wallet
+label() { case "$1" in
+  *-windows-x86_64-setup.exe) echo "Windows (64-bit installer)";; *-macos-aarch64.dmg) echo "macOS Apple Silicon (.dmg)";;
+  *-macos-aarch64.zip) echo "macOS Apple Silicon (.zip)";; *-macos-x86_64.dmg) echo "macOS Intel (.dmg)";;
+  *-macos-x86_64.zip) echo "macOS Intel (.zip)";; *-linux-x86_64.AppImage) echo "Linux (AppImage)";;
+  *-linux-x86_64.deb) echo "Linux (.deb)";; *-android.apk) echo "Android (APK)";; *-web.tgz) echo "Web app bundle";; *) echo "$1";; esac; }
+# First entry: the zkas.info release page (SHA256SUMS as the content, the page as its location),
+# because a Radicle release has no description field of its own.
+P="https://zkas.info/downloads/wallet/$V/"
+cid=$(rad-artifact cid "$D/SHA256SUMS" | tail -1 | awk '{print $NF}')
+rad-artifact register "$D/SHA256SUMS" --revision "$REV" -n "Release page: all downloads + SHA256SUMS → $P" --no-input >/dev/null
+rad-artifact location add --revision "$REV" --cid "$cid" "$P" >/dev/null
+rad-artifact location add --revision "$REV" --cid "$cid" "${P}SHA256SUMS" >/dev/null
+for f in "$D"/ZKas-Wallet-*; do
+  n=$(basename "$f"); cid=$(rad-artifact cid "$f" | tail -1 | awk '{print $NF}')
+  rad-artifact register "$f" --revision "$REV" -n "$(label "$n") — $n" --no-input >/dev/null
+  rad-artifact location add --revision "$REV" --cid "$cid" "https://zkas.info/downloads/wallet/$V/$n" >/dev/null
+  echo "registered $n $cid"
+done
+rad sync --announce 2>&1 | tail -1
+rad-artifact show "$REV" 2>&1 | head -40
