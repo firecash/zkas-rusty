@@ -15,6 +15,9 @@
 //!   for block processing;
 //! - a **per-peer** bucket: outbound rate `g/4` burst `g`; inbound rate `g/16` burst `g/4`; a NEW
 //!   inbound peer gets burst `g/64` until it has been connected [`TRUST_RAMP`] (trust ramp);
+//!   a bundle costing more than a bucket's burst is admitted when the bucket is full and leaves
+//!   it in debt (see [`TokenBucket::try_take`]), so any legal bundle can be admitted from any
+//!   peer, at the bucket's rate;
 //! - when a bucket is empty the peer's shielded transactions wait at most [`MAX_BUDGET_WAIT`] and are
 //!   then dropped silently (not misbehaviour: an honest peer can be faster than our budget).
 //!
@@ -71,10 +74,16 @@ impl TokenBucket {
         self.burst
     }
 
-    /// Take `n` tokens if available.
+    /// Take `n` tokens if available. A cost above the burst can never be "available", so it is
+    /// admitted when the bucket is FULL and leaves it in debt (negative tokens) that the rate pays
+    /// back first. Without this, every bundle costing more than a burst was dropped forever: on a
+    /// box with up to 5 cores (g <= 1,000) even a 1-action bundle (17 VU) from a new inbound peer
+    /// (burst g/64 <= 15.6), and on 1-2 cores any bundle above ~170 actions from any inbound peer.
+    /// Sustained work stays bounded by the rate; the most one admission can overshoot the burst
+    /// is its own cost.
     pub fn try_take(&mut self, n: f64, now: Instant) -> bool {
         self.refill(now);
-        if self.tokens >= n {
+        if self.tokens >= n.min(self.burst) {
             self.tokens -= n;
             true
         } else {
@@ -87,16 +96,15 @@ impl TokenBucket {
         self.tokens = (self.tokens + n).min(self.burst);
     }
 
-    /// How long until `n` tokens are available; `None` if `n` exceeds the burst (never).
+    /// How long until [`Self::try_take`] would admit `n` (a cost above the burst waits for a full
+    /// bucket). Always `Some`; kept as an `Option` for its callers.
     pub fn time_until(&mut self, n: f64, now: Instant) -> Option<Duration> {
         self.refill(now);
-        if n > self.burst {
-            return None;
-        }
-        if self.tokens >= n {
+        let need = n.min(self.burst);
+        if self.tokens >= need {
             return Some(Duration::ZERO);
         }
-        Some(Duration::from_secs_f64((n - self.tokens) / self.rate))
+        Some(Duration::from_secs_f64((need - self.tokens) / self.rate))
     }
 }
 
@@ -187,6 +195,29 @@ pub fn charge(peer: &mut PeerBudget, global: &mut TokenBucket, vu: f64, now: Ins
 mod tests {
     use super::*;
 
+    /// On the smallest boxes every peer, new inbound included, can get one shielded transaction
+    /// of any legal size verified, at once and again after the trust ramp.
+    #[test]
+    fn a_small_box_admits_any_legal_bundle_from_every_peer() {
+        let t0 = Instant::now();
+        for cores in [1, 2, 3] {
+            let params = BudgetParams::for_cores(cores);
+            for outbound in [false, true] {
+                for n in [1usize, 2, 38, kaspa_shielded_core::bundle::MAX_ACTIONS_PER_BUNDLE] {
+                    let mut global = params.global_bucket(t0);
+                    let mut peer = PeerBudget::new(&params, outbound, t0);
+                    assert_eq!(charge(&mut peer, &mut global, verify_units(n), t0), Admission::Admitted, "cores {cores}, outbound {outbound}, {n} actions, new peer");
+                    // The ramp raises the burst at TRUST_RAMP; the bucket then refills to it.
+                    let mut peer = PeerBudget::new(&params, outbound, t0);
+                    peer.burst(t0 + TRUST_RAMP);
+                    let later = t0 + TRUST_RAMP + Duration::from_secs(3600);
+                    let mut global = params.global_bucket(later);
+                    assert_eq!(charge(&mut peer, &mut global, verify_units(n), later), Admission::Admitted, "cores {cores}, outbound {outbound}, {n} actions, after the ramp");
+                }
+            }
+        }
+    }
+
     #[test]
     fn verify_units_follow_the_measured_fit() {
         assert_eq!(verify_units(1), 17.0);
@@ -221,7 +252,9 @@ mod tests {
         let mut peer = PeerBudget::new(&params, false, t0);
         let secs = 60;
         let admitted = offer(&mut peer, &mut global, t0, secs, 1_360, 2);
-        let bound = params.global_rate / 64.0 + params.global_rate / 16.0 * secs as f64;
+        // burst + rate x time, plus at most one bundle: a full bucket admits a bundle larger than
+        // its burst (here 18 VU > g/64 = 15.6) into debt (`TokenBucket::try_take`).
+        let bound = params.global_rate / 64.0 + params.global_rate / 16.0 * secs as f64 + verify_units(2);
         assert!(admitted <= bound + 1.0, "admitted {admitted} VU > bound {bound}");
         let offered = 1_360.0 * secs as f64 * verify_units(2);
         assert!(admitted / offered < 0.01, "a flooder gets < 1% of what it offers ({admitted} of {offered})");
