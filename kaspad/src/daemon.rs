@@ -354,7 +354,7 @@ pub fn create_core_with_runtime(runtime: &Runtime, args: &Args, fd_total_budget:
     let db_dir = app_dir.join(network.to_prefixed()).join(DEFAULT_DATA_DIR);
 
     // Print package name and version
-    info!("{} v{}", env!("CARGO_PKG_NAME"), git::with_short_hash(version()));
+    info!("{} v{} (zkas-v{})", env!("CARGO_PKG_NAME"), git::with_short_hash(version()), kaspa_core::kaspad_env::zkas_release());
 
     assert!(!db_dir.to_str().unwrap().is_empty());
     info!("Application directory: {}", app_dir.display());

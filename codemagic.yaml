@@ -37,6 +37,10 @@ workflows:
               cargo build --locked --release --target "$TRIPLE" -p "${pb%%:*}" --bin "${pb##*:}"
               cp "target/$TRIPLE/release/${pb##*:}" "pkg-$NAME/bin/"
             done
+            if [ "$NAME" = osx-arm64 ] && [ -n "${CM_TAG:-}" ]; then
+              KV="$("pkg-$NAME/bin/kaspad" --version || true)"; echo "$KV"
+              case "$KV" in *"($CM_TAG)"*) ;; *) echo "kaspad reports $KV, not $CM_TAG" >&2; exit 5 ;; esac
+            fi
             cp docs/RELEASE_README.txt "pkg-$NAME/bin/README.txt"
             # Ad-hoc signatures (Apple Silicon refuses unsigned binaries); notarization needs an
             # Apple Developer account.

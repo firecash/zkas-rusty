@@ -29,6 +29,10 @@ export PATH="/root/.cargo/bin:/usr/lib/llvm-14/bin:$PATH"
 export CARGO_TARGET_DIR="$CI_ROOT/target-node-windows"
 # aws-lc-sys: use its bundled pre-assembled objects instead of needing nasm.
 export AWS_LC_SYS_PREBUILT_NASM=1
+# The Visual Studio 2019 (16) CRT/STL headers: the current ones (17) refuse any Clang older than 19
+# ("STL1000: Unexpected compiler version"), and the box has Clang 14. Only C++ dependencies
+# (RocksDB) notice; a separate cache dir keeps the wallet build's v17 download untouched.
+export XWIN_VERSION=16 XWIN_CACHE_DIR="${XWIN_CACHE_DIR:-/root/.cache/cargo-xwin-16}"
 
 missing=""
 command -v cargo-xwin >/dev/null || missing="$missing cargo-xwin"

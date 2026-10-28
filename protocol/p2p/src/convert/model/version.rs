@@ -1,6 +1,6 @@
 use kaspa_consensus_core::subnets::SubnetworkId;
 use kaspa_core::{
-    kaspad_env::{name, version},
+    kaspad_env::{name, version, zkas_name, zkas_release},
     time::unix_now,
 };
 use kaspa_utils::networking::{NetAddress, PeerId};
@@ -35,7 +35,7 @@ impl Version {
             timestamp: unix_now(),
             address,
             id,
-            user_agent: format!("/{}:{}/", name(), version()),
+            user_agent: format!("/{}:{}/{}:{}/", name(), version(), zkas_name(), zkas_release()),
             disable_relay_tx: false,
             subnetwork_id,
         }

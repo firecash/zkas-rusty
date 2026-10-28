@@ -67,8 +67,16 @@ const PROTOCOL_VERSION: u32 = 10;
 /// Whether a peer that relayed an invalid shielded proof is exempt from the ban (N1, spec 08
 /// R1.4.4): it advertises a protocol version above ours, or a newer release of this node software.
 pub(crate) fn shielded_proof_ban_exempt(peer_protocol_version: u32, user_agent: &str) -> bool {
-    peer_protocol_version > PROTOCOL_VERSION
-        || crate::user_agent_rule::advertises_newer_release(user_agent, kaspa_core::kaspad_env::name(), kaspa_core::kaspad_env::version())
+    peer_protocol_version > PROTOCOL_VERSION || advertises_newer_release_of_ours(user_agent)
+}
+
+/// Whether `user_agent` names a newer release of this node software: a newer upstream `kaspad`
+/// version, or a newer ZKas release (`zkas:<release>`). Every ZKas release before v1.0.13
+/// advertised only `kaspad:2.0.1`, so comparing that alone never saw a newer ZKas release.
+pub(crate) fn advertises_newer_release_of_ours(user_agent: &str) -> bool {
+    use kaspa_core::kaspad_env::{name, version, zkas_name, zkas_release};
+    crate::user_agent_rule::advertises_newer_release(user_agent, name(), version())
+        || crate::user_agent_rule::advertises_newer_release(user_agent, zkas_name(), zkas_release())
 }
 
 /// Concurrent pruning-point nullifier exports one node serves (spec 08 R3.3). Each one walks the
@@ -593,7 +601,7 @@ impl FlowContext {
         };
         if fork_reject {
             let user_agent = &router.properties().user_agent;
-            if crate::user_agent_rule::advertises_newer_release(user_agent, kaspa_core::kaspad_env::name(), kaspa_core::kaspad_env::version()) {
+            if advertises_newer_release_of_ours(user_agent) {
                 info!(
                     "P2P, not auto-banning peer {} ({}): it runs a newer release ({}), so this node may be the one behind",
                     router, reason, user_agent
@@ -1188,6 +1196,11 @@ mod n1_tests {
         assert!(shielded_proof_ban_exempt(PROTOCOL_VERSION + 1, &same), "newer protocol: exempt");
         assert!(shielded_proof_ban_exempt(PROTOCOL_VERSION, &format!("/{name}:999.0.0/")), "newer release: exempt");
         assert!(!shielded_proof_ban_exempt(PROTOCOL_VERSION, "/someone-else:999.0.0/"), "another software's version is not ours");
+        // ZKas releases share the upstream kaspad version, so the zkas segment decides.
+        let zkas = kaspa_core::kaspad_env::zkas_release();
+        assert!(!shielded_proof_ban_exempt(PROTOCOL_VERSION, &format!("/{name}:{ours}/zkas:{zkas}/")), "same ZKas release: banned");
+        assert!(shielded_proof_ban_exempt(PROTOCOL_VERSION, &format!("/{name}:{ours}/zkas:999.0.0/")), "newer ZKas release: exempt");
+        assert!(!shielded_proof_ban_exempt(PROTOCOL_VERSION, &format!("/{name}:{ours}/zkas:1.0.0/")), "older ZKas release: banned");
         assert!(!ProtocolError::InvalidShieldedProof("x".into()).is_auto_ban_eligible());
         assert!(Config::new(kaspa_consensus_core::config::params::MAINNET_PARAMS).ban_invalid_shielded_proofs, "on by default");
     }

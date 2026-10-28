@@ -250,7 +250,7 @@ pub fn cli() -> Command {
     #[allow(clippy::let_and_return)]
     let cmd = Command::new("kaspad")
         .about(format!("{} (rusty-kaspa) v{}", env!("CARGO_PKG_DESCRIPTION"), version()))
-        .version(env!("CARGO_PKG_VERSION"))
+        .version(kaspa_core::kaspad_env::full_version())
         .arg(arg!(-C --configfile <CONFIG_FILE> "Path of config file.").env("KASPAD_CONFIGFILE"))
         .arg(arg!(-b --appdir <DATA_DIR> "Directory to store data.").env("KASPAD_APPDIR"))
         .arg(arg!(--logdir <LOG_DIR> "Directory to log output.").env("KASPAD_LOGDIR"))

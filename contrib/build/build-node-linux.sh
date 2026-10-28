@@ -45,7 +45,9 @@ PKG="$OUT/linux-amd64"
 rm -rf "$PKG" && mkdir -p "$PKG/bin"
 for pb in "${BINS[@]}"; do cp "$CARGO_TARGET_DIR/release/${pb##*:}" "$PKG/bin/"; done
 cp docs/RELEASE_README.txt "$PKG/bin/README.txt"
-"$PKG/bin/kaspad" --version || true   # prints the version, then exits 1
+KV="$("$PKG/bin/kaspad" --version || true)"   # prints the version, then exits 1
+echo "$KV"
+case "$KV" in *"(zkas-v$VER)"*) ;; *) echo "kaspad reports \"$KV\", not zkas-v$VER: bump kaspad_env::zkas_release" >&2; exit 5 ;; esac
 echo "glibc floor: $(objdump -T "$PKG/bin/kaspad" | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1)"
 
 ARCHIVE="zkas-$TAG-linux-amd64.zip"
