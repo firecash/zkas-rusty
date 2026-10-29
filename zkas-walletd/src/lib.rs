@@ -7611,53 +7611,76 @@ impl AppState {
                         // (its size can never match another block's) and sent BOTH wallets back
                         // to a birthday rescan on every load — the daily mass-rescan source, and
                         // the 20,087-iteration loop described below.
-                        let twin_tip = match self.frontier_at_checkpoint_cursor(token, &genesis).await {
-                            Ok(t) => t,
+                        match self.frontier_at_checkpoint_cursor(token, &genesis).await {
+                            // A twin is an OPTIMISATION, so failing to verify one must never cost this
+                            // wallet the checkpoint it loaded and verified a few lines up. This arm used
+                            // to `return None` from the whole load, so a wallet whose own checkpoint had
+                            // just been ACCEPTED (`ResumeWithoutBind`, the v1.0.13 fix) never opened, and
+                            // the ~1 Hz client poll repeated the same sequence for ever: the log shows its
+                            // own checkpoint resuming one second and the twin declining the next, which is
+                            // "still stuck in the opening loop after updating to 1.0.13".
+                            //
+                            // `put_back(); mine` is precisely what BOTH decline arms below already do —
+                            // only this one was missed. Every error reaching here is a reason to decline
+                            // the DONOR, not to fail the load: no node connection, a timed-out
+                            // verification, or a node that will not vouch for a frontier in history it got
+                            // from peers (`PEER_SUPPLIED_HISTORY`). Adopting an unverifiable donor unbound
+                            // in that last case would be a separate, deliberate trust decision; declining
+                            // costs only the donor's extra progress, which the next load reconsiders.
                             Err(e) => {
-                                log::warn!("wallet {token_p}: cannot verify the adopted twin checkpoint ({e}); retrying later", token_p = log_pseudonym(&token));
-                                put_back();
-                                return None;
-                            }
-                        };
-                        match load_checkpoint(&self.wallet_dir, token, key, &genesis, twin_tip.as_ref()) {
-                            Some(restored) => {
-                                log::info!(
-                                    "wallet {token_p}: adopted checkpoint from twin token {donor_p} (birthday {keep_birthday}) instead of rescanning from {birthday}", token_p = log_pseudonym(&token), donor_p = log_pseudonym(&donor));
-                                if set_aside {
-                                    let _ = std::fs::remove_file(&own_aside);
-                                }
-                                Some(restored)
-                            }
-                            None => {
-                                // The donor's checkpoint is no better than the one just
-                                // rejected — twins share a viewing key, so they share a
-                                // cursor, and a cursor that has left the selected chain has
-                                // left it for BOTH of them.
-                                //
-                                // `adopt_twin_checkpoint` cannot see that: it runs on a
-                                // blocking thread and the test needs the node. So it copies
-                                // the donor's file into place and only then is the copy
-                                // rejected — leaving a known-bad checkpoint as THIS wallet's
-                                // own. The next load rejects it, adopts the twin again, and
-                                // so on: measured on the public daemon, one wallet did this
-                                // 20,087 times over 30 hours and never once completed a scan.
-                                // A wallet that cannot finish a scan cannot see the notes
-                                // being paid to it, so money arrived on-chain and never
-                                // appeared in the app.
-                                //
-                                // Discard the copy. Scanning from scratch is slow; looping
-                                // forever is permanent.
+                                // Discard the copy adoption left at the live name, exactly as the
+                                // "rejected too" arm below does: with no own checkpoint to put back,
+                                // keeping it would leave an unverified donor file as this wallet's own.
                                 let scan = scan_path(&self.wallet_dir, token);
-                                if std::fs::remove_file(&scan).is_ok() {
-                                    log::warn!(
-                                        "wallet {token_p}: twin {donor_p}'s checkpoint was rejected too (same cursor); discarded it{}",
-                                        if set_aside { " and kept its own" } else { " and scanning clean" }, token_p = log_pseudonym(&token), donor_p = log_pseudonym(&donor));
-                                }
-                                // Its own checkpoint, if it had one, was verified above and is
-                                // still the best this wallet has.
+                                let _ = std::fs::remove_file(&scan);
+                                log::warn!(
+                                    "wallet {token_p}: could not verify twin {donor_p}'s checkpoint ({e}); declined it{}",
+                                    if set_aside { " and kept its own" } else { " and scanning clean" },
+                                    token_p = log_pseudonym(&token),
+                                    donor_p = log_pseudonym(&donor));
                                 put_back();
                                 mine
                             }
+                            Ok(twin_tip) => match load_checkpoint(&self.wallet_dir, token, key, &genesis, twin_tip.as_ref()) {
+                                Some(restored) => {
+                                    log::info!(
+                                        "wallet {token_p}: adopted checkpoint from twin token {donor_p} (birthday {keep_birthday}) instead of rescanning from {birthday}", token_p = log_pseudonym(&token), donor_p = log_pseudonym(&donor));
+                                    if set_aside {
+                                        let _ = std::fs::remove_file(&own_aside);
+                                    }
+                                    Some(restored)
+                                }
+                                None => {
+                                    // The donor's checkpoint is no better than the one just
+                                    // rejected — twins share a viewing key, so they share a
+                                    // cursor, and a cursor that has left the selected chain has
+                                    // left it for BOTH of them.
+                                    //
+                                    // `adopt_twin_checkpoint` cannot see that: it runs on a
+                                    // blocking thread and the test needs the node. So it copies
+                                    // the donor's file into place and only then is the copy
+                                    // rejected — leaving a known-bad checkpoint as THIS wallet's
+                                    // own. The next load rejects it, adopts the twin again, and
+                                    // so on: measured on the public daemon, one wallet did this
+                                    // 20,087 times over 30 hours and never once completed a scan.
+                                    // A wallet that cannot finish a scan cannot see the notes
+                                    // being paid to it, so money arrived on-chain and never
+                                    // appeared in the app.
+                                    //
+                                    // Discard the copy. Scanning from scratch is slow; looping
+                                    // forever is permanent.
+                                    let scan = scan_path(&self.wallet_dir, token);
+                                    if std::fs::remove_file(&scan).is_ok() {
+                                        log::warn!(
+                                            "wallet {token_p}: twin {donor_p}'s checkpoint was rejected too (same cursor); discarded it{}",
+                                            if set_aside { " and kept its own" } else { " and scanning clean" }, token_p = log_pseudonym(&token), donor_p = log_pseudonym(&donor));
+                                    }
+                                    // Its own checkpoint, if it had one, was verified above and is
+                                    // still the best this wallet has.
+                                    put_back();
+                                    mine
+                                }
+                            },
                         }
                     }
                     // No twin was adopted after all: `adopt_twin` applies the history and
