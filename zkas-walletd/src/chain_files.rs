@@ -52,7 +52,15 @@ const MANIFEST_TTL: std::time::Duration = std::time::Duration::from_secs(600);
 /// re-asked: 72 manifest requests and 144 warnings in 90 s against a refused mirror.
 const MANIFEST_RETRY: std::time::Duration = std::time::Duration::from_secs(60);
 const MAGIC: &[u8; 8] = b"ZKASSEG1";
-const MANIFEST_VERSION: u32 = 1;
+/// 2 since the signed manifest. The segment files did not change; the number did so that the
+/// 1.0.52-rc20 client — whose shared-cursor cache re-downloaded segments in a loop when two
+/// wallets synced at different heights — refuses the published manifest and reads from the
+/// node instead, which is correct, only slower. Version-1 manifests are upgraded on export.
+const MANIFEST_VERSION: u32 = 2;
+/// The published manifest's file name. Not `manifest.json`: rc20 refetches a manifest it
+/// refuses on EVERY page (it has no back-off), so the old name is retired to a tiny 404 rather
+/// than left serving a 200 KB file rc20 would download and reject in a loop.
+pub const MANIFEST_FILE: &str = "manifest-v2.json";
 
 /// A tree frontier at a chain block: where a segment starts or ends.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -452,11 +460,18 @@ pub async fn export(node: &str, out_dir: &std::path::Path, max_new: usize) -> Re
     let genesis = RpcHash::from_bytes(kaspa_consensus_core::config::params::MAINNET_PARAMS.genesis.hash.as_bytes());
     let tip = client.get_block_dag_info().await.map_err(|e| e.to_string())?.virtual_daa_score;
     std::fs::create_dir_all(out_dir).map_err(|e| e.to_string())?;
-    let manifest_path = out_dir.join("manifest.json");
-    let mut manifest = match std::fs::read(&manifest_path) {
+    let manifest_path = out_dir.join(MANIFEST_FILE);
+    // First run after the rename: carry the version-1 list over instead of re-exporting it.
+    let existing = std::fs::read(&manifest_path).or_else(|_| std::fs::read(out_dir.join("manifest.json")));
+    let mut manifest = match existing {
         Ok(b) => serde_json::from_slice::<Manifest>(&b).map_err(|e| format!("existing manifest: {e}"))?,
         Err(_) => Manifest { zkas_chain_files: MANIFEST_VERSION, genesis: genesis.to_string(), segment_daa: SEGMENT_DAA, segments: Vec::new(), signature: None },
     };
+    if manifest.zkas_chain_files == 1 {
+        manifest.zkas_chain_files = MANIFEST_VERSION;
+        manifest.signature = None; // re-signed just below
+        log::info!("chain files: manifest upgraded to version {MANIFEST_VERSION}");
+    }
     manifest.check(&genesis)?;
     let key = publisher_key_from_env()?;
     // A manifest written before signing existed, or by another key: re-sign it now rather than
@@ -614,7 +629,7 @@ pub struct Stats {
 
 impl ChainFiles {
     /// `bases` is one or more comma-separated mirrors: `https://…` URLs or local directories
-    /// holding `manifest.json` and the files.
+    /// holding `manifest-v2.json` (`MANIFEST_FILE`) and the files.
     pub fn new(bases: &str, genesis: RpcHash) -> Arc<Self> {
         let bases: Vec<String> =
             bases.split(',').map(|b| b.trim().trim_end_matches('/').to_string()).filter(|b| !b.is_empty()).collect();
@@ -657,7 +672,7 @@ impl ChainFiles {
     /// The manifest one mirror serves, if it is well formed, for this network and — when it
     /// came over HTTP — signed by the publisher.
     async fn manifest_from(&self, base: &str) -> Result<Manifest, String> {
-        let b = self.get_from(base, "manifest.json").await?;
+        let b = self.get_from(base, MANIFEST_FILE).await?;
         let man = serde_json::from_slice::<Manifest>(&b).map_err(|e| e.to_string())?;
         man.check(&self.genesis)?;
         if is_http(base) {
@@ -1145,7 +1160,7 @@ mod tests {
     async fn a_refused_manifest_is_not_refetched_on_every_page() {
         let dir = std::env::temp_dir().join(format!("cf-nomanifest-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("manifest.json"), b"not json").unwrap();
+        std::fs::write(dir.join(MANIFEST_FILE), b"not json").unwrap();
         let cf = ChainFiles::new(&dir.display().to_string(), RpcHash::from_bytes([9; 32]));
         assert!(cf.manifest().await.is_none());
         let first = *cf.manifest_failed.lock().unwrap();
@@ -1153,7 +1168,7 @@ mod tests {
         // Now a good manifest appears; inside the back-off window it is not even looked at.
         let mut m = manifest_for_test();
         m.segments.clear();
-        std::fs::write(dir.join("manifest.json"), serde_json::to_vec(&m).unwrap()).unwrap();
+        std::fs::write(dir.join(MANIFEST_FILE), serde_json::to_vec(&m).unwrap()).unwrap();
         assert!(cf.manifest().await.is_none(), "still backing off");
         assert_eq!(*cf.manifest_failed.lock().unwrap(), first, "no new attempt was made");
         // Once the window has passed it is fetched and used.
@@ -1161,5 +1176,17 @@ mod tests {
         assert!(cf.manifest().await.is_some());
         assert!(cf.manifest_failed.lock().unwrap().is_none());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Version 1 is what the looping 1.0.52-rc20 cache reads; the published manifest must not be
+    /// one, and a client of this version must not accept one either.
+    #[test]
+    fn version_one_manifests_are_not_used() {
+        let g = RpcHash::from_bytes([9; 32]);
+        let mut m = manifest_for_test();
+        assert!(m.check(&g).is_ok());
+        m.zkas_chain_files = 1;
+        assert!(m.check(&g).is_err());
+        assert_eq!(MANIFEST_VERSION, 2);
     }
 }

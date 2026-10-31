@@ -6,7 +6,7 @@
 //! With `ZKAS_CHAIN_FILES_KEY=<secret key path>` the manifest is signed (required by clients
 //! that fetch it over HTTP).
 //!
-//! Incremental: segments already in `<out dir>/manifest.json` are kept; each new one is
+//! Incremental: segments already in `<out dir>/manifest-v2.json` are kept; each new one is
 //! verified against the node's frontiers before it is written. Run it every 12 hours.
 #[tokio::main]
 async fn main() {
