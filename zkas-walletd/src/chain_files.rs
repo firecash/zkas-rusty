@@ -41,7 +41,14 @@ pub const EXPORT_TIP_MARGIN_DAA: u64 = 7_200;
 /// Segments kept decoded in memory: the one being ingested and one read ahead. A decoded
 /// 12-hour segment is ~100 MB of block structures (measured on the phone configuration), so
 /// on a phone this is the bound that matters.
-const LOADED_SEGMENTS: usize = 2;
+/// Segments read ahead of a page's end.
+const READ_AHEAD_SEGMENTS: usize = 2;
+/// Decoded segments held at once, shared by every wallet in the process. Two wallets catching
+/// up at different heights each need their current and next segment, so this must be at least
+/// 2 x READ_AHEAD_SEGMENTS or they evict each other's and re-download on every page.
+const LOADED_SEGMENTS: usize = 4;
+/// A segment no page has read for this long is dropped.
+const SEGMENT_IDLE: std::time::Duration = std::time::Duration::from_secs(120);
 /// How long a fetched manifest is trusted before it is fetched again.
 const MANIFEST_TTL: std::time::Duration = std::time::Duration::from_secs(600);
 const MAGIC: &[u8; 8] = b"ZKASSEG1";
@@ -475,6 +482,8 @@ struct Loaded {
     offsets: Vec<usize>,
     /// Block hash -> its position in `offsets`.
     pos: HashMap<RpcHash, usize>,
+    /// Milliseconds since `ChainFiles::epoch` a page last read from this segment.
+    used_ms: AtomicU64,
 }
 
 impl Loaded {
@@ -497,8 +506,8 @@ pub struct ChainFiles {
     loading: Mutex<HashSet<u64>>,
     /// The node's sink blue score as last seen, for the settlement margin a page carries.
     sink: AtomicU64,
-    /// DAA score of the newest block a page was served up to: segments wholly below it are done.
-    cursor_daa: AtomicU64,
+    /// Base for `Loaded::used_ms`.
+    epoch: std::time::Instant,
     /// Set the first time a file page disagrees with the node: from then on this process
     /// reads everything from the node, so a poisoned source cannot be re-adopted by the
     /// rebuild it triggers.
@@ -522,7 +531,7 @@ impl ChainFiles {
             loaded: Mutex::new(VecDeque::new()),
             loading: Mutex::new(HashSet::new()),
             sink: AtomicU64::new(0),
-            cursor_daa: AtomicU64::new(0),
+            epoch: std::time::Instant::now(),
             disabled: std::sync::atomic::AtomicBool::new(false),
             pages_served: AtomicU64::new(0),
             segments_loaded: AtomicU64::new(0),
@@ -603,6 +612,8 @@ impl ChainFiles {
             None
         };
         let (mut seg, mut at) = find(&low)?;
+        let now_ms = self.now_ms();
+        seg.used_ms.store(now_ms, Ordering::Relaxed);
         let mut blocks = Vec::with_capacity(limit as usize);
         while (blocks.len() as u64) < limit {
             if at < seg.len() {
@@ -613,6 +624,7 @@ impl ChainFiles {
             match loaded.iter().find(|s| s.index == seg.index + 1 && s.from == seg.to) {
                 Some(next) => {
                     seg = next.clone();
+                    seg.used_ms.store(now_ms, Ordering::Relaxed);
                     at = 0;
                 }
                 None => break,
@@ -625,22 +637,30 @@ impl ChainFiles {
         Some(GetShieldedBlocksResponse { blocks, reorged: false, sink_blue_score: sink })
     }
 
+    fn now_ms(&self) -> u64 {
+        self.epoch.elapsed().as_millis() as u64
+    }
+
     /// Make sure the segments from the one covering `daa` onward are loading, in the background.
+    ///
+    /// `daa` is where THIS page ended. Several wallets read at once, each at its own height, so
+    /// nothing here may assume one cursor for the process: an earlier version kept the highest
+    /// `daa` seen and dropped every segment below it, so a wallet near the tip made a new
+    /// 30-day-old wallet's segment be discarded the moment it finished downloading — on a phone,
+    /// the same 10 MB file fetched 32 times in five minutes. Eviction is by last use instead.
     pub fn prefetch_from(self: &Arc<Self>, daa: u64) {
         if self.is_disabled() {
             return;
         }
-        self.cursor_daa.fetch_max(daa, Ordering::Relaxed);
         {
-            // Done with: wholly below the cursor. Dropping them here, not only on insert, is
-            // what keeps the decoded segments to the ones still ahead of the wallet.
-            let mut loaded = self.loaded.lock().unwrap();
-            loaded.retain(|s| s.to_daa > daa);
+            let now = self.now_ms();
+            let idle = SEGMENT_IDLE.as_millis() as u64;
+            self.loaded.lock().unwrap().retain(|s| now.saturating_sub(s.used_ms.load(Ordering::Relaxed)) < idle);
         }
         let me = self.clone();
         tokio::spawn(async move {
             let Some(man) = me.manifest().await else { return };
-            let wanted: Vec<SegmentEntry> = man.segments.iter().filter(|s| s.to.daa > daa).take(LOADED_SEGMENTS).cloned().collect();
+            let wanted: Vec<SegmentEntry> = man.segments.iter().filter(|s| s.to.daa > daa).take(READ_AHEAD_SEGMENTS).cloned().collect();
             // (the bound above also caps how many downloads run at once)
             for entry in wanted {
                 let skip = {
@@ -698,22 +718,33 @@ impl ChainFiles {
             body,
             offsets,
             pos,
+            used_ms: AtomicU64::new(self.now_ms()),
         });
-        let cursor = self.cursor_daa.load(Ordering::Relaxed);
         let mut loaded = self.loaded.lock().unwrap();
-        if seg.to_daa <= cursor {
-            return Ok(n); // the wallet already went past it while it was downloading
-        }
-        loaded.retain(|s| s.index != index && s.to_daa > cursor);
-        loaded.push_back(seg);
-        // Over the bound: drop the segment furthest AHEAD (it is re-read when needed); the one
-        // being ingested is the lowest and is never the one dropped.
-        while loaded.len() > LOADED_SEGMENTS {
-            let far = loaded.iter().enumerate().max_by_key(|(_, s)| s.index).map(|(i, _)| i).unwrap();
-            loaded.remove(far);
-        }
+        loaded.retain(|s| s.index != index);
+        insert_bounded(&mut loaded, seg, LOADED_SEGMENTS);
         self.segments_loaded.fetch_add(1, Ordering::Relaxed);
         Ok(n)
+    }
+}
+
+/// Add `seg`, then drop least-recently-read segments (never `seg` itself) down to `cap`. A
+/// segment a wallet has moved past stops being read and goes first; the ones wallets are
+/// reading are touched on every page and stay.
+fn insert_bounded(loaded: &mut VecDeque<Arc<Loaded>>, seg: Arc<Loaded>, cap: usize) {
+    let index = seg.index;
+    loaded.push_back(seg);
+    while loaded.len() > cap {
+        let Some(lru) = loaded
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.index != index)
+            .min_by_key(|(_, s)| s.used_ms.load(Ordering::Relaxed))
+            .map(|(i, _)| i)
+        else {
+            break;
+        };
+        loaded.remove(lru);
     }
 }
 
@@ -793,7 +824,7 @@ mod tests {
             let idx = index_body(&body, n).unwrap();
             let pos = idx.iter().enumerate().map(|(i, b)| (b.0, i)).collect();
             let offsets = idx.iter().map(|b| b.2).collect();
-            Arc::new(Loaded { index, from: RpcHash::from_bytes([from; 32]), to, to_daa: u64::MAX, body, offsets, pos })
+            Arc::new(Loaded { index, from: RpcHash::from_bytes([from; 32]), to, to_daa: u64::MAX, body, offsets, pos, used_ms: AtomicU64::new(0) })
         };
         cf.loaded.lock().unwrap().push_back(mk(1, 0, 1..11)); // blocks 1..=10, after block 0
         cf.loaded.lock().unwrap().push_back(mk(2, 10, 11..21)); // blocks 11..=20, after block 10
@@ -809,5 +840,63 @@ mod tests {
         assert!(!p.reorged);
         assert!(cf.page(RpcHash::from_bytes([20; 32]), 5).is_none(), "the last block of the last segment: the node serves what follows");
         assert!(cf.page(RpcHash::from_bytes([99; 32]), 5).is_none(), "an unknown cursor");
+    }
+
+    /// Two wallets catching up at different heights share the decoded segments. Each must keep
+    /// the segment it is reading while the other loads its own: the shared-cursor version threw
+    /// away a lower wallet's segment as soon as it downloaded, and the phone re-fetched it forever.
+    #[test]
+    fn two_wallets_at_different_heights_do_not_evict_each_other() {
+        let g = RpcHash::from_bytes([9; 32]);
+        let mk = |index: u64, used: u64| {
+            let blocks = vec![block(index as u8 * 10, 1, 1)];
+            let to = blocks[0].hash;
+            let (body, n) = segment_body(&encode_segment(&g, index, &blocks), &g, index).unwrap();
+            let idx = index_body(&body, n).unwrap();
+            Arc::new(Loaded {
+                index,
+                from: RpcHash::from_bytes([index as u8; 32]),
+                to,
+                to_daa: index * 100,
+                pos: idx.iter().enumerate().map(|(i, b)| (b.0, i)).collect(),
+                offsets: idx.iter().map(|b| b.2).collect(),
+                body,
+                used_ms: AtomicU64::new(used),
+            })
+        };
+        let held = |l: &VecDeque<Arc<Loaded>>| {
+            let mut v: Vec<u64> = l.iter().map(|s| s.index).collect();
+            v.sort();
+            v
+        };
+        let mut l = VecDeque::new();
+        // The tip-side wallet reads segments 50 and 51; the new 30-day wallet then loads 10 and
+        // 11, BELOW it. All four are kept.
+        insert_bounded(&mut l, mk(50, 1), LOADED_SEGMENTS);
+        insert_bounded(&mut l, mk(51, 2), LOADED_SEGMENTS);
+        insert_bounded(&mut l, mk(10, 3), LOADED_SEGMENTS);
+        insert_bounded(&mut l, mk(11, 4), LOADED_SEGMENTS);
+        assert_eq!(held(&l), vec![10, 11, 50, 51]);
+        // Both keep reading their current segment (10 and 51); 50 and 11 are not read again.
+        for s in l.iter() {
+            match s.index {
+                10 => s.used_ms.store(10, Ordering::Relaxed),
+                51 => s.used_ms.store(11, Ordering::Relaxed),
+                _ => {}
+            }
+        }
+        // The low wallet's read-ahead loads 12: the least recently read (50, which the tip-side
+        // wallet moved past) goes — not either wallet's current segment.
+        insert_bounded(&mut l, mk(12, 12), LOADED_SEGMENTS);
+        assert_eq!(held(&l), vec![10, 11, 12, 51]);
+        // A segment that was just inserted is never the one evicted, even if older ones were
+        // read more recently.
+        let mut l2 = VecDeque::new();
+        for i in 0..LOADED_SEGMENTS as u64 {
+            insert_bounded(&mut l2, mk(i, 100), LOADED_SEGMENTS);
+        }
+        insert_bounded(&mut l2, mk(99, 0), LOADED_SEGMENTS);
+        assert!(held(&l2).contains(&99));
+        assert_eq!(l2.len(), LOADED_SEGMENTS);
     }
 }
