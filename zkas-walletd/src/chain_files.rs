@@ -120,6 +120,24 @@ impl Manifest {
     }
 }
 
+/// Where ZKas publishes its chain files.
+pub const PUBLIC_CHAIN_FILES: &str = "https://zkas.info/shielded-chain";
+
+/// The chain files an engine talking to `node` should use: the public ones when `node` is one
+/// of ZKas's public nodes — the same operator already sees that engine's page requests, so no
+/// new party learns anything — and none otherwise. A user's own node is never paired with a
+/// server the user did not choose. Callers must also leave them off when the engine is routed
+/// through Tor (the file fetch does not use that proxy).
+pub fn default_for_node(node: &str) -> Option<String> {
+    let node = node.trim().to_ascii_lowercase();
+    let host = match node.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or("").to_string(),
+        None => node.rsplit_once(':').map(|(h, _)| h.to_string()).unwrap_or(node.clone()),
+    };
+    let public = host == "zkas.info" || host.ends_with(".zkas.info") || ["185.147.157.125", "160.187.211.153"].contains(&host.as_str());
+    public.then(|| PUBLIC_CHAIN_FILES.to_string())
+}
+
 // ---------------------------------------------------------------------------------------------
 // Segment file format: gzip( MAGIC | genesis 32 | index u64 | block count u32 | blocks ).
 // Each block: hash 32 | blue u64 | daa u64 | timestamp u64 | coinbase txid 32 |
@@ -719,6 +737,16 @@ mod tests {
             accepted_actions: (0..acts).map(|j| vec![j as u8; 148 * (j + 1)]).collect(),
             accepted_txids: (0..acts).map(|j| RpcHash::from_bytes([j as u8; 32])).collect(),
             timestamp: 1_700_000_000_000 + i as u64,
+        }
+    }
+
+    #[test]
+    fn public_files_only_for_public_nodes() {
+        for n in ["seed.zkas.info:16110", "SEED.ZKAS.INFO:16110", "185.147.157.125:16110", "160.187.211.153:16110", "zkas.info"] {
+            assert_eq!(default_for_node(n).as_deref(), Some(PUBLIC_CHAIN_FILES), "{n}");
+        }
+        for n in ["127.0.0.1:16810", "192.168.1.5:16110", "evilzkas.info:16110", "zkas.info.evil.com:16110", "[::1]:16110", "my-node:16110", ""] {
+            assert_eq!(default_for_node(n), None, "{n}");
         }
     }
 
