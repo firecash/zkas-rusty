@@ -9607,10 +9607,18 @@ async fn wallet_create(
     };
     // A brand-new wallet holds no historical funds: birth it at the current tip so
     // it is instantly ready to receive — no full-history scan needed.
+    //
+    // Never at 0. A node not reached yet, or a failed RPC, used to fall back to 0, which
+    // means "from genesis": an empty wallet created in the second after startup replayed
+    // the whole chain (measured 2026-10-31 on the phone engine). Refuse instead; nothing
+    // has been written yet, so the client simply retries.
     let tip = match state.request_client().await {
         Some(c) => c.get_block_dag_info().await.map(|d| d.virtual_daa_score).unwrap_or(0),
         None => 0,
     };
+    if tip == 0 {
+        return Err(err(StatusCode::SERVICE_UNAVAILABLE, "not connected to a node yet; a new wallet waits for the current block - retry in a moment"));
+    }
     load_new_wallet(&state, &token, seed, tip, false).await?;
     Ok(Json(CreateResp {
         address,
