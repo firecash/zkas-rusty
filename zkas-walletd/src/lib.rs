@@ -45,6 +45,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 pub mod selfhost;
+mod almanac;
 pub use selfhost::{SelfHostConfig, run_selfhost};
 mod engine_host;
 pub use engine_host::{EngineConfig, serve_engine};
@@ -6580,6 +6581,12 @@ impl AppState {
                 // and survives restarts) is the better experience than a hung "Opening".
                 w = self.birthday_start(guard, birthday, WALK_PAGES_ARCHIVE).await;
             }
+            // The node cannot place this birthday: start from the frontier almanac instead of
+            // genesis (see `almanac`). Without it a pruned node sends every wallet older than its
+            // frontier window — ~10.8 days on the public node — through a whole-chain scan.
+            if w.is_none() {
+                w = self.almanac_start(birthday).await;
+            }
             w
         } else {
             self.birthday_start(cp.block_hash, birthday, WALK_PAGES_HEADERS).await
@@ -6660,6 +6667,32 @@ impl AppState {
     /// that predates the field ignores it and answers with its finality point — which, in the
     /// only branch that calls this, lies at-or-past the birthday — so the `< birthday` check
     /// tells the two apart and never lets an overshooting frontier skip the birthday's notes.
+    /// The newest frontier-almanac start below `birthday`, if the almanac covers this network
+    /// and the node confirms the start block is on its selected chain.
+    async fn almanac_start(&self, birthday: u64) -> Option<(RpcHash, u64, u64, RpcHash, Vec<RpcHash>)> {
+        let start = almanac::frontier_below(&self.genesis, birthday)?;
+        // One cheap read: the scan resumes from this block, so it must be on THIS node's chain.
+        // A stale almanac (a reorg deeper than days), or any refusal, falls through to the full
+        // scan exactly as before.
+        match self.request_client().await?.get_shielded_block_metadata(start.0, 1).await {
+            Ok(page) if !page.reorged => {}
+            Ok(_) => {
+                log::warn!("frontier almanac start {} (daa {}) is off this node's selected chain; not using it", start.0, start.1);
+                return None;
+            }
+            Err(e) => {
+                log::warn!("frontier almanac start {} (daa {}) not confirmed by the node ({e}); not using it", start.0, start.1);
+                return None;
+            }
+        }
+        log::info!(
+            "wallet birthday {birthday}: the node cannot place it; starting from the frontier almanac at daa {} (tree position {}) instead of genesis",
+            start.1,
+            start.2
+        );
+        Some(start)
+    }
+
     async fn frontier_below_daa(&self, birthday: u64) -> BirthdayPlacement {
         let req = kaspa_rpc_core::GetShieldedTreeStateRequest { block_hash: None, below_daa_score: Some(birthday) };
         let Some(client) = self.request_client().await else { return BirthdayPlacement::Unknown };
