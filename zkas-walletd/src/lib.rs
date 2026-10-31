@@ -3063,9 +3063,11 @@ fn select_coinbase_cmx(
     trust_node: bool,
 ) -> Option<kaspa_shielded_core::ExtractedNoteCommitment> {
     if trust_node {
-        return supplied.or_else(|| kaspa_shielded_core::coinbase::coinbase_note_commitment(desc, value).ok());
+        return supplied.or_else(|| kaspa_shielded_core::coinbase::coinbase_note_commitment_vartime(desc, value).ok());
     }
-    match kaspa_shielded_core::coinbase::coinbase_note_commitment(desc, value).ok() {
+    // The fast derivation: same commitment, a fraction of the Sinsemilla work, and the
+    // node's value is still never taken on trust (see `coinbase_note_commitment_vartime`).
+    match kaspa_shielded_core::coinbase::coinbase_note_commitment_vartime(desc, value).ok() {
         Some(derived) => {
             // A mismatch means the node's record is inconsistent, and which half is wrong cannot be
             // told from here: forged outputs paired with the real commitment (a history-backfill peer

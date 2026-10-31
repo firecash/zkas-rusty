@@ -128,6 +128,44 @@ pub fn coinbase_note_commitment(desc: &CoinbaseNoteDesc, value: u64) -> Result<E
     Ok(ExtractedNoteCommitment::from(cm))
 }
 
+/// [`coinbase_note_commitment`], several times faster, for WALLETS. The same commitment on
+/// every input (see `Note::from_parts_with_commitment_vartime`) and the same errors, but
+/// not constant time — fine, because a coinbase note's description and value are public.
+///
+/// Wallet decode only. Consensus keeps [`coinbase_note_commitment`]: the fast path's
+/// hash evaluator differs from the reference only on an input exhibiting a discrete-log
+/// relation, and a node must not depend on even that argument for what it accepts.
+pub fn coinbase_note_commitment_vartime(desc: &CoinbaseNoteDesc, value: u64) -> Result<ExtractedNoteCommitment, CoinbaseNoteError> {
+    let recipient = cached_recipient(&desc.recipient)?;
+    let rho: Rho = Option::from(Rho::from_bytes(&desc.rho)).ok_or(CoinbaseNoteError::BadRho)?;
+    let rseed: RandomSeed = Option::from(RandomSeed::from_bytes(desc.rseed, &rho)).ok_or(CoinbaseNoteError::BadRseed)?;
+    let (_note, cm) =
+        Note::from_parts_with_commitment_vartime(recipient, NoteValue::from_raw(value), rho, rseed, orchard::note::NoteVersion::V2)
+            .ok_or(CoinbaseNoteError::BadNote)?;
+    Ok(ExtractedNoteCommitment::from(cm))
+}
+
+/// Parsing a raw address decompresses `pk_d` and checks `g_d`; a chain's coinbase pays a
+/// few hundred recipients over and over, so do it once per recipient per thread.
+fn cached_recipient(raw: &[u8; 43]) -> Result<Address, CoinbaseNoteError> {
+    use std::{cell::RefCell, collections::HashMap};
+    thread_local! {
+        static RECIPIENTS: RefCell<HashMap<[u8; 43], Option<Address>>> = RefCell::new(HashMap::new());
+    }
+    RECIPIENTS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(hit) = cache.get(raw) {
+            return hit.ok_or(CoinbaseNoteError::BadRecipient);
+        }
+        if cache.len() >= 4096 {
+            cache.clear();
+        }
+        let parsed: Option<Address> = Option::from(Address::from_raw_address_bytes(raw));
+        cache.insert(*raw, parsed);
+        parsed.ok_or(CoinbaseNoteError::BadRecipient)
+    })
+}
+
 /// Build a single [`CoinbaseNote`] (value + commitment) from its public
 /// description and the emission- and fee-checked value.
 pub fn coinbase_note(desc: &CoinbaseNoteDesc, value: u64) -> Result<CoinbaseNote, CoinbaseNoteError> {
@@ -144,6 +182,56 @@ pub fn coinbase_mint(notes: &[(CoinbaseNoteDesc, u64)]) -> Result<CoinbaseMint, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The wallet fast path is the consensus derivation, byte for byte, on many notes — real
+    /// recipients from many keys and diversifiers, many seeds and values — and fails the same
+    /// way on every malformed field.
+    #[test]
+    fn vartime_commitment_is_the_reference_commitment() {
+        use orchard::keys::{FullViewingKey, Scope, SpendingKey};
+        let mut checked = 0usize;
+        for k in 0u8..12 {
+            let mut skb = [0u8; 32];
+            skb[0] = k.wrapping_mul(37).wrapping_add(1);
+            skb[31] = k;
+            let Some(sk) = Option::<SpendingKey>::from(SpendingKey::from_bytes(skb)) else { continue };
+            let fvk = FullViewingKey::from(&sk);
+            for j in 0u32..8 {
+                let recipient = fvk.address_at(j * 7919 + u32::from(k), Scope::External).to_raw_address_bytes();
+                for s in 0u32..12 {
+                    let mut seed = [0u8; 64];
+                    seed[..4].copy_from_slice(&s.to_le_bytes());
+                    seed[4] = k;
+                    seed[5..9].copy_from_slice(&j.to_le_bytes());
+                    let desc = derive_coinbase_note_desc(recipient, &seed);
+                    let value = (u64::from(s) * 1_234_567_891).wrapping_add(u64::from(j) << 40) % 21_000_000_0000_0000;
+                    let reference = coinbase_note_commitment(&desc, value).map(|c| c.to_bytes());
+                    let fast = coinbase_note_commitment_vartime(&desc, value).map(|c| c.to_bytes());
+                    assert_eq!(fast, reference, "key {k} addr {j} seed {s} value {value}");
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked >= 1000, "{checked}");
+        // Same value twice (cache hit) and the extremes of the value range.
+        let recipient = FullViewingKey::from(&SpendingKey::from_bytes([3u8; 32]).unwrap()).address_at(0u32, Scope::External).to_raw_address_bytes();
+        let desc = derive_coinbase_note_desc(recipient, &[9u8; 64]);
+        for value in [0u64, 1, u64::MAX >> 1, 2_100_000_000_000_000] {
+            for _ in 0..2 {
+                assert_eq!(
+                    coinbase_note_commitment_vartime(&desc, value).map(|c| c.to_bytes()),
+                    coinbase_note_commitment(&desc, value).map(|c| c.to_bytes())
+                );
+            }
+        }
+        // Malformed fields fail identically.
+        let mut bad = desc.clone();
+        bad.recipient = [0xff; 43];
+        assert_eq!(coinbase_note_commitment_vartime(&bad, 1).err(), coinbase_note_commitment(&bad, 1).err());
+        let mut bad = desc.clone();
+        bad.rho = [0xff; 32];
+        assert_eq!(coinbase_note_commitment_vartime(&bad, 1).err(), coinbase_note_commitment(&bad, 1).err());
+    }
     use orchard::keys::{FullViewingKey, Scope, SpendingKey};
 
     fn canon32(seed: u8) -> [u8; 32] {

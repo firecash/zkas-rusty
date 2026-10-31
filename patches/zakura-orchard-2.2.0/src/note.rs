@@ -323,6 +323,134 @@ impl Note {
         cm.map(|cm| (note, cm))
     }
 
+    /// [`Note::from_parts_with_commitment`], for a note whose contents are PUBLIC: a ZKAS
+    /// coinbase note, whose `rseed` (so `rcm` and `psi`) derives from block data.
+    ///
+    /// The same commitment, about four times faster: the Sinsemilla hash runs on the
+    /// fixed-length position-weighted evaluator (`sinsemilla::weighted`), `[rcm] R` on a
+    /// precomputed fixed-base table instead of a fresh wNAF on every call, and `g_d` comes
+    /// from a per-thread cache by diversifier (coinbase recipients repeat). The weighted
+    /// evaluator can disagree with the reference only on an input exhibiting a discrete-log
+    /// relation between the Sinsemilla bases (its module docs give the reduction), which is
+    /// also the only input on which the reference has no commitment; so this is `Some`
+    /// wherever `from_parts_with_commitment` is.
+    ///
+    /// NOT constant time. Never use it for a note whose `rseed` is secret.
+    pub fn from_parts_with_commitment_vartime(
+        recipient: Address,
+        value: NoteValue,
+        rho: Rho,
+        rseed: RandomSeed,
+        version: NoteVersion,
+    ) -> Option<(Self, NoteCommitment)> {
+        let note = Note {
+            recipient,
+            value,
+            rho,
+            rseed,
+            version,
+        };
+        let cm = note.commitment_vartime();
+        Some((note, cm))
+    }
+
+    /// The `from_parts_with_commitment_vartime` commitment: the reference's exact bit stream,
+    /// packed into the 109 ten-bit Sinsemilla words of NoteCommit's 1,086-bit message.
+    fn commitment_vartime(&self) -> NoteCommitment {
+        use bitvec::{array::BitArray, order::Lsb0};
+        use ff::PrimeFieldBits;
+        let (hash, comb) = Self::note_commit_vartime_tables();
+        let g_d = BitArray::<_, Lsb0>::new(Self::g_d_bytes_cached(&self.recipient));
+        let pk_d = BitArray::<_, Lsb0>::new(self.recipient.pk_d().inner().to_bytes());
+        let value = self.value.to_le_bits();
+        let rho = self.rho.0.to_le_bits();
+        let psi = self.psi().to_le_bits();
+        let bits = core::iter::empty()
+            .chain(g_d.iter().by_vals())
+            .chain(pk_d.iter().by_vals())
+            .chain(value.iter().by_vals())
+            .chain(rho.iter().by_vals().take(crate::constants::L_ORCHARD_BASE))
+            .chain(psi.iter().by_vals().take(crate::constants::L_ORCHARD_BASE));
+        let mut words = [0u16; 109];
+        for (i, bit) in bits.enumerate() {
+            if bit {
+                words[i / sinsemilla::K] |= 1 << (i % sinsemilla::K);
+            }
+        }
+        NoteCommitment(hash.hash_words_to_point(&words) + Self::fixed_base_mul(comb, &self.rcm().inner()))
+    }
+
+    /// NoteCommit's weighted hash domain and its blinding base `R` as a table of
+    /// `[j * 2^(8w)] R` (32 byte-windows by 256 multiples), built once (~7.5 MB).
+    fn note_commit_vartime_tables(
+    ) -> &'static (sinsemilla::weighted::UncheckedFixedLengthHashDomain<109>, alloc::vec::Vec<alloc::vec::Vec<pallas::Affine>>) {
+        use group::{Curve, Group};
+        use pasta_curves::arithmetic::CurveExt;
+        static TABLES: crate::once::OnceTable<(
+            sinsemilla::weighted::UncheckedFixedLengthHashDomain<109>,
+            alloc::vec::Vec<alloc::vec::Vec<pallas::Affine>>,
+        )> = crate::once::OnceTable::new();
+        TABLES.get_or_init(|| {
+            let domain = crate::constants::fixed_bases::NOTE_COMMITMENT_PERSONALIZATION;
+            let m = sinsemilla::HashDomain::new(&format!("{domain}-M"));
+            let r = pallas::Point::hash_to_curve(&format!("{domain}-r"))(&[]);
+            let mut comb = alloc::vec::Vec::with_capacity(32);
+            let mut window_base = r;
+            for _ in 0..32 {
+                let mut row = vec![pallas::Point::identity(); 256];
+                for j in 1..256 {
+                    row[j] = row[j - 1] + window_base;
+                }
+                let mut affine = vec![pallas::Point::identity().to_affine(); 256];
+                pallas::Point::batch_normalize(&row, &mut affine);
+                comb.push(affine);
+                for _ in 0..8 {
+                    window_base = window_base.double();
+                }
+            }
+            (sinsemilla::weighted::UncheckedFixedLengthHashDomain::<109>::new(&m), comb)
+        })
+    }
+
+    /// `[s] R` from the byte-window table: one complete mixed addition per nonzero byte.
+    fn fixed_base_mul(comb: &[alloc::vec::Vec<pallas::Affine>], s: &pallas::Scalar) -> pallas::Point {
+        use group::Group;
+        let repr = s.to_repr();
+        let mut acc = pallas::Point::identity();
+        for (window, byte) in repr.as_ref().iter().enumerate() {
+            if *byte != 0 {
+                acc += comb[window][*byte as usize];
+            }
+        }
+        acc
+    }
+
+    /// `g_d = DiversifyHash(d)` (a hash to curve), cached per thread by diversifier.
+    fn g_d_bytes_cached(recipient: &Address) -> [u8; 32] {
+        #[cfg(feature = "std")]
+        {
+            std::thread_local! {
+                static G_D: core::cell::RefCell<std::collections::HashMap<[u8; 11], [u8; 32]>> =
+                    core::cell::RefCell::new(std::collections::HashMap::new());
+            }
+            let d = *recipient.diversifier().as_array();
+            return G_D.with(|cache| {
+                let mut cache = cache.borrow_mut();
+                if let Some(g_d) = cache.get(&d) {
+                    return *g_d;
+                }
+                if cache.len() >= 4096 {
+                    cache.clear();
+                }
+                let g_d = recipient.g_d().to_bytes();
+                cache.insert(d, g_d);
+                g_d
+            });
+        }
+        #[cfg(not(feature = "std"))]
+        recipient.g_d().to_bytes()
+    }
+
     /// Generates a new note.
     ///
     /// Defined in [Zcash Protocol Spec § 4.7.3: Sending Notes (Orchard)][orchardsend].

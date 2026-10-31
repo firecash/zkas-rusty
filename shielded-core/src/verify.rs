@@ -566,7 +566,7 @@ mod e2e {
             crate::verify::ORCHARD_CRATE,
             // walletd-scale 2026-10-21: the registry crate (checksum unchanged) plus the one
             // additive function `orchard_patch_is_one_additive_function` below proves.
-            "zakura-orchard 2.2.0 b460a562603ba2e9820cb988b5f873ef470bd007c6c2f86e50abaa91b45e241e+zkas-patch:from_parts_with_commitment"
+            "zakura-orchard 2.2.0 b460a562603ba2e9820cb988b5f873ef470bd007c6c2f86e50abaa91b45e241e+zkas-patch:from_parts_with_commitment+vartime"
         );
         assert_eq!(
             crate::verify::HALO2_GADGETS_CRATE,
@@ -633,8 +633,15 @@ mod e2e {
         let suf = o.iter().rev().zip(p.iter().rev()).take_while(|(a, b)| a == b).count().min(o.len() - pre);
         assert_eq!(pre + suf, o.len(), "the patch must only INSERT (nothing of the original removed or changed)");
         let inserted = &patched[pre..p.len() - suf];
-        assert_eq!(inserted.matches("fn ").count(), 1, "exactly one function inserted");
-        assert!(inserted.contains("pub fn from_parts_with_commitment("), "and it is the documented one");
+        // 2026-10-31: plus the public-note fast path, `from_parts_with_commitment_vartime`, and
+        // its private helpers. Two public items, both named here; the circuit is untouched.
+        assert_eq!(inserted.matches("pub fn ").count(), 2, "exactly two public functions inserted");
+        assert!(inserted.contains("pub fn from_parts_with_commitment("), "the documented one");
+        assert!(inserted.contains("pub fn from_parts_with_commitment_vartime("), "and its public-note fast path");
+        assert_eq!(inserted.matches("fn ").count(), 6, "plus exactly four private helpers");
+        for helper in ["fn commitment_vartime(", "fn note_commit_vartime_tables(", "fn fixed_base_mul(", "fn g_d_bytes_cached("] {
+            assert!(inserted.contains(helper), "{helper}");
+        }
         assert!(!inserted.contains("unsafe"), "no unsafe code");
     }
 
