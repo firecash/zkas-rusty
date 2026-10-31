@@ -3942,6 +3942,11 @@ struct WalletEntry {
     /// Set by the shared-tree audit on a divergence: the next sync pass retires this entry's
     /// checkpoint and the caller rebuilds it, as for a reorg it cannot follow. A flag, not a strike
     /// count, because a successful page clears the strikes before the pass reaches the retire step.
+    /// Drop this wallet from memory and load it again from its on-disk checkpoint, WITHOUT
+    /// retiring that checkpoint: what a chain-files page that could not be confirmed with the
+    /// node (a timeout, the phone's network asleep) needs. Nothing ingested since the last
+    /// checkpoint is kept, and nothing before it is lost.
+    reload_from_checkpoint: bool,
     audit_retire: bool,
     /// The last block this wallet ingested from published chain files, until the node has
     /// confirmed the wallet's tree there (`chain_files` rule 3).
@@ -4168,6 +4173,7 @@ impl WalletEntry {
             sink_blue,
             sink_live: false,
             reorged_strikes: 0,
+            reload_from_checkpoint: false,
             audit_retire: false,
             files_handoff: None,
             preview: Preview::default(),
@@ -4806,21 +4812,35 @@ impl WalletEntry {
                             break;
                         }
                     }
+                    if confirmed.is_none() {
+                        // The node did not answer — on a phone, usually its network being put to
+                        // sleep with the screen. That is not evidence against the file, and it
+                        // used to be treated as if it were: the checkpoint was retired and the
+                        // wallet rescanned from its birthday (a user watched 86% become 35%).
+                        // Instead nothing since the last checkpoint is kept (no checkpoint is
+                        // written while `error` is set), the files rest for a while, and the
+                        // page is read and confirmed again after the reload.
+                        if let Some(f) = cache.lock().await.files.clone() {
+                            f.pause(chain_files::UNCONFIRMED_PAUSE);
+                        }
+                        log::warn!(
+                            "wallet {token_p}: a chain-files page after block {page_low} changed this wallet but the node could not confirm it now; resuming from the last checkpoint",
+                            token_p = log_pseudonym(&token)
+                        );
+                        self.reload_from_checkpoint = true;
+                        self.error = Some("could not confirm downloaded chain data with the node; resuming from the last checkpoint".into());
+                        return;
+                    }
                     if confirmed != Some(true) {
                         if let Some(f) = cache.lock().await.files.clone() {
-                            f.disable(if confirmed.is_none() {
-                                "the node could not confirm a file page that changed a wallet"
-                            } else {
-                                "a file page that changed a wallet differs from the node's page"
-                            });
+                            f.disable("a file page that changed a wallet differs from the node's page");
                         }
                         log::error!(
-                            "wallet {token_p}: a chain-files page after block {page_low} changed this wallet and was {}; rebuilding from the node",
-                            if confirmed.is_none() { "not confirmable by the node" } else { "NOT the node's page" },
+                            "wallet {token_p}: a chain-files page after block {page_low} changed this wallet and was NOT the node's page; rebuilding from the node",
                             token_p = log_pseudonym(&token)
                         );
                         self.audit_retire = true;
-                        self.error = Some("published chain data could not be confirmed with the node; rebuilding from the node".into());
+                        self.error = Some("published chain data disagreed with the node; rebuilding from the node".into());
                         return;
                     }
                     log::info!(
@@ -8516,6 +8536,12 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
     // a spend becomes a lookup instead of an O(chain) Sinsemilla replay; `witness_path_at`
     // still rebuilds on demand for any note whose witness isn't held (correctness never
     // depends on the pre-advance).
+    if e.reload_from_checkpoint {
+        // See `reload_from_checkpoint`: evicted with its checkpoint left in place, so the next
+        // load resumes from it. Not a retirement — nothing is renamed and no rescan starts.
+        log::info!("wallet '{token_p}': reloading from its last checkpoint", token_p = log_pseudonym(&token));
+        return SyncOutcome::Retired(token);
+    }
     if e.reorged_strikes >= REORG_STRIKES || e.audit_retire {
         // Cursor off the selected chain (or pruned away) for enough passes: retire the
         // checkpoint to .bak and let the caller evict + reload it from a fresh anchor.

@@ -44,6 +44,9 @@ const READ_AHEAD_SEGMENTS: usize = 2;
 /// up at different heights each need their current and next segment, so this must be at least
 /// 2 x READ_AHEAD_SEGMENTS or they evict each other's and re-download on every page.
 const LOADED_SEGMENTS: usize = 4;
+/// How long the files rest after a page that changed a wallet could not be confirmed with the
+/// node (see `ChainFiles::pause`).
+pub const UNCONFIRMED_PAUSE: std::time::Duration = std::time::Duration::from_secs(120);
 /// A segment no page has read for this long is dropped.
 const SEGMENT_IDLE: std::time::Duration = std::time::Duration::from_secs(120);
 /// How long a fetched manifest is trusted before it is fetched again.
@@ -596,6 +599,8 @@ pub struct ChainFiles {
     manifest: tokio::sync::Mutex<Option<(std::time::Instant, Arc<Manifest>)>>,
     /// When every mirror last failed to serve a usable manifest (see `MANIFEST_RETRY`).
     manifest_failed: Mutex<Option<std::time::Instant>>,
+    /// Until when `page` answers nothing (see `pause`).
+    paused_until: Mutex<Option<std::time::Instant>>,
     loaded: Mutex<VecDeque<Arc<Loaded>>>,
     loading: Mutex<HashSet<u64>>,
     /// The node's sink blue score as last seen, for the settlement margin a page carries.
@@ -644,6 +649,7 @@ impl ChainFiles {
             genesis,
             manifest: tokio::sync::Mutex::new(None),
             manifest_failed: Mutex::new(None),
+            paused_until: Mutex::new(None),
             loaded: Mutex::new(VecDeque::new()),
             loading: Mutex::new(HashSet::new()),
             sink: AtomicU64::new(0),
@@ -755,8 +761,20 @@ impl ChainFiles {
         self.disabled.load(Ordering::SeqCst)
     }
 
+    /// Serve nothing for `d`: the node could not confirm a file page just now (a network
+    /// blip, not a bad file), so the reloaded wallet reads from the node for a while rather
+    /// than immediately needing the same confirmation again.
+    pub fn pause(&self, d: std::time::Duration) {
+        *self.paused_until.lock().unwrap() = Some(std::time::Instant::now() + d);
+        log::info!("chain files: paused for {} s; the node serves pages meanwhile", d.as_secs());
+    }
+
+    fn is_paused(&self) -> bool {
+        self.paused_until.lock().unwrap().is_some_and(|t| std::time::Instant::now() < t)
+    }
+
     pub fn page(&self, low: RpcHash, limit: u64) -> Option<GetShieldedBlocksResponse> {
-        if self.is_disabled() {
+        if self.is_disabled() || self.is_paused() {
             return None;
         }
         let sink = self.sink.load(Ordering::Relaxed);
@@ -835,7 +853,7 @@ impl ChainFiles {
         let me = self.clone();
         tokio::spawn(async move {
             let Some(man) = me.manifest().await else { return };
-            let wanted: Vec<SegmentEntry> = man.segments.iter().filter(|s| s.to.daa > daa).take(READ_AHEAD_SEGMENTS).cloned().collect();
+            let wanted = segments_within_reach(&man.segments, daa);
             // (the bound above also caps how many downloads run at once)
             for entry in wanted {
                 let skip = {
@@ -914,6 +932,16 @@ impl ChainFiles {
         self.segments_loaded.fetch_add(1, Ordering::Relaxed);
         Ok(n)
     }
+}
+
+/// The segments worth reading ahead for a page that ended at `daa`: the one covering it and
+/// the next, and only if they START within `READ_AHEAD_SEGMENTS` segment widths of `daa`. A
+/// wallet far below the oldest published segment must not download it: nothing reads it for
+/// hours, the idle rule drops it after two minutes and the next page fetched it again — a
+/// phone 60 days behind spent ~18 MB every two minutes that way (1.0.52-rc21).
+fn segments_within_reach(segments: &[SegmentEntry], daa: u64) -> Vec<SegmentEntry> {
+    let reach = daa.saturating_add(READ_AHEAD_SEGMENTS as u64 * SEGMENT_DAA);
+    segments.iter().filter(|s| s.to.daa > daa && s.from.daa <= reach).take(READ_AHEAD_SEGMENTS).cloned().collect()
 }
 
 /// Add `seg`, then drop least-recently-read segments (never `seg` itself) down to `cap`. A
@@ -1028,6 +1056,13 @@ mod tests {
         assert!(!p.reorged);
         assert!(cf.page(RpcHash::from_bytes([20; 32]), 5).is_none(), "the last block of the last segment: the node serves what follows");
         assert!(cf.page(RpcHash::from_bytes([99; 32]), 5).is_none(), "an unknown cursor");
+        // A pause (the node could not confirm a page) serves nothing until it ends; it is
+        // not a disable, so pages come back afterwards.
+        cf.pause(std::time::Duration::from_secs(3600));
+        assert!(cf.page(RpcHash::from_bytes([0; 32]), 5).is_none(), "paused");
+        assert!(!cf.is_disabled());
+        *cf.paused_until.lock().unwrap() = Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+        assert!(cf.page(RpcHash::from_bytes([0; 32]), 5).is_some(), "the pause ended");
     }
 
     /// Two wallets catching up at different heights share the decoded segments. Each must keep
@@ -1188,5 +1223,24 @@ mod tests {
         m.zkas_chain_files = 1;
         assert!(m.check(&g).is_err());
         assert_eq!(MANIFEST_VERSION, 2);
+    }
+
+    /// A wallet far below the published range reads nothing ahead; one inside it, or about to
+    /// enter it, reads the covering segment and the next.
+    #[test]
+    fn read_ahead_only_within_reach() {
+        let seg = |index: u64| {
+            let mut e = manifest_for_test().segments.remove(0);
+            e.index = index;
+            e.from.daa = index * SEGMENT_DAA - 100;
+            e.to.daa = (index + 1) * SEGMENT_DAA - 100;
+            e
+        };
+        let published: Vec<_> = (90..95).map(seg).collect();
+        let idx = |v: Vec<SegmentEntry>| v.iter().map(|s| s.index).collect::<Vec<_>>();
+        assert!(segments_within_reach(&published, 72 * SEGMENT_DAA).is_empty(), "18 segments below: nothing");
+        assert_eq!(idx(segments_within_reach(&published, 89 * SEGMENT_DAA)), vec![90, 91], "one segment below: ready when it arrives");
+        assert_eq!(idx(segments_within_reach(&published, 91 * SEGMENT_DAA)), vec![91, 92], "inside: covering + next");
+        assert!(segments_within_reach(&published, 96 * SEGMENT_DAA).is_empty(), "past the newest: the node");
     }
 }
