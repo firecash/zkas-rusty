@@ -398,23 +398,11 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 /// `from`) and require the resulting tree to be exactly `to`. This is what makes a segment
 /// publishable: its content reproduces the node's own frontiers under the code every wallet runs.
 pub fn verify_segment(from: &Boundary, to: &Boundary, blocks: &[RpcShieldedChainBlock]) -> Result<(), String> {
-    let fs = from.frontier_state().ok_or("bad start frontier")?;
-    let mut db = kaspa_shielded_core::walletdb::WalletDb::from_frontier([0x5a; 32], &fs).ok_or("start frontier does not build a tree")?;
-    db.set_leaves_only(true);
-    let mut expect_parent = from.block.clone();
-    for b in blocks {
-        let d = crate::decode_block(b)?;
-        db.ingest_block_compact_precomputed_with_meta(&d.coinbase, &d.compact, None);
-        if db.poisoned() {
-            return Err(format!("block {} repeats a nullifier", b.hash));
-        }
-        expect_parent = b.hash.to_string();
+    let end = blocks.last().map(|b| b.hash.to_string()).unwrap_or_else(|| from.block.clone());
+    if end != to.block {
+        return Err(format!("segment ends at {end}, not at {}", to.block));
     }
-    db.end_page();
-    if expect_parent != to.block {
-        return Err(format!("segment ends at {expect_parent}, not at {}", to.block));
-    }
-    let got = db.tip_frontier_state().ok_or("no tree after the segment")?;
+    let got = end_frontier(from, blocks)?;
     if !to.same_frontier(&got) {
         return Err(format!("re-ingested tree has {} leaves, the node's frontier at the end has {}", got.size, to.size));
     }
@@ -425,9 +413,6 @@ pub fn verify_segment(from: &Boundary, to: &Boundary, blocks: &[RpcShieldedChain
 // Exporter
 // ---------------------------------------------------------------------------------------------
 
-/// Write every complete segment not yet in `out_dir`, newest first, at most `max_new` of them,
-/// then the manifest. Reads from `node`, which must hold frontiers for the whole range (an
-/// archival node synced from genesis). Each segment is verified before it is written.
 /// Read the publisher's secret key (64 hex chars) from the file `ZKAS_CHAIN_FILES_KEY` names.
 pub fn publisher_key_from_env() -> Result<Option<secp256k1::Keypair>, String> {
     let Ok(path) = std::env::var("ZKAS_CHAIN_FILES_KEY") else { return Ok(None) };
@@ -446,6 +431,17 @@ fn write_manifest(path: &std::path::Path, manifest: &mut Manifest, key: Option<&
     std::fs::rename(&tmp, path).map_err(|e| e.to_string())
 }
 
+/// Write every complete segment not yet in `out_dir`, at most `max_new` of them, updating the
+/// signed manifest after each. Any node with the complete shielded HISTORY will do — an
+/// ordinary pruned node included; an archival node is not needed:
+///
+/// 1. newest first, while the node can place frontiers (an archival node: everywhere; a pruned
+///    one: its recent window), each segment verified against the node's own two frontiers;
+/// 2. below that, replayed upward from genesis (or from the end of the highest segment already
+///    published below the gap), each end frontier COMPUTED by the leaf rules every wallet runs.
+///    Where the replay meets a published segment, or reaches blocks the node can place, the
+///    computed frontier must equal the recorded one; a frontier commits to every leaf before
+///    it, so one match verifies the whole replay below it.
 pub async fn export(node: &str, out_dir: &std::path::Path, max_new: usize) -> Result<usize, String> {
     use kaspa_rpc_core::api::rpc::RpcApi;
     let client = kaspa_grpc_client::GrpcClient::connect_with_args(
@@ -505,8 +501,14 @@ pub async fn export(node: &str, out_dir: &std::path::Path, max_new: usize) -> Re
     while k >= 1 && written < max_new {
         if !have.contains(&k) {
             let t0 = std::time::Instant::now();
-            let from = place(k * SEGMENT_DAA).await?;
-            let to = place((k + 1) * SEGMENT_DAA).await?;
+            // A pruned node places frontiers only in its recent window: below it, phase 2.
+            let (from, to) = match (place(k * SEGMENT_DAA).await, place((k + 1) * SEGMENT_DAA).await) {
+                (Ok(f), Ok(t)) => (f, t),
+                (Err(e), _) | (_, Err(e)) => {
+                    log::info!("chain files: the node cannot place segment {k} ({e}); older segments are replayed from genesis");
+                    break;
+                }
+            };
             let to_hash = to.hash().ok_or("bad end hash")?;
             let mut cursor = from.hash().ok_or("bad start hash")?;
             let mut blocks: Vec<RpcShieldedChainBlock> = Vec::new();
@@ -531,27 +533,148 @@ pub async fn export(node: &str, out_dir: &std::path::Path, max_new: usize) -> Re
                 }
             }
             verify_segment(&from, &to, &blocks).map_err(|e| format!("segment {k} failed verification: {e}"))?;
-            let bytes = encode_segment(&genesis, k, &blocks);
-            let sha = sha256_hex(&bytes);
-            let file = format!("seg-{k:06}-{}.zks", &sha[..16]);
-            let tmp = out_dir.join(format!("{file}.tmp"));
-            std::fs::write(&tmp, &bytes).map_err(|e| e.to_string())?;
-            std::fs::rename(&tmp, out_dir.join(&file)).map_err(|e| e.to_string())?;
-            log::info!(
-                "chain files: segment {k} written: {} blocks, {} leaves, {} KB, verified, {:.1} s",
-                blocks.len(),
-                to.size - from.size,
-                bytes.len() / 1024,
-                t0.elapsed().as_secs_f64()
-            );
-            manifest.segments.push(SegmentEntry { index: k, file, sha256: sha, bytes: bytes.len() as u64, blocks: blocks.len() as u64, from, to });
-            manifest.segments.sort_by_key(|s| s.index);
-            write_manifest(&manifest_path, &mut manifest, key.as_ref())?;
+            publish_segment(out_dir, &genesis, k, &blocks, from, to, &mut manifest, &manifest_path, key.as_ref(), "verified against the node", t0)?;
             written += 1;
         }
         k -= 1;
     }
+
+    // Phase 2: replay upward below what the node could place.
+    let genesis_boundary = Boundary {
+        block: genesis.to_string(),
+        daa: kaspa_consensus_core::config::params::MAINNET_PARAMS.genesis.daa_score,
+        size: 0,
+        leaf: RpcHash::from_bytes([0; 32]).to_string(),
+        ommers: Vec::new(),
+    };
+    let mut k = 0u64;
+    let mut from = genesis_boundary;
+    while let Some(s) = manifest.segments.iter().find(|s| s.index == k) {
+        from = s.to.clone();
+        k += 1;
+    }
+    while k <= last && written < max_new && !manifest.segments.iter().any(|s| s.index == k) {
+        let t0 = std::time::Instant::now();
+        // Where the replay meets a published segment it must end exactly at that segment's
+        // start; otherwise at the last chain block below (k + 1) * SEGMENT_DAA.
+        let junction = manifest.segments.iter().find(|s| s.index == k + 1).map(|s| s.from.clone());
+        let limit = (k + 1) * SEGMENT_DAA;
+        let mut cursor = from.hash().ok_or("bad start hash")?;
+        let mut blocks: Vec<RpcShieldedChainBlock> = Vec::new();
+        'replay: loop {
+            let page = client.get_shielded_blocks(cursor, 2000).await.map_err(|e| format!("replay segment {k}: {e}"))?;
+            if page.reorged {
+                return Err(format!("replay segment {k}: the node reports a reorg below the cursor"));
+            }
+            if page.blocks.is_empty() {
+                return Err(format!("replay segment {k}: reached the tip before the end of the segment"));
+            }
+            for b in page.blocks {
+                match &junction {
+                    Some(j) => {
+                        if b.daa_score > j.daa {
+                            return Err(format!("replay segment {k}: passed daa {} without meeting the next segment's start", j.daa));
+                        }
+                        cursor = b.hash;
+                        let end = b.hash.to_string() == j.block;
+                        blocks.push(b);
+                        if end {
+                            break 'replay;
+                        }
+                    }
+                    None => {
+                        if b.daa_score >= limit {
+                            break 'replay;
+                        }
+                        cursor = b.hash;
+                        blocks.push(b);
+                    }
+                }
+            }
+        }
+        let last_block = blocks.last().ok_or_else(|| format!("replay segment {k} has no blocks"))?;
+        let got = end_frontier(&from, &blocks).map_err(|e| format!("replay segment {k}: {e}"))?;
+        let to = Boundary {
+            block: last_block.hash.to_string(),
+            daa: last_block.daa_score,
+            size: got.size,
+            leaf: got.leaf.map(|l| RpcHash::from_bytes(l).to_string()).unwrap_or_else(|| RpcHash::from_bytes([0; 32]).to_string()),
+            ommers: got.ommers.iter().map(|o| RpcHash::from_bytes(*o).to_string()).collect(),
+        };
+        let how = if let Some(j) = &junction {
+            if !j.same_frontier(&got) {
+                return Err(format!(
+                    "replay segment {k}: the computed tree ({} leaves) differs from the published start of segment {} ({} leaves); nothing written",
+                    got.size,
+                    k + 1,
+                    j.size
+                ));
+            }
+            "replayed; matches the next published segment"
+        } else {
+            match place(limit).await {
+                Ok(n) if n.block == to.block && !n.same_frontier(&got) => {
+                    return Err(format!("replay segment {k}: the computed tree ({} leaves) differs from the node's ({} leaves)", got.size, n.size));
+                }
+                Ok(n) if n.block == to.block => "replayed; matches the node's frontier",
+                _ => "replayed from genesis",
+            }
+        };
+        let next_from = to.clone();
+        publish_segment(out_dir, &genesis, k, &blocks, from, to, &mut manifest, &manifest_path, key.as_ref(), how, t0)?;
+        from = next_from;
+        written += 1;
+        k += 1;
+    }
     Ok(written)
+}
+
+/// The frontier `blocks` leave behind on top of `from`, by the leaf rules every wallet runs.
+pub fn end_frontier(from: &Boundary, blocks: &[RpcShieldedChainBlock]) -> Result<kaspa_shielded_core::tree::FrontierState, String> {
+    let fs = from.frontier_state().ok_or("bad start frontier")?;
+    let mut db = kaspa_shielded_core::walletdb::WalletDb::from_frontier([0x5a; 32], &fs).ok_or("start frontier does not build a tree")?;
+    db.set_leaves_only(true);
+    for b in blocks {
+        let d = crate::decode_block(b)?;
+        db.ingest_block_compact_precomputed_with_meta(&d.coinbase, &d.compact, None);
+        if db.poisoned() {
+            return Err(format!("block {} repeats a nullifier", b.hash));
+        }
+    }
+    db.end_page();
+    db.tip_frontier_state().ok_or_else(|| "no tree after the segment".to_string())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_segment(
+    out_dir: &std::path::Path,
+    genesis: &RpcHash,
+    k: u64,
+    blocks: &[RpcShieldedChainBlock],
+    from: Boundary,
+    to: Boundary,
+    manifest: &mut Manifest,
+    manifest_path: &std::path::Path,
+    key: Option<&secp256k1::Keypair>,
+    how: &str,
+    t0: std::time::Instant,
+) -> Result<(), String> {
+    let bytes = encode_segment(genesis, k, blocks);
+    let sha = sha256_hex(&bytes);
+    let file = format!("seg-{k:06}-{}.zks", &sha[..16]);
+    let tmp = out_dir.join(format!("{file}.tmp"));
+    std::fs::write(&tmp, &bytes).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, out_dir.join(&file)).map_err(|e| e.to_string())?;
+    log::info!(
+        "chain files: segment {k} written: {} blocks, {} leaves, {} KB, {how}, {:.1} s",
+        blocks.len(),
+        to.size - from.size,
+        bytes.len() / 1024,
+        t0.elapsed().as_secs_f64()
+    );
+    manifest.segments.push(SegmentEntry { index: k, file, sha256: sha, bytes: bytes.len() as u64, blocks: blocks.len() as u64, from, to });
+    manifest.segments.sort_by_key(|s| s.index);
+    write_manifest(manifest_path, manifest, key)
 }
 
 // ---------------------------------------------------------------------------------------------
