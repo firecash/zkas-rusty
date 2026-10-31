@@ -46,6 +46,7 @@ use std::sync::Arc;
 
 pub mod selfhost;
 mod almanac;
+pub mod chain_files;
 pub use selfhost::{SelfHostConfig, run_selfhost};
 mod engine_host;
 pub use engine_host::{EngineConfig, serve_engine};
@@ -549,6 +550,10 @@ pub struct ResourceLimits {
     /// remote node) raises it so the loop stops fetching pages one-at-a-time
     /// with the cores idle between round-trips. See `deep_prefetch`.
     pub prefetch_depth: usize,
+    /// Published chain files (see [`chain_files`]): an `https://` base URL or a local directory
+    /// holding `manifest.json` and the 12-hour segments. Pages they cover are read from them
+    /// instead of the node. `None` (the default) reads everything from the node.
+    pub chain_files: Option<String>,
     /// Seconds before a wallet that has advanced is checkpointed on the TIME rule.
     ///
     /// The built-in 60 was chosen for a phone: the comment on `CHECKPOINT_INTERVAL` is about
@@ -614,6 +619,7 @@ impl Default for ResourceLimits {
             warm_budget_pct: 60,
             subtree_free_floor_mb: 1_200,
             prefetch_depth: 1,
+            chain_files: None,
             checkpoint_interval_secs: 60,
             catchup_checkpoint_interval_secs: 0,
         }
@@ -3038,6 +3044,9 @@ struct DecodedPage {
     /// `--shared-scan-engine`: the page memo per viewing key (`IvkKey` id), filled by the
     /// first wallet of a cohort to reach the page for every wallet registered at this cursor.
     cohort: std::sync::Mutex<HashMap<[u8; 64], Arc<Vec<kaspa_shielded_core::wallet::ReceivedNote>>>>,
+    /// Read from published chain files, not the node: the digest of the raw blocks, so a page
+    /// that changes a wallet can be compared with the node's answer (`chain_files` rule 2).
+    file_digest: Option<[u8; 32]>,
 }
 
 /// Whether to trust a node-supplied coinbase commitment verbatim instead of
@@ -3440,6 +3449,8 @@ struct PageCache {
     /// indistinguishable from a first fetch in `misses` alone. Without this nobody can say
     /// how much of the miss rate is the cache giving up on pages it still had.
     expired_refetch: u64,
+    /// Published chain files to answer pages from before asking the node; see [`chain_files`].
+    files: Option<std::sync::Arc<chain_files::ChainFiles>>,
 }
 
 impl PageCache {
@@ -3462,6 +3473,7 @@ impl PageCache {
             misses: 0,
             scout: ScoutCost::default(),
             expired_refetch: 0,
+            files: None,
         }
     }
 }
@@ -3743,15 +3755,33 @@ async fn fetch_shielded_page_traced(
     // Not held across the fetch/decode below: `_lead` is what serialises duplicates,
     // and taking the cache lock here would serialise every page instead of this one.
     let t_rpc = std::time::Instant::now();
-    let raw = match client.get_shielded_blocks(low, limit).await {
-        Ok(raw) => raw,
-        Err(e) => {
-            // Release the slot on the way out or the next asker inherits a gate whose
-            // leader is gone and waits for an answer nobody is producing.
-            cache.lock().await.in_flight.remove(&key);
-            return Err(e);
-        }
+    // Published chain files answer the same (cursor, limit) question when a loaded segment
+    // covers the cursor; everything else, and everything newer than the newest segment, is
+    // still the node's. See `chain_files`.
+    let files = { cache.lock().await.files.clone() };
+    let from_files = files.as_ref().and_then(|f| f.page(low, limit));
+    let served_by_files = from_files.is_some();
+    let raw = match from_files {
+        Some(raw) => raw,
+        None => match client.get_shielded_blocks(low, limit).await {
+            Ok(raw) => raw,
+            Err(e) => {
+                // Release the slot on the way out or the next asker inherits a gate whose
+                // leader is gone and waits for an answer nobody is producing.
+                cache.lock().await.in_flight.remove(&key);
+                return Err(e);
+            }
+        },
     };
+    let file_digest = served_by_files.then(|| chain_files::blocks_digest(&raw.blocks));
+    if let Some(f) = files.as_ref() {
+        if !served_by_files {
+            f.note_sink(raw.sink_blue_score);
+        }
+        if let Some(last) = raw.blocks.last() {
+            f.prefetch_from(last.daa_score);
+        }
+    }
     // Decode the page ACROSS CORES. The per-block coinbase Sinsemilla commitment is the
     // dominant scan cost (~1 ms/block — it, not decryption, set the measured ~900 blk/s
     // single-thread ceiling), and each block decodes independently. `block_in_place`
@@ -3802,6 +3832,7 @@ async fn fetch_shielded_page_traced(
             low,
             limit,
             cohort: std::sync::Mutex::new(HashMap::new()),
+            file_digest,
         });
     let mut c = cache.lock().await;
     // Re-inserting a key must not leave a second copy in the eviction queue. A page
@@ -3912,6 +3943,9 @@ struct WalletEntry {
     /// checkpoint and the caller rebuilds it, as for a reorg it cannot follow. A flag, not a strike
     /// count, because a successful page clears the strikes before the pass reaches the retire step.
     audit_retire: bool,
+    /// The last block this wallet ingested from published chain files, until the node has
+    /// confirmed the wallet's tree there (`chain_files` rule 3).
+    files_handoff: Option<RpcHash>,
     /// Balance effect of the blocks between the settled cutoff and the tip — value
     /// arriving and owned value being spent, seen by trial-decryption without touching
     /// the append-only tree. This is what makes a payment visible ~1 second after it is
@@ -4135,6 +4169,7 @@ impl WalletEntry {
             sink_live: false,
             reorged_strikes: 0,
             audit_retire: false,
+            files_handoff: None,
             preview: Preview::default(),
             mempool: Preview::default(),
             unsettled_nulls: HashSet::new(),
@@ -4493,6 +4528,55 @@ impl WalletEntry {
             self.reorged_strikes = 0;
             self.sink_blue = resp.sink_blue_score;
             self.sink_live = true;
+            // Rule 3 of `chain_files`: the tree built from published files must end at the
+            // node's own tree. Checked once, at the first node page that continues it, before
+            // anything from the node is added on top.
+            if resp.file_digest.is_none() && self.files_handoff == Some(self.low) {
+                self.files_handoff = None;
+                let mine = self.db.tip_frontier_state();
+                match tokio::time::timeout(SYNC_RPC_TIMEOUT, client.get_shielded_tree_state(Some(self.low))).await {
+                    Ok(Ok(ts)) if ts.block_hash == self.low => {
+                        let node = kaspa_shielded_core::tree::FrontierState {
+                            size: ts.size,
+                            leaf: (ts.size > 0).then(|| ts.leaf.as_bytes()),
+                            ommers: ts.ommers.iter().map(|o| o.as_bytes()).collect(),
+                        };
+                        let same = mine.as_ref().is_some_and(|m| m.size == node.size && m.leaf == node.leaf && m.ommers == node.ommers);
+                        if same {
+                            log::info!(
+                                "wallet {token_p}: chain files verified: the tree built from them equals the node's at block {} ({} leaves)",
+                                self.low,
+                                node.size,
+                                token_p = log_pseudonym(&token)
+                            );
+                        } else {
+                            if let Some(f) = cache.lock().await.files.clone() {
+                                f.disable("a wallet's tree built from chain files differs from the node's");
+                            }
+                            log::error!(
+                                "wallet {token_p}: the tree built from chain files does NOT equal the node's at block {} (mine {:?} leaves, node {}); rebuilding from the node",
+                                self.low,
+                                mine.as_ref().map(|m| m.size),
+                                node.size,
+                                token_p = log_pseudonym(&token)
+                            );
+                            self.audit_retire = true;
+                            self.error = Some("published chain data disagreed with the node; rebuilding from the node".into());
+                            return;
+                        }
+                    }
+                    other => log::info!(
+                        "wallet {token_p}: chain-files hand-off at block {} not checkable here ({}); the next checkpoint binds against the node",
+                        self.low,
+                        match other {
+                            Ok(Ok(_)) => "the node answered another block".to_string(),
+                            Ok(Err(e)) => e.to_string(),
+                            Err(_) => "timed out".to_string(),
+                        },
+                        token_p = log_pseudonym(&token)
+                    ),
+                }
+            }
             // PREFETCH the next page while this one is being ingested below. The next
             // cursor is this page's LAST block hash - known right now, before any
             // ingest - and the result lands in the shared page cache, so this loop's
@@ -4528,6 +4612,8 @@ impl WalletEntry {
             // This section is synchronous trial-decryption/tree work. Mark it as
             // blocking so Tokio starts replacement workers for HTTP and RPC tasks
             // while up to three wallets continue ingesting in parallel.
+            let page_low = self.low;
+            let before = (self.db.notes().len(), self.db.history().len(), self.db.balance());
             let t_ingest = std::time::Instant::now();
             let (advanced, at_margin) = tokio::task::block_in_place(|| {
                 let mut advanced = false;
@@ -4704,6 +4790,47 @@ impl WalletEntry {
             self.stats.ingest_ns += t_ingest.elapsed().as_nanos() as u64;
             if self.db.poisoned() {
                 return;
+            }
+            if let Some(digest) = resp.file_digest {
+                // Rule 2 of `chain_files`: a page read from files that changed this wallet —
+                // a note received or spent, a history row — must be exactly the node's page
+                // before anything built on it is kept. Pages that change nothing need no check
+                // here; rule 3 covers their leaves.
+                let after = (self.db.notes().len(), self.db.history().len(), self.db.balance());
+                if after != before {
+                    let mut confirmed = None;
+                    for _ in 0..2 {
+                        if let Ok(Ok(node)) = tokio::time::timeout(SYNC_RPC_TIMEOUT, client.get_shielded_blocks(page_low, resp.limit)).await {
+                            let n = resp.blocks.len().min(node.blocks.len());
+                            confirmed = Some(n == resp.blocks.len() && chain_files::blocks_digest(&node.blocks[..n]) == digest);
+                            break;
+                        }
+                    }
+                    if confirmed != Some(true) {
+                        if let Some(f) = cache.lock().await.files.clone() {
+                            f.disable(if confirmed.is_none() {
+                                "the node could not confirm a file page that changed a wallet"
+                            } else {
+                                "a file page that changed a wallet differs from the node's page"
+                            });
+                        }
+                        log::error!(
+                            "wallet {token_p}: a chain-files page after block {page_low} changed this wallet and was {}; rebuilding from the node",
+                            if confirmed.is_none() { "not confirmable by the node" } else { "NOT the node's page" },
+                            token_p = log_pseudonym(&token)
+                        );
+                        self.audit_retire = true;
+                        self.error = Some("published chain data could not be confirmed with the node; rebuilding from the node".into());
+                        return;
+                    }
+                    log::info!(
+                        "wallet {token_p}: chain-files page after block {page_low} changed this wallet; confirmed identical to the node's",
+                        token_p = log_pseudonym(&token)
+                    );
+                }
+                if advanced {
+                    self.files_handoff = Some(self.low);
+                }
             }
             // Own sends ingested from compact records have no recipient/memo/fee yet — fetch
             // the full transaction for each new Sent row and recover them with the OVK. Rare
@@ -14118,7 +14245,19 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
         allow_default_token: cfg.allow_default_token,
         wallet_secret,
         genesis,
-        page_cache: Mutex::new(PageCache::new(&resources)),
+        page_cache: Mutex::new({
+            let mut pc = PageCache::new(&resources);
+            if let Some(base) = resources.chain_files.as_deref() {
+                if cfg.node_socks_proxy.is_some() {
+                    // The file fetch would leave the Tor proxy the node connection uses.
+                    log::warn!("chain files disabled: the node connection is routed through a proxy");
+                } else {
+                    log::info!("chain files: pages covered by published segments are read from them");
+                    pc.files = Some(chain_files::ChainFiles::new(base, genesis));
+                }
+            }
+            pc
+        }),
         last_touch: Mutex::new(HashMap::new()),
         activity: Mutex::new(activity_seed),
         persisted_snaps: Mutex::new(snap_seed),

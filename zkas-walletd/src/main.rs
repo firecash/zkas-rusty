@@ -263,6 +263,10 @@ struct Cli {
     /// than a new baked-in number, so the trade can be measured on the box it runs on.
     #[arg(long, value_name = "N")]
     prefetch_depth: Option<usize>,
+    /// Read the pages published chain files cover from them instead of the node: an
+    /// `https://` base URL or a local directory with `manifest.json` (see `chain_export`).
+    #[arg(long, value_name = "URL_OR_DIR")]
+    chain_files: Option<String>,
     /// Seconds before a wallet that has advanced is checkpointed on the time rule (default 60).
     ///
     /// Checkpoint writes are the dominant disk I/O on a hosted daemon: a far-behind wallet
@@ -399,6 +403,9 @@ async fn run(cli: Cli) {
     }
     if let Some(v) = cli.prefetch_depth.filter(|v| *v > 0) {
         resources.prefetch_depth = v;
+    }
+    if let Some(v) = cli.chain_files.clone().filter(|v| !v.trim().is_empty()) {
+        resources.chain_files = Some(v);
     }
     if let Some(v) = cli.checkpoint_interval.filter(|v| *v > 0) {
         resources.checkpoint_interval_secs = v;
