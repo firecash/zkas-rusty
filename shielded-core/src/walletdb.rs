@@ -422,6 +422,11 @@ pub struct WalletDb {
     /// [`base_frontier`](Self::base_frontier), so it already reflects everything up
     /// to the fast-sync checkpoint before any leaf is ingested.
     tree: CommitmentTree<MerkleHashOrchard, TREE_DEPTH>,
+    /// Leaves appended to the stream but not yet hashed into `tree`. Ingest buffers a page
+    /// and [`Self::flush_mirror`] adds them level by level with batched MerkleCRH (one
+    /// shared normalization per level) instead of one hash per leaf. Never persisted, and
+    /// never visible: every read of the mirror goes through [`Self::mirror`].
+    mirror_pending: Vec<MerkleHashOrchard>,
     /// The checkpoint frontier the wallet's stream starts from — empty for a
     /// genesis/position-0 (full-scan) start, or a node-supplied frontier when the
     /// wallet fast-syncs ([`Self::from_frontier`]). Its ommers are exactly the
@@ -961,6 +966,7 @@ impl WalletDb {
             my_address,
             known_addresses,
             tree: CommitmentTree::empty(),
+            mirror_pending: Vec::new(),
             base_frontier: Frontier::empty(),
             base_size: 0,
             leaves: Vec::new(),
@@ -1121,6 +1127,7 @@ impl WalletDb {
         self.base_frontier = gt.frontier().clone();
         self.base_size = gt.size();
         self.tree = CommitmentTree::from_frontier(&self.base_frontier);
+        self.mirror_pending.clear();
         self.lag_tree = CommitmentTree::from_frontier(&self.base_frontier);
         self.witnessed_upto = self.base_size;
         self.witnesses.clear();
@@ -1188,7 +1195,7 @@ impl WalletDb {
         // An empty tree has the Orchard empty-tree anchor; a non-empty tree roots
         // its full depth. This mirrors `GlobalTree::anchor`.
         use orchard::tree::Anchor;
-        if self.size == 0 { Anchor::empty_tree().to_bytes() } else { self.tree.root().to_bytes() }
+        if self.size == 0 { Anchor::empty_tree().to_bytes() } else { self.mirror().root().to_bytes() }
     }
 
     /// Ingest one accepted chain block's shielded effects, **in the exact order
@@ -2308,8 +2315,12 @@ impl WalletDb {
         if self.borrow_tree {
             self.tree_valid = false;
         } else {
-            // `append` only errors when the tree is full (2^32 leaves) — unreachable.
-            let _ = self.tree.append(leaf);
+            // Hashed in batches at the end of the page (see `flush_mirror`); bounded so a
+            // path that never ends a page still batches instead of growing without limit.
+            self.mirror_pending.push(leaf);
+            if self.mirror_pending.len() >= MIRROR_BATCH_MAX {
+                self.flush_mirror();
+            }
         }
         self.scan_cost.mirror_ns += t_mirror.elapsed().as_nanos();
         let t_subtree = std::time::Instant::now();
@@ -2370,7 +2381,7 @@ impl WalletDb {
         if !self.tree_valid {
             return None;
         }
-        let f = self.tree.to_frontier();
+        let f = self.mirror().to_frontier();
         Some(match f.value() {
             None => FrontierState { size: 0, leaf: None, ommers: Vec::new() },
             Some(nef) => FrontierState {
@@ -2400,6 +2411,8 @@ impl WalletDb {
         }
         let Ok(t) = GlobalTree::from_state(fs) else { return false };
         self.tree = CommitmentTree::from_frontier(t.frontier());
+        // Same size, so the adopted frontier already covers every buffered leaf.
+        self.mirror_pending.clear();
         self.tree_valid = true;
         true
     }
@@ -2479,6 +2492,31 @@ impl WalletDb {
     /// memo would answer for a later page it never saw.
     pub fn end_page(&mut self) {
         self.predecrypted = None;
+        self.flush_mirror();
+    }
+
+    /// The mirror tree including any buffered leaves. Borrowed when nothing is pending
+    /// (the case between pages); otherwise a copy extended with the buffer, so a read in the
+    /// middle of a page is still exact.
+    fn mirror(&self) -> std::borrow::Cow<'_, CommitmentTree<MerkleHashOrchard, TREE_DEPTH>> {
+        if self.mirror_pending.is_empty() {
+            std::borrow::Cow::Borrowed(&self.tree)
+        } else {
+            std::borrow::Cow::Owned(CommitmentTree::from_frontier(&frontier_extend(&self.tree.to_frontier(), &self.mirror_pending)))
+        }
+    }
+
+    /// Hash the buffered leaves into the mirror tree, level by level in batches.
+    fn flush_mirror(&mut self) {
+        if self.mirror_pending.is_empty() {
+            return;
+        }
+        let t = std::time::Instant::now();
+        let pending = std::mem::take(&mut self.mirror_pending);
+        self.tree = CommitmentTree::from_frontier(&frontier_extend(&self.tree.to_frontier(), &pending));
+        let ns = t.elapsed().as_nanos();
+        self.scan_cost.mirror_ns += ns;
+        self.scan_cost.tree_ns += ns;
     }
 
     /// Ingest for the **tree only**, skipping trial decryption.
@@ -2832,7 +2870,7 @@ impl WalletDb {
             None => Err("cache cannot produce a root at the wallet size"),
             // A borrowed tree is not this wallet's to disagree with — see
             // `cache_matches_tree`.
-            Some(r) if !self.tree_valid || r == self.tree.root() => {
+            Some(r) if !self.tree_valid || r == self.mirror().root() => {
                 self.subtree = c;
                 Ok(())
             }
@@ -2973,7 +3011,7 @@ impl WalletDb {
         if !self.tree_valid {
             return true;
         }
-        root == self.tree.root()
+        root == self.mirror().root()
     }
 
     /// The tree root at exactly `matured` leaves, derived from the cache in O(depth).
@@ -3510,7 +3548,7 @@ impl WalletDb {
         db.reindex_owned_nfs();
         db.witnesses = witnesses;
         db.witnessed_upto = size;
-        db.lag_tree = db.tree.clone();
+        db.lag_tree = db.mirror().into_owned();
         db.last_daa = last_daa;
         Some((db, ScanReceiptMeta { scanned_daa, anchor_leaves: size }))
     }
@@ -3615,7 +3653,7 @@ impl WalletDb {
         // a non-zero size is self-evidently "not recorded", and the load path treats it
         // as such rather than as an empty tree.
         if self.tree_valid {
-            write_frontier(&mut out, &self.tree.to_frontier());
+            write_frontier(&mut out, &self.mirror().to_frontier());
         } else {
             out.push(0);
         }
@@ -4477,7 +4515,7 @@ impl WalletDb {
                 return false;
             }
         }
-        self.tree_valid && t.root() == self.tree.root()
+        self.tree_valid && t.root() == self.mirror().root()
     }
 
     /// The canonical bytes of the leaf at absolute `position`, if this stream holds it.
@@ -4508,6 +4546,59 @@ fn write_subtree_section(out: &mut Vec<u8>, subtree: &SubtreeCache) {
 }
 
 /// Serialize a frontier: `0` for empty, else `1 ‖ leaf(32) ‖ n_ommers(u64) ‖ ommer(32)*`.
+/// Leaves buffered for the mirror before a flush is forced (a page is ~2,000).
+const MIRROR_BATCH_MAX: usize = 4_096;
+
+/// `frontier` with `leaves` appended: exactly the frontier that appending them one by one
+/// would produce, with the MerkleCRH work done level by level in batches
+/// ([`MerkleHashOrchard::combine_batch`] shares one normalization across a level) instead
+/// of one hash per leaf.
+///
+/// A tree of `size` leaves holds one waiting left node at every level `k` where bit `k` of
+/// `size` is set; for a frontier at `position` those nodes are exactly its ommers. Appending
+/// is then, per level: put that waiting node in front, combine the sequence in pairs, carry
+/// an odd one out as the new waiting node, and continue one level up with the results.
+fn frontier_extend(frontier: &Frontier<MerkleHashOrchard, TREE_DEPTH>, leaves: &[MerkleHashOrchard]) -> Frontier<MerkleHashOrchard, TREE_DEPTH> {
+    let Some(&last) = leaves.last() else { return frontier.clone() };
+    let depth = usize::from(TREE_DEPTH);
+    let mut waiting: Vec<Option<MerkleHashOrchard>> = vec![None; depth];
+    let mut items: Vec<MerkleHashOrchard> = Vec::with_capacity(leaves.len());
+    let size: u64 = match frontier.value() {
+        None => 0,
+        Some(f) => {
+            let position = u64::from(f.position());
+            let mut ommers = f.ommers().iter();
+            for (k, slot) in waiting.iter_mut().enumerate() {
+                if (position >> k) & 1 == 1 {
+                    *slot = ommers.next().copied();
+                }
+            }
+            items.push(*f.leaf());
+            position
+        }
+    };
+    // Every leaf but the last is absorbed into the waiting nodes; the last is the
+    // frontier's leaf, so the waiting nodes at the end are its ommers.
+    items.extend_from_slice(&leaves[..leaves.len() - 1]);
+    let position = size + items.len() as u64;
+    let mut absorbed = size;
+    for (k, slot) in waiting.iter_mut().enumerate() {
+        if items.is_empty() {
+            break;
+        }
+        let mut seq = Vec::with_capacity(items.len() + 1);
+        if absorbed & 1 == 1 {
+            seq.push(slot.take().expect("a waiting node at every set bit"));
+        }
+        seq.extend_from_slice(&items);
+        *slot = if seq.len() % 2 == 1 { seq.last().copied() } else { None };
+        items = MerkleHashOrchard::combine_batch(Level::from(k as u8), seq.chunks_exact(2).map(|pair| (&pair[0], &pair[1])));
+        absorbed >>= 1;
+    }
+    let ommers: Vec<MerkleHashOrchard> = waiting.into_iter().flatten().collect();
+    Frontier::from_parts(incrementalmerkletree::Position::from(position), last, ommers).expect("a frontier from consistent parts")
+}
+
 fn write_frontier(out: &mut Vec<u8>, f: &Frontier<MerkleHashOrchard, TREE_DEPTH>) {
     match f.value() {
         None => out.push(0),
@@ -5502,13 +5593,13 @@ mod tests {
             fresh.leaves = db.leaves.clone();
             fresh.notes = db.notes.to_vec();
             fresh.size = db.size;
-            fresh.tree = db.tree.clone();
+            fresh.tree = db.mirror().into_owned();
 
             let mut live = WalletDb::from_seed(mine).unwrap();
             live.leaves = db.leaves.clone();
             live.notes = db.notes.to_vec();
             live.size = db.size;
-            live.tree = db.tree.clone();
+            live.tree = db.mirror().into_owned();
             live.advance_witnesses(cutoff);
 
             for n in db.notes() {
@@ -5560,7 +5651,7 @@ mod tests {
             w.leaves = db.leaves.clone();
             w.notes = db.notes.to_vec();
             w.size = db.size;
-            w.tree = db.tree.clone();
+            w.tree = db.mirror().into_owned();
             if base > 0 {
                 w.advance_base_capped(base, u64::MAX);
             }
@@ -5578,7 +5669,7 @@ mod tests {
                 w2.leaves = w.leaves.clone();
                 w2.notes = w.notes.to_vec();
                 w2.size = w.size;
-                w2.tree = w.tree.clone();
+                w2.tree = w.mirror().into_owned();
                 w2.base_frontier = w.base_frontier.clone();
                 w2.base_size = w.base_size;
                 w2.build_subtree_cache();
@@ -5738,7 +5829,7 @@ mod tests {
             // `base` — otherwise every base collapses to the earliest note's position.
             w.notes = db.notes.iter().filter(|n| n.position >= base).cloned().collect();
             w.size = db.size;
-            w.tree = db.tree.clone();
+            w.tree = db.mirror().into_owned();
             if base > 0 {
                 // Returns whether MORE rolling remains; a full roll to `base` yields false.
                 let more = w.advance_base_capped(base, u64::MAX);
@@ -5875,7 +5966,7 @@ mod tests {
         refn.leaves = db.leaves.clone();
         refn.notes = db.notes.to_vec();
         refn.size = db.size();
-        refn.tree = db.tree.clone();
+        refn.tree = db.mirror().into_owned();
         let want: Vec<_> = db
             .notes()
             .iter()
@@ -6680,7 +6771,7 @@ mod tests {
 
         let v4 = db.to_checkpoint();
         let mut suffix = Vec::new();
-        write_frontier(&mut suffix, &db.tree.to_frontier());
+        write_frontier(&mut suffix, &db.mirror().to_frontier());
         let mut v3 = v4[..v4.len() - suffix.len()].to_vec();
         v3[0] = CHECKPOINT_VERSION_V3;
 
@@ -6717,7 +6808,7 @@ mod tests {
         // versions append — the v4 tip frontier plus the length-prefixed v5
         // (witnesses), v6 (history) and v7 (pending spends) sections.
         let mut tip = Vec::new();
-        write_frontier(&mut tip, &db.tree.to_frontier());
+        write_frontier(&mut tip, &db.mirror().to_frontier());
         let mut wsec = Vec::new();
         wsec.extend_from_slice(&db.witnessed_upto.to_le_bytes());
         write_tree(&mut wsec, &db.lag_tree);
@@ -7579,5 +7670,62 @@ mod circuit_tests {
 
         db.set_history_enabled(false);
         assert!(db.history().is_empty(), "disabling erases the record");
+    }
+}
+
+#[cfg(test)]
+mod mirror_batch_tests {
+    use super::*;
+
+    fn leaf(i: u64) -> MerkleHashOrchard {
+        let mut b = [0u8; 32];
+        b[..8].copy_from_slice(&i.wrapping_mul(0x9e37_79b9_7f4a_7c15).to_le_bytes());
+        b[31] &= 0x3f;
+        Option::from(MerkleHashOrchard::from_bytes(&b)).expect("canonical")
+    }
+
+    fn sequential(start: &Frontier<MerkleHashOrchard, TREE_DEPTH>, leaves: &[MerkleHashOrchard]) -> Frontier<MerkleHashOrchard, TREE_DEPTH> {
+        let mut f = start.clone();
+        for l in leaves {
+            assert!(f.append(*l));
+        }
+        f
+    }
+
+    /// Batched extension is the sequential frontier — same position, leaf, ommers and
+    /// root — from an empty tree and from every start size up to 140 plus sizes straddling
+    /// high powers of two, for batches of every length from 0 to 48 and some long ones.
+    #[test]
+    fn batched_extension_equals_sequential_appends() {
+        let mut starts: Vec<u64> = (0..140).collect();
+        starts.extend([511, 512, 513, 1023, 1024, 4095, 4096, 4097, 65_535, 65_536]);
+        let mut cases = 0usize;
+        for &s in &starts {
+            let base = sequential(&Frontier::empty(), &(0..s).map(leaf).collect::<Vec<_>>());
+            let mut lens: Vec<u64> = (0..48).collect();
+            if s % 37 == 0 {
+                lens.extend([255, 256, 257, 2_000, 4_097]);
+            }
+            for &n in &lens {
+                let add: Vec<_> = (s..s + n).map(leaf).collect();
+                let want = sequential(&base, &add);
+                let got = frontier_extend(&base, &add);
+                assert_eq!(got, want, "start {s} len {n}");
+                assert_eq!(got.root(), want.root(), "start {s} len {n}");
+                cases += 1;
+            }
+        }
+        assert!(cases > 7_000, "{cases}");
+    }
+
+    /// Splitting one stream into batches anywhere gives the same frontier as one batch.
+    #[test]
+    fn batching_is_associative() {
+        let all: Vec<_> = (0..3_000).map(leaf).collect();
+        let whole = frontier_extend(&Frontier::empty(), &all);
+        for cut in [1usize, 2, 3, 999, 1_000, 1_024, 2_047, 2_999] {
+            let a = frontier_extend(&Frontier::empty(), &all[..cut]);
+            assert_eq!(frontier_extend(&a, &all[cut..]), whole, "cut {cut}");
+        }
     }
 }
