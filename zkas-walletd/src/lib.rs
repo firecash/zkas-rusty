@@ -9564,6 +9564,11 @@ struct StatusResp {
     /// only alongside `spend_ready` — it is the caveat attached to paying while behind.
     #[serde(default)]
     blocks_behind: u64,
+    /// The published chain files this engine reads catch-up from, when configured: where
+    /// from, whether a check switched them off, and what they have cost so far. Absent when
+    /// the engine reads only from its node.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chain_files: Option<chain_files::Stats>,
 }
 
 /// The `/api/status` answer before any wallet is consulted (shared with `engine_host`).
@@ -9605,6 +9610,7 @@ fn status_base(network: &str, node_connected: bool, daa_score: u64) -> StatusRes
         missing_history: false,
         history_from_daa: None,
         watch_only: false,
+        chain_files: None,
     }
 }
 
@@ -9624,6 +9630,7 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Json<
     };
 
     let mut resp = status_base(&state.network, node_connected, daa_score);
+    resp.chain_files = state.page_cache.lock().await.files.as_ref().map(|f| f.stats());
 
     if let Some(token) = token {
         // NEVER load on the request path. A wallet load makes node RPCs and rebuilds a

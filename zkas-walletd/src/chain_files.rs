@@ -38,9 +38,6 @@ pub const SEGMENT_DAA: u64 = 43_200;
 /// A segment ends at least this far below the tip when it is exported (2 hours), far past any
 /// reorg on this chain.
 pub const EXPORT_TIP_MARGIN_DAA: u64 = 7_200;
-/// Segments kept decoded in memory: the one being ingested and one read ahead. A decoded
-/// 12-hour segment is ~100 MB of block structures (measured on the phone configuration), so
-/// on a phone this is the bound that matters.
 /// Segments read ahead of a page's end.
 const READ_AHEAD_SEGMENTS: usize = 2;
 /// Decoded segments held at once, shared by every wallet in the process. Two wallets catching
@@ -110,9 +107,52 @@ pub struct Manifest {
     pub genesis: String,
     pub segment_daa: u64,
     pub segments: Vec<SegmentEntry>,
+    /// BIP-340 Schnorr signature (hex) by the publisher over SHA-256 of `signing_payload()`:
+    /// this manifest with `signature` left out, as compact JSON. Inside the file rather than
+    /// beside it, so a mirror can never pair a new list with an old signature mid-update.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
 }
 
+/// The publisher keys (BIP-340 x-only, hex) a manifest fetched over HTTP must be signed by.
+/// The segment files are pinned by the manifest's SHA-256s, so this one signature is what
+/// stops a mirror, a CDN or anything on the path from substituting the whole set. Rules 2 and
+/// 3 (the node cross-checks) still apply on top: a signed file that disagrees with the node is
+/// dropped like any other.
+pub const PUBLISHER_KEYS: &[&str] = &["e8603874d997c626e6d29ef4e76da894bbdb001478b7454d1cb548ae3bfc6fc1"];
+
 impl Manifest {
+    pub fn signing_payload(&self) -> Vec<u8> {
+        let mut m = self.clone();
+        m.signature = None;
+        serde_json::to_vec(&m).expect("a manifest always serialises")
+    }
+
+    fn digest(&self) -> secp256k1::Message {
+        let d: [u8; 32] = Sha256::digest(self.signing_payload()).into();
+        secp256k1::Message::from_digest(d)
+    }
+
+    pub fn sign(&mut self, key: &secp256k1::Keypair) {
+        self.signature = None;
+        let sig = secp256k1::SECP256K1.sign_schnorr(&self.digest(), key);
+        self.signature = Some(hex::encode(sig.as_ref()));
+    }
+
+    pub fn verify_signature(&self, keys: &[&str]) -> Result<(), String> {
+        let sig = self.signature.as_deref().ok_or("manifest is not signed")?;
+        let sig = hex::decode(sig).map_err(|_| "manifest signature is not hex".to_string())?;
+        let sig = secp256k1::schnorr::Signature::from_slice(&sig).map_err(|e| format!("manifest signature: {e}"))?;
+        let msg = self.digest();
+        for k in keys {
+            let Ok(pk) = k.parse::<secp256k1::XOnlyPublicKey>() else { continue };
+            if secp256k1::SECP256K1.verify_schnorr(&sig, &msg, &pk).is_ok() {
+                return Ok(());
+            }
+        }
+        Err("manifest signature does not match the publisher key".into())
+    }
+
     fn check(&self, genesis: &RpcHash) -> Result<(), String> {
         if self.zkas_chain_files != MANIFEST_VERSION {
             return Err(format!("unsupported manifest version {}", self.zkas_chain_files));
@@ -127,7 +167,9 @@ impl Manifest {
     }
 }
 
-/// Where ZKas publishes its chain files.
+/// Where ZKas publishes its chain files. A comma-separated list of mirrors is accepted
+/// (segments are spread across them by index, each falling back to the others); add a mirror
+/// here only once it is serving. The node is always the last fallback.
 pub const PUBLIC_CHAIN_FILES: &str = "https://zkas.info/shielded-chain";
 
 /// The chain files an engine talking to `node` should use: the public ones when `node` is one
@@ -372,6 +414,24 @@ pub fn verify_segment(from: &Boundary, to: &Boundary, blocks: &[RpcShieldedChain
 /// Write every complete segment not yet in `out_dir`, newest first, at most `max_new` of them,
 /// then the manifest. Reads from `node`, which must hold frontiers for the whole range (an
 /// archival node synced from genesis). Each segment is verified before it is written.
+/// Read the publisher's secret key (64 hex chars) from the file `ZKAS_CHAIN_FILES_KEY` names.
+pub fn publisher_key_from_env() -> Result<Option<secp256k1::Keypair>, String> {
+    let Ok(path) = std::env::var("ZKAS_CHAIN_FILES_KEY") else { return Ok(None) };
+    let hexkey = std::fs::read_to_string(&path).map_err(|e| format!("publisher key {path}: {e}"))?;
+    let raw = hex::decode(hexkey.trim()).map_err(|_| format!("publisher key {path} is not hex"))?;
+    secp256k1::Keypair::from_seckey_slice(secp256k1::SECP256K1, &raw).map(Some).map_err(|e| format!("publisher key {path}: {e}"))
+}
+
+fn write_manifest(path: &std::path::Path, manifest: &mut Manifest, key: Option<&secp256k1::Keypair>) -> Result<(), String> {
+    match key {
+        Some(k) => manifest.sign(k),
+        None => manifest.signature = None,
+    }
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(&manifest).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, path).map_err(|e| e.to_string())
+}
+
 pub async fn export(node: &str, out_dir: &std::path::Path, max_new: usize) -> Result<usize, String> {
     use kaspa_rpc_core::api::rpc::RpcApi;
     let client = kaspa_grpc_client::GrpcClient::connect_with_args(
@@ -392,9 +452,19 @@ pub async fn export(node: &str, out_dir: &std::path::Path, max_new: usize) -> Re
     let manifest_path = out_dir.join("manifest.json");
     let mut manifest = match std::fs::read(&manifest_path) {
         Ok(b) => serde_json::from_slice::<Manifest>(&b).map_err(|e| format!("existing manifest: {e}"))?,
-        Err(_) => Manifest { zkas_chain_files: MANIFEST_VERSION, genesis: genesis.to_string(), segment_daa: SEGMENT_DAA, segments: Vec::new() },
+        Err(_) => Manifest { zkas_chain_files: MANIFEST_VERSION, genesis: genesis.to_string(), segment_daa: SEGMENT_DAA, segments: Vec::new(), signature: None },
     };
     manifest.check(&genesis)?;
+    let key = publisher_key_from_env()?;
+    // A manifest written before signing existed, or by another key: re-sign it now rather than
+    // wait for the next new segment, or every HTTP client keeps refusing it.
+    if let Some(k) = key.as_ref() {
+        let pk = k.x_only_public_key().0.to_string();
+        if manifest.verify_signature(&[pk.as_str()]).is_err() {
+            write_manifest(&manifest_path, &mut manifest, Some(k))?;
+            log::info!("chain files: manifest (re)signed by {pk}");
+        }
+    }
     let have: HashSet<u64> = manifest.segments.iter().map(|s| s.index).collect();
     let place = |daa: u64| {
         let c = client.clone();
@@ -455,9 +525,7 @@ pub async fn export(node: &str, out_dir: &std::path::Path, max_new: usize) -> Re
             );
             manifest.segments.push(SegmentEntry { index: k, file, sha256: sha, bytes: bytes.len() as u64, blocks: blocks.len() as u64, from, to });
             manifest.segments.sort_by_key(|s| s.index);
-            let tmp = out_dir.join("manifest.json.tmp");
-            std::fs::write(&tmp, serde_json::to_vec_pretty(&manifest).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-            std::fs::rename(&tmp, &manifest_path).map_err(|e| e.to_string())?;
+            write_manifest(&manifest_path, &mut manifest, key.as_ref())?;
             written += 1;
         }
         k -= 1;
@@ -496,9 +564,15 @@ impl Loaded {
     }
 }
 
+fn is_http(base: &str) -> bool {
+    base.starts_with("http://") || base.starts_with("https://")
+}
+
 /// The wallet side: answers page requests from published segments where it can.
 pub struct ChainFiles {
-    base: String,
+    /// Mirrors, each an `https://…` URL or a local directory. Segment `k` is fetched from
+    /// mirror `k % n` first and from the others if that fails or serves the wrong bytes.
+    bases: Vec<String>,
     http: Option<reqwest::Client>,
     genesis: RpcHash,
     manifest: tokio::sync::Mutex<Option<(std::time::Instant, Arc<Manifest>)>>,
@@ -514,17 +588,38 @@ pub struct ChainFiles {
     disabled: std::sync::atomic::AtomicBool,
     pub pages_served: AtomicU64,
     pub segments_loaded: AtomicU64,
+    /// Bytes of segment files fetched this process, and how often each segment was fetched:
+    /// a segment fetched more than twice means the cache is fighting itself, which costs a
+    /// phone its data plan and is the first thing a log should say.
+    pub bytes_downloaded: AtomicU64,
+    fetches: Mutex<HashMap<u64, u32>>,
+}
+
+/// What `/api/status` reports about the chain files.
+#[derive(serde::Serialize, Clone, Debug)]
+pub struct Stats {
+    pub source: String,
+    pub disabled: bool,
+    pub pages_served: u64,
+    pub segments_loaded: u64,
+    pub downloaded_mb: f64,
+    /// Segments fetched more than once this process.
+    pub refetched_segments: u64,
 }
 
 impl ChainFiles {
-    /// `base` is an `https://…` URL or a local directory holding `manifest.json` and the files.
-    pub fn new(base: &str, genesis: RpcHash) -> Arc<Self> {
-        let base = base.trim_end_matches('/').to_string();
-        let http = (base.starts_with("http://") || base.starts_with("https://"))
+    /// `bases` is one or more comma-separated mirrors: `https://…` URLs or local directories
+    /// holding `manifest.json` and the files.
+    pub fn new(bases: &str, genesis: RpcHash) -> Arc<Self> {
+        let bases: Vec<String> =
+            bases.split(',').map(|b| b.trim().trim_end_matches('/').to_string()).filter(|b| !b.is_empty()).collect();
+        let http = bases
+            .iter()
+            .any(|b| is_http(b))
             .then(|| reqwest::Client::builder().timeout(std::time::Duration::from_secs(120)).build().ok())
             .flatten();
         Arc::new(Self {
-            base,
+            bases,
             http,
             genesis,
             manifest: tokio::sync::Mutex::new(None),
@@ -535,20 +630,34 @@ impl ChainFiles {
             disabled: std::sync::atomic::AtomicBool::new(false),
             pages_served: AtomicU64::new(0),
             segments_loaded: AtomicU64::new(0),
+            bytes_downloaded: AtomicU64::new(0),
+            fetches: Mutex::new(HashMap::new()),
         })
     }
 
-    async fn get(&self, name: &str) -> Result<Vec<u8>, String> {
-        match &self.http {
-            Some(c) => {
-                let r = c.get(format!("{}/{name}", self.base)).send().await.map_err(|e| e.to_string())?;
-                if !r.status().is_success() {
-                    return Err(format!("HTTP {}", r.status()));
-                }
-                Ok(r.bytes().await.map_err(|e| e.to_string())?.to_vec())
+    async fn get_from(&self, base: &str, name: &str) -> Result<Vec<u8>, String> {
+        if is_http(base) {
+            let c = self.http.as_ref().ok_or("no HTTP client")?;
+            let r = c.get(format!("{base}/{name}")).send().await.map_err(|e| e.to_string())?;
+            if !r.status().is_success() {
+                return Err(format!("HTTP {}", r.status()));
             }
-            None => tokio::fs::read(format!("{}/{name}", self.base)).await.map_err(|e| e.to_string()),
+            Ok(r.bytes().await.map_err(|e| e.to_string())?.to_vec())
+        } else {
+            tokio::fs::read(format!("{base}/{name}")).await.map_err(|e| e.to_string())
         }
+    }
+
+    /// The manifest one mirror serves, if it is well formed, for this network and — when it
+    /// came over HTTP — signed by the publisher.
+    async fn manifest_from(&self, base: &str) -> Result<Manifest, String> {
+        let b = self.get_from(base, "manifest.json").await?;
+        let man = serde_json::from_slice::<Manifest>(&b).map_err(|e| e.to_string())?;
+        man.check(&self.genesis)?;
+        if is_http(base) {
+            man.verify_signature(PUBLISHER_KEYS)?;
+        }
+        Ok(man)
     }
 
     async fn manifest(&self) -> Option<Arc<Manifest>> {
@@ -558,19 +667,48 @@ impl ChainFiles {
                 return Some(man.clone());
             }
         }
-        let fetched = self.get("manifest.json").await.and_then(|b| serde_json::from_slice::<Manifest>(&b).map_err(|e| e.to_string()));
-        match fetched.and_then(|man| man.check(&self.genesis).map(|_| man)) {
-            Ok(man) => {
-                let man = Arc::new(man);
-                *m = Some((std::time::Instant::now(), man.clone()));
-                Some(man)
-            }
-            Err(e) => {
-                log::warn!("chain files: manifest unavailable ({e}); reading from the node");
-                // Keep a stale one if there is one: published segments never change.
-                m.as_ref().map(|(_, man)| man.clone())
+        let mut why = Vec::new();
+        for base in &self.bases {
+            match self.manifest_from(base).await {
+                Ok(man) => {
+                    let man = Arc::new(man);
+                    *m = Some((std::time::Instant::now(), man.clone()));
+                    return Some(man);
+                }
+                Err(e) => {
+                    log::warn!("chain files: manifest from {base} not used ({e})");
+                    why.push(e);
+                }
             }
         }
+        if m.is_none() {
+            log::warn!("chain files: no mirror served a usable manifest; reading from the node");
+        }
+        // Keep a stale one if there is one: published segments never change.
+        m.as_ref().map(|(_, man)| man.clone())
+    }
+
+    /// One segment's bytes, matching the manifest's size and SHA-256, from the first mirror
+    /// (starting at `index % n`, which spreads segments over the mirrors) that serves them.
+    async fn fetch_segment(&self, entry: &SegmentEntry) -> Result<Vec<u8>, String> {
+        let n = self.bases.len().max(1);
+        let mut last = String::from("no mirrors configured");
+        for i in 0..self.bases.len() {
+            let base = &self.bases[(entry.index as usize + i) % n];
+            match self.get_from(base, &entry.file).await {
+                Ok(bytes) if bytes.len() as u64 == entry.bytes && sha256_hex(&bytes) == entry.sha256 => return Ok(bytes),
+                Ok(bytes) => {
+                    self.bytes_downloaded.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                    log::warn!("chain files: {base} served segment {} that does not match the manifest; trying another mirror", entry.index);
+                    last = "file does not match the manifest".into();
+                }
+                Err(e) => {
+                    log::warn!("chain files: segment {} from {base} failed ({e}); trying another mirror", entry.index);
+                    last = e;
+                }
+            }
+        }
+        Err(last)
     }
 
     pub fn note_sink(&self, sink_blue: u64) {
@@ -637,6 +775,17 @@ impl ChainFiles {
         Some(GetShieldedBlocksResponse { blocks, reorged: false, sink_blue_score: sink })
     }
 
+    pub fn stats(&self) -> Stats {
+        Stats {
+            source: self.bases.join(","),
+            disabled: self.is_disabled(),
+            pages_served: self.pages_served.load(Ordering::Relaxed),
+            segments_loaded: self.segments_loaded.load(Ordering::Relaxed),
+            downloaded_mb: (self.bytes_downloaded.load(Ordering::Relaxed) as f64 / 1_048_576.0 * 10.0).round() / 10.0,
+            refetched_segments: self.fetches.lock().unwrap().values().filter(|&&n| n > 1).count() as u64,
+        }
+    }
+
     fn now_ms(&self) -> u64 {
         self.epoch.elapsed().as_millis() as u64
     }
@@ -678,10 +827,12 @@ impl ChainFiles {
                     me2.loading.lock().unwrap().remove(&entry.index);
                     match r {
                         Ok(n) => log::info!(
-                            "chain files: segment {} ready: {n} blocks, {} KB, {} ms",
+                            "chain files: segment {} ready: {n} blocks, {} KB, {} ms ({} MB downloaded this session, {} pages served from files)",
                             entry.index,
                             entry.bytes / 1024,
-                            t0.elapsed().as_millis()
+                            t0.elapsed().as_millis(),
+                            me2.bytes_downloaded.load(Ordering::Relaxed) / 1_048_576,
+                            me2.pages_served.load(Ordering::Relaxed)
                         ),
                         Err(e) => log::warn!("chain files: segment {} not used ({e}); the node serves that range", entry.index),
                     }
@@ -691,9 +842,20 @@ impl ChainFiles {
     }
 
     async fn load(&self, entry: &SegmentEntry) -> Result<usize, String> {
-        let bytes = self.get(&entry.file).await?;
-        if bytes.len() as u64 != entry.bytes || sha256_hex(&bytes) != entry.sha256 {
-            return Err("file does not match the manifest".into());
+        let bytes = self.fetch_segment(entry).await?;
+        let total = self.bytes_downloaded.fetch_add(bytes.len() as u64, Ordering::Relaxed) + bytes.len() as u64;
+        let times = {
+            let mut f = self.fetches.lock().unwrap();
+            let n = f.entry(entry.index).or_insert(0);
+            *n += 1;
+            *n
+        };
+        if times > 2 {
+            log::warn!(
+                "chain files: segment {} fetched {times} times this session ({} MB downloaded in total) — the segment cache is evicting what a wallet still reads",
+                entry.index,
+                total / 1_048_576
+            );
         }
         let genesis = self.genesis;
         let index = entry.index;
@@ -849,7 +1011,7 @@ mod tests {
     fn two_wallets_at_different_heights_do_not_evict_each_other() {
         let g = RpcHash::from_bytes([9; 32]);
         let mk = |index: u64, used: u64| {
-            let blocks = vec![block(index as u8 * 10, 1, 1)];
+            let blocks = vec![block(index as u8, 1, 1)];
             let to = blocks[0].hash;
             let (body, n) = segment_body(&encode_segment(&g, index, &blocks), &g, index).unwrap();
             let idx = index_body(&body, n).unwrap();
@@ -898,5 +1060,71 @@ mod tests {
         insert_bounded(&mut l2, mk(99, 0), LOADED_SEGMENTS);
         assert!(held(&l2).contains(&99));
         assert_eq!(l2.len(), LOADED_SEGMENTS);
+    }
+
+    fn manifest_for_test() -> Manifest {
+        let b = Boundary { block: RpcHash::from_bytes([1; 32]).to_string(), daa: 10, size: 3, leaf: RpcHash::from_bytes([2; 32]).to_string(), ommers: vec![] };
+        Manifest {
+            zkas_chain_files: MANIFEST_VERSION,
+            genesis: RpcHash::from_bytes([9; 32]).to_string(),
+            segment_daa: SEGMENT_DAA,
+            segments: vec![SegmentEntry { index: 7, file: "seg-7.zks".into(), sha256: "ab".repeat(32), bytes: 5, blocks: 1, from: b.clone(), to: b }],
+            signature: None,
+        }
+    }
+
+    /// The signature covers every field a client acts on, survives the JSON round trip the
+    /// file goes through, and only the publisher's key verifies it.
+    #[test]
+    fn manifest_signature_binds_the_segment_list() {
+        let kp = secp256k1::Keypair::new(secp256k1::SECP256K1, &mut secp256k1::rand::thread_rng());
+        let pk = kp.x_only_public_key().0.to_string();
+        let mut m = manifest_for_test();
+        assert!(m.verify_signature(&[pk.as_str()]).is_err(), "unsigned is refused");
+        m.sign(&kp);
+        let back: Manifest = serde_json::from_slice(&serde_json::to_vec_pretty(&m).unwrap()).unwrap();
+        back.verify_signature(&[pk.as_str()]).expect("signed by the publisher");
+        let other = secp256k1::Keypair::new(secp256k1::SECP256K1, &mut secp256k1::rand::thread_rng());
+        assert!(back.verify_signature(&[other.x_only_public_key().0.to_string().as_str()]).is_err(), "another key");
+        let mut t = back.clone();
+        t.segments[0].sha256 = "cd".repeat(32);
+        assert!(t.verify_signature(&[pk.as_str()]).is_err(), "a swapped file hash");
+        let mut t = back.clone();
+        t.segments.push(t.segments[0].clone());
+        assert!(t.verify_signature(&[pk.as_str()]).is_err(), "an added segment");
+        let mut t = back;
+        t.signature = Some("00".repeat(64));
+        assert!(t.verify_signature(&[pk.as_str()]).is_err(), "a junk signature");
+    }
+
+    #[test]
+    fn the_built_in_publisher_key_parses() {
+        for k in PUBLISHER_KEYS {
+            k.parse::<secp256k1::XOnlyPublicKey>().expect("PUBLISHER_KEYS entries are x-only keys");
+        }
+    }
+
+    /// A mirror that serves a wrong file is skipped and the next mirror's copy is used; a
+    /// segment no mirror serves correctly is refused.
+    #[tokio::test]
+    async fn a_bad_mirror_falls_back_to_a_good_one() {
+        let g = RpcHash::from_bytes([9; 32]);
+        let good = encode_segment(&g, 7, &[block(1, 1, 1)]);
+        let dir = std::env::temp_dir().join(format!("cf-mirrors-{}", std::process::id()));
+        let (a, b) = (dir.join("a"), dir.join("b"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::write(a.join("seg-7.zks"), b"poisoned").unwrap();
+        std::fs::write(b.join("seg-7.zks"), &good).unwrap();
+        let mut entry = manifest_for_test().segments.remove(0);
+        entry.bytes = good.len() as u64;
+        entry.sha256 = sha256_hex(&good);
+        // Segment 7 of two mirrors starts at mirror 7 % 2 = 1, the second listed: the bad one.
+        let cf = ChainFiles::new(&format!("{},{}", b.display(), a.display()), g);
+        assert_eq!(cf.fetch_segment(&entry).await.unwrap(), good, "bad mirror a first, good b after");
+        std::fs::write(b.join("seg-7.zks"), b"poisoned too").unwrap();
+        assert!(cf.fetch_segment(&entry).await.is_err(), "no mirror has the right bytes");
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(cf.stats().source, format!("{},{}", b.display(), a.display()));
     }
 }
