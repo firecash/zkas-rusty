@@ -48,6 +48,9 @@ const LOADED_SEGMENTS: usize = 4;
 const SEGMENT_IDLE: std::time::Duration = std::time::Duration::from_secs(120);
 /// How long a fetched manifest is trusted before it is fetched again.
 const MANIFEST_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+/// After every mirror failed, how long before they are asked again. Without it each page
+/// re-asked: 72 manifest requests and 144 warnings in 90 s against a refused mirror.
+const MANIFEST_RETRY: std::time::Duration = std::time::Duration::from_secs(60);
 const MAGIC: &[u8; 8] = b"ZKASSEG1";
 const MANIFEST_VERSION: u32 = 1;
 
@@ -576,6 +579,8 @@ pub struct ChainFiles {
     http: Option<reqwest::Client>,
     genesis: RpcHash,
     manifest: tokio::sync::Mutex<Option<(std::time::Instant, Arc<Manifest>)>>,
+    /// When every mirror last failed to serve a usable manifest (see `MANIFEST_RETRY`).
+    manifest_failed: Mutex<Option<std::time::Instant>>,
     loaded: Mutex<VecDeque<Arc<Loaded>>>,
     loading: Mutex<HashSet<u64>>,
     /// The node's sink blue score as last seen, for the settlement margin a page carries.
@@ -623,6 +628,7 @@ impl ChainFiles {
             http,
             genesis,
             manifest: tokio::sync::Mutex::new(None),
+            manifest_failed: Mutex::new(None),
             loaded: Mutex::new(VecDeque::new()),
             loading: Mutex::new(HashSet::new()),
             sink: AtomicU64::new(0),
@@ -667,12 +673,16 @@ impl ChainFiles {
                 return Some(man.clone());
             }
         }
+        if self.manifest_failed.lock().unwrap().is_some_and(|at| at.elapsed() < MANIFEST_RETRY) {
+            return m.as_ref().map(|(_, man)| man.clone());
+        }
         let mut why = Vec::new();
         for base in &self.bases {
             match self.manifest_from(base).await {
                 Ok(man) => {
                     let man = Arc::new(man);
                     *m = Some((std::time::Instant::now(), man.clone()));
+                    *self.manifest_failed.lock().unwrap() = None;
                     return Some(man);
                 }
                 Err(e) => {
@@ -681,8 +691,9 @@ impl ChainFiles {
                 }
             }
         }
+        *self.manifest_failed.lock().unwrap() = Some(std::time::Instant::now());
         if m.is_none() {
-            log::warn!("chain files: no mirror served a usable manifest; reading from the node");
+            log::warn!("chain files: no mirror served a usable manifest; reading from the node (asking again in {} s)", MANIFEST_RETRY.as_secs());
         }
         // Keep a stale one if there is one: published segments never change.
         m.as_ref().map(|(_, man)| man.clone())
@@ -1126,5 +1137,29 @@ mod tests {
         assert!(cf.fetch_segment(&entry).await.is_err(), "no mirror has the right bytes");
         std::fs::remove_dir_all(&dir).ok();
         assert_eq!(cf.stats().source, format!("{},{}", b.display(), a.display()));
+    }
+
+    /// A refused manifest is not re-requested on every page: one attempt, then quiet until
+    /// `MANIFEST_RETRY` has passed.
+    #[tokio::test]
+    async fn a_refused_manifest_is_not_refetched_on_every_page() {
+        let dir = std::env::temp_dir().join(format!("cf-nomanifest-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("manifest.json"), b"not json").unwrap();
+        let cf = ChainFiles::new(&dir.display().to_string(), RpcHash::from_bytes([9; 32]));
+        assert!(cf.manifest().await.is_none());
+        let first = *cf.manifest_failed.lock().unwrap();
+        assert!(first.is_some());
+        // Now a good manifest appears; inside the back-off window it is not even looked at.
+        let mut m = manifest_for_test();
+        m.segments.clear();
+        std::fs::write(dir.join("manifest.json"), serde_json::to_vec(&m).unwrap()).unwrap();
+        assert!(cf.manifest().await.is_none(), "still backing off");
+        assert_eq!(*cf.manifest_failed.lock().unwrap(), first, "no new attempt was made");
+        // Once the window has passed it is fetched and used.
+        *cf.manifest_failed.lock().unwrap() = Some(std::time::Instant::now() - MANIFEST_RETRY - std::time::Duration::from_secs(1));
+        assert!(cf.manifest().await.is_some());
+        assert!(cf.manifest_failed.lock().unwrap().is_none());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
