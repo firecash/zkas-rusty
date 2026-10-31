@@ -4549,6 +4549,11 @@ fn write_subtree_section(out: &mut Vec<u8>, subtree: &SubtreeCache) {
 /// Leaves buffered for the mirror before a flush is forced (a page is ~2,000).
 const MIRROR_BATCH_MAX: usize = 4_096;
 
+/// Pairs at one tree level from which [`frontier_extend`] hashes the level across cores.
+const PARALLEL_COMBINE_MIN_PAIRS: usize = 512;
+/// The smallest run of pairs one core takes, so each run still amortizes its normalization.
+const PARALLEL_COMBINE_MIN_RUN: usize = 128;
+
 /// `frontier` with `leaves` appended: exactly the frontier that appending them one by one
 /// would produce, with the MerkleCRH work done level by level in batches
 /// ([`MerkleHashOrchard::combine_batch`] shares one normalization across a level) instead
@@ -4592,7 +4597,23 @@ fn frontier_extend(frontier: &Frontier<MerkleHashOrchard, TREE_DEPTH>, leaves: &
         }
         seq.extend_from_slice(&items);
         *slot = if seq.len() % 2 == 1 { seq.last().copied() } else { None };
-        items = MerkleHashOrchard::combine_batch(Level::from(k as u8), seq.chunks_exact(2).map(|pair| (&pair[0], &pair[1])));
+        let level = Level::from(k as u8);
+        let pairs = seq.len() / 2;
+        // A long level splits into independent runs of pairs, hashed across cores and
+        // joined in order: each pair's parent depends on that pair alone, so the result is
+        // byte-identical to one batch. Below the threshold one batch is cheaper than the
+        // fan-out (and keeps the single shared normalization).
+        items = if pairs >= PARALLEL_COMBINE_MIN_PAIRS {
+            use rayon::prelude::*;
+            let run = (pairs / rayon::current_num_threads().max(1)).max(PARALLEL_COMBINE_MIN_RUN) * 2;
+            seq[..pairs * 2]
+                .par_chunks(run)
+                .map(|c| MerkleHashOrchard::combine_batch(level, c.chunks_exact(2).map(|pair| (&pair[0], &pair[1]))))
+                .collect::<Vec<Vec<_>>>()
+                .concat()
+        } else {
+            MerkleHashOrchard::combine_batch(level, seq.chunks_exact(2).map(|pair| (&pair[0], &pair[1])))
+        };
         absorbed >>= 1;
     }
     let ommers: Vec<MerkleHashOrchard> = waiting.into_iter().flatten().collect();
@@ -7716,6 +7737,21 @@ mod mirror_batch_tests {
             }
         }
         assert!(cases > 7_000, "{cases}");
+    }
+
+    /// Levels long enough to be hashed across cores (`PARALLEL_COMBINE_MIN_PAIRS`) give the
+    /// frontier sequential appends give, at odd start sizes and lengths that cut the runs
+    /// anywhere.
+    #[test]
+    fn parallel_levels_equal_sequential_appends() {
+        for &(s, n) in &[(0u64, 20_000u64), (1, 19_999), (777, 12_345), (65_535, 9_001), (4_097, 30_000)] {
+            let base = sequential(&Frontier::empty(), &(0..s).map(leaf).collect::<Vec<_>>());
+            let add: Vec<_> = (s..s + n).map(leaf).collect();
+            let want = sequential(&base, &add);
+            let got = frontier_extend(&base, &add);
+            assert_eq!(got, want, "start {s} len {n}");
+            assert_eq!(got.root(), want.root(), "start {s} len {n}");
+        }
     }
 
     /// Splitting one stream into batches anywhere gives the same frontier as one batch.
