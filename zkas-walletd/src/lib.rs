@@ -1643,7 +1643,11 @@ const WITNESS_MIN_STEP: u64 = 32;
 /// couple of minutes of throttled passes, after which every spend replays only the few
 /// thousand leaves above the notes instead of the whole chain. See
 /// [`WalletDb::advance_base_capped`].
-const BASE_ADVANCE_STEP: u64 = 8192;
+// 262,144, not 8,192: each step also shifts the whole retained leaf vector (`drain`), so a
+// phone with 10.5M leaves above its base moved ~320 MB per 8,192-leaf step — ~400 GB over the
+// 21 minutes compaction took — while every checkpoint in that time wrote the full ~660 MB.
+// The step is hashed in batches across cores now, about a second on a phone.
+const BASE_ADVANCE_STEP: u64 = 262_144;
 
 /// Leaves per step for the ONE-TIME cold warm (base roll + witness build) of a freshly
 /// loaded / full-scan wallet. Larger than the steady step so the ~30–90 s one-time build
@@ -1653,6 +1657,9 @@ const BASE_ADVANCE_STEP: u64 = 8192;
 /// most once per wallet load, then `witnesses_warm` latches and only the cheap incremental
 /// step runs.
 const COLD_WARM_STEP: u64 = 16384;
+/// Leaves per base-roll step of the cold warm: the roll costs leaves (batched across cores),
+/// not leaves x witnesses, so it takes the large step; the witness step keeps `COLD_WARM_STEP`.
+const COLD_WARM_BASE_STEP: u64 = BASE_ADVANCE_STEP;
 
 /// Per-step WORK budget (≈ leaves × witnesses) for the cold warm. Dividing the leaf step
 /// by the note count keeps a 32-note wallet's step as cheap as a 1-note wallet's, so no
@@ -3949,6 +3956,8 @@ struct WalletEntry {
     /// node (a timeout, the phone's network asleep) needs. Nothing ingested since the last
     /// checkpoint is kept, and nothing before it is lost.
     reload_from_checkpoint: bool,
+    /// When this wallet last published mid-pass progress (see `SNAPSHOT_PUBLISH_EVERY`).
+    last_progress_publish: std::time::Instant,
     audit_retire: bool,
     /// The wallet's tree has not yet been confirmed equal to the node's (`chain_files` rule 3).
     /// True from load — a restored checkpoint may hold leaves read from chain files that were
@@ -4182,6 +4191,7 @@ impl WalletEntry {
             sink_live: false,
             reorged_strikes: 0,
             reload_from_checkpoint: false,
+            last_progress_publish: std::time::Instant::now(),
             audit_retire: false,
             files_unverified: true,
             files_check_at: None,
@@ -4368,9 +4378,11 @@ impl WalletEntry {
             self.error = Some("inconsistent shielded data from the node; sync halted until restart".into());
             return;
         }
-        // Local to the pass on purpose: a fresh pass should publish promptly rather
-        // than inherit a timer from the last one.
-        let mut last_publish = std::time::Instant::now();
+        // The progress-publish timer lives on the wallet (`last_progress_publish`), not here:
+        // a far-behind wallet runs many short chunks per pass, and a timer local to the
+        // chunk restarted at zero each time and never reached SNAPSHOT_PUBLISH_EVERY, so no
+        // mid-pass progress was published at all — the app saw progress only at pass ends,
+        // every ~15-20 s, and its percent and ETA froze between them (measured 1 Nov).
         let pass_started = std::time::Instant::now();
         // Stop building this wallet's own mirror tree while the shared tree is at or
         // ahead of us. That tree is ~80% of a scan (measured: 319 s of Sinsemilla
@@ -4544,6 +4556,7 @@ impl WalletEntry {
                     } else {
                         log::debug!("wallet sync page failed (transient, checkpoint kept): {e}");
                         self.error = Some(format!("get_shielded_blocks failed: {e}"));
+                        state.page_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                     return;
                 }
@@ -4908,10 +4921,10 @@ impl WalletEntry {
             // "Catching up" once per pass — replacing the bug this publishing exists to
             // fix with a noisier one. A wallet already at the tip has nothing to report
             // mid-pass anyway: its end-of-pass snapshot is the whole story.
-            if !was_caught_up && last_publish.elapsed() >= SNAPSHOT_PUBLISH_EVERY && self.db.notes().len() <= SNAPSHOT_NOTE_CEILING {
+            if !was_caught_up && self.last_progress_publish.elapsed() >= SNAPSHOT_PUBLISH_EVERY && self.db.notes().len() <= SNAPSHOT_NOTE_CEILING {
                 let snap = snap_from_entry(state.address_of(&self.db), self, self.chain_len);
                 state.snapshots.lock().await.insert(token.to_string(), snap);
-                last_publish = std::time::Instant::now();
+                self.last_progress_publish = std::time::Instant::now();
             }
             // A FULL small page means more blocks arrived than CAUGHT_UP_PAGE
             // carried: this wallet is not at the tip after all — take a full
@@ -5247,7 +5260,7 @@ impl WalletEntry {
                         // stream moved" failures live). The base is a memory optimisation;
                         // it can wait the ~minutes a build takes, then resume.
                         if !self.build_in_flight
-                            && tokio::task::block_in_place(|| self.db.advance_base_capped(matured, COLD_WARM_STEP))
+                            && tokio::task::block_in_place(|| self.db.advance_base_capped(matured, COLD_WARM_BASE_STEP))
                         {
                             continue;
                         }
@@ -5988,6 +6001,8 @@ struct AppState {
     ///
     /// An atomic cannot fail to be read, which is the property that was actually needed.
     chain_tree_size: std::sync::atomic::AtomicU64,
+    /// Transient page-fetch failures since the sync loop last looked (see its back-off).
+    page_failures: std::sync::atomic::AtomicU64,
     /// The shared tree's BASE — the oldest position it can witness. Published alongside
     /// `chain_tree_size` for the same lock-free reason.
     ///
@@ -6162,6 +6177,18 @@ struct AppState {
 /// Build a status snapshot from a locked wallet entry. Shared by the sync loop and the
 /// `status` handler so the spendable/maturing split is computed identically to what
 /// `/prepare` will actually draw on (same anchor-depth cutoff).
+/// The chain height a just-submitted spend is stamped with, for the never-landed reclaim
+/// (`PENDING_SPEND_EXPIRY_DAA`). The chain TIP, not the wallet's scan cursor: a wallet that
+/// sends while still catching up (a phone reopened 38,500 blocks behind) stamped its sends
+/// with a cursor far in the past, and once it caught up the reclaim saw them as hours old,
+/// returned the notes ten seconds after the payment was submitted, and every retry was then
+/// rejected as a double spend while the original payments were being mined (1 Nov). The
+/// reclaim itself keeps measuring with the scan cursor: "scanned this far past the send
+/// without seeing it" is the evidence it needs.
+fn submit_clock(e: &WalletEntry) -> u64 {
+    (e.scanned as u64).max(e.chain_len)
+}
+
 fn snap_from_entry(address: String, e: &WalletEntry, daa_score: u64) -> StatusSnap {
     let tip = e.chain_len.max(daa_score);
     let total = e.db.balance();
@@ -6516,6 +6543,11 @@ impl AppState {
     /// out (`subtree_paths`), so a chain tree that had somehow diverged would return
     /// `None` and decline, never a wrong witness.
     fn chain_tree_paths(&self, positions: &[u64], matured: u64) -> Option<Vec<Option<kaspa_shielded_core::MerklePath>>> {
+        // No shared tree is built here (phone, desktop): there is nothing to ask, and asking
+        // logged a WARN on every send that read like a fault. The wallet's own cache serves.
+        if !self.build_shared_tree {
+            return None;
+        }
         // Wait BRIEFLY for the tree, don't bail on the first miss.
         //
         // A bare `try_lock().ok()?` returned `None` the instant the sync loop held the
@@ -9214,6 +9246,7 @@ async fn sync_loop(state: Arc<AppState>) {
     // Keyed on `sync_wallets == 1`, which is exactly the on-device profile, so the hosted
     // daemon is unaffected.
     let single_wallet = state.resources.sync_wallets <= 1;
+    let mut fail_backoff = std::time::Duration::ZERO;
     loop {
         if single_wallet && proving_now() {
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
@@ -9479,9 +9512,19 @@ async fn sync_loop(state: Arc<AppState>) {
         }
         // While catching up a big initial scan, loop back immediately (only a
         // tiny yield so status calls can grab the lock); idle slowly once synced.
-        if any_behind {
+        // Back off while page fetches fail (the node unreachable — a phone's network asleep):
+        // the 10 ms catch-up loop below otherwise retried ~10 times a second for as long as
+        // the outage lasted (logged 30 failures in 3 s on a phone). Doubles to 8 s, and the
+        // first lap without a failure resets it.
+        let failures = state.page_failures.swap(0, std::sync::atomic::Ordering::Relaxed);
+        if failures > 0 {
+            fail_backoff = (fail_backoff * 2).clamp(std::time::Duration::from_secs(1), std::time::Duration::from_secs(8));
+            tokio::time::sleep(fail_backoff).await;
+        } else if any_behind {
+            fail_backoff = std::time::Duration::ZERO;
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         } else {
+            fail_backoff = std::time::Duration::ZERO;
             // A caught-up wallet used to idle here for 12 SECONDS, which is most of the
             // delay before a payment appears: the tx is mined in ~1s, but nothing looks at
             // it until this sleep ends. It is a cheap pass when nothing has changed (one
@@ -11432,7 +11475,7 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
                     let mut e = w.lock().await;
                     // The wallet's scan cursor is its chain clock — available whether or
                     // not the node serves block metadata, unlike WalletDb's own.
-                    let now_daa = e.scanned as u64;
+                    let now_daa = submit_clock(&e);
                     for p in positions {
                         e.db.mark_spent(p, accepted.as_bytes(), now_daa);
                     }
@@ -11760,7 +11803,7 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
                 paid += group_pay;
                 total_fee += fee;
                 let mut e = w.lock().await;
-                let now_daa = e.scanned as u64;
+                let now_daa = submit_clock(&e);
                 for p in b.positions {
                     e.db.mark_spent(p, accepted.as_bytes(), now_daa);
                 }
@@ -11954,7 +11997,7 @@ async fn consolidate_once(
     match submit_guarded(&node, &tx).await {
         Ok(accepted) => {
             let mut e = w.lock().await;
-            let now_daa = e.scanned as u64;
+            let now_daa = submit_clock(&e);
             for p in positions {
                 e.db.mark_spent(p, accepted.as_bytes(), now_daa);
             }
@@ -12564,12 +12607,17 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
         .fvk()
         .clone();
     // The per-wallet recoverable-history flag lives in the wallet file; prepare is
-    // keyed by FVK, so resolve it via the (optional) token — default on.
-    let recoverable = token_from(&headers, state.allow_default_token)
-        .ok()
-        .and_then(|t| load_wallet_meta(&state.wallet_dir, &t, state.wallet_secret.as_deref()))
+    // keyed by FVK, so resolve it via the (optional) token — default on. "Private sends"
+    // (`private_sends`) turns it off exactly as on the custodial paths: this path ignored
+    // it, so a phone wallet with Private sends switched on still built sender-recoverable
+    // payments — the opposite of what the user chose.
+    let tok = token_from(&headers, state.allow_default_token).ok();
+    let recoverable = tok
+        .as_deref()
+        .and_then(|t| load_wallet_meta(&state.wallet_dir, t, state.wallet_secret.as_deref()))
         .map(|(_, _, r)| r)
-        .unwrap_or(true);
+        .unwrap_or(true)
+        && !tok.as_deref().is_some_and(|t| private_sends(&state.wallet_dir, t));
     let memo = memo_bytes(req.memo.as_deref())?;
     let _consolidate_permit = if self_payment {
         // WAIT for a consolidation slot rather than reject on the first busy instant. A
@@ -12860,7 +12908,7 @@ async fn wallet_submit(
             if let Some(token) = token {
                 if let Some(w) = state.get_wallet(&token).await {
                     let mut e = w.lock().await;
-                    let now_daa = e.scanned as u64;
+                    let now_daa = submit_clock(&e);
                     for p in &positions {
                         e.db.mark_spent(*p, accepted.as_bytes(), now_daa);
                     }
@@ -14314,6 +14362,7 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
         node_error: node_error.clone(),
         chain_tree: chain_tree.clone(),
         chain_tree_size: std::sync::atomic::AtomicU64::new(0),
+        page_failures: std::sync::atomic::AtomicU64::new(0),
         chain_tree_base: std::sync::atomic::AtomicU64::new(0),
         chain_tree_frontier: Mutex::new(None),
         wallet_dir,
@@ -18081,5 +18130,26 @@ mod mem_available_tests {
             let os = os_available_mb().expect("the OS reports available memory");
             assert!(os > 0 && os <= total_mb, "OS free {os} MB must be within total {total_mb} MB");
         }
+    }
+}
+
+#[cfg(test)]
+mod send_stamp_tests {
+    /// A send is stamped with the chain tip, not the wallet's scan cursor: a wallet that sends
+    /// while 38,500 blocks behind must not see its own payment as hours old once it catches
+    /// up (the never-landed reclaim returned the notes 10 s after submit, 1 Nov).
+    #[test]
+    fn a_send_is_stamped_with_the_chain_tip_not_the_scan_cursor() {
+        let mut e = super::chain_tree_from_genesis(kaspa_rpc_core::RpcHash::from_bytes([3; 32]));
+        e.scanned = 8_402_097;
+        e.chain_len = 8_440_600;
+        assert_eq!(super::submit_clock(&e), 8_440_600, "behind: the tip");
+        e.scanned = 8_440_700;
+        assert_eq!(super::submit_clock(&e), 8_440_700, "a cursor past a stale tip: the cursor");
+        // Measured the way the reclaim measures it (the cursor, once caught up), the send is
+        // seconds old — nowhere near the expiry.
+        let stamped = 8_440_600u64;
+        let caught_up_cursor = 8_440_650u64;
+        assert!(caught_up_cursor - stamped < super::PENDING_SPEND_EXPIRY_DAA);
     }
 }

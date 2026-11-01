@@ -2099,20 +2099,17 @@ impl WalletDb {
         }
         let step_target = full_target.min(self.base_size.saturating_add(max_leaves));
         let rel = (step_target - self.base_size) as usize;
-        // Rebuild the frontier at `step_target` from the current base + the leaves we drop.
-        let mut tree = CommitmentTree::from_frontier(&self.base_frontier);
-        {
+        // Rebuild the frontier at `step_target` from the current base + the leaves we drop,
+        // level by level in batches across cores (`frontier_extend`), byte-identical to
+        // appending them one by one — which is what this did, at ~13 us a leaf on one core.
+        let new_base = {
             let leaves = self.decoded_leaves();
             if rel > leaves.len() {
                 return false;
             }
-            for leaf in &leaves[..rel] {
-                if tree.append(*leaf).is_err() {
-                    return false;
-                }
-            }
-        }
-        self.base_frontier = tree.to_frontier();
+            frontier_extend(&self.base_frontier, &leaves[..rel])
+        };
+        self.base_frontier = new_base;
         self.base_size = step_target;
         // Drop the now-summarised prefix (the stream is held once; see `leaves`).
         self.leaves.drain(..rel);
