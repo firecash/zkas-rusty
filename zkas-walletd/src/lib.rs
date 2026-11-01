@@ -3065,6 +3065,51 @@ struct DecodedPage {
     file_digest: Option<[u8; 32]>,
 }
 
+/// Derive every coinbase commitment instead of taking the supplied one (the old default).
+///
+/// No longer needed for safety: a commitment matters only for an output this wallet OWNS,
+/// and `WalletDb::owned_coinbase_checked` derives and checks exactly those before crediting
+/// one (a mismatch credits nothing and marks the data inconsistent). Every other leaf credits
+/// nothing and is covered by the tree checks against the node. Deriving all of them was over
+/// half the decode of a sync. ZKAS_WALLETD_DERIVE_ALL_CMX=1 restores it.
+fn derive_all_cmx() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("ZKAS_WALLETD_DERIVE_ALL_CMX").as_deref() == Ok("1") && !trust_node_cmx())
+}
+
+/// A prepare that cannot succeed, known before any witness is built: the selected notes do not
+/// cover amount + fee, and the caller did not allow (or cannot get) a partial chunk. Mirrors the
+/// refusal at the shortfall check exactly (a tracked wallet: chunking needs its session).
+fn prepare_is_doomed(selected: u64, need: u64, fee: u64, have: u64, self_payment: bool, allow_partial: bool) -> bool {
+    selected < need && !(allow_partial && (have >= need || self_payment) && selected.saturating_sub(fee) > 0)
+}
+
+/// Per-token backoff for poll-driven load retries (see `spawn_load`): when the next attempt
+/// may start, and how many have failed in a row.
+fn load_backoff() -> &'static std::sync::Mutex<HashMap<String, (std::time::Instant, u32)>> {
+    static B: std::sync::OnceLock<std::sync::Mutex<HashMap<String, (std::time::Instant, u32)>>> = std::sync::OnceLock::new();
+    B.get_or_init(Default::default)
+}
+
+const LOAD_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn load_backoff_allows(token: &str) -> bool {
+    load_backoff().lock().unwrap().get(token).is_none_or(|(next, _)| std::time::Instant::now() >= *next)
+}
+
+/// Record a failed load; returns how long the next poll-driven attempt waits (2 s doubling to 60 s).
+fn load_backoff_failed(token: &str) -> std::time::Duration {
+    let mut b = load_backoff().lock().unwrap();
+    let fails = b.get(token).map_or(0, |(_, f)| *f).saturating_add(1);
+    let wait = std::time::Duration::from_secs(1u64 << fails.min(6)).min(LOAD_BACKOFF_MAX);
+    b.insert(token.to_string(), (std::time::Instant::now() + wait, fails));
+    wait
+}
+
+fn load_backoff_clear(token: &str) {
+    load_backoff().lock().unwrap().remove(token);
+}
+
 /// Whether to trust a node-supplied coinbase commitment verbatim instead of
 /// re-deriving it. Off by default (safety); operators syncing against their own
 /// trusted node can set ZKAS_WALLETD_TRUST_NODE_CMX=1 to skip the Sinsemilla
@@ -3169,7 +3214,7 @@ fn decode_block(b: &kaspa_rpc_core::RpcShieldedChainBlock) -> Result<DecodedBloc
             // Never trust a coinbase leaf we cannot reproduce: derive it from the
             // PoW-committed block fields and reject a valid-but-wrong node value
             // (which would silently fork the wallet tree). See select_coinbase_cmx.
-            let cmx = select_coinbase_cmx(supplied, &desc, out.value, trust_node_cmx())
+            let cmx = select_coinbase_cmx(supplied, &desc, out.value, !derive_all_cmx())
                 .ok_or_else(|| format!("block {}: coinbase output {i} does not derive a note commitment, or disagrees with the node's", b.hash))?;
             coinbase.push((desc, out.value, cmx));
         }
@@ -7154,6 +7199,15 @@ impl AppState {
     /// The request path calls this and returns "loading…" immediately; when the load
     /// finishes the wallet is in the map and the next poll answers from it.
     fn spawn_load(self: &Arc<Self>, token: &str) {
+        // Backoff after a failed load. Every failure path ("keeping checkpoint and retrying":
+        // the node could not verify the cursor, a probe timed out, the node has not reached
+        // it) costs up to two 8 s node RPCs, and the app's ~1 Hz status poll used to start the
+        // next attempt at once, forever: a stuck phone said "Opening…" indefinitely and every
+        // stuck wallet multiplied load on the node. Requests that need the wallet itself still
+        // load it directly; only the poll-driven retries wait.
+        if !load_backoff_allows(token) {
+            return;
+        }
         let state = self.clone();
         let token = token.to_string();
         tokio::spawn(async move {
@@ -7168,7 +7222,14 @@ impl AppState {
             // with no thread to pull. One line here is the difference between a diagnosis
             // and a guess.
             if state.get_wallet(&token).await.is_none() {
-                log::warn!("wallet {token_p}: load did not complete; it stays 'opening' until a later request succeeds", token_p = log_pseudonym(&token));
+                let wait = load_backoff_failed(&token);
+                log::warn!(
+                    "wallet {token_p}: load did not complete; it stays 'opening' and the next attempt waits {}s",
+                    wait.as_secs(),
+                    token_p = log_pseudonym(&token)
+                );
+            } else {
+                load_backoff_clear(&token);
             }
         });
     }
@@ -12470,6 +12531,17 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
                     let take = take;
                     fee = dyn_fee;
                     need = amount.saturating_add(fee);
+                    // Whether this prepare can succeed is known from the note VALUES alone. The
+                    // witnesses below cost ~48 s on a note-heavy wallet, and they were built
+                    // before the shortfall check: a payment that could never be paid (more than
+                    // a transaction's notes can carry) paid that every time — 23,456 retries of
+                    // one such payment cost ~6 core-hours a day for 36 days. Witness only what
+                    // will be used: a payment that fits, or a partial chunk the caller allowed.
+                    let preview: u64 = candidates.iter().take(take).map(|n| n.value()).sum();
+                    if prepare_is_doomed(preview, need, fee, have_total.unwrap_or(0), self_payment, allow_partial) {
+                        selected = preview;
+                        session_token = Some(token.clone());
+                    } else {
                     // Build every selected note's witness in ONE base→matured pass
                     // (O(chain + N·depth)) instead of N independent O(chain) replays —
                     // the difference between ~one pass and N × ~26 s on a note-heavy
@@ -12502,6 +12574,7 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
                         selected += n.value();
                     }
                     session_token = Some(token.clone());
+                    }
                 }
                 }
             }
@@ -16170,10 +16243,56 @@ mod sdk_api_tests {
                 .unwrap();
         let mut with_commitment = base;
         with_commitment.coinbase_outputs[0].commitment = Some(supplied_cmx.to_bytes());
-        // Secure default: a supplied commitment that disagrees with the outputs refuses the block.
-        // Keeping the derived value instead would credit forged outputs that a history-backfill peer
-        // paired with the real commitment (the node's replay checks only the commitment).
-        assert!(decode_block(&with_commitment).is_err(), "an inconsistent coinbase record is refused");
+        // An inconsistent record (outputs that do not derive the supplied commitment: forged outputs
+        // a history-backfill peer paired with the real commitment) must never become income. The
+        // check is where income is decided: decode takes the supplied commitment as the leaf (it
+        // credits nothing by itself), and the wallet that OWNS the output derives and compares it
+        // before crediting (`WalletDb::owned_coinbase_checked`).
+        let decoded = decode_block(&with_commitment).expect("decode takes the supplied commitment as the leaf");
+        assert_eq!(decoded.coinbase[0].2.to_bytes(), supplied_cmx.to_bytes());
+        let mut owner = WalletDb::from_seed([0x31; 32]).unwrap();
+        owner.ingest_block_compact_precomputed_with_meta(&decoded.coinbase, &decoded.compact, None);
+        assert_eq!(owner.balance(), 0, "the forged output credits nothing");
+        assert!(owner.poisoned(), "the owner's data is marked inconsistent and rebuilt from the node");
+        let mut bystander = WalletDb::from_seed([0x32; 32]).unwrap();
+        bystander.ingest_block_compact_precomputed_with_meta(&decoded.coinbase, &decoded.compact, None);
+        assert!(!bystander.poisoned(), "a wallet the output does not concern only gains a leaf");
+        // A consistent record is credited.
+        let mut ok = WalletDb::from_seed([0x31; 32]).unwrap();
+        ok.ingest_block_compact_precomputed_with_meta(&legacy.coinbase, &legacy.compact, None);
+        assert_eq!(ok.balance(), value as u128);
+    }
+
+    #[test]
+    fn a_doomed_prepare_is_known_before_witnessing() {
+        // Fits: proceeds.
+        assert!(!prepare_is_doomed(1_000, 900, 10, 5_000, false, false));
+        // Short and no partial allowed: doomed, whatever the wallet holds.
+        assert!(prepare_is_doomed(800, 900, 10, 5_000, false, false));
+        // Short but a partial chunk is allowed and the wallet holds enough overall: proceeds.
+        assert!(!prepare_is_doomed(800, 900, 10, 5_000, false, true));
+        // Partial allowed but the wallet does not hold enough (not a self-payment): doomed.
+        assert!(prepare_is_doomed(800, 900, 10, 850, false, true));
+        // A self-payment short by its fee may chunk.
+        assert!(!prepare_is_doomed(800, 900, 10, 850, true, true));
+        // Nothing left after the fee: doomed.
+        assert!(prepare_is_doomed(10, 900, 10, 5_000, false, true));
+    }
+
+    #[test]
+    fn a_failing_load_backs_off_and_a_success_clears_it() {
+        let t = "backoff-test-token";
+        load_backoff_clear(t);
+        assert!(load_backoff_allows(t));
+        assert_eq!(load_backoff_failed(t).as_secs(), 2);
+        assert!(!load_backoff_allows(t), "the next poll does not retry at once");
+        assert_eq!(load_backoff_failed(t).as_secs(), 4);
+        for _ in 0..10 {
+            load_backoff_failed(t);
+        }
+        assert_eq!(load_backoff_failed(t), LOAD_BACKOFF_MAX, "capped");
+        load_backoff_clear(t);
+        assert!(load_backoff_allows(t));
     }
 
     #[test]

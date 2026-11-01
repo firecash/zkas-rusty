@@ -378,6 +378,37 @@ thread_local! {
     static OWNED_NF_INDEX_CHECK: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
 }
 
+/// `std::thread::scope`, except on wasm32 where a browser has no `std::thread`: there `spawn`
+/// runs its closure at once and `join` returns the result, so code written for two threads
+/// (the batch witness builder) runs the same work in sequence instead of panicking.
+#[cfg(not(target_arch = "wasm32"))]
+use std::thread::scope as scope_compat;
+
+#[cfg(target_arch = "wasm32")]
+fn scope_compat<T, F: FnOnce(&InlineScope) -> T>(f: F) -> T {
+    f(&InlineScope)
+}
+
+#[cfg(target_arch = "wasm32")]
+struct InlineScope;
+
+#[cfg(target_arch = "wasm32")]
+impl InlineScope {
+    fn spawn<R, F: FnOnce() -> R>(&self, f: F) -> InlineHandle<R> {
+        InlineHandle(f())
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+struct InlineHandle<R>(R);
+
+#[cfg(target_arch = "wasm32")]
+impl<R> InlineHandle<R> {
+    fn join(self) -> std::thread::Result<R> {
+        Ok(self.0)
+    }
+}
+
 /// The applied-nullifier set of a wallet that keeps its own: a sorted run plus a small hash set
 /// of recent inserts, merged into the run once it reaches [`NfTable::MERGE_AT`].
 ///
@@ -1382,7 +1413,7 @@ impl WalletDb {
             self.last_daa = self.last_daa.max(m.daa_score);
         }
         for (desc, value, cmx) in coinbase {
-            let owned = self.recover_coinbase_note(desc, *value);
+            let owned = self.owned_coinbase_checked(desc, *value, cmx);
             if owned.is_some() {
                 if let Some(m) = meta {
                     self.record_coinbase_history(*value, m);
@@ -1488,7 +1519,7 @@ impl WalletDb {
             // `leaves_only`: recognising the note is the only key-dependent step here.
             // The commit-or-skip rule that decides whether this leaf exists at all was
             // applied by the caller when it built `coinbase`, so the stream is unchanged.
-            let owned = if self.leaves_only { None } else { self.recover_coinbase_note(desc, *value) };
+            let owned = if self.leaves_only { None } else { self.owned_coinbase_checked(desc, *value, cmx) };
             if owned.is_some() {
                 if let Some(m) = meta {
                     self.record_coinbase_history(*value, m);
@@ -3325,7 +3356,7 @@ impl WalletDb {
         let base_frontier = &self.base_frontier;
         let cold_positions: Vec<u64> = cold.iter().map(|(p, _)| *p).collect();
         type Auth = [MerkleHashOrchard; TREE_DEPTH as usize];
-        let (nodes, left_ctx, matured_root) = std::thread::scope(|s| {
+        let (nodes, left_ctx, matured_root) = scope_compat(|s| {
             // PASS A (own thread): node map over [base, matured): nodes[l] maps an ABSOLUTE
             // level-l index to the hash of that subtree, for subtrees whose range is fully
             // >= base (partially filled at the right edge → combined with empty_root; fully
@@ -3461,6 +3492,28 @@ impl WalletDb {
     /// comparison returning before any curve work is why coinbase scanning costs
     /// nothing today. Deriving per candidate instead would have put a scalar
     /// multiplication on that path.
+    /// A coinbase output of OURS, with its caller-supplied commitment checked against the
+    /// one derived here — the one place a coinbase note becomes income.
+    ///
+    /// The precomputed paths take each output's commitment from the caller, who may have taken it
+    /// from the node or a published file instead of deriving it (the derivation is most of a
+    /// scan's decode cost, ~129 k commitments per three segments). For a leaf that is not ours
+    /// that is safe: it credits nothing, and a wrong leaf changes the tree, which is checked
+    /// against the node. For our own output it is not: forged outputs paired with a real
+    /// commitment would credit income that does not exist. So ours is derived and compared;
+    /// a mismatch credits nothing and marks the data inconsistent (as a repeated nullifier
+    /// does), so the wallet is rebuilt from the node.
+    fn owned_coinbase_checked(&mut self, desc: &CoinbaseNoteDesc, value: u64, cmx: &ExtractedNoteCommitment) -> Option<Note> {
+        let note = self.recover_coinbase_note(desc, value)?;
+        match crate::coinbase::coinbase_note_commitment_vartime(desc, value) {
+            Ok(derived) if derived.to_bytes() == cmx.to_bytes() => Some(note),
+            _ => {
+                self.poisoned = true;
+                None
+            }
+        }
+    }
+
     fn recover_coinbase_note(&self, desc: &CoinbaseNoteDesc, value: u64) -> Option<Note> {
         if desc.recipient != self.my_address && !self.known_addresses.contains(&desc.recipient) {
             return None;
@@ -6197,6 +6250,31 @@ mod tests {
         let mut shuffled: Vec<[u8; 32]> = reference.iter().copied().collect();
         shuffled.reverse();
         assert_eq!(NfTable::load(shuffled), t);
+    }
+
+    #[test]
+    fn own_coinbase_needs_a_commitment_that_derives() {
+        let mine = [47u8; 32];
+        let desc = derive_coinbase_note_desc(address_of(mine), &[1, 2, 3]);
+        let real = crate::coinbase::coinbase_note_commitment_vartime(&desc, 500).unwrap();
+        // Ours with the real commitment: credited.
+        let mut db = WalletDb::from_seed(mine).unwrap();
+        db.ingest_block_compact_precomputed_with_meta(&[(desc.clone(), 500, real)], &[], None);
+        assert_eq!(db.balance(), 500);
+        assert!(!db.poisoned());
+        // Ours with a forged value but the real commitment (the backfill-peer forgery): nothing
+        // credited, the data marked inconsistent.
+        let mut db = WalletDb::from_seed(mine).unwrap();
+        db.ingest_block_compact_precomputed_with_meta(&[(desc.clone(), 9_000, real)], &[], None);
+        assert_eq!(db.balance(), 0);
+        assert!(db.poisoned());
+        // Not ours: the supplied commitment is a leaf like any other, no derivation needed.
+        let theirs = derive_coinbase_note_desc(address_of([48u8; 32]), &[4, 5, 6]);
+        let mut db = WalletDb::from_seed(mine).unwrap();
+        db.ingest_block_compact_precomputed_with_meta(&[(theirs, 700, real)], &[], None);
+        assert_eq!(db.balance(), 0);
+        assert!(!db.poisoned());
+        assert_eq!(db.size(), 1);
     }
 
     /// A wallet holding nothing compacts to its tip on every page (rc26: a genesis restore held

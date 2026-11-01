@@ -193,13 +193,16 @@ pub fn decode(b: &Block) -> Result<(Coinbase, Vec<Vec<CompactActionRecord>>), St
         let mut recipient = [0u8; ORCHARD_SCRIPT_LEN];
         recipient.copy_from_slice(&script[..ORCHARD_SCRIPT_LEN]);
         let desc = derive_coinbase_note_desc(recipient, &coinbase_note_seed(b, i));
-        let derived = coinbase_note_commitment_vartime(&desc, *value).map_err(|_| format!("coinbase output {i} derives no commitment"))?;
-        if let Some(s) = supplied {
-            if *s != derived.to_bytes() {
-                return Err(format!("coinbase output {i}: supplied commitment disagrees with the derived one"));
-            }
-        }
-        coinbase.push((desc, *value, derived));
+        // The supplied commitment is taken as the leaf: deriving every one was 55% of a
+        // segment's ingest. The wallet derives and checks the commitment of any output that is
+        // ITS OWN before crediting it (`WalletDb::owned_coinbase_checked`); any other leaf
+        // credits nothing, and a wrong one changes the tree, which is checked against the
+        // node and the signed segment frontiers.
+        let cmx = match supplied.as_ref().and_then(|s| Option::<ExtractedNoteCommitment>::from(ExtractedNoteCommitment::from_bytes(s))) {
+            Some(c) => c,
+            None => coinbase_note_commitment_vartime(&desc, *value).map_err(|_| format!("coinbase output {i} derives no commitment"))?,
+        };
+        coinbase.push((desc, *value, cmx));
     }
     let mut compact = Vec::with_capacity(b.actions.len());
     for (i, blob) in b.actions.iter().enumerate() {
@@ -680,8 +683,16 @@ impl Engine {
         }
         let mut inputs = Vec::with_capacity(take);
         let mut positions = Vec::with_capacity(take);
-        for n in &cands[..take] {
-            let path = self.db.witness_path_at(n.position, s).ok_or("a coin to spend has no path in this wallet's tree")?;
+        // Every selected note witnessed in ONE pass over the leaves (walletd's batch builder; each
+        // path verified to the matured root or declined), then a per-note replay only for any it
+        // declined. Per note first was a full replay from the oldest note for every coin without
+        // a live witness — minutes in a browser for a wallet with many old coins.
+        let batch = self.db.witness_paths_at(&cands[..take].iter().map(|n| n.position).collect::<Vec<_>>(), s);
+        for (i, n) in cands[..take].iter().enumerate() {
+            let path = match batch.get(i).cloned().flatten() {
+                Some(p) => p,
+                None => self.db.witness_path_at(n.position, s).ok_or("a coin to spend has no path in this wallet's tree")?,
+            };
             let cmx = ExtractedNoteCommitment::from(n.note.commitment());
             // The node's own root at the anchor: a tree that drifted declines here instead of
             // proving a payment consensus would reject.

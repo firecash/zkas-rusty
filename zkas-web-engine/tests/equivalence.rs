@@ -103,3 +103,42 @@ fn a_viewing_key_gives_the_address_walletd_gives() {
     );
     assert!(address_of_fvk_str("00").is_err());
 }
+
+/// Where a segment's ingest time goes (decode incl. coinbase commitments / trial decryption /
+/// apply). Prints only; run with --nocapture.
+#[test]
+fn profile_segment_ingest() {
+    let Some(d) = dir() else { return };
+    let (_, m) = manifest(&d);
+    let k = m.segments.iter().position(|s| s.index == 150).expect("segment 150 published");
+    let mut blocks = Vec::new();
+    for s in &m.segments[k..k + 3] {
+        blocks.extend(parse_segment(&std::fs::read(format!("{d}/{}", s.file)).unwrap(), s.index).unwrap());
+    }
+    let (mut outs, mut supplied, mut actions) = (0usize, 0usize, 0usize);
+    for b in &blocks {
+        outs += b.outputs.len();
+        supplied += b.outputs.iter().filter(|o| o.2.is_some()).count();
+        actions += b.actions.iter().map(|a| a.len() / kaspa_shielded_core::wallet::CompactActionRecord::SERIALIZED_LEN).sum::<usize>();
+    }
+    let t = std::time::Instant::now();
+    let decoded: Vec<_> = blocks.iter().map(|b| decode(b).unwrap()).collect();
+    let t_decode = t.elapsed();
+    let fvk = kaspa_shielded_core::walletdb::WalletDb::from_seed([7; 32]).unwrap().fvk().to_bytes();
+    let mut db = kaspa_shielded_core::walletdb::WalletDb::from_fvk(&fvk).unwrap();
+    db.apply_frontier(&m.segments[k].from.frontier().unwrap()).unwrap();
+    let all: Vec<_> = decoded.iter().flat_map(|(_, c)| c.iter().flatten().copied()).collect();
+    let t = std::time::Instant::now();
+    db.predecrypt_page(&all);
+    let t_decrypt = t.elapsed();
+    db.set_borrow_tree(true);
+    let t = std::time::Instant::now();
+    for (cb, c) in &decoded {
+        db.ingest_block_compact_precomputed_with_meta(cb, c, None);
+    }
+    let t_apply = t.elapsed();
+    println!(
+        "PROFILE {} blocks, {} coinbase outputs ({} with a supplied commitment), {} actions | decode {:.2?} | decrypt {:.2?} | apply {:.2?}",
+        blocks.len(), outs, supplied, actions, t_decode, t_decrypt, t_apply
+    );
+}

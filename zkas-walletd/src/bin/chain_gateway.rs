@@ -36,6 +36,36 @@ struct Gw {
     node: kaspa_grpc_client::GrpcClient,
     genesis: RpcHash,
     gate: tokio::sync::Semaphore,
+    /// Answers that are the same for every caller, shared for a moment: every browser wallet
+    /// polls /tip, /mempool and its anchor every few seconds, and without this each poll was a
+    /// node RPC — load that grew with the number of open browsers. Now it is constant.
+    cache: Mutex<HashMap<String, (std::time::Instant, serde_json::Value)>>,
+}
+
+use std::sync::Mutex;
+
+/// Serve `key` from the shared cache if younger than `ttl`, else compute it.
+async fn cached<F, Fut>(gw: &Gw, key: String, ttl: std::time::Duration, f: F) -> Response
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<serde_json::Value, Response>>,
+{
+    if let Some((at, v)) = gw.cache.lock().unwrap().get(&key) {
+        if at.elapsed() < ttl {
+            return Json(v.clone()).into_response();
+        }
+    }
+    match f().await {
+        Ok(v) => {
+            let mut c = gw.cache.lock().unwrap();
+            if c.len() > 4096 {
+                c.retain(|_, (at, _)| at.elapsed() < std::time::Duration::from_secs(60));
+            }
+            c.insert(key, (std::time::Instant::now(), v.clone()));
+            Json(v).into_response()
+        }
+        Err(r) => r,
+    }
 }
 
 fn bad(code: StatusCode, msg: &str) -> Response {
@@ -64,61 +94,83 @@ async fn blocks(State(gw): State<Arc<Gw>>, Query(q): Query<HashMap<String, Strin
 }
 
 async fn tree(State(gw): State<Arc<Gw>>, Query(q): Query<HashMap<String, String>>) -> Response {
-    let req = match (q.get("block").and_then(|h| h.parse::<RpcHash>().ok()), q.get("below").and_then(|d| d.parse::<u64>().ok())) {
-        (Some(b), _) => kaspa_rpc_core::GetShieldedTreeStateRequest { block_hash: Some(b), below_daa_score: None },
-        (None, Some(d)) => kaspa_rpc_core::GetShieldedTreeStateRequest { block_hash: None, below_daa_score: Some(d) },
+    // A frontier at a named block never changes; one "below a DAA score" is what browser
+    // wallets ask for their matured anchor every few seconds, each with its own score — rounded
+    // down to a multiple of 100 they share one answer (the anchor is then at most 100 DAA
+    // deeper, well inside the consensus window).
+    let (req, key, ttl) = match (q.get("block").and_then(|h| h.parse::<RpcHash>().ok()), q.get("below").and_then(|d| d.parse::<u64>().ok())) {
+        (Some(b), _) => (
+            kaspa_rpc_core::GetShieldedTreeStateRequest { block_hash: Some(b), below_daa_score: None },
+            format!("tree:{b}"),
+            std::time::Duration::from_secs(600),
+        ),
+        (None, Some(d)) => {
+            let d = d - d % 100;
+            (
+                kaspa_rpc_core::GetShieldedTreeStateRequest { block_hash: None, below_daa_score: Some(d) },
+                format!("below:{d}"),
+                std::time::Duration::from_secs(30),
+            )
+        }
         _ => return bad(StatusCode::BAD_REQUEST, "block=<hash> or below=<daa> required"),
     };
-    let Ok(_permit) = gw.gate.try_acquire() else {
-        return bad(StatusCode::SERVICE_UNAVAILABLE, "busy, retry");
-    };
-    match tokio::time::timeout(NODE_TIMEOUT, gw.node.get_shielded_tree_state_call(None, req)).await {
-        Ok(Ok(ts)) => Json(serde_json::json!({
-            "block": ts.block_hash.to_string(),
-            "daa": ts.daa_score,
-            "size": ts.size,
-            "leaf": ts.leaf.to_string(),
-            "ommers": ts.ommers.iter().map(|o| o.to_string()).collect::<Vec<_>>(),
-        }))
-        .into_response(),
-        Ok(Err(e)) => bad(StatusCode::BAD_GATEWAY, &format!("node: {e}")),
-        Err(_) => bad(StatusCode::GATEWAY_TIMEOUT, "node timed out"),
-    }
+    let g = gw.clone();
+    cached(&gw, key, ttl, || async move {
+        let Ok(_permit) = g.gate.try_acquire() else {
+            return Err(bad(StatusCode::SERVICE_UNAVAILABLE, "busy, retry"));
+        };
+        match tokio::time::timeout(NODE_TIMEOUT, g.node.get_shielded_tree_state_call(None, req)).await {
+            Ok(Ok(ts)) => Ok(serde_json::json!({
+                "block": ts.block_hash.to_string(),
+                "daa": ts.daa_score,
+                "size": ts.size,
+                "leaf": ts.leaf.to_string(),
+                "ommers": ts.ommers.iter().map(|o| o.to_string()).collect::<Vec<_>>(),
+            })),
+            Ok(Err(e)) => Err(bad(StatusCode::BAD_GATEWAY, &format!("node: {e}"))),
+            Err(_) => Err(bad(StatusCode::GATEWAY_TIMEOUT, "node timed out")),
+        }
+    })
+    .await
 }
 
 async fn tip(State(gw): State<Arc<Gw>>) -> Response {
-    match tokio::time::timeout(NODE_TIMEOUT, gw.node.get_block_dag_info()).await {
-        Ok(Ok(i)) => Json(serde_json::json!({
-            "virtual_daa_score": i.virtual_daa_score,
-            "sink": i.sink.to_string(),
-            "network": i.network.to_string(),
-        }))
-        .into_response(),
-        Ok(Err(e)) => bad(StatusCode::BAD_GATEWAY, &format!("node: {e}")),
-        Err(_) => bad(StatusCode::GATEWAY_TIMEOUT, "node timed out"),
-    }
+    let g = gw.clone();
+    cached(&gw, "tip".into(), std::time::Duration::from_secs(1), || async move {
+        match tokio::time::timeout(NODE_TIMEOUT, g.node.get_block_dag_info()).await {
+            Ok(Ok(i)) => Ok(serde_json::json!({
+                "virtual_daa_score": i.virtual_daa_score,
+                "sink": i.sink.to_string(),
+                "network": i.network.to_string(),
+            })),
+            Ok(Err(e)) => Err(bad(StatusCode::BAD_GATEWAY, &format!("node: {e}"))),
+            Err(_) => Err(bad(StatusCode::GATEWAY_TIMEOUT, "node timed out")),
+        }
+    })
+    .await
 }
 
 /// The mempool's shielded transactions, as their bundle payloads. Public data: every node
 /// relays them. A browser wallet trial-decrypts them to show an incoming payment at once.
 async fn mempool(State(gw): State<Arc<Gw>>) -> Response {
-    let Ok(_permit) = gw.gate.try_acquire() else {
-        return bad(StatusCode::SERVICE_UNAVAILABLE, "busy, retry");
-    };
-    match tokio::time::timeout(NODE_TIMEOUT, gw.node.get_mempool_entries(false, false)).await {
-        Ok(Ok(entries)) => {
-            let list: Vec<String> = entries
+    let g = gw.clone();
+    let mut r = cached(&gw, "mempool".into(), std::time::Duration::from_secs(2), || async move {
+        let Ok(_permit) = g.gate.try_acquire() else {
+            return Err(bad(StatusCode::SERVICE_UNAVAILABLE, "busy, retry"));
+        };
+        match tokio::time::timeout(NODE_TIMEOUT, g.node.get_mempool_entries(false, false)).await {
+            Ok(Ok(entries)) => Ok(serde_json::json!(entries
                 .iter()
                 .filter(|e| e.transaction.version == kaspa_consensus_core::tx::TX_VERSION_SHIELDED)
                 .map(|e| hex::encode(&e.transaction.payload))
-                .collect();
-            let mut r = Json(list).into_response();
-            r.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-            r
+                .collect::<Vec<String>>())),
+            Ok(Err(e)) => Err(bad(StatusCode::BAD_GATEWAY, &format!("node: {e}"))),
+            Err(_) => Err(bad(StatusCode::GATEWAY_TIMEOUT, "node timed out")),
         }
-        Ok(Err(e)) => bad(StatusCode::BAD_GATEWAY, &format!("node: {e}")),
-        Err(_) => bad(StatusCode::GATEWAY_TIMEOUT, "node timed out"),
-    }
+    })
+    .await;
+    r.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    r
 }
 
 /// Largest bundle accepted for submission (a 38-spend bundle is ~120 KB).
@@ -169,7 +221,7 @@ async fn main() {
         std::process::exit(1);
     });
     let genesis = RpcHash::from_bytes(kaspa_consensus_core::config::params::MAINNET_PARAMS.genesis.hash.as_bytes());
-    let gw = Arc::new(Gw { node, genesis, gate: tokio::sync::Semaphore::new(MAX_IN_FLIGHT) });
+    let gw = Arc::new(Gw { node, genesis, gate: tokio::sync::Semaphore::new(MAX_IN_FLIGHT), cache: Mutex::new(HashMap::new()) });
     // Public data, read-only: any origin may read it (the browser wallet is one of them).
     let cors = tower_http::cors::CorsLayer::new()
         .allow_origin(tower_http::cors::Any)
