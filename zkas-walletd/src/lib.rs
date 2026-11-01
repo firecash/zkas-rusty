@@ -1086,6 +1086,35 @@ fn sanitize_token(raw: &str) -> Option<String> {
 /// header at all and, with `--allow-default-token`, named the "default" wallet. The hosted
 /// proxy refuses only an EMPTY header, so any internet caller reached that wallet that way:
 /// its status and history, and for a seed wallet `/reveal` and `/send`.
+/// Whether this daemon listens on loopback only (set at `serve`). Decides whether the
+/// single-user "default" token may act with a custodial seed (see `require_strong_token`).
+static LISTENS_LOOPBACK_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Shortest token that may reveal or spend with a custodial seed. Every token the app makes is
+/// 32 hex (128 bits); pairing tokens are 16-128 characters.
+const MIN_SPEND_TOKEN_LEN: usize = 16;
+
+/// A token strong enough to act with a custodial SEED (reveal it, spend or sign with it).
+///
+/// A token is the only credential for a custodial wallet, and any non-empty one was accepted:
+/// a wallet registered under a short or guessable token ("a", "test", "wallet1") had its seed
+/// readable by anyone who guessed it, over the internet on a hosted daemon. Viewing endpoints
+/// are unchanged; only the ones that hand out or use spend authority need this. The literal
+/// "default" wallet is the single-user local case and is allowed only when the daemon listens
+/// on loopback alone.
+fn require_strong_token(token: &str) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if token == "default" && LISTENS_LOOPBACK_ONLY.load(std::sync::atomic::Ordering::Relaxed) {
+        return Ok(());
+    }
+    if token.len() < MIN_SPEND_TOKEN_LEN {
+        return Err(err(
+            StatusCode::FORBIDDEN,
+            "this wallet's access token is too short to reveal or spend with its seed; restore the wallet from its seed in the app, which issues a strong token",
+        ));
+    }
+    Ok(())
+}
+
 fn token_from(headers: &HeaderMap, allow_default: bool) -> Result<String, (StatusCode, Json<serde_json::Value>)> {
     match headers.get("x-wallet-token") {
         Some(raw) => raw
@@ -10219,6 +10248,7 @@ async fn wallet_reveal(
 ) -> Result<Json<RevealResp>, (StatusCode, Json<serde_json::Value>)> {
     require_custodial(&state)?;
     let token = token_from(&headers, state.allow_default_token)?;
+    require_strong_token(&token)?;
     let w = state.get_wallet(&token).await.ok_or_else(|| err(StatusCode::NOT_FOUND, "no wallet loaded"))?;
     let e = w.lock().await;
     let address = state.address_of(&e.db);
@@ -11344,6 +11374,7 @@ async fn wallet_send(
     }
     require_custodial(&state)?;
     let token = token_from(&headers, state.allow_default_token)?;
+    require_strong_token(&token)?;
     let w = state.get_wallet(&token).await.ok_or_else(|| err(StatusCode::NOT_FOUND, "no wallet loaded"))?;
     // Serialise this wallet's spends end to end: selection through submit. Taken before
     // anything is planned, so the loser waits rather than racing us to the same notes.
@@ -11751,6 +11782,7 @@ async fn wallet_send_many(
     }
     require_custodial(&state)?;
     let token = token_from(&headers, state.allow_default_token)?;
+    require_strong_token(&token)?;
     let w = state.get_wallet(&token).await.ok_or_else(|| err(StatusCode::NOT_FOUND, "no wallet loaded"))?;
     // Same end-to-end spend gate as `wallet_send` — a payout run and a withdrawal must
     // not select the same notes.
@@ -12046,6 +12078,7 @@ async fn wallet_consolidate(
     }
     require_custodial(&state)?;
     let token = token_from(&headers, state.allow_default_token)?;
+    require_strong_token(&token)?;
     let w = state.get_wallet(&token).await.ok_or_else(|| err(StatusCode::NOT_FOUND, "no wallet loaded"))?;
     let (base_fee, heal) = match body {
         Some(Json(b)) => (b.fee.unwrap_or(DEFAULT_FEE_SOMPI), b.heal.unwrap_or(false)),
@@ -13159,6 +13192,7 @@ async fn wallet_sign(
 ) -> Result<Json<SignResp>, (StatusCode, Json<serde_json::Value>)> {
     require_custodial(&state)?;
     let token = token_from(&headers, state.allow_default_token)?;
+    require_strong_token(&token)?;
     let w = state.get_wallet(&token).await.ok_or_else(|| err(StatusCode::NOT_FOUND, "no wallet loaded"))?;
     let seed = { w.lock().await.key.seed()? };
     let tag = state.prefix.to_string();
@@ -14397,6 +14431,7 @@ pub fn release_memory() -> usize {
 
 pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>) -> Result<(), String> {
     let listen = cfg.listen;
+    LISTENS_LOOPBACK_ONLY.store(listen.ip().is_loopback(), std::sync::atomic::Ordering::Relaxed);
     // Route node gRPC through Tor/SOCKS when the embedder asked for it, and CLEAR it
     // when they did not -- set on every start so toggling Tor off takes effect (a stale
     // proxy with no Orbot leaves the node unreachable and the wallet stuck "opening").

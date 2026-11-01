@@ -972,6 +972,14 @@ impl ChainFiles {
                 at += 1;
                 continue;
             }
+            // A page ends at its segment's end. A wallet that skips hashing adopts the segment's
+            // signed frontier only when its cursor is EXACTLY the segment's last block; pages
+            // running across the boundary almost never left it there, so nothing was adopted or
+            // compacted during the whole catch-up and every leaf stayed in RAM (11-16 M leaves,
+            // ~1 GB, measured on a genesis restore). One extra page per ~20 k-block segment.
+            if !blocks.is_empty() {
+                break;
+            }
             match loaded.iter().find(|s| s.index == seg.index + 1 && s.from == seg.to) {
                 Some(next) => {
                     seg = next.clone();
@@ -1245,8 +1253,13 @@ mod tests {
         assert_eq!(p.blocks.iter().map(|b| b.hash.as_bytes()[0]).collect::<Vec<_>>(), vec![1, 2, 3, 4, 5], "from a segment start");
         let p = cf.page(RpcHash::from_bytes([4; 32]), 3).unwrap();
         assert_eq!(p.blocks.iter().map(|b| b.hash.as_bytes()[0]).collect::<Vec<_>>(), vec![5, 6, 7], "exclusive cursor inside a segment");
+        // A page ends at its segment's last block (a cursor exactly there is where a wallet that
+        // skipped hashing adopts the signed frontier), and the next page continues from the
+        // following segment's first block: nothing skipped, nothing repeated.
         let p = cf.page(RpcHash::from_bytes([8; 32]), 6).unwrap();
-        assert_eq!(p.blocks.iter().map(|b| b.hash.as_bytes()[0]).collect::<Vec<_>>(), vec![9, 10, 11, 12, 13, 14], "runs on into the next segment");
+        assert_eq!(p.blocks.iter().map(|b| b.hash.as_bytes()[0]).collect::<Vec<_>>(), vec![9, 10], "stops at the segment's end");
+        let p = cf.page(RpcHash::from_bytes([10; 32]), 6).unwrap();
+        assert_eq!(p.blocks.iter().map(|b| b.hash.as_bytes()[0]).collect::<Vec<_>>(), vec![11, 12, 13, 14, 15, 16], "continues in the next segment");
         assert_eq!(p.sink_blue_score, 5_000);
         assert!(!p.reorged);
         assert!(cf.page(RpcHash::from_bytes([20; 32]), 5).is_none(), "the last block of the last segment: the node serves what follows");
