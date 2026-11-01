@@ -181,10 +181,11 @@ impl Manifest {
     }
 }
 
-/// Where ZKas publishes its chain files. A comma-separated list of mirrors is accepted
-/// (segments are spread across them by index, each falling back to the others); add a mirror
-/// here only once it is serving. The node is always the last fallback.
-pub const PUBLIC_CHAIN_FILES: &str = "https://zkas.info/shielded-chain";
+/// Where ZKas publishes its chain files: Cloudflare R2 (a CDN, so a third party that sees the
+/// downloading device's IP — the app says so) and zkas.info itself. Segments are spread across
+/// them by index, each falling back to the other; the manifest must carry the ZKas publisher
+/// signature whichever serves it, so neither can substitute files. The node is the last fallback.
+pub const PUBLIC_CHAIN_FILES: &str = "https://pub-ae5ed92258b2437e985b69ab9947ef60.r2.dev,https://zkas.info/shielded-chain";
 
 /// The chain files an engine talking to `node` should use: the public ones when `node` is one
 /// of ZKas's public nodes — the same operator already sees that engine's page requests, so no
