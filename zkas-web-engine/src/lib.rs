@@ -466,6 +466,40 @@ impl Engine {
         .ok()
     }
 
+    /// This wallet's history in walletd's `/api/wallet/history` shape, newest first, so the app's
+    /// history view reads it unchanged. Recipient addresses and the per-address breakdown are not
+    /// rendered here yet (they need the address encoding), and stay null / empty.
+    pub fn history(&self, limit: u32, offset: u32) -> String {
+        use kaspa_shielded_core::walletdb::HistoryKind;
+        const SOMPI_PER_ZKAS: f64 = 100_000_000.0;
+        let all = self.db.history();
+        let rows: Vec<serde_json::Value> = all
+            .iter()
+            .rev()
+            .skip(offset as usize)
+            .take((limit as usize).clamp(1, 5_000))
+            .map(|h| {
+                serde_json::json!({
+                    "kind": match h.kind { HistoryKind::Coinbase => "coinbase", HistoryKind::Received => "received", HistoryKind::Sent => "sent" },
+                    "txid": hex::encode(h.txid),
+                    "daaScore": h.daa_score,
+                    "timestamp": h.timestamp_ms,
+                    "amountSompi": h.amount,
+                    "amountSompiExact": h.amount.to_string(),
+                    "amountZkas": h.amount as f64 / SOMPI_PER_ZKAS,
+                    "amountKind": if h.amount_is_net_outflow { "netOutflow" } else { "paid" },
+                    "feeSompi": h.fee,
+                    "feeSompiExact": h.fee.to_string(),
+                    "feeKnown": h.fee_known,
+                    "recipient": null,
+                    "memo": (!h.memo.is_empty()).then(|| String::from_utf8_lossy(&h.memo).into_owned()),
+                    "credits": [],
+                })
+            })
+            .collect();
+        serde_json::json!({ "recoverableHistory": true, "total": all.len(), "rows": rows }).to_string()
+    }
+
     pub fn status(&self) -> String {
         serde_json::to_string(&Status {
             low: self.low(),
