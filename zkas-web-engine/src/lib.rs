@@ -712,7 +712,10 @@ impl Engine {
         let ctx = kaspa_shielded_wallet::tx::payment_tx_context();
         let bundle = kaspa_shielded_core::wallet::build::build_wallet_payment_multi_anchored(sk, inputs, &[(recipient, amount, memo_b)], fee, &net, &ctx, true, Some(block))
             .map_err(|e| format!("building the payment failed: {e:?}"))?;
-        Ok(serde_json::json!({ "bundle_hex": hex::encode(bundle), "positions": positions, "fee": fee, "outflow": amount + fee }).to_string())
+        // The transaction id the network will know it by (the gateway wraps the bundle in exactly
+        // this shape): lets a browser that lost the submit's answer park its coins under it.
+        let txid = kaspa_shielded_wallet::tx::payment_tx(bundle.clone()).id().to_string();
+        Ok(serde_json::json!({ "bundle_hex": hex::encode(bundle), "positions": positions, "fee": fee, "outflow": amount + fee, "txid": txid }).to_string())
     }
 
     /// Are all of these leaf positions still unspent notes of this wallet (none spent or parked
@@ -857,6 +860,9 @@ mod send_tests {
         let fee = r["fee"].as_u64().unwrap();
         assert_eq!(bundle.value_balance, fee as i64, "the fee is the bundle's public value balance");
 
+        // The txid the engine computes is the one the network gives this transaction.
+        let tx = kaspa_shielded_wallet::tx::payment_tx(bytes.clone());
+        assert_eq!(r["txid"].as_str().unwrap(), tx.id().to_string());
         let positions = r["positions"].to_string();
         assert_eq!(r["positions"].as_array().unwrap().len(), 2);
         e.mark_sent(&positions, &hex::encode([5u8; 32]), amount + fee).unwrap();

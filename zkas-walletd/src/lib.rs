@@ -6531,6 +6531,46 @@ struct PreparedSession {
     token: Option<String>,
     /// Absolute leaf positions of the notes this payment spends, to park on acceptance.
     positions: Vec<u64>,
+    /// `sent_requests` key of the client's request id, recorded when the broadcast succeeds.
+    request_key: Option<String>,
+}
+
+/// Payments broadcast per client request id, for a day: what makes a send idempotent.
+///
+/// A submit whose RESPONSE is lost (the client timed out, the connection dropped) but whose
+/// broadcast went through left the client unable to tell whether it paid — and the notes it
+/// spent already parked, so a retry selected OTHER notes and paid a second time. A client that
+/// retries a payment with the same request id now gets the original result instead. Keyed by
+/// wallet (a hash of the viewing key) and id, so one client cannot read another's payments.
+fn sent_requests() -> &'static std::sync::Mutex<HashMap<String, (std::time::Instant, SendResp)>> {
+    static S: std::sync::OnceLock<std::sync::Mutex<HashMap<String, (std::time::Instant, SendResp)>>> = std::sync::OnceLock::new();
+    S.get_or_init(Default::default)
+}
+
+const SENT_REQUEST_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+
+fn sent_request_key(fvk_hex: &str, request_id: &str) -> Option<String> {
+    let id = request_id.trim();
+    if id.is_empty() || id.len() > 128 {
+        return None;
+    }
+    let mut h = <sha2::Sha256 as sha2::Digest>::new();
+    sha2::Digest::update(&mut h, fvk_hex.trim().to_ascii_lowercase().as_bytes());
+    Some(format!("{}:{id}", hex(&sha2::Digest::finalize(h)[..16])))
+}
+
+fn sent_request(key: &str) -> Option<SendResp> {
+    let mut m = sent_requests().lock().unwrap();
+    m.retain(|_, (at, _)| at.elapsed() < SENT_REQUEST_TTL);
+    m.get(key).map(|(_, r)| r.clone())
+}
+
+fn record_sent_request(key: String, resp: &SendResp) {
+    let mut m = sent_requests().lock().unwrap();
+    if m.len() > 100_000 {
+        m.retain(|_, (at, _)| at.elapsed() < SENT_REQUEST_TTL);
+    }
+    m.insert(key, (std::time::Instant::now(), resp.clone()));
 }
 
 /// How long a prepared (unsigned) non-custodial payment lives before it is swept.
@@ -10407,7 +10447,7 @@ struct SendReq {
     memo: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct SendResp {
     /// First transaction id (kept for callers that expect a single txid).
     txid: String,
@@ -12192,6 +12232,10 @@ struct PrepareReq {
     /// Drop this earlier, unsubmitted session first and free the notes it held: a client that
     /// held a uniform payment past an anchor-epoch roll re-prepares it this way (W5).
     replace_session: Option<String>,
+    /// The client's id for this payment, kept across its retries. A prepare whose id this
+    /// daemon already broadcast is answered `409 {already_sent: SendResp}` instead of building
+    /// a second payment (see `sent_requests`).
+    request_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -12267,6 +12311,16 @@ async fn wallet_prepare(
     let fvk_bytes = unhex(&req.fvk_hex)
         .and_then(|b| <[u8; FVK_LEN]>::try_from(b.as_slice()).ok())
         .ok_or_else(|| err(StatusCode::BAD_REQUEST, "fvk_hex must be 96 bytes of hex"))?;
+
+    // A retry of a payment this daemon already broadcast: answer with it, build nothing.
+    let request_key = req.request_id.as_deref().and_then(|id| sent_request_key(&req.fvk_hex, id));
+    if let Some(done) = request_key.as_deref().and_then(sent_request) {
+        log::info!("prepare: request already broadcast as {}; returning it instead of paying again", done.txid);
+        return Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": format!("this payment was already sent (transaction {})", done.txid), "already_sent": done })),
+        ));
+    }
 
     if let Some(old) = req.replace_session.as_deref() {
         let dropped = state.prepared.lock().await.remove(old);
@@ -12905,7 +12959,7 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
         map.retain(|_, s| now.duration_since(s.created) < PREPARED_TTL); // bound memory
         map.insert(
             session.clone(),
-            PreparedSession { payment, amount, fee, created: now, token: session_token, positions: spent_positions },
+            PreparedSession { payment, amount, fee, created: now, token: session_token, positions: spent_positions, request_key },
         );
     }
 
@@ -12978,7 +13032,7 @@ async fn wallet_submit(
         map.retain(|_, s| now.duration_since(s.created) < PREPARED_TTL);
         map.remove(&req.session)
     };
-    let PreparedSession { payment, amount, fee, token, positions, .. } =
+    let PreparedSession { payment, amount, fee, token, positions, request_key, .. } =
         session.ok_or_else(|| err(StatusCode::NOT_FOUND, "no such prepared session (expired or already submitted)"))?;
 
     // How many actions this transaction actually has, so a client-supplied index cannot
@@ -13064,7 +13118,7 @@ async fn wallet_submit(
                 }
             }
             let txid = accepted.to_string();
-            Ok(Json(SendResp {
+            let resp = SendResp {
                 txid: txid.clone(),
                 amount_sompi: amount,
                 fee_sompi: fee,
@@ -13072,7 +13126,11 @@ async fn wallet_submit(
                 fee_sompi_exact: fee.to_string(),
                 txids: vec![txid],
                 tx_count: 1,
-            }))
+            };
+            if let Some(k) = request_key {
+                record_sent_request(k, &resp);
+            }
+            Ok(Json(resp))
         }
         Err(e) => {
             log::error!("submit REJECTED by the node for session {}: {e}", req.session);
@@ -16261,6 +16319,28 @@ mod sdk_api_tests {
         let mut ok = WalletDb::from_seed([0x31; 32]).unwrap();
         ok.ingest_block_compact_precomputed_with_meta(&legacy.coinbase, &legacy.compact, None);
         assert_eq!(ok.balance(), value as u128);
+    }
+
+    #[test]
+    fn a_broadcast_request_is_remembered_per_wallet() {
+        let fvk_a = "ab".repeat(96);
+        let fvk_b = "cd".repeat(96);
+        let ka = sent_request_key(&fvk_a, "rid-1").unwrap();
+        assert_ne!(Some(ka.clone()), sent_request_key(&fvk_b, "rid-1"), "another wallet's id is another key");
+        assert!(sent_request_key(&fvk_a, "").is_none() && sent_request_key(&fvk_a, &"x".repeat(129)).is_none());
+        assert!(sent_request(&ka).is_none());
+        let resp = SendResp {
+            txid: "t1".into(),
+            amount_sompi: 5,
+            fee_sompi: 1,
+            amount_sompi_exact: "5".into(),
+            fee_sompi_exact: "1".into(),
+            txids: vec!["t1".into()],
+            tx_count: 1,
+        };
+        record_sent_request(ka.clone(), &resp);
+        assert_eq!(sent_request(&ka).map(|r| r.txid), Some("t1".to_string()));
+        assert_eq!(sent_request_key(&fvk_a.to_uppercase(), " rid-1 "), Some(ka), "hex case and spaces do not split a payment");
     }
 
     #[test]
