@@ -299,6 +299,13 @@ pub fn address_of_fvk_str(fvk_hex: &str) -> Result<String, String> {
     Ok(String::from(&kaspa_addresses::Address::new(kaspa_addresses::Prefix::Mainnet, kaspa_addresses::Version::ShieldedOrchard, &raw)))
 }
 
+/// Build the Halo 2 proving key now (a few seconds, once per page): called when the wallet is
+/// idle at the tip, so the first payment does not pay for it. Later calls return at once.
+#[wasm_bindgen]
+pub fn warm_prover() {
+    let _ = kaspa_shielded_core::wallet::build::proving_key();
+}
+
 #[wasm_bindgen]
 pub fn address_of_fvk(fvk_hex: &str) -> Result<String, JsValue> {
     address_of_fvk_str(fvk_hex).map_err(err)
@@ -687,6 +694,13 @@ impl Engine {
         let bundle = kaspa_shielded_core::wallet::build::build_wallet_payment_multi_anchored(sk, inputs, &[(recipient, amount, memo_b)], fee, &net, &ctx, true, Some(block))
             .map_err(|e| format!("building the payment failed: {e:?}"))?;
         Ok(serde_json::json!({ "bundle_hex": hex::encode(bundle), "positions": positions, "fee": fee, "outflow": amount + fee }).to_string())
+    }
+
+    /// Are all of these leaf positions still unspent notes of this wallet (none spent or parked
+    /// since)? A payment proven ahead of the user's confirmation is submitted only if so.
+    pub fn unspent(&self, positions_json: &str) -> bool {
+        let Ok(positions) = serde_json::from_str::<Vec<u64>>(positions_json) else { return false };
+        !positions.is_empty() && positions.iter().all(|p| self.db.notes().iter().any(|n| n.position == *p))
     }
 
     /// The payment `txid` was accepted by the node: park its notes (they leave the balance, and
