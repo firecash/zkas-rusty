@@ -3113,6 +3113,26 @@ fn prepare_is_doomed(selected: u64, need: u64, fee: u64, have: u64, self_payment
     selected < need && !(allow_partial && (have >= need || self_payment) && selected.saturating_sub(fee) > 0)
 }
 
+/// Why a wallet's last load attempt did not complete, by token: a short code the status
+/// reports while the wallet is "opening", so the app can say why (wait / another node / the
+/// node has not caught up) instead of "Opening..." with no reason. Cleared on a load.
+fn load_reasons() -> &'static std::sync::Mutex<HashMap<String, &'static str>> {
+    static R: std::sync::OnceLock<std::sync::Mutex<HashMap<String, &'static str>>> = std::sync::OnceLock::new();
+    R.get_or_init(Default::default)
+}
+
+fn set_load_reason(token: &str, code: &'static str) {
+    let mut m = load_reasons().lock().unwrap();
+    if m.len() > 100_000 {
+        m.clear();
+    }
+    m.insert(token.to_string(), code);
+}
+
+fn load_reason(token: &str) -> Option<&'static str> {
+    load_reasons().lock().unwrap().get(token).copied()
+}
+
 /// Per-token backoff for poll-driven load retries (see `spawn_load`): when the next attempt
 /// may start, and how many have failed in a row.
 fn load_backoff() -> &'static std::sync::Mutex<HashMap<String, (std::time::Instant, u32)>> {
@@ -3137,6 +3157,7 @@ fn load_backoff_failed(token: &str) -> std::time::Duration {
 
 fn load_backoff_clear(token: &str) {
     load_backoff().lock().unwrap().remove(token);
+    load_reasons().lock().unwrap().remove(token);
 }
 
 /// Whether to trust a node-supplied coinbase commitment verbatim instead of
@@ -7763,6 +7784,7 @@ impl AppState {
                     Ok(r) => r,
                     Err(_) => {
                         log::warn!("checkpoint cursor verification timed out ({cursor}); keeping checkpoint and retrying");
+                        set_load_reason(token, "node_slow");
                         return None;
                     }
                 };
@@ -7789,6 +7811,7 @@ impl AppState {
                                 "node cannot serve the frontier at the checkpoint cursor {cursor} (served {} instead) and has not reached it ({why}); keeping checkpoint and retrying",
                                 ts.block_hash
                             );
+                            set_load_reason(token, "node_behind");
                             return None;
                         }
                         if ts.history_complete || ts.history_from_daa_score <= cursor_daa {
@@ -7803,6 +7826,7 @@ impl AppState {
                                 None
                             } else {
                                 log::warn!("cannot quarantine stale checkpoint (foreign block served); keeping checkpoint and retrying");
+                                set_load_reason(token, "checkpoint_io");
                                 return None;
                             }
                         } else {
@@ -7817,6 +7841,7 @@ impl AppState {
                             // wallet at a later cursor. The wallet stays "opening" until
                             // the node's floor passes the cursor or walletd is repointed.
                             log::warn!("wallet {token_p}: {msg}", token_p = log_pseudonym(&token));
+                            set_load_reason(token, "node_history_short");
                             return None;
                         }
                     }
@@ -7850,6 +7875,7 @@ impl AppState {
                                     log::warn!(
                                         "checkpoint cursor {cursor} is unservable on the node ({detail}) but the node has not reached it ({why}); keeping checkpoint and retrying"
                                     );
+                                    set_load_reason(token, "node_behind");
                                     return None;
                                 }
                             };
@@ -7872,6 +7898,7 @@ impl AppState {
                                 "This node holds shielded history only from block {history_from}, but this wallet was last synced at block {cursor_daa}, in history the node got from peers. Rebuilding here would show only part of the balance, so the wallet is paused with its progress kept. Wait for the node to finish filling in shielded history (its log says \"shielded history: VERIFIED\"), or connect to a node with complete history."
                             );
                             log::warn!("wallet {token_p}: {msg}", token_p = log_pseudonym(&token));
+                            set_load_reason(token, "node_history_short");
                             return None;
                         }
                         if action == UnservableCursor::ResumeWithoutBind {
@@ -7891,12 +7918,14 @@ impl AppState {
                                 None
                             } else {
                                 log::warn!("cannot quarantine stale checkpoint ({detail}); keeping checkpoint and retrying");
+                                set_load_reason(token, "checkpoint_io");
                                 return None;
                             }
                         } else {
                             log::warn!(
                                 "cannot verify checkpoint cursor against selected chain ({detail}); keeping checkpoint and retrying"
                             );
+                            set_load_reason(token, "node_unverifiable");
                             return None;
                         }
                     }
@@ -7934,6 +7963,7 @@ impl AppState {
                     if strikes < UNVERIFIED_STRIKES_MAX {
                         log::info!(
                             "wallet '{token_p}': node cannot verify the checkpoint yet (attempt {strikes}/{UNVERIFIED_STRIKES_MAX}); keeping it and retrying on the next request", token_p = log_pseudonym(&token));
+                        set_load_reason(token, "node_unverifiable");
                         return None;
                     }
                     log::warn!(
@@ -9850,6 +9880,12 @@ struct StatusResp {
     /// rendered as "opening", never as a balance.
     #[serde(default)]
     loading: bool,
+    /// While `loading`: why the last attempt to open the wallet did not complete, as a code
+    /// (`node_slow`, `node_behind`, `node_history_short`, `node_unverifiable`,
+    /// `checkpoint_io`), so a client can say what is happening instead of "Opening...".
+    /// Absent while a load is simply in progress.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    loading_reason: Option<&'static str>,
     /// Blocks between this wallet's view and the chain tip. Non-zero is NORMAL: a wallet
     /// deliberately never ingests the last `SYNC_TIP_MARGIN` blocks. Meaningful to show
     /// only alongside `spend_ready` — it is the caveat attached to paying while behind.
@@ -9888,6 +9924,7 @@ fn status_base(network: &str, node_connected: bool, daa_score: u64) -> StatusRes
         warming_eta_secs: None,
         spend_ready: false,
         loading: false,
+        loading_reason: None,
         blocks_behind: 0,
         scanned_blocks: 0,
         chain_len: daa_score,
@@ -9984,6 +10021,7 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Json<
             state.spawn_load(&token);
             resp.has_wallet = true;
             resp.loading = true;
+            resp.loading_reason = load_reason(&token);
             resp.address = state.address_from_disk(&token).await;
             apply_last_known(&mut resp, &state, &token).await;
         }
