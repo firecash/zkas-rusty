@@ -389,3 +389,85 @@ fn bench_uniform_cost_vs_legacy() {
         }
     }
 }
+
+/// Change split into dummy slots: never more parts than spare slots, each part at least the
+/// minimum, and the parts always sum to the change exactly.
+#[test]
+fn change_split_uses_only_spare_slots_and_sums_exactly() {
+    let legacy = SendShape::LEGACY.with_change_split(3, 1_000);
+    assert_eq!(legacy.change_values(10_001, 1, 1), vec![10_001], "1 spend, 1 payee: 2 actions, no spare slot");
+    assert_eq!(legacy.change_values(10_001, 3, 1), vec![5_001, 5_000], "3 spends pad to 3 actions: one spare slot");
+    assert_eq!(legacy.change_values(10_001, 5, 1), vec![3_335, 3_333, 3_333], "capped at change_parts");
+    assert_eq!(legacy.change_values(2_500, 5, 1), vec![1_250, 1_250], "no part under the minimum");
+    assert_eq!(legacy.change_values(999, 5, 1), vec![999], "small change stays one note");
+    assert_eq!(legacy.change_values(0, 5, 1), vec![0], "zero change is still one (uniform needs it present)");
+    let uniform = SendShape::UNIFORM.with_change_split(3, 1_000);
+    assert_eq!(uniform.change_values(9_000, 1, 1), vec![3_000, 3_000, 3_000], "uniform: 4 slots, 1 payee, 2 spare");
+    assert_eq!(uniform.change_values(9_000, 1, 3), vec![9_000], "uniform with 3 payees: no spare slot");
+    assert_eq!(SendShape::UNIFORM.change_values(9_000, 1, 1), vec![9_000], "the default never splits");
+    let extra = SendShape::LEGACY.with_change_split(3, 1_000).with_change_extra_actions(1);
+    assert_eq!(extra.change_values(10_000, 1, 1), vec![5_000, 5_000], "1 spend, 1 payee: one extra action buys a second note");
+    assert_eq!(extra.actions_for(1, 1, 2), 3);
+    assert_eq!(SendShape::UNIFORM.with_change_split(3, 1).with_change_extra_actions(1).change_values(9, 1, 3), vec![9], "uniform never grows");
+    for spends in 1..=6 {
+        for payees in 1..=3 {
+            for change in [0u64, 1, 999, 1_000, 7_777, u64::MAX / 2] {
+                let v = legacy.change_values(change, spends, payees);
+                assert_eq!(v.iter().map(|x| *x as u128).sum::<u128>(), change as u128);
+                assert!(payees + v.len() <= spends.max(payees + 1).max(2), "never adds an action");
+            }
+        }
+    }
+}
+
+/// A real split payment: the bundle is byte-for-byte the uniform envelope (same length, same 4
+/// actions, verifies, consensus accepts it), the wallet holds each change part as its own note,
+/// the payee sees exactly its payment, and the history records one payment of the paid amount.
+#[test]
+fn split_change_is_a_normal_uniform_payment_with_separate_change_notes() {
+    let z = ZKAS;
+    let (mut state, mut db) = fixture(&[5 * z]);
+    let shape = SendShape::UNIFORM.with_change_split(3, z / 10);
+    let p = build_wallet_payment_multi_shaped(MINER, inputs(&db, 1), &[(payee(2), 2 * z, [0u8; 512])], F, &NET, CTX, true, Some(ANCHOR_BLOCK), shape, &mut rng(51)).unwrap();
+    let b = assert_uniform(&p, &state);
+    state.apply_chain_block(None, &[ShieldedTx::from_bundle(&b).unwrap()]).unwrap();
+    db.ingest_block(&[], &[&b]);
+    let change = 3 * z - F;
+    assert_eq!(db.balance(), change as u128);
+    let mut parts: Vec<u64> = db.notes().iter().map(|n| n.value()).collect();
+    parts.sort();
+    assert_eq!(parts.len(), 3, "three change notes, each spendable on its own");
+    assert_eq!(parts.iter().sum::<u64>(), change);
+    let mut payee_db = WalletDb::from_seed([2u8; 32]).unwrap();
+    payee_db.ingest_block(&[], &[&b]);
+    assert_eq!(payee_db.balance(), 2 * z as u128, "the payee sees exactly its payment");
+    // Each part can be spent alone.
+    let one = db.notes().iter().take(1).map(|o| (o.note.clone(), db.witness_path(o.position).unwrap())).collect();
+    let again = build_wallet_payment_multi_shaped(MINER, one, &[(payee(3), z / 2, [0u8; 512])], F, &NET, CTX, true, Some(ANCHOR_BLOCK), SendShape::UNIFORM, &mut rng(52)).unwrap();
+    assert_uniform(&again, &state);
+}
+
+/// Legacy shape, one note paying one payee (the common phone case: no spare slot): one allowed
+/// extra action gives a 3-action bundle that verifies and that consensus accepts, holding the
+/// change as two notes that each mature and spend on their own.
+#[test]
+fn legacy_split_with_one_extra_action_verifies_and_holds_two_change_notes() {
+    let z = ZKAS;
+    let (mut state, mut db) = fixture(&[5 * z]);
+    let shape = SendShape::LEGACY.with_change_split(2, z / 10).with_change_extra_actions(1);
+    let p = build_wallet_payment_multi_shaped(MINER, inputs(&db, 1), &[(payee(2), z, [0u8; 512])], F, &NET, CTX, true, Some(ANCHOR_BLOCK), shape, &mut rng(61)).unwrap();
+    let b = ShieldedBundle::from_bytes(&p).unwrap();
+    assert_eq!(b.actions.len(), shape.actions_for(1, 1, 2));
+    assert_eq!(b.actions.len(), 3);
+    verify_bundle(&b, &sighash(&b, &NET, CTX)).expect("verifies");
+    state.apply_chain_block(None, &[ShieldedTx::from_bundle(&b).unwrap()]).unwrap();
+    db.ingest_block(&[], &[&b]);
+    let change = 4 * z - F;
+    let v: Vec<u64> = db.notes().iter().map(|n| n.value()).collect();
+    assert_eq!(v.len(), 2);
+    assert_eq!(v.iter().sum::<u64>(), change);
+    // Without the allowance the same request stays a 2-action, single-change payment.
+    let (_s2, db2) = fixture(&[5 * z]);
+    let p2 = build_wallet_payment_multi_shaped(MINER, inputs(&db2, 1), &[(payee(2), z, [0u8; 512])], F, &NET, CTX, true, Some(ANCHOR_BLOCK), SendShape::LEGACY.with_change_split(2, z / 10), &mut rng(62)).unwrap();
+    assert_eq!(ShieldedBundle::from_bytes(&p2).unwrap().actions.len(), 2);
+}

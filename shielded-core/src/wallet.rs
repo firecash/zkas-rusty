@@ -991,15 +991,67 @@ pub mod build {
         /// 10-CORE B1, 02 W6). Requires every client that can hold this seed to run the spec 11
         /// R4 internal-IVK trigger scan, or the change is invisible to it.
         pub internal_change: bool,
+        /// Split the change across up to this many notes (0 and 1 = one note), but ONLY into
+        /// output slots the bundle pads with dummies anyway: the action count, the proof work,
+        /// the size and so the fee are exactly those of a single-change transaction, and a
+        /// real output is indistinguishable from a dummy on chain. Each change note matures on
+        /// its own, so the next payment does not wait for the whole change to (the
+        /// "ready-note ladder" refilled by ordinary sends). Never use for consolidation.
+        pub change_parts: u8,
+        /// No change part below this value (sompi): small change stays one note.
+        pub change_part_min: u64,
+        /// Actions a change split may ADD beyond the padded count (never in the uniform shape,
+        /// which is always 4). The caller sets it only after checking its fee still clears the
+        /// relay minimum for the larger bundle; it costs one action's proving time each.
+        pub change_extra_actions: u8,
     }
 
     impl SendShape {
         /// Today's shape: `BundleType::DEFAULT` (pad to 2), external change.
-        pub const LEGACY: SendShape = SendShape { uniform: false, internal_change: false };
+        pub const LEGACY: SendShape = SendShape { uniform: false, internal_change: false, change_parts: 1, change_part_min: 0, change_extra_actions: 0 };
         /// Stage W with external change (the opt-in default of `uniform_v1`).
-        pub const UNIFORM: SendShape = SendShape { uniform: true, internal_change: false };
+        pub const UNIFORM: SendShape = SendShape { uniform: true, internal_change: false, change_parts: 1, change_part_min: 0, change_extra_actions: 0 };
         /// Stage W with internal change.
-        pub const UNIFORM_INTERNAL: SendShape = SendShape { uniform: true, internal_change: true };
+        pub const UNIFORM_INTERNAL: SendShape = SendShape { uniform: true, internal_change: true, change_parts: 1, change_part_min: 0, change_extra_actions: 0 };
+
+        /// This shape with its change split as described on [`SendShape::change_parts`].
+        pub const fn with_change_split(self, parts: u8, part_min: u64) -> SendShape {
+            SendShape { change_parts: parts, change_part_min: part_min, ..self }
+        }
+
+        /// Let the change split add up to `n` actions (ignored by the uniform shape).
+        pub const fn with_change_extra_actions(self, n: u8) -> SendShape {
+            SendShape { change_extra_actions: n, ..self }
+        }
+
+        fn extra_actions(&self) -> usize {
+            if self.uniform { 0 } else { self.change_extra_actions as usize }
+        }
+
+        /// The action count of the bundle this shape builds for these spends, payees and change
+        /// parts: what the caller's fee must cover.
+        pub fn actions_for(&self, spends: usize, payees: usize, change_parts: usize) -> usize {
+            self.padded_actions(spends, payees + change_parts.max(1))
+        }
+
+        /// Actions the bundle has for `spends` spends and `outputs` outputs: uniform is always
+        /// 4; `BundleType::DEFAULT` pads to max(spends, outputs, 2).
+        fn padded_actions(&self, spends: usize, outputs: usize) -> usize {
+            if self.uniform { UNIFORM_ACTIONS } else { spends.max(outputs).max(2) }
+        }
+
+        /// The change values: one note, or up to `change_parts` near-equal notes that fit in
+        /// dummy slots (plus `change_extra_actions`) and are each at least `change_part_min`.
+        /// Sums to `change` exactly.
+        pub fn change_values(&self, change: u64, spends: usize, payees: usize) -> Vec<u64> {
+            let spare = self.padded_actions(spends, payees + 1).saturating_sub(payees + 1) + self.extra_actions();
+            let mut parts = (self.change_parts.max(1) as usize).min(1 + spare) as u64;
+            while parts > 1 && change / parts < self.change_part_min.max(1) {
+                parts -= 1;
+            }
+            let base = change / parts;
+            (0..parts).map(|i| if i == 0 { base + change % parts } else { base }).collect()
+        }
 
         fn bundle_type(&self) -> BundleType {
             if self.uniform { UNIFORM_BUNDLE_TYPE } else { BundleType::DEFAULT }
@@ -1435,6 +1487,7 @@ pub mod build {
         // The shared anchor: all supplied witnesses were taken at one tree state.
         let anchor = first_path.root(ExtractedNoteCommitment::from(first_note.commitment()));
         let mut builder = Builder::new(shape.bundle_type(), crate::verify::BUNDLE_VERSION, orchard::bundle::Flags::ENABLED, anchor).expect("orchard v2 ENABLED flags are always representable");
+        let (n_spends, n_payees) = (inputs.len(), recipients.len());
         for (note, merkle_path) in inputs {
             builder.add_spend(keys.fvk.clone(), note, merkle_path).map_err(|e| BuildError::Builder(format!("{e:?}")))?;
         }
@@ -1443,14 +1496,20 @@ pub mod build {
                 .add_output(ovk.clone(), recipient, NoteValue::from_raw(amount), memo)
                 .map_err(|e| BuildError::Builder(format!("{e:?}")))?;
         }
-        builder
-            .add_output(ovk, change_addr, NoteValue::from_raw(change), [0u8; 512])
-            .map_err(|e| BuildError::Builder(format!("{e:?}")))?;
+        for part in shape.change_values(change, n_spends, n_payees) {
+            builder
+                .add_output(ovk.clone(), change_addr, NoteValue::from_raw(part), [0u8; 512])
+                .map_err(|e| BuildError::Builder(format!("{e:?}")))?;
+        }
 
         let pk = proving_key();
         let (unauth, _meta) =
             builder.build::<i64>(&mut *rng).map_err(|e| BuildError::Builder(format!("{e:?}")))?.ok_or(BuildError::Empty)?;
         shape.check_built(unauth.actions().len())?;
+        let base_actions = shape.padded_actions(n_spends, n_payees + 1);
+        if unauth.actions().len() > base_actions + shape.extra_actions() {
+            return Err(BuildError::Builder(format!("a change split added more than {} action(s)", shape.extra_actions())));
+        }
         let proven = unauth.create_proof(pk, &mut *rng).map_err(|e| BuildError::Proof(format!("{e:?}")))?;
 
         let mut effects = to_wire(&proven, |_| [0u8; 64], Vec::new(), [0u8; 64]);
