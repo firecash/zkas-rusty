@@ -1396,7 +1396,7 @@ impl WalletDb {
             // The nullifier drop rule above is key-independent and has already run, so
             // skipping decryption cannot change which bundles append leaves — only
             // whether we notice that one of those leaves is ours. See `set_leaves_only`.
-            let t_dec = std::time::Instant::now();
+            let t_dec = crate::clock::Instant::now();
             let from_memo = self.predecrypted.is_some();
             let received = if self.leaves_only {
                 Vec::new()
@@ -2300,7 +2300,7 @@ impl WalletDb {
     fn append_leaf(&mut self, cmx: ExtractedNoteCommitment, owned: Option<Note>) {
         // ~25 ns of clock against ~150 us of Sinsemilla: under 0.02% overhead, and it
         // is the only place every ingest path (full, compact, precomputed) converges.
-        let t_leaf = std::time::Instant::now();
+        let t_leaf = crate::clock::Instant::now();
         self.scan_cost.leaves += 1;
         let leaf = MerkleHashOrchard::from_cmx(&cmx);
         self.leaves.push(leaf);
@@ -2308,7 +2308,7 @@ impl WalletDb {
         // tree is building the identical thing. A borrowing wallet skips it and adopts
         // that frontier instead (see `adopt_tip_frontier`), which is sound because the
         // frontier at N leaves depends only on leaves 0..N.
-        let t_mirror = std::time::Instant::now();
+        let t_mirror = crate::clock::Instant::now();
         if self.borrow_tree {
             self.tree_valid = false;
         } else {
@@ -2320,7 +2320,7 @@ impl WalletDb {
             }
         }
         self.scan_cost.mirror_ns += t_mirror.elapsed().as_nanos();
-        let t_subtree = std::time::Instant::now();
+        let t_subtree = crate::clock::Instant::now();
         // Keep the complete-subtree cache in step: one combine per leaf, amortized. If
         // the mountain range ever refuses a leaf the cache is dropped, not patched — a
         // half-updated cache must never be consulted.
@@ -2473,7 +2473,7 @@ impl WalletDb {
         // moving the timer made both counters read ~0.1 us/action while the daemon was
         // doing exactly as much work as before — telemetry that flatters the change it
         // is supposed to measure is worse than none, and I nearly reported it as a win.
-        let t_dec = std::time::Instant::now();
+        let t_dec = crate::clock::Instant::now();
         let found = crate::wallet::scan_compact_auto_prepared(&self.prepared_ivk, self.agree_scalar.as_ref(), all, prep, epks);
         self.install_predecrypted(all, found, t_dec.elapsed().as_nanos());
     }
@@ -2527,7 +2527,7 @@ impl WalletDb {
         if self.mirror_pending.is_empty() {
             return;
         }
-        let t = std::time::Instant::now();
+        let t = crate::clock::Instant::now();
         let pending = std::mem::take(&mut self.mirror_pending);
         self.tree = CommitmentTree::from_frontier(&frontier_extend(&self.tree.to_frontier(), &pending));
         let ns = t.elapsed().as_nanos();
@@ -5138,7 +5138,7 @@ mod tests {
                     .collect();
                 let flat: Vec<CompactActionRecord> = blocks.iter().flatten().flatten().copied().collect();
                 db.predecrypt_page_cached(&flat, None);
-                let t = std::time::Instant::now();
+                let t = crate::clock::Instant::now();
                 for txs in &blocks {
                     db.ingest_block_compact_precomputed_with_meta(&[], txs, None);
                 }
@@ -6846,10 +6846,10 @@ mod tests {
         let mut v3 = v4[..v4.len() - suffix.len()].to_vec();
         v3[0] = CHECKPOINT_VERSION_V3;
 
-        let t = std::time::Instant::now();
+        let t = crate::clock::Instant::now();
         let a = WalletDb::from_checkpoint(mine, &v3).unwrap();
         let v3_ms = t.elapsed().as_millis();
-        let t = std::time::Instant::now();
+        let t = crate::clock::Instant::now();
         let b = WalletDb::from_checkpoint(mine, &v4).unwrap();
         let v4_ms = t.elapsed().as_millis();
 
@@ -7079,14 +7079,14 @@ mod circuit_tests {
         let _ = prove(batches[0].clone());
 
         let cores = std::thread::available_parallelism().map(|c| c.get()).unwrap_or(4);
-        let t0 = std::time::Instant::now();
+        let t0 = crate::clock::Instant::now();
         for b in &batches {
             let _ = prove(b.clone());
         }
         let seq = t0.elapsed().as_secs_f64();
 
         let per = (cores / N).max(1);
-        let t1 = std::time::Instant::now();
+        let t1 = crate::clock::Instant::now();
         std::thread::scope(|s| {
             for b in &batches {
                 let prove = &prove;
@@ -7141,7 +7141,7 @@ mod circuit_tests {
             let sum: u64 = db.notes()[..n].iter().map(|o| o.note.value().inner()).sum();
             let fee = 3_000_000u64 * n as u64;
             let c0 = cpu_secs();
-            let t0 = std::time::Instant::now();
+            let t0 = crate::clock::Instant::now();
             let payload =
                 crate::wallet::build::build_wallet_payment(miner, sel, payee, sum - fee, fee, &net, ctx, true, [0u8; 512]).unwrap();
             let wall = t0.elapsed().as_secs_f64();

@@ -1288,7 +1288,7 @@ impl ScanEngine {
         self.stats.pairs += (page.actions.len() * self.keys.len()) as u64;
         let mut out = PageFolds { first_seq: self.seq + 1, ..Default::default() };
         // (2) one detection pass: flat action index -> [(key, note)].
-        let t = std::time::Instant::now();
+        let t = crate::clock::Instant::now();
         let mut hits_at: HashMap<usize, Vec<(u32, ReceivedNote)>> = HashMap::new();
         if !page.actions.is_empty() && !self.keys.is_empty() {
             let keys: Vec<&IvkKey> = self.keys.iter().collect();
@@ -1327,7 +1327,7 @@ impl ScanEngine {
     fn ingest_block(&mut self, b: &SharedBlock, flat: &mut usize, hits_at: &HashMap<usize, Vec<(u32, ReceivedNote)>>, out: &mut PageFolds) {
         self.stats.blocks += 1;
         let seq = self.seq;
-        let t_fold = std::time::Instant::now();
+        let t_fold = crate::clock::Instant::now();
         let size0 = self.chain.size();
         let live = |wallets: &Vec<WalletLite>, w: WalletId| wallets[w as usize].start_seq < seq;
         let meta = b.meta.as_ref();
@@ -1430,7 +1430,7 @@ impl ScanEngine {
             out.applied_nullifiers.extend_from_slice(&nullifiers);
         }
         self.stats.fold_ns += t_fold.elapsed().as_nanos();
-        let t_tree = std::time::Instant::now();
+        let t_tree = crate::clock::Instant::now();
         self.chain.ingest(b);
         self.stats.tree_ns += t_tree.elapsed().as_nanos();
         assert_eq!(self.chain.size(), pos, "engine leaf positions drifted from the shared tree");

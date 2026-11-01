@@ -59,3 +59,15 @@ pub use orchard::{
     tree::{Anchor, MerkleHashOrchard, MerklePath},
     value::{NoteValue, ValueCommitment, ValueSum},
 };
+
+/// The clock the cost counters read. `std::time::Instant::now()` panics in a browser
+/// (wasm32-unknown-unknown has no clock), which made the whole wallet abort in the web engine;
+/// `web_time::Instant` is the same type over `performance.now()` there, and IS
+/// `std::time::Instant` everywhere else, so native builds are unchanged.
+pub mod clock {
+    #[cfg(target_arch = "wasm32")]
+    pub use web_time::Instant;
+    #[cfg(not(target_arch = "wasm32"))]
+    pub use std::time::Instant;
+}
+

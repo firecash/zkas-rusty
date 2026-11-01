@@ -85,3 +85,8 @@ rayon.workspace = true
 [[example]]
 name = "proof_corpus"
 required-features = ["circuit"]
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# A clock for the cost counters in a browser (see `clock`).
+web-time = "1.1"
+

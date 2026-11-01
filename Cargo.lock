@@ -4322,6 +4322,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "web-time",
  "zakura-orchard",
  "zakura-pasta-curves",
  "zcash_note_encryption",
