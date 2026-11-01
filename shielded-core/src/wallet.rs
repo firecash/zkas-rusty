@@ -1502,10 +1502,15 @@ pub mod build {
                 .add_output(ovk.clone(), recipient, NoteValue::from_raw(amount), memo)
                 .map_err(|e| BuildError::Builder(format!("{e:?}")))?;
         }
-        for part in shape.change_values(change, n_spends, n_payees) {
-            builder
-                .add_output(ovk.clone(), change_addr, NoteValue::from_raw(part), [0u8; 512])
-                .map_err(|e| BuildError::Builder(format!("{e:?}")))?;
+        // No change, no change note (outside the uniform shape, which always carries one): an
+        // exact payment or a consolidation used to leave a 0-value coin in the wallet that later
+        // payments then had to carry as a spend.
+        if change > 0 || shape.uniform {
+            for part in shape.change_values(change, n_spends, n_payees) {
+                builder
+                    .add_output(ovk.clone(), change_addr, NoteValue::from_raw(part), [0u8; 512])
+                    .map_err(|e| BuildError::Builder(format!("{e:?}")))?;
+            }
         }
 
         let pk = proving_key();

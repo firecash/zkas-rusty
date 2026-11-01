@@ -659,7 +659,33 @@ impl Engine {
     /// spending key; it is used for this call only. Returns the bundle to submit, the leaf
     /// positions it spends and the fee. Nothing is marked spent until [`Engine::mark_sent`].
     pub fn prepare_send(&self, sk_hex: &str, to: &str, amount: u64, memo: &str) -> Result<String, String> {
-        use zkas_wallet_engine::payment::{max_spends_per_tx, select_spend_count, single_note_target, spend_order_key, DEFAULT_FEE_SOMPI};
+        let payees = serde_json::json!([{ "to": to, "amount_sompi": amount.to_string(), "memo": memo }]).to_string();
+        self.prepare_payment(sk_hex, &payees, "{}")
+    }
+
+    /// The general form of [`Engine::prepare_send`]: several payees in one transaction
+    /// (`payees_json` = `[{to, amount_sompi, memo}]`), or a consolidation (`opts.consolidate`:
+    /// no payees; the wallet's settled coins merged into one, paid to itself), with
+    /// `opts.recoverable` (default true) choosing whether the payment can be read back from
+    /// the seed (false = the wallet's "private sends"). Returns the same shape as prepare_send,
+    /// plus `merged` (coins merged) for a consolidation.
+    pub fn prepare_payment(&self, sk_hex: &str, payees_json: &str, opts_json: &str) -> Result<String, String> {
+        use zkas_wallet_engine::payment::{max_payees_per_tx, max_spends_per_tx, min_relay_fee_for_actions, select_spend_count, single_note_target, spend_order_key, DEFAULT_FEE_SOMPI};
+        #[derive(Deserialize)]
+        struct PayeeIn {
+            to: String,
+            amount_sompi: String,
+            #[serde(default)]
+            memo: String,
+        }
+        #[derive(Deserialize, Default)]
+        struct Opts {
+            #[serde(default)]
+            consolidate: bool,
+            recoverable: Option<bool>,
+        }
+        let opts: Opts = serde_json::from_str(opts_json).map_err(|e| format!("bad options: {e}"))?;
+        let recoverable = opts.recoverable.unwrap_or(true);
         if self.db.poisoned() {
             return Err("this wallet received inconsistent chain data; it is being rebuilt".into());
         }
@@ -669,26 +695,71 @@ impl Engine {
         if owner.my_address_bytes() != self.db.my_address_bytes() {
             return Err("this key does not belong to this wallet".into());
         }
-        let addr = kaspa_addresses::Address::try_from(to.trim()).map_err(|e| format!("not a ZKAS address: {e}"))?;
-        if addr.version != kaspa_addresses::Version::ShieldedOrchard || addr.prefix != kaspa_addresses::Prefix::Mainnet {
-            return Err("not a mainnet ZKAS address".into());
+        let parse_addr = |to: &str| -> Result<[u8; 43], String> {
+            let addr = kaspa_addresses::Address::try_from(to.trim()).map_err(|e| format!("not a ZKAS address: {e}"))?;
+            if addr.version != kaspa_addresses::Version::ShieldedOrchard || addr.prefix != kaspa_addresses::Prefix::Mainnet {
+                return Err("not a mainnet ZKAS address".into());
+            }
+            addr.payload.as_slice().try_into().map_err(|_| "address payload is not 43 bytes".to_string())
+        };
+        let mut payees: Vec<([u8; 43], u64, [u8; 512])> = Vec::new();
+        if !opts.consolidate {
+            let list: Vec<PayeeIn> = serde_json::from_str(payees_json).map_err(|e| format!("bad payees: {e}"))?;
+            if list.is_empty() {
+                return Err("no payee".into());
+            }
+            if list.len() > max_payees_per_tx() {
+                return Err(format!("one payment can pay at most {} addresses", max_payees_per_tx()));
+            }
+            for p in list {
+                let amount: u64 = p.amount_sompi.trim().parse().map_err(|_| "the amount must be a whole number of sompi".to_string())?;
+                if amount == 0 {
+                    return Err("the amount must be more than zero".into());
+                }
+                let mb = p.memo.as_bytes();
+                if mb.len() > 512 {
+                    return Err("the memo is longer than 512 bytes".into());
+                }
+                let mut memo_b = [0u8; 512];
+                memo_b[..mb.len()].copy_from_slice(mb);
+                payees.push((parse_addr(&p.to)?, amount, memo_b));
+            }
         }
-        let recipient: [u8; 43] = addr.payload.as_slice().try_into().map_err(|_| "address payload is not 43 bytes".to_string())?;
-        if amount == 0 {
-            return Err("the amount must be more than zero".into());
-        }
-        let target = single_note_target(amount, DEFAULT_FEE_SOMPI);
+        let paying: u64 = payees.iter().try_fold(0u64, |a, p| a.checked_add(p.1)).ok_or("the amounts overflow")?;
         let mut cands: Vec<_> = self.db.notes().iter().filter(|n| n.position < s).collect();
-        cands.sort_by_key(|n| spend_order_key(n.value(), target));
-        let values: Vec<u64> = cands.iter().map(|n| n.value()).collect();
-        let (take, fee) = select_spend_count(&values, amount, DEFAULT_FEE_SOMPI, max_spends_per_tx()).map_err(|e| format!("{e:?}"))?;
-        let have: u64 = values[..take.min(values.len())].iter().sum();
-        if take == 0 || have < amount.saturating_add(fee) {
-            let spendable: u64 = values.iter().sum();
+        let fast = threads_available() > 1;
+        let (take, fee) = if opts.consolidate {
+            // Merge the smallest coins first (they are what makes payments need many spends),
+            // as many as one transaction carries — fewer without threads, where every coin adds
+            // about a second of proving.
+            cands.sort_by_key(|n| n.value());
+            let cap = if fast { max_spends_per_tx() } else { 10 };
+            let take = cands.len().min(cap);
+            if take < 2 {
+                return Err("there is nothing to merge: this wallet has fewer than two settled coins".into());
+            }
+            let fee = DEFAULT_FEE_SOMPI.max(min_relay_fee_for_actions(take));
+            (take, fee)
+        } else {
+            let target = single_note_target(paying, DEFAULT_FEE_SOMPI);
+            cands.sort_by_key(|n| spend_order_key(n.value(), target));
+            let values: Vec<u64> = cands.iter().map(|n| n.value()).collect();
+            let (take, fee) = select_spend_count(&values, paying, DEFAULT_FEE_SOMPI, max_spends_per_tx()).map_err(|e| format!("{e:?}"))?;
+            // Several payees: the bundle carries max(spends, payees + change) actions.
+            (take, fee.max(min_relay_fee_for_actions(take.max(payees.len() + 1))))
+        };
+        let have: u64 = cands[..take.min(cands.len())].iter().map(|n| n.value()).sum();
+        if opts.consolidate {
+            if have <= fee {
+                return Err("the coins to merge do not cover the fee".into());
+            }
+            payees.push((self.db.my_address_bytes(), have - fee, [0u8; 512]));
+        } else if take == 0 || have < paying.saturating_add(fee) {
+            let spendable: u64 = cands.iter().map(|n| n.value()).sum();
             return Err(format!(
                 "not enough settled funds: {} ZKAS ready to spend, {} ZKAS needed (amount plus a {} ZKAS fee). Received coins become spendable about 10 minutes after they are mined.",
                 spendable as f64 / 1e8,
-                amount.saturating_add(fee) as f64 / 1e8,
+                paying.saturating_add(fee) as f64 / 1e8,
                 fee as f64 / 1e8
             ));
         }
@@ -713,28 +784,29 @@ impl Engine {
             inputs.push((n.note.clone(), path));
             positions.push(n.position);
         }
-        let mut memo_b = [0u8; 512];
-        let mb = memo.as_bytes();
-        if mb.len() > 512 {
-            return Err("the memo is longer than 512 bytes".into());
-        }
-        memo_b[..mb.len()].copy_from_slice(mb);
         let net: [u8; 32] = kaspa_consensus_core::config::params::MAINNET_PARAMS.genesis.hash.as_bytes();
         let ctx = kaspa_shielded_wallet::tx::payment_tx_context();
         // Ready-note ladder: while this payment would leave fewer than 3 settled coins, its change
         // comes back as several coins that each settle on their own, so the next payment does not
         // wait ~10 minutes for this one's change. Free dummy slots always; one extra action only
-        // with the threaded prover (single-threaded it would add ~50% to the proof).
-        let change = have - amount - fee;
-        let fast = threads_available() > 1;
-        let (parts, part_min, extra) = zkas_wallet_engine::payment::change_split(cands.len() - take, change, amount, fee, take, 1, fast);
+        // with the threaded prover (single-threaded it would add ~50% to the proof). Never for a
+        // consolidation, which exists to merge.
+        let (parts, part_min, extra) = if opts.consolidate {
+            (1, 0, 0)
+        } else {
+            let change = have - paying - fee;
+            let unit = payees.iter().map(|p| p.1).max().unwrap_or(paying);
+            zkas_wallet_engine::payment::change_split(cands.len() - take, change, unit, fee, take, payees.len(), fast)
+        };
         let shape = kaspa_shielded_core::wallet::build::SendShape::LEGACY.with_change_split(parts, part_min).with_change_extra_actions(extra);
-        let bundle = kaspa_shielded_core::wallet::build::build_wallet_payment_multi_anchored_with(sk, inputs, &[(recipient, amount, memo_b)], fee, &net, &ctx, true, Some(block), shape)
+        let bundle = kaspa_shielded_core::wallet::build::build_wallet_payment_multi_anchored_with(sk, inputs, &payees, fee, &net, &ctx, recoverable, Some(block), shape)
             .map_err(|e| format!("building the payment failed: {e:?}"))?;
         // The transaction id the network will know it by (the gateway wraps the bundle in exactly
         // this shape): lets a browser that lost the submit's answer park its coins under it.
         let txid = kaspa_shielded_wallet::tx::payment_tx(bundle.clone()).id().to_string();
-        Ok(serde_json::json!({ "bundle_hex": hex::encode(bundle), "positions": positions, "fee": fee, "outflow": amount + fee, "txid": txid }).to_string())
+        // What leaves the wallet: the payees and the fee (a consolidation pays itself: only the fee).
+        let outflow = if opts.consolidate { fee } else { paying + fee };
+        Ok(serde_json::json!({ "bundle_hex": hex::encode(bundle), "positions": positions, "fee": fee, "outflow": outflow, "txid": txid, "merged": if opts.consolidate { take } else { 0 } }).to_string())
     }
 
     /// Are all of these leaf positions still unspent notes of this wallet (none spent or parked
@@ -888,6 +960,97 @@ mod send_tests {
         let st: serde_json::Value = serde_json::from_str(&e.status()).unwrap();
         assert_eq!(st["balance_sompi"], "2000000000", "the two spent notes left the balance");
         assert_eq!(st["pending_change_sompi"], (1_000_000_000 - amount - fee).to_string(), "change owed back");
+    }
+
+    /// A funded engine (six settled 5-ZKAS coins) at an anchor, for the payment tests below.
+    fn funded(sk: [u8; 32]) -> (Engine, Vec<(kaspa_shielded_core::coinbase::CoinbaseNoteDesc, u64)>) {
+        let mine = address_bytes_from_seed(sk).unwrap();
+        let mut db = WalletDb::from_seed(sk).unwrap();
+        let notes: Vec<_> = (0..6u8).map(|b| (derive_coinbase_note_desc(mine, &[b, 3, 3]), 500_000_000u64)).collect();
+        db.ingest_block(&notes, &[]);
+        let mut out = CHECKPOINT_MAGIC.to_vec();
+        out.extend_from_slice(&[0u8; 32]);
+        out.extend_from_slice(&1000u64.to_le_bytes());
+        out.extend_from_slice(&0u64.to_le_bytes());
+        let body = db.to_checkpoint();
+        out.extend_from_slice(&(body.len() as u64).to_le_bytes());
+        out.extend_from_slice(&body);
+        let mut e = Engine::restore_from(&hex::encode(db.fvk().to_bytes()), &out).unwrap();
+        let fs = e.db.tip_frontier_state().unwrap();
+        let boundary = Boundary { block: hex::encode([79u8; 32]), daa: 1000, size: fs.size, leaf: hex::encode(fs.leaf.unwrap()), ommers: fs.ommers.iter().map(hex::encode).collect() };
+        e.set_anchor(&serde_json::to_string(&boundary).unwrap()).unwrap();
+        (e, notes)
+    }
+
+    fn verified(r: &serde_json::Value) -> kaspa_shielded_core::bundle::ShieldedBundle {
+        let bytes = hex::decode(r["bundle_hex"].as_str().unwrap()).unwrap();
+        let bundle = kaspa_shielded_core::bundle::ShieldedBundle::from_bytes_at(&bytes, true).unwrap();
+        let net: [u8; 32] = kaspa_consensus_core::config::params::MAINNET_PARAMS.genesis.hash.as_bytes();
+        let ctx = kaspa_shielded_wallet::tx::payment_tx_context();
+        kaspa_shielded_core::verify::verify_bundle(&bundle, &kaspa_shielded_core::verify::sighash(&bundle, &net, &ctx)).expect("verifies");
+        assert_eq!(bundle.value_balance, r["fee"].as_i64().unwrap());
+        bundle
+    }
+
+    /// Consolidation in the browser: the settled coins merge into one coin of the wallet's own,
+    /// only the fee leaves, and the merged amount is owed back as change until it lands.
+    #[test]
+    fn a_browser_consolidation_merges_into_one_coin() {
+        let sk = [24u8; 32];
+        let (mut e, notes) = funded(sk);
+        let r: serde_json::Value = serde_json::from_str(&e.prepare_payment(&hex::encode(sk), "[]", r#"{"consolidate":true}"#).unwrap()).unwrap();
+        let b = verified(&r);
+        assert_eq!(r["merged"], 6);
+        let fee = r["fee"].as_u64().unwrap();
+        assert_eq!(r["outflow"].as_u64().unwrap(), fee, "only the fee leaves");
+        let mut seen = WalletDb::from_seed(sk).unwrap();
+        seen.ingest_block(&notes, &[]);
+        seen.ingest_block(&[], &[&b]);
+        let v: Vec<u64> = seen.notes().iter().map(|n| n.value()).collect();
+        assert_eq!(v, vec![3_000_000_000 - fee], "one coin, no change split");
+        e.mark_sent(&r["positions"].to_string(), &hex::encode([7u8; 32]), fee).unwrap();
+        let st: serde_json::Value = serde_json::from_str(&e.status()).unwrap();
+        assert_eq!(st["pending_change_sompi"], (3_000_000_000 - fee).to_string());
+    }
+
+    /// Several payees in one browser payment, and private sends (not readable back from the seed).
+    #[test]
+    fn a_browser_payment_pays_several_and_can_be_private() {
+        let sk = [26u8; 32];
+        let (e, notes) = funded(sk);
+        let (a, b) = (address_bytes_from_seed([91u8; 32]).unwrap(), address_bytes_from_seed([92u8; 32]).unwrap());
+        let payees = serde_json::json!([
+            { "to": zkas(&a), "amount_sompi": "100000000", "memo": "one" },
+            { "to": zkas(&b), "amount_sompi": "250000000" },
+        ])
+        .to_string();
+        let r: serde_json::Value = serde_json::from_str(&e.prepare_payment(&hex::encode(sk), &payees, "{}").unwrap()).unwrap();
+        let bundle = verified(&r);
+        assert_eq!(r["outflow"].as_u64().unwrap(), 350_000_000 + r["fee"].as_u64().unwrap());
+        for (seed, want) in [([91u8; 32], 100_000_000u128), ([92u8; 32], 250_000_000u128)] {
+            let mut p = WalletDb::from_seed(seed).unwrap();
+            p.ingest_block(&[], &[&bundle]);
+            assert_eq!(p.balance(), want);
+        }
+        // Recoverable (default): a restore from the seed can name the recipients.
+        let mut restored = WalletDb::from_seed(sk).unwrap();
+        restored.ingest_block(&notes, &[]);
+        restored.ingest_block_with_meta(&[], &[&bundle], Some(&kaspa_shielded_core::walletdb::BlockMeta { coinbase_txid: [0xa2; 32], txids: vec![[0xb2; 32]], timestamp_ms: 2_000, daa_score: 20 }));
+        assert!(restored.history().iter().any(|h| h.recipient.is_some() && h.credits.len() == 2), "both recipients named");
+        // Private: the same payment cannot be read back.
+        let r: serde_json::Value = serde_json::from_str(&e.prepare_payment(&hex::encode(sk), &payees, r#"{"recoverable":false}"#).unwrap()).unwrap();
+        let bundle = verified(&r);
+        let mut restored = WalletDb::from_seed(sk).unwrap();
+        restored.ingest_block(&notes, &[]);
+        restored.ingest_block_with_meta(&[], &[&bundle], Some(&kaspa_shielded_core::walletdb::BlockMeta { coinbase_txid: [0xa2; 32], txids: vec![[0xb2; 32]], timestamp_ms: 2_000, daa_score: 20 }));
+        assert!(!restored.history().is_empty(), "the payment is still in the history");
+        assert!(restored.history().iter().all(|h| h.recipient.is_none() && h.credits.is_empty()), "nothing names a recipient");
+        // Refusals: no payee, a zero amount, an amount that is not whole sompi.
+        assert!(e.prepare_payment(&hex::encode(sk), "[]", "{}").unwrap_err().contains("no payee"));
+        let zero = serde_json::json!([{ "to": zkas(&a), "amount_sompi": "0" }]).to_string();
+        assert!(e.prepare_payment(&hex::encode(sk), &zero, "{}").unwrap_err().contains("more than zero"));
+        let frac = serde_json::json!([{ "to": zkas(&a), "amount_sompi": "1.5" }]).to_string();
+        assert!(e.prepare_payment(&hex::encode(sk), &frac, "{}").unwrap_err().contains("whole number"));
     }
 
     /// One big coin paying a small amount: the change comes back as separate coins (each
