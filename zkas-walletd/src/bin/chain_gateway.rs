@@ -40,6 +40,21 @@ struct Gw {
     /// polls /tip, /mempool and its anchor every few seconds, and without this each poll was a
     /// node RPC — load that grew with the number of open browsers. Now it is constant.
     cache: Mutex<HashMap<String, (std::time::Instant, serde_json::Value)>>,
+    /// Tip pages (shorter than asked for: the wallet is at the tip) by request, for a second.
+    /// Every browser wallet at the tip asks for the same few cursors every 5 s; each ask was a
+    /// node RPC. Full pages (catch-up, mostly served from chain files) are not kept: they are
+    /// large, and caching them would need a byte budget for no shared benefit.
+    tip_pages: Mutex<HashMap<(RpcHash, u64), (std::time::Instant, Bytes)>>,
+}
+
+const TIP_PAGE_TTL: std::time::Duration = std::time::Duration::from_secs(1);
+const TIP_PAGES_MAX: usize = 1024;
+
+fn page_response(body: Bytes) -> Response {
+    let mut r = (StatusCode::OK, body).into_response();
+    r.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("application/octet-stream"));
+    r.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    r
 }
 
 use std::sync::Mutex;
@@ -77,16 +92,29 @@ async fn blocks(State(gw): State<Arc<Gw>>, Query(q): Query<HashMap<String, Strin
         return bad(StatusCode::BAD_REQUEST, "after=<block hash> required");
     };
     let limit = q.get("limit").and_then(|l| l.parse::<u64>().ok()).unwrap_or(MAX_LIMIT).clamp(1, MAX_LIMIT);
+    if let Some((at, body)) = gw.tip_pages.lock().unwrap().get(&(after, limit)) {
+        if at.elapsed() < TIP_PAGE_TTL {
+            return page_response(body.clone());
+        }
+    }
     let Ok(_permit) = gw.gate.try_acquire() else {
         return bad(StatusCode::SERVICE_UNAVAILABLE, "busy, retry");
     };
     match tokio::time::timeout(NODE_TIMEOUT, gw.node.get_shielded_blocks(after, limit)).await {
         Ok(Ok(page)) => {
-            let body = zkas_walletd::chain_files::encode_page(&gw.genesis, &page);
-            let mut r = (StatusCode::OK, body).into_response();
-            r.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("application/octet-stream"));
-            r.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-            r
+            let at_tip = (page.blocks.len() as u64) < limit;
+            let body = Bytes::from(zkas_walletd::chain_files::encode_page(&gw.genesis, &page));
+            if at_tip {
+                let mut c = gw.tip_pages.lock().unwrap();
+                if c.len() >= TIP_PAGES_MAX {
+                    c.retain(|_, (t, _)| t.elapsed() < TIP_PAGE_TTL);
+                    if c.len() >= TIP_PAGES_MAX {
+                        c.clear();
+                    }
+                }
+                c.insert((after, limit), (std::time::Instant::now(), body.clone()));
+            }
+            page_response(body)
         }
         Ok(Err(e)) => bad(StatusCode::BAD_GATEWAY, &format!("node: {e}")),
         Err(_) => bad(StatusCode::GATEWAY_TIMEOUT, "node timed out"),
@@ -221,7 +249,7 @@ async fn main() {
         std::process::exit(1);
     });
     let genesis = RpcHash::from_bytes(kaspa_consensus_core::config::params::MAINNET_PARAMS.genesis.hash.as_bytes());
-    let gw = Arc::new(Gw { node, genesis, gate: tokio::sync::Semaphore::new(MAX_IN_FLIGHT), cache: Mutex::new(HashMap::new()) });
+    let gw = Arc::new(Gw { node, genesis, gate: tokio::sync::Semaphore::new(MAX_IN_FLIGHT), cache: Mutex::new(HashMap::new()), tip_pages: Mutex::new(HashMap::new()) });
     // Public data, read-only: any origin may read it (the browser wallet is one of them).
     let cors = tower_http::cors::CorsLayer::new()
         .allow_origin(tower_http::cors::Any)
