@@ -471,3 +471,29 @@ fn legacy_split_with_one_extra_action_verifies_and_holds_two_change_notes() {
     let p2 = build_wallet_payment_multi_shaped(MINER, inputs(&db2, 1), &[(payee(2), z, [0u8; 512])], F, &NET, CTX, true, Some(ANCHOR_BLOCK), SendShape::LEGACY.with_change_split(2, z / 10), &mut rng(62)).unwrap();
     assert_eq!(ShieldedBundle::from_bytes(&p2).unwrap().actions.len(), 2);
 }
+
+/// The non-custodial path: a payment whose change is split passes the device's own payment
+/// check (the one that runs before it signs), signs, finalizes, verifies and is accepted, and
+/// the wallet then holds the change as two coins. The device signer needs no update for it.
+#[test]
+fn a_split_noncustodial_payment_passes_the_device_check() {
+    let z = ZKAS;
+    let (mut state, mut db) = fixture(&[5 * z]);
+    let sk = SpendingKey::from_bytes(MINER).unwrap();
+    let fvk = FullViewingKey::from(&sk);
+    let ask = SpendAuthorizingKey::from(&sk);
+    let shape = SendShape::LEGACY.with_change_split(2, z + F).with_change_extra_actions(1);
+    let mut r = rng(71);
+    let p = prepare_payment_shaped(&fvk, inputs(&db, 1), payee(2), z, F, &NET, CTX, true, [0u8; 512], Some(ANCHOR_BLOCK), shape, &mut r).unwrap();
+    assert_eq!(p.disclosure.len(), 3, "1 spend + payment + 2 change parts");
+    crate::payment_check::check_prepared_payment(&p.effects, &p.disclosure, &fvk, &payee(2), z, F).expect("device accepts it");
+    let sigs: Vec<_> = p.spend_auth_requests.iter().map(|(i, a)| (*i, sign_spend_auth_with_rng(&ask, *a, p.sighash, &mut r).unwrap())).collect();
+    let b = finalize_payment_with_rng(p, sigs, &mut r).unwrap();
+    verify_bundle(&b, &sighash(&b, &NET, CTX)).expect("verifies");
+    state.apply_chain_block(None, &[ShieldedTx::from_bundle(&b).unwrap()]).unwrap();
+    db.ingest_block(&[], &[&b]);
+    let v: Vec<u64> = db.notes().iter().map(|n| n.value()).collect();
+    assert_eq!(v.len(), 2);
+    assert_eq!(v.iter().sum::<u64>(), 4 * z - F);
+    assert!(v.iter().all(|x| *x > z), "every part exceeds the amount, so none reads as a second payment");
+}

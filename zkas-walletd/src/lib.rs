@@ -87,7 +87,7 @@ use zkas_sdk::{
     SpendAuthRequest as SdkSpendAuthRequest,
 };
 use zkas_wallet_engine::{
-    DEFAULT_FEE_SOMPI, chunk_fee, max_payees_per_tx, max_spends_per_tx, min_relay_fee_for_actions, plan_payment,
+    DEFAULT_FEE_SOMPI, change_split, chunk_fee, max_payees_per_tx, max_spends_per_tx, min_relay_fee_for_actions, plan_payment,
     select_spend_count as engine_select_spend_count, single_note_target, spend_order_key,
 };
 
@@ -12506,6 +12506,8 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
     // chain), which on a phone reads as a hung app; the proof itself is ~7s.
     let mut inputs = Vec::new();
     let mut selected = 0u64;
+    // Settled coins the wallet keeps after this payment (unknown = no change split).
+    let mut ready_after = usize::MAX;
     let mut have_total: Option<u64> = None;
     // Set when a matured replay could not reach genesis, so the refusal below can say
     // that the node's history — not the wallet's balance — is what is short.
@@ -12654,6 +12656,7 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
                         }
                     }
                     let take = take;
+                    ready_after = candidates.len().saturating_sub(take);
                     fee = dyn_fee;
                     need = amount.saturating_add(fee);
                     // Whether this prepare can succeed is known from the note VALUES alone. The
@@ -12771,6 +12774,7 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
         }
         fee = dyn_fee;
         need = amount.saturating_add(fee);
+        ready_after = candidates.len().saturating_sub(take);
         for n in candidates.iter().take(take) {
             let path = db
                 .witness_path(n.position)
@@ -12943,10 +12947,27 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
             .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "prepare gate closed"))?
     };
 
+    // Ready-note ladder: while this payment leaves fewer than 3 settled coins, its change comes
+    // back as several coins that settle on their own, so the next payment does not wait ~10
+    // minutes for this one's change. Never for a consolidation (it exists to merge) and not in
+    // the uniform shape's fixed layout beyond its free slots.
+    let split = if self_payment || uniform_req || selected < need {
+        (1, 0, 0)
+    } else {
+        let n_in = inputs.len();
+        change_split(ready_after, selected - need, amount, fee, n_in, 1, true)
+    };
+    if split.0 > 1 {
+        log::info!("prepare: change back as up to {} coins ({} settled coins left after this payment)", split.0, ready_after);
+    }
     let t_proof = std::time::Instant::now();
     let payment = tokio::task::spawn_blocking(move || {
         let _proving = ProvingGuard::new();
-        let shape = if uniform_req { uniform_policy_shape() } else { kaspa_shielded_core::wallet::build::SendShape::LEGACY };
+        let shape = if uniform_req {
+            uniform_policy_shape()
+        } else {
+            kaspa_shielded_core::wallet::build::SendShape::LEGACY.with_change_split(split.0, split.1).with_change_extra_actions(split.2)
+        };
         kaspa_shielded_core::wallet::build::prepare_payment_shaped(
             &fvk,
             inputs,

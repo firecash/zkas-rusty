@@ -116,6 +116,31 @@ pub fn chunk_fee(base_fee: u64, n_spends: usize) -> u64 {
     base_fee.max(min_relay_fee_for_spends(n_spends))
 }
 
+/// Ready (matured, unspent) notes a wallet tries to keep, so a payment never waits for the
+/// change of the previous one to mature (~10 minutes).
+pub const READY_NOTE_TARGET: usize = 3;
+
+/// How to split a payment's change into several notes (the "ready-note ladder"), as
+/// `(parts, part_min, extra_actions)` for `SendShape::with_change_split` /
+/// `with_change_extra_actions`. Splits only while the wallet would be left with fewer than
+/// [`READY_NOTE_TARGET`] ready notes, and only into parts that can each pay this same payment
+/// again (`amount + fee`, at least 10 fees). One extra action is allowed when `extra_ok` (the
+/// caller proves fast enough) and the fee still clears the relay minimum for it; free dummy
+/// slots are always usable. Never for consolidation.
+pub fn change_split(ready_after: usize, change: u64, amount: u64, fee: u64, spends: usize, payees: usize, extra_ok: bool) -> (u8, u64, u8) {
+    if ready_after >= READY_NOTE_TARGET {
+        return (1, 0, 0);
+    }
+    let part_min = amount.saturating_add(fee).max(fee.saturating_mul(10));
+    if change / 2 < part_min {
+        return (1, 0, 0);
+    }
+    let want = (READY_NOTE_TARGET - ready_after).min(3) as u8;
+    let actions = spends.max(payees + 1).max(2);
+    let extra = extra_ok && actions < max_actions_per_tx() && fee >= min_relay_fee_for_actions(actions + 1);
+    (want.max(2), part_min, u8::from(extra))
+}
+
 /// The smallest a single note must be to pay `amount` on its own, fee included.
 pub fn single_note_target(amount: u64, base_fee: u64) -> u64 {
     amount.saturating_add(chunk_fee(base_fee, 1))
@@ -228,6 +253,23 @@ mod tests {
         // limit (the physical ceiling), so the wallet never plans an unmineable tx.
         let transient = (expected_wire_len(38) as u64 + 94) * TRANSIENT_BYTE_TO_MASS_FACTOR;
         assert!(transient <= STANDARD_TX_MASS_CAP, "38-spend transient {transient} exceeds cap {STANDARD_TX_MASS_CAP}");
+    }
+
+    #[test]
+    fn change_split_only_while_the_ladder_is_short() {
+        let z = 100_000_000u64;
+        let f = DEFAULT_FEE_SOMPI;
+        assert_eq!(change_split(3, 50 * z, z, f, 1, 1, true), (1, 0, 0), "enough ready notes: one change note");
+        assert_eq!(change_split(0, z, z, f, 1, 1, true), (1, 0, 0), "change too small to pay this again twice");
+        let (parts, min, extra) = change_split(0, 50 * z, z, f, 1, 1, true);
+        assert_eq!((parts, extra), (3, 1));
+        assert_eq!(min, z + f);
+        assert_eq!(change_split(0, 50 * z, z, f, 1, 1, false).2, 0, "a slow prover gets free slots only");
+        assert_eq!(change_split(2, 50 * z, z, f, 1, 1, true).0, 2);
+        // The floor fee covers one extra action at 2 -> 3 actions; a bundle whose fee does not is
+        // never grown.
+        assert!(f >= min_relay_fee_for_actions(3));
+        assert_eq!(change_split(0, 50 * z, z, min_relay_fee_for_actions(2), 1, 1, true).2, 0);
     }
 
     #[test]

@@ -307,6 +307,17 @@ pub fn address_of_fvk_str(fvk_hex: &str) -> Result<String, String> {
 #[cfg(all(feature = "threads", target_arch = "wasm32"))]
 pub use wasm_bindgen_rayon::init_thread_pool;
 
+/// Worker threads the prover can use: 1 in the single-threaded browser build.
+#[cfg(all(target_arch = "wasm32", not(feature = "threads")))]
+fn threads_available() -> usize {
+    1
+}
+
+#[cfg(not(all(target_arch = "wasm32", not(feature = "threads"))))]
+fn threads_available() -> usize {
+    rayon::current_num_threads()
+}
+
 /// Build the Halo 2 proving key now (a few seconds, once per page): called when the wallet is
 /// idle at the tip, so the first payment does not pay for it. Later calls return at once.
 #[wasm_bindgen]
@@ -710,7 +721,15 @@ impl Engine {
         memo_b[..mb.len()].copy_from_slice(mb);
         let net: [u8; 32] = kaspa_consensus_core::config::params::MAINNET_PARAMS.genesis.hash.as_bytes();
         let ctx = kaspa_shielded_wallet::tx::payment_tx_context();
-        let bundle = kaspa_shielded_core::wallet::build::build_wallet_payment_multi_anchored(sk, inputs, &[(recipient, amount, memo_b)], fee, &net, &ctx, true, Some(block))
+        // Ready-note ladder: while this payment would leave fewer than 3 settled coins, its change
+        // comes back as several coins that each settle on their own, so the next payment does not
+        // wait ~10 minutes for this one's change. Free dummy slots always; one extra action only
+        // with the threaded prover (single-threaded it would add ~50% to the proof).
+        let change = have - amount - fee;
+        let fast = threads_available() > 1;
+        let (parts, part_min, extra) = zkas_wallet_engine::payment::change_split(cands.len() - take, change, amount, fee, take, 1, fast);
+        let shape = kaspa_shielded_core::wallet::build::SendShape::LEGACY.with_change_split(parts, part_min).with_change_extra_actions(extra);
+        let bundle = kaspa_shielded_core::wallet::build::build_wallet_payment_multi_anchored_with(sk, inputs, &[(recipient, amount, memo_b)], fee, &net, &ctx, true, Some(block), shape)
             .map_err(|e| format!("building the payment failed: {e:?}"))?;
         // The transaction id the network will know it by (the gateway wraps the bundle in exactly
         // this shape): lets a browser that lost the submit's answer park its coins under it.
@@ -869,6 +888,52 @@ mod send_tests {
         let st: serde_json::Value = serde_json::from_str(&e.status()).unwrap();
         assert_eq!(st["balance_sompi"], "2000000000", "the two spent notes left the balance");
         assert_eq!(st["pending_change_sompi"], (1_000_000_000 - amount - fee).to_string(), "change owed back");
+    }
+
+    /// One big coin paying a small amount: the change comes back as separate coins (each
+    /// settles on its own, so the next payment does not wait for all of it), in a bundle the
+    /// consensus verifier accepts, with the same fee.
+    #[test]
+    fn a_wallet_with_one_coin_gets_its_change_back_as_several() {
+        let sk = [23u8; 32];
+        let mine = address_bytes_from_seed(sk).unwrap();
+        let mut db = WalletDb::from_seed(sk).unwrap();
+        db.ingest_block(&[(derive_coinbase_note_desc(mine, &[7, 7, 7]), 5_000_000_000u64)], &[]);
+        let fvk_hex = hex::encode(db.fvk().to_bytes());
+        let mut out = CHECKPOINT_MAGIC.to_vec();
+        out.extend_from_slice(&[0u8; 32]);
+        out.extend_from_slice(&1000u64.to_le_bytes());
+        out.extend_from_slice(&0u64.to_le_bytes());
+        let body = db.to_checkpoint();
+        out.extend_from_slice(&(body.len() as u64).to_le_bytes());
+        out.extend_from_slice(&body);
+        let mut e = Engine::restore_from(&fvk_hex, &out).unwrap();
+        let fs = e.db.tip_frontier_state().unwrap();
+        let boundary = Boundary { block: hex::encode([78u8; 32]), daa: 1000, size: fs.size, leaf: hex::encode(fs.leaf.unwrap()), ommers: fs.ommers.iter().map(hex::encode).collect() };
+        e.set_anchor(&serde_json::to_string(&boundary).unwrap()).unwrap();
+        let to = zkas(&address_bytes_from_seed([98u8; 32]).unwrap());
+        let amount = 100_000_000u64;
+        let r: serde_json::Value = serde_json::from_str(&e.prepare_send(&hex::encode(sk), &to, amount, "").unwrap()).unwrap();
+        let bytes = hex::decode(r["bundle_hex"].as_str().unwrap()).unwrap();
+        let bundle = kaspa_shielded_core::bundle::ShieldedBundle::from_bytes_at(&bytes, true).unwrap();
+        let net: [u8; 32] = kaspa_consensus_core::config::params::MAINNET_PARAMS.genesis.hash.as_bytes();
+        let ctx = kaspa_shielded_wallet::tx::payment_tx_context();
+        kaspa_shielded_core::verify::verify_bundle(&bundle, &kaspa_shielded_core::verify::sighash(&bundle, &net, &ctx)).expect("verifies");
+        let fee = r["fee"].as_u64().unwrap();
+        assert_eq!(fee, zkas_wallet_engine::payment::DEFAULT_FEE_SOMPI, "the split does not raise the fee");
+        let mut seen = WalletDb::from_seed(sk).unwrap();
+        seen.ingest_block(&[(derive_coinbase_note_desc(mine, &[7, 7, 7]), 5_000_000_000u64)], &[]);
+        seen.ingest_block(&[], &[&bundle]);
+        let change: Vec<u64> = seen.notes().iter().map(|n| n.value()).collect();
+        assert_eq!(change.iter().sum::<u64>(), 5_000_000_000 - amount - fee);
+        // 1 spend + 1 payee pads to 2 actions with no free slot: the one extra action (allowed
+        // with threads, as in this native test) gives exactly two change coins.
+        assert!(threads_available() > 1);
+        assert_eq!(change.len(), 2, "two change coins");
+        assert_eq!(bundle.actions.len(), 3);
+        e.mark_sent(&r["positions"].to_string(), &hex::encode([6u8; 32]), amount + fee).unwrap();
+        let st: serde_json::Value = serde_json::from_str(&e.status()).unwrap();
+        assert_eq!(st["pending_change_sompi"], (5_000_000_000 - amount - fee).to_string(), "change owed back is the total");
     }
 }
 

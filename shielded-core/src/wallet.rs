@@ -1431,18 +1431,24 @@ pub mod build {
         recoverable: bool,
         anchor_block: Option<[u8; 32]>,
     ) -> Result<Vec<u8>, BuildError> {
-        build_wallet_payment_multi_shaped(
-            owner_seed,
-            inputs,
-            payees,
-            fee,
-            network_domain,
-            tx_context,
-            recoverable,
-            anchor_block,
-            SendShape::LEGACY,
-            &mut rand::rng(),
-        )
+        build_wallet_payment_multi_anchored_with(owner_seed, inputs, payees, fee, network_domain, tx_context, recoverable, anchor_block, SendShape::LEGACY)
+    }
+
+    /// [`build_wallet_payment_multi_anchored`] with an explicit [`SendShape`] (e.g. a change
+    /// split) and the OS RNG.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_wallet_payment_multi_anchored_with(
+        owner_seed: [u8; 32],
+        inputs: Vec<(Note, MerklePath)>,
+        payees: &[([u8; 43], u64, [u8; 512])],
+        fee: u64,
+        network_domain: &[u8; 32],
+        tx_context: &[u8],
+        recoverable: bool,
+        anchor_block: Option<[u8; 32]>,
+        shape: SendShape,
+    ) -> Result<Vec<u8>, BuildError> {
+        build_wallet_payment_multi_shaped(owner_seed, inputs, payees, fee, network_domain, tx_context, recoverable, anchor_block, shape, &mut rand::rng())
     }
 
     /// [`build_wallet_payment_multi_anchored`] with an explicit [`SendShape`] and RNG. The RNG
@@ -1670,6 +1676,7 @@ pub mod build {
         let anchor = first_path.root(ExtractedNoteCommitment::from(first_note.commitment()));
 
         let mut builder = Builder::new(shape.bundle_type(), crate::verify::BUNDLE_VERSION, orchard::bundle::Flags::ENABLED, anchor).expect("orchard v2 ENABLED flags are always representable");
+        let n_spends = inputs.len();
         for (note, merkle_path) in inputs {
             builder.add_spend(fvk.clone(), note, merkle_path).map_err(|e| BuildError::Builder(format!("{e:?}")))?;
         }
@@ -1677,14 +1684,22 @@ pub mod build {
             .add_output(ovk.clone(), recipient, NoteValue::from_raw(amount), memo)
             .map_err(|e| BuildError::Builder(format!("{e:?}")))?;
         if change > 0 || shape.uniform {
-            builder
-                .add_output(ovk, change_addr, NoteValue::from_raw(change), [0u8; 512])
-                .map_err(|e| BuildError::Builder(format!("{e:?}")))?;
+            // Every part goes to this wallet's own change address: the device's payment check
+            // accepts any number of own outputs (each must decrypt to its disclosed value), and
+            // each part exceeds `amount`, so none can pass for a second payment.
+            for part in shape.change_values(change, n_spends, 1) {
+                builder
+                    .add_output(ovk.clone(), change_addr, NoteValue::from_raw(part), [0u8; 512])
+                    .map_err(|e| BuildError::Builder(format!("{e:?}")))?;
+            }
         }
 
         let pk = proving_key();
         let (mut pczt, _meta) = builder.build_for_pczt(&mut *rng).map_err(|e| BuildError::Builder(format!("{e:?}")))?;
         shape.check_built(pczt.actions().len())?;
+        if pczt.actions().len() > shape.padded_actions(n_spends, 2) + shape.extra_actions() {
+            return Err(BuildError::Builder(format!("a change split added more than {} action(s)", shape.extra_actions())));
+        }
         pczt.create_proof(pk, &mut *rng).map_err(|e| BuildError::Proof(format!("{e:?}")))?;
 
         let effects = pczt.extract_effects::<i64>().map_err(|e| BuildError::Proof(format!("{e:?}")))?.ok_or(BuildError::Empty)?;
