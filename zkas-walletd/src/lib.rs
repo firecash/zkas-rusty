@@ -1772,6 +1772,13 @@ static MEM_AVAILABLE_MB: std::sync::Mutex<Option<(u64, std::time::Instant)>> = s
 /// MemAvailable 33.6 GB against scope headroom 31.2 GB, and on 2026-10-19 29.8 GB against
 /// 20.2 GB. Outside a cgroup ceiling (desktop, phone, an unlimited scope) the host figure
 /// stands unchanged.
+/// This process's resident set in MB (VmRSS), or None where /proc is not readable.
+fn self_rss_mb() -> Option<u64> {
+    let s = std::fs::read_to_string("/proc/self/status").ok()?;
+    let kb: u64 = s.lines().find_map(|l| l.strip_prefix("VmRSS:"))?.split_whitespace().next()?.parse().ok()?;
+    Some(kb / 1024)
+}
+
 fn mem_available_mb() -> Option<u64> {
     let mut slot = MEM_AVAILABLE_MB.lock().ok()?;
     if let Some((mb, at)) = *slot {
@@ -4426,21 +4433,37 @@ impl WalletEntry {
         let oldest_note = self.db.notes().iter().map(|n| n.position).min().unwrap_or(u64::MAX);
         let covered =
             !self.db.is_leaves_only() && shared_tree_covers > 0 && shared_tree_covers >= self.db.size() && shared_tree_base <= oldest_note;
-        if !covered && shared_tree_covers == 0 && !self.db.tree_is_valid() && !self.db.is_leaves_only() {
+        // The published chain files are the other source of a frontier to adopt: each segment's
+        // signed end frontier. A wallet holding NO note (unspent or pending) needs its tree only
+        // to be exact at the end, so through a segment it skips the hashing — ~60% of a phone
+        // scan (measured rc26: tree 22 us/leaf vs decrypt 30 us/action) — and adopts the frontier
+        // when its cursor reaches the segment's last block (after each page, below). The leaves
+        // are kept until then: a note found mid-segment, or files that stop serving, end the
+        // borrowing and the tree is rebuilt from them (at most one segment's worth) just below.
+        // No shared tree only: a hosted daemon borrows from that instead.
+        let files_cover = shared_tree_covers == 0
+            && !self.db.is_leaves_only()
+            && self.db.notes().is_empty()
+            && self.db.pending_spends().is_empty()
+            && match cache.lock().await.files.clone() {
+                Some(f) => f.covers(&self.low),
+                None => false,
+            };
+        if !covered && !files_cover && shared_tree_covers == 0 && !self.db.tree_is_valid() && !self.db.is_leaves_only() {
             // No shared tree to adopt a frontier from, ever: rebuild this wallet's own tree
             // from the leaves it holds, once. Without it the wallet stays "borrowing" for
             // good — no anchor of its own for a send, and no tree to check against the node.
             let t0 = std::time::Instant::now();
             let ok = tokio::task::block_in_place(|| self.db.rebuild_tree_from_leaves());
-            log::warn!(
-                "wallet {token_p}: rebuilt its own tree from {} leaves in {:.1} s ({}); it had been relying on a shared tree this engine does not build",
+            log::info!(
+                "wallet {token_p}: rebuilt its own tree from {} leaves in {:.1} s ({}); it had skipped hashing while borrowing a frontier it can no longer adopt (a note found mid-segment, the chain files ended, or a shared tree this engine does not build)",
                 self.db.size(),
                 t0.elapsed().as_secs_f64(),
                 if ok { "ok" } else { "FAILED: leaves do not reach the tip" },
                 token_p = log_pseudonym(&token)
             );
         }
-        self.db.set_borrow_tree(covered || !self.db.tree_is_valid());
+        self.db.set_borrow_tree(covered || files_cover || !self.db.tree_is_valid());
 
         // Set when a small caught-up page comes back FULL: more blocks than it
         // carried arrived, so the next iteration must take a full page to catch
@@ -4897,6 +4920,19 @@ impl WalletEntry {
                 if advanced {
                     self.files_unverified = true;
                 }
+            }
+            // A wallet holding no note keeps no leaves. The near-tip warm below is the only other
+            // place the base rolls, so a long catch-up of an empty wallet held every leaf since its
+            // base — a genesis restore on a phone reached 13 M leaves in RAM and a 568 MB checkpoint
+            // rewritten every few minutes, for a wallet with nothing to witness. O(1) per page
+            // (the tip frontier becomes the base); never while a cache build snapshots the stream.
+            if advanced && !self.db.tree_is_valid() && self.db.is_borrowing() && shared_tree_covers == 0 {
+                if let Some(fs) = cache.lock().await.files.clone().and_then(|f| f.frontier_at(&self.low)) {
+                    self.db.adopt_tip_frontier(&fs);
+                }
+            }
+            if advanced && !self.build_in_flight {
+                self.db.compact_if_holding_nothing();
             }
             // Own sends ingested from compact records have no recipient/memo/fee yet — fetch
             // the full transaction for each new Sent row and recover them with the OVK. Rare
@@ -8605,7 +8641,16 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
         let cost = e.db.scan_cost();
         let behind = chain_len.saturating_sub(e.scanned as u64);
         if let Some(line) = e.stats.take_line(&token, cost, behind, std::time::Instant::now(), scan_stats_limiter()) {
-            log::info!("{line}");
+            // Appended keys (the format allows that): where the memory is. `rss_mb` is the whole
+            // process (VmRSS, which Android exposes too); `heap_mb` this wallet's own estimate;
+            // `leaves_held` / `nfs` its two structures that grow with the chain.
+            let rss = self_rss_mb().map_or(-1.0, |v| v as f64);
+            log::info!(
+                "{line} rss_mb={rss:.0} heap_mb={:.0} leaves_held={} nfs={}",
+                e.db.approx_heap_bytes() as f64 / 1e6,
+                e.db.leaf_count(),
+                e.db.nf_len()
+            );
         }
     }
     // NB: the eager witness pre-advance and base compaction live in `sync_chunk`'s

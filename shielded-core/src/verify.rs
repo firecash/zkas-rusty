@@ -194,7 +194,7 @@ pub fn sighash(bundle: &ShieldedBundle, network_domain: &[u8; 32], tx_context: &
     out
 }
 
-#[cfg(feature = "circuit")]
+#[cfg(feature = "circuit-core")]
 mod circuit_verify {
     use super::*;
     use group::{Group, GroupEncoding};
@@ -474,7 +474,7 @@ mod circuit_verify {
     }
 }
 
-#[cfg(feature = "circuit")]
+#[cfg(feature = "circuit-core")]
 pub use circuit_verify::{
     verify_bundle, verify_bundle_with_vk, verify_bundles_batched, verify_bundles_in_batches, verify_bundles_pass, verifying_key,
 };
@@ -503,7 +503,7 @@ pub struct BatchPass {
 /// accepts it and rejects tampering. This is the test that proves the
 /// verification math is actually correct (it requires the `circuit` feature, and
 /// is expensive: it builds a proving key and produces a real proof).
-#[cfg(all(test, feature = "circuit"))]
+#[cfg(all(test, feature = "circuit-core"))]
 mod e2e {
     use super::*;
     use crate::bundle::{ActionWire, ShieldedBundle};
@@ -1044,7 +1044,7 @@ pub const BUNDLE_VERSION: orchard::bundle::BundleVersion = orchard::bundle::Bund
 /// anchored-base circuit of halo2_gadgets 0.5.0 / orchard 0.14.0 — the circuit every proof on
 /// the live chain has been verified against. `PostNu6_3` adds a constrained public input and is
 /// a DIFFERENT circuit: changing this constant is a hard fork.
-#[cfg(feature = "circuit")]
+#[cfg(feature = "circuit-core")]
 pub const CIRCUIT_VERSION: orchard::circuit::OrchardCircuitVersion = orchard::circuit::OrchardCircuitVersion::FixedPostNu6_2;
 
 /// Fingerprint of the verifying key every proof on this chain is checked against:
@@ -1058,7 +1058,7 @@ pub const VERIFYING_KEY_FINGERPRINT: [u8; 32] = [
 ];
 
 /// Builds (and caches) the verifying key and checks it against [`VERIFYING_KEY_FINGERPRINT`].
-#[cfg(feature = "circuit")]
+#[cfg(feature = "circuit-core")]
 pub fn check_verifying_key() -> Result<(), String> {
     let got = verifying_key().fingerprint();
     if got == VERIFYING_KEY_FINGERPRINT {
@@ -1085,9 +1085,9 @@ pub const HALO2_GADGETS_CRATE: &str = env!("ZKAS_HALO2_GADGETS_CRATE");
 /// One line identifying the shielded circuit this node verifies against.
 /// Intended for the startup log and for `getInfo`-style RPC exposure.
 pub fn circuit_identity() -> String {
-    #[cfg(feature = "circuit")]
+    #[cfg(feature = "circuit-core")]
     let version = format!("{CIRCUIT_VERSION:?}");
-    #[cfg(not(feature = "circuit"))]
+    #[cfg(not(feature = "circuit-core"))]
     let version = "no-circuit-feature".to_string();
     format!("circuit={version} orchard=[{ORCHARD_CRATE}] halo2_gadgets=[{HALO2_GADGETS_CRATE}]")
 }

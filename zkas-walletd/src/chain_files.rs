@@ -733,6 +733,8 @@ struct Loaded {
     from: RpcHash,
     to: RpcHash,
     to_daa: u64,
+    /// The signed tree frontier after `to` (see [`ChainFiles::frontier_at`]).
+    to_frontier: Option<kaspa_shielded_core::tree::FrontierState>,
     body: Vec<u8>,
     /// Byte offset of each block in `body`, in chain order.
     offsets: Vec<usize>,
@@ -986,6 +988,31 @@ impl ChainFiles {
         Some(GetShieldedBlocksResponse { blocks, reorged: false, sink_blue_score: sink })
     }
 
+    /// Will the next page after `low` come from the files? True when a loaded segment holds
+    /// blocks after `low`: `low` is its start, or a block inside it other than its last (at the
+    /// last block, only if the next segment is loaded too). A wallet holding no note uses this
+    /// to skip hashing its tree until it reaches the segment's end (see [`Self::frontier_at`]).
+    pub fn covers(&self, low: &RpcHash) -> bool {
+        if self.is_disabled() || self.is_paused() || self.sink.load(Ordering::Relaxed) == 0 {
+            return false;
+        }
+        let loaded = self.loaded.lock().unwrap();
+        loaded.iter().any(|s| &s.from == low || (&s.to != low && s.pos.contains_key(low)))
+    }
+
+    /// The tree frontier right after block `block`, when `block` ends a loaded segment: the
+    /// manifest's signed `to` frontier, which the exporter reproduced from the segment's own
+    /// leaves and the node confirmed. `WalletDb::adopt_tip_frontier` accepts it only at exactly
+    /// the wallet's leaf count, so a wallet that skipped hashing a segment it holds no note in
+    /// becomes exact again at its end.
+    pub fn frontier_at(&self, block: &RpcHash) -> Option<kaspa_shielded_core::tree::FrontierState> {
+        if self.is_disabled() {
+            return None;
+        }
+        let loaded = self.loaded.lock().unwrap();
+        loaded.iter().find(|s| &s.to == block).and_then(|s| s.to_frontier.clone())
+    }
+
     pub fn stats(&self) -> Stats {
         Stats {
             source: self.bases.join(","),
@@ -1088,6 +1115,7 @@ impl ChainFiles {
             from: entry.from.hash().ok_or("bad start hash")?,
             to: entry.to.hash().ok_or("bad end hash")?,
             to_daa: entry.to.daa,
+            to_frontier: entry.to.frontier_state(),
             body,
             offsets,
             pos,
@@ -1207,7 +1235,7 @@ mod tests {
             let idx = index_body(&body, n).unwrap();
             let pos = idx.iter().enumerate().map(|(i, b)| (b.0, i)).collect();
             let offsets = idx.iter().map(|b| b.2).collect();
-            Arc::new(Loaded { index, from: RpcHash::from_bytes([from; 32]), to, to_daa: u64::MAX, body, offsets, pos, used_ms: AtomicU64::new(0) })
+            Arc::new(Loaded { index, from: RpcHash::from_bytes([from; 32]), to, to_daa: u64::MAX, to_frontier: None, body, offsets, pos, used_ms: AtomicU64::new(0) })
         };
         cf.loaded.lock().unwrap().push_back(mk(1, 0, 1..11)); // blocks 1..=10, after block 0
         cf.loaded.lock().unwrap().push_back(mk(2, 10, 11..21)); // blocks 11..=20, after block 10
@@ -1248,6 +1276,7 @@ mod tests {
                 from: RpcHash::from_bytes([index as u8; 32]),
                 to,
                 to_daa: index * 100,
+                to_frontier: None,
                 pos: idx.iter().enumerate().map(|(i, b)| (b.0, i)).collect(),
                 offsets: idx.iter().map(|b| b.2).collect(),
                 body,

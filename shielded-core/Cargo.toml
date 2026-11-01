@@ -15,7 +15,11 @@ default = []
 # Enables Halo 2 proof verification (the `verify` module's circuit path, single
 # + batch). Pulls halo2_proofs via orchard plus the batch/reconstruction deps;
 # kept opt-in so non-verifying consumers stay light.
-circuit = ["orchard/circuit", "orchard/multicore", "dep:nonempty"]
+circuit = ["circuit-core", "orchard/multicore"]
+# The circuit code without multicore proving: what a browser (wasm32 without atomics, where
+# halo2's multicore refuses to compile) builds. Native consumers use `circuit`, which is this
+# plus multicore, so nothing changes for them.
+circuit-core = ["orchard/circuit", "dep:nonempty"]
 
 [dependencies]
 # Orchard primitives (Halo 2 / Pasta). `circuit` (halo2_proofs) is enabled via

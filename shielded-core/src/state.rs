@@ -783,7 +783,7 @@ mod tests {
 /// consensus verifier accepts it, and the §2.4 state transition applies it. This
 /// exercises coinbase issuance → tree/anchor → real proof → verify → nullifier /
 /// turnstile / tree in one flow — the make-or-break economic loop (PLAN §2.4/2.6/2.7).
-#[cfg(all(test, feature = "circuit"))]
+#[cfg(all(test, feature = "circuit-core"))]
 mod circuit_e2e {
     use super::*;
     use crate::coinbase::{CoinbaseNoteDesc, coinbase_note_commitment};

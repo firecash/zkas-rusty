@@ -102,7 +102,7 @@ pub enum PaymentError {
     Build(String),
 }
 
-#[cfg(feature = "circuit")]
+#[cfg(feature = "circuit-core")]
 impl ShieldedAccount {
     /// Build a real, proven shielded **payment**: spend one tracked note worth at
     /// least `amount + fee`, send `amount` to `recipient` (a shielded
@@ -219,7 +219,7 @@ mod tests {
 /// Halo 2 proof, the consensus verifier + §2.4 transition accept it, and both
 /// wallets scan the resulting bundle — Bob receives the amount, Alice keeps the
 /// change. This is the end-to-end "a person can send private money" proof.
-#[cfg(all(test, feature = "circuit"))]
+#[cfg(all(test, feature = "circuit-core"))]
 mod circuit_tests {
     use super::*;
     use crate::coinbase::{coinbase_note_commitment, derive_coinbase_note_desc};

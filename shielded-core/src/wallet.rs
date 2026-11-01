@@ -905,7 +905,7 @@ pub use scan::{
     cpu_agree_points, cpu_epk_reuse_enabled,
 };
 
-#[cfg(feature = "circuit")]
+#[cfg(feature = "circuit-core")]
 pub mod build {
     use crate::bundle::{ActionWire, ShieldedBundle};
     use crate::verify::sighash;
@@ -2810,7 +2810,7 @@ pub mod build {
     }
 }
 
-#[cfg(feature = "circuit")]
+#[cfg(feature = "circuit-core")]
 pub use build::{
     BuildError, PreparedPayment, ShieldedKeys, build_output_only_bundle, build_payment_bundle, build_spend_bundle, finalize_payment,
     prepare_payment, sign_spend_auth, to_wire,

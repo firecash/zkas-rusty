@@ -10,6 +10,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 kaspa-shielded-core.workspace = true
+kaspa-addresses.workspace = true
 kaspa-consensus-core.workspace = true
 flate2.workspace = true
 sha2.workspace = true

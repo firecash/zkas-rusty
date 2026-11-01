@@ -267,6 +267,10 @@ struct Cli {
     /// `https://` base URL or a local directory with `manifest.json` (see `chain_export`).
     #[arg(long, value_name = "URL_OR_DIR")]
     chain_files: Option<String>,
+    /// Do not build the daemon-wide shared chain tree: every wallet keeps its own, as the
+    /// on-device engines (phone, desktop) do. For measuring and running that configuration.
+    #[arg(long)]
+    no_shared_tree: bool,
     /// Seconds before a wallet that has advanced is checkpointed on the time rule (default 60).
     ///
     /// Checkpoint writes are the dominant disk I/O on a hosted daemon: a far-behind wallet
@@ -571,7 +575,7 @@ async fn run(cli: Cli) {
         tls: None,
         require_bearer: None,
         auto_consolidate: (!cli.no_auto_consolidate).then_some(cli.auto_consolidate),
-        build_shared_tree: true,
+        build_shared_tree: !cli.no_shared_tree,
         node_socks_proxy: None,
         allow_custodial: !cli.no_custodial,
         // 0 makes no sense (every prepare would 503); fall back to the default.

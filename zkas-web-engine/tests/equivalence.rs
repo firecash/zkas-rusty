@@ -49,9 +49,24 @@ fn segment_blocks_match_walletd_and_three_segments_rebuild_the_published_frontie
     let mut e = Engine::create(&hex::encode(fvk), &serde_json::to_string(&run[0].from).unwrap(), run[0].from.daa).unwrap();
     for s in run {
         let b = std::fs::read(format!("{d}/{}", s.file)).unwrap();
-        e.segment(&b, s.index, &s.from.block).unwrap();
+        e.segment(&b, s.index, &s.from.block, &serde_json::to_string(&s.to).unwrap()).unwrap();
     }
     assert_eq!(e.low(), run[2].to.block);
+    // The skipping engine adopted each segment's signed frontier; one that hashes every leaf
+    // must reach the identical tree, and walletd's independent replay must reproduce the
+    // manifest's frontier from the segment's own leaves.
+    let mut hashed = Engine::create(&hex::encode(fvk), &serde_json::to_string(&run[0].from).unwrap(), run[0].from.daa).unwrap();
+    hashed.set_hash_every_leaf(true);
+    for s in run {
+        let b = std::fs::read(format!("{d}/{}", s.file)).unwrap();
+        hashed.segment(&b, s.index, &s.from.block, &serde_json::to_string(&s.to).unwrap()).unwrap();
+        let wd_from: zkas_walletd::chain_files::Boundary = serde_json::from_value(serde_json::to_value(&s.from).unwrap()).unwrap();
+        let blocks = zkas_walletd::chain_files::decode_segment(&b, &genesis, s.index).unwrap();
+        let replayed = zkas_walletd::chain_files::end_frontier(&wd_from, &blocks).unwrap();
+        let want = s.to.frontier().unwrap();
+        assert_eq!((replayed.size, replayed.leaf, replayed.ommers.clone()), (want.size, want.leaf, want.ommers.clone()), "segment {} replays to its signed frontier", s.index);
+    }
+    assert_eq!(hashed.tip_frontier(), e.tip_frontier(), "skipping and hashing reach the same tree");
     let got: serde_json::Value = serde_json::from_str(&e.tip_frontier().expect("own tree")).unwrap();
     let want = run[2].to.frontier().unwrap();
     assert_eq!(got["size"].as_u64().unwrap(), want.size);
@@ -60,19 +75,31 @@ fn segment_blocks_match_walletd_and_three_segments_rebuild_the_published_frontie
 
     // Checkpoint, restore, and resume mid-run: the same tree.
     let mut half = Engine::create(&hex::encode(fvk), &serde_json::to_string(&run[0].from).unwrap(), run[0].from.daa).unwrap();
-    half.segment(&std::fs::read(format!("{d}/{}", run[0].file)).unwrap(), run[0].index, &run[0].from.block).unwrap();
+    half.segment(&std::fs::read(format!("{d}/{}", run[0].file)).unwrap(), run[0].index, &run[0].from.block, &serde_json::to_string(&run[0].to).unwrap()).unwrap();
     let ck = half.checkpoint();
     let mut back = Engine::restore_from(&hex::encode(fvk), &ck).unwrap();
     assert_eq!(back.low(), run[0].to.block);
     for s in &run[1..] {
-        back.segment(&std::fs::read(format!("{d}/{}", s.file)).unwrap(), s.index, &s.from.block).unwrap();
+        back.segment(&std::fs::read(format!("{d}/{}", s.file)).unwrap(), s.index, &s.from.block, &serde_json::to_string(&s.to).unwrap()).unwrap();
     }
     assert_eq!(back.tip_frontier(), e.tip_frontier(), "restored + resumed == straight through");
     // Re-feeding a segment already ingested adds nothing.
     let before = back.tip_frontier();
-    back.segment(&std::fs::read(format!("{d}/{}", run[2].file)).unwrap(), run[2].index, &run[2].from.block).unwrap();
+    back.segment(&std::fs::read(format!("{d}/{}", run[2].file)).unwrap(), run[2].index, &run[2].from.block, &serde_json::to_string(&run[2].to).unwrap()).unwrap();
     assert_eq!(back.tip_frontier(), before);
     // A segment the wallet has passed is refused, not ingested twice.
-    assert!(back.segment(&std::fs::read(format!("{d}/{}", run[1].file)).unwrap(), run[1].index, &run[1].from.block).is_err());
+    assert!(back.segment(&std::fs::read(format!("{d}/{}", run[1].file)).unwrap(), run[1].index, &run[1].from.block, &serde_json::to_string(&run[1].to).unwrap()).is_err());
     assert_eq!(back.tip_frontier(), before);
+}
+
+#[test]
+fn a_viewing_key_gives_the_address_walletd_gives() {
+    // walletd's own answer for this seed (POST /api/wallet/import on 142, 1 Nov).
+    let seed: [u8; 32] = hex::decode("65bc8908745793238284d5fd365d14ca66e79ec046a77d7b7413bb0693f5595d").unwrap().try_into().unwrap();
+    let fvk = kaspa_shielded_core::walletdb::WalletDb::from_seed(seed).unwrap().fvk().to_bytes();
+    assert_eq!(
+        address_of_fvk_str(&hex::encode(fvk)).unwrap(),
+        "zkas:pxs42v89kfawvh6u7zduate3zm728yn77n8hn878frz54hx7td3wgua490d3tyukrn0fcxchm4swd5x"
+    );
+    assert!(address_of_fvk_str("00").is_err());
 }

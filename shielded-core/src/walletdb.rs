@@ -378,6 +378,119 @@ thread_local! {
     static OWNED_NF_INDEX_CHECK: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
 }
 
+/// The applied-nullifier set of a wallet that keeps its own: a sorted run plus a small hash set
+/// of recent inserts, merged into the run once it reaches [`NfTable::MERGE_AT`].
+///
+/// Exact (no fingerprints, no false positives) and 32 bytes a member. Every member is a
+/// uniformly random chain nullifier and the set only grows, which is the case a sorted array
+/// serves best: lookups are a binary search, and the merge is a backward in-place pass. The
+/// checkpoint format is unchanged — a count and the members, in any order — so either side of
+/// an upgrade reads the other's checkpoints.
+#[derive(Default, Clone, Debug)]
+pub(crate) struct NfTable {
+    sorted: Vec<[u8; 32]>,
+    recent: HashSet<[u8; 32]>,
+}
+
+impl NfTable {
+    /// Merge once this many recent members are waiting: the recent table stays ~10 MB and a
+    /// genesis scan (~10 M nullifiers) pays ~40 linear merges.
+    const MERGE_AT: usize = 1 << 18;
+
+    pub(crate) fn contains(&self, nf: &[u8; 32]) -> bool {
+        self.recent.contains(nf) || self.sorted.binary_search(nf).is_ok()
+    }
+
+    /// Insert; false when already present.
+    pub(crate) fn insert(&mut self, nf: [u8; 32]) -> bool {
+        if self.contains(&nf) {
+            return false;
+        }
+        self.recent.insert(nf);
+        if self.recent.len() >= Self::MERGE_AT {
+            self.merge();
+        }
+        true
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.sorted.len() + self.recent.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn merge(&mut self) {
+        if self.recent.is_empty() {
+            return;
+        }
+        let mut add: Vec<[u8; 32]> = self.recent.drain().collect();
+        add.sort_unstable();
+        let (n, k) = (self.sorted.len(), add.len());
+        self.sorted.reserve_exact(k);
+        self.sorted.resize(n + k, [0u8; 32]);
+        // Backward merge in place: the two runs are disjoint (insert checks first).
+        let (mut i, mut j, mut w) = (n, k, n + k);
+        while j > 0 {
+            if i > 0 && self.sorted[i - 1] > add[j - 1] {
+                self.sorted[w - 1] = self.sorted[i - 1];
+                i -= 1;
+            } else {
+                self.sorted[w - 1] = add[j - 1];
+                j -= 1;
+            }
+            w -= 1;
+        }
+    }
+
+    /// Build from a checkpoint's members. A checkpoint this code wrote is already sorted (see
+    /// `write_sorted`), so this is one linear check; an older one (hash-set order) sorts once.
+    /// Duplicates, which no writer produces, are dropped rather than trusted.
+    pub(crate) fn load(mut all: Vec<[u8; 32]>) -> Self {
+        if !all.windows(2).all(|w| w[0] < w[1]) {
+            all.sort_unstable();
+            all.dedup();
+        }
+        all.shrink_to_fit();
+        NfTable { sorted: all, recent: HashSet::new() }
+    }
+
+    /// Append every member, as one ascending sequence: the sorted run merged with the recent
+    /// members on the fly, without touching `self`.
+    pub(crate) fn write_sorted(&self, out: &mut Vec<u8>) {
+        let mut add: Vec<&[u8; 32]> = self.recent.iter().collect();
+        add.sort_unstable();
+        out.reserve(self.len() * 32);
+        let (mut i, mut j) = (0, 0);
+        while i < self.sorted.len() || j < add.len() {
+            if j >= add.len() || (i < self.sorted.len() && self.sorted[i] < *add[j]) {
+                out.extend_from_slice(&self.sorted[i]);
+                i += 1;
+            } else {
+                out.extend_from_slice(add[j]);
+                j += 1;
+            }
+        }
+    }
+
+    pub(crate) fn into_vec(mut self) -> Vec<[u8; 32]> {
+        self.merge();
+        self.sorted
+    }
+
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.sorted.capacity() * 32 + self.recent.capacity() * 33
+    }
+}
+
+impl PartialEq for NfTable {
+    fn eq(&self, other: &Self) -> bool {
+        self.len() == other.len() && self.sorted.iter().chain(self.recent.iter()).all(|nf| other.contains(nf))
+    }
+}
+
 /// A wallet's running view of the global note-commitment tree: it walks the
 /// canonical commitment stream, recognises its own notes, and keeps a spendable
 /// witness for each.
@@ -495,7 +608,10 @@ pub struct WalletDb {
     /// transparent inputs, so nothing conflicts there — observed live when two
     /// parallel DAG blocks both carried the same tx) double-counts its outputs
     /// and shifts every later leaf position off the consensus tree.
-    spent_nullifiers: HashSet<[u8; 32]>,
+    ///
+    /// Held as an [`NfTable`]: exact, 32 bytes a nullifier, where a `HashSet` cost ~55 B in its
+    /// power-of-two table (10 M chain nullifiers: ~550 MB per wallet on a phone).
+    spent_nullifiers: NfTable,
     /// When set, the applied-nullifier set lives HERE as a bitset over a shared interner and
     /// `spent_nullifiers` stays empty (see [`NullifierInterner`]). Read and written only
     /// through `nf_contains` / `nf_insert` / `nf_len` / `nf_all`.
@@ -976,7 +1092,7 @@ impl WalletDb {
             witness_budget: MAX_LIVE_WITNESSES,
             lag_tree: CommitmentTree::empty(),
             witnessed_upto: 0,
-            spent_nullifiers: HashSet::new(),
+            spent_nullifiers: NfTable::default(),
             nf_shared: DEFAULT_NF_INTERNER.get().map(|i| SharedNfSet { interner: i.clone(), bits: Vec::new(), count: 0 }),
             ovk,
             history: Vec::new(),
@@ -2099,10 +2215,19 @@ impl WalletDb {
         }
         let step_target = full_target.min(self.base_size.saturating_add(max_leaves));
         let rel = (step_target - self.base_size) as usize;
-        // Rebuild the frontier at `step_target` from the current base + the leaves we drop,
-        // level by level in batches across cores (`frontier_extend`), byte-identical to
-        // appending them one by one — which is what this did, at ~13 us a leaf on one core.
-        let new_base = {
+        if rel > self.leaves.len() {
+            return false;
+        }
+        // Rolling all the way to the tip with a valid tip tree: the new base IS the tip tree's
+        // frontier (a frontier at N leaves is a function of leaves 0..N alone), so take it
+        // instead of re-hashing every dropped leaf. That makes compacting a wallet holding no
+        // notes O(1), which is what lets a long catch-up drop its leaves as it goes instead of
+        // holding (and checkpointing) every leaf since its base — 13 M leaves and a 568 MB
+        // checkpoint for an empty wallet scanning from genesis on a phone.
+        let new_base = if step_target == self.size && self.tree_valid {
+            self.flush_mirror();
+            self.tree.to_frontier()
+        } else {
             let leaves = self.decoded_leaves();
             if rel > leaves.len() {
                 return false;
@@ -2127,6 +2252,27 @@ impl WalletDb {
             self.witnesses.retain(|(p, _)| *p >= self.base_size);
         }
         step_target < full_target
+    }
+
+    /// Drop every retained leaf when the wallet holds nothing they could ever witness: no
+    /// unspent note and no pending spend. The base becomes the tip tree's frontier, in O(1)
+    /// (see [`Self::advance_base_capped`]). A note found later lands above the new base and is
+    /// witnessed from it exactly as before. Refuses (false, nothing changed) for a shared
+    /// tree, a borrowing wallet (its tip tree is not its own until it adopts one), or when
+    /// there is nothing to drop. Safe to call after every page of a catch-up.
+    pub fn compact_if_holding_nothing(&mut self) -> bool {
+        // `tree_valid`, not `!borrow_tree`: a borrowing wallet's tree is invalidated by every
+        // leaf it skips and made valid only by `adopt_tip_frontier` at exactly its size, so a
+        // valid tree is exact whatever the flag says.
+        if self.leaves_only || !self.tree_valid || self.leaves.is_empty() {
+            return false;
+        }
+        if !self.notes.is_empty() || !self.pending_spends.is_empty() {
+            return false;
+        }
+        let before = self.base_size;
+        self.advance_base_capped(self.size, u64::MAX);
+        self.base_size > before
     }
 
     /// Repair a wallet whose base compacted past a still-held note (see
@@ -2606,14 +2752,14 @@ impl WalletDb {
             }
         }
         let members: Vec<[u8; 32]> = match &self.nf_shared {
-            None => std::mem::take(&mut self.spent_nullifiers).into_iter().collect(),
+            None => std::mem::take(&mut self.spent_nullifiers).into_vec(),
             Some(sh) => sh.to_vec(),
         };
         let mut sh = SharedNfSet { interner: interner.clone(), bits: Vec::new(), count: 0 };
         for nf in &members {
             sh.insert(nf);
         }
-        self.spent_nullifiers = HashSet::new();
+        self.spent_nullifiers = NfTable::default();
         self.nf_shared = Some(sh);
     }
 
@@ -2625,7 +2771,7 @@ impl WalletDb {
     pub fn approx_heap_bytes(&self) -> usize {
         let leaves = self.leaves.capacity() * std::mem::size_of::<MerkleHashOrchard>();
         let nfs = match &self.nf_shared {
-            None => self.spent_nullifiers.capacity() * 33,
+            None => self.spent_nullifiers.heap_bytes(),
             Some(sh) => sh.bits.capacity() * 8,
         };
         let subtree = self.subtree.approx_heap_bytes();
@@ -3648,9 +3794,9 @@ impl WalletDb {
         out.extend_from_slice(&(self.nf_len() as u64).to_le_bytes());
         match &self.nf_shared {
             None => {
-                for nf in &self.spent_nullifiers {
-                    out.extend_from_slice(nf);
-                }
+                // Sorted run first (already in order), then the few recent ones sorted: a
+                // restore then finds the list ordered and needs no sort (see `NfTable::load`).
+                self.spent_nullifiers.write_sorted(&mut out);
             }
             Some(sh) => {
                 for nf in sh.to_vec() {
@@ -3866,9 +4012,17 @@ impl WalletDb {
             db.notes.push(note);
         }
         let n_nfs = r.u64()? as usize;
-        for _ in 0..n_nfs {
-            let nf = r.arr::<32>()?;
-            db.nf_insert(&nf);
+        if db.nf_shared.is_some() {
+            for _ in 0..n_nfs {
+                let nf = r.arr::<32>()?;
+                db.nf_insert(&nf);
+            }
+        } else {
+            let mut all = Vec::with_capacity(n_nfs.min(r.remaining() as usize / 32));
+            for _ in 0..n_nfs {
+                all.push(r.arr::<32>()?);
+            }
+            db.spent_nullifiers = NfTable::load(all);
         }
         // The tip mirror tree. v4 carries it as a frontier, so restoring it is O(1) —
         // no hashing at all. A v3 blob has no such field, so fall back to replaying the
@@ -6009,6 +6163,106 @@ mod tests {
         assert_eq!(restored.balance(), db.balance());
     }
 
+    #[test]
+    fn nf_table_is_an_exact_set_across_merges_and_checkpoint_order() {
+        let mut t = NfTable::default();
+        let mut reference = HashSet::new();
+        let nf = |i: u64| {
+            let mut b = [0u8; 32];
+            b[..8].copy_from_slice(&i.wrapping_mul(0x9E37_79B9_7F4A_7C15).to_le_bytes());
+            b[8..16].copy_from_slice(&i.to_be_bytes());
+            b
+        };
+        // More than two merges' worth, with repeats.
+        let n = NfTable::MERGE_AT as u64 * 2 + 777;
+        for i in 0..n {
+            assert_eq!(t.insert(nf(i)), reference.insert(nf(i)));
+            if i % 3 == 0 {
+                assert!(!t.insert(nf(i / 2)), "a member is never inserted twice");
+            }
+        }
+        assert_eq!(t.len(), reference.len());
+        for i in (0..n).step_by(997) {
+            assert!(t.contains(&nf(i)));
+        }
+        assert!(!t.contains(&nf(n + 5)));
+        assert!(t.sorted.windows(2).all(|w| w[0] < w[1]), "the run stays strictly sorted");
+        // What a checkpoint writes is one ascending sequence; it loads without a sort.
+        let mut out = Vec::new();
+        t.write_sorted(&mut out);
+        let all: Vec<[u8; 32]> = out.chunks(32).map(|c| c.try_into().unwrap()).collect();
+        assert!(all.windows(2).all(|w| w[0] < w[1]));
+        assert_eq!(NfTable::load(all.clone()), t);
+        // An older checkpoint's hash-set order loads to the same set.
+        let mut shuffled: Vec<[u8; 32]> = reference.iter().copied().collect();
+        shuffled.reverse();
+        assert_eq!(NfTable::load(shuffled), t);
+    }
+
+    /// A wallet holding nothing compacts to its tip on every page (rc26: a genesis restore held
+    /// 13 M leaves and wrote a 568 MB checkpoint with 0 notes) without changing its tree, and a
+    /// note found afterwards is witnessed exactly as by a wallet that never compacted.
+    #[test]
+    fn empty_wallet_compacts_to_its_tip_and_still_witnesses_later_notes() {
+        let mine = [41u8; 32];
+        let mut db = WalletDb::from_seed(mine).unwrap();
+        let mut reference = WalletDb::from_seed(mine).unwrap();
+        let strangers = |b: u8| coinbase_for(address_of([b.wrapping_add(1); 32]), &[b, 1, 2, 3], 100 + b as u64);
+        for b in 0..30u8 {
+            db.ingest_block(&[strangers(b)], &[]);
+            reference.ingest_block(&[strangers(b)], &[]);
+            // Every "page": a wallet holding nothing keeps nothing.
+            db.compact_if_holding_nothing();
+        }
+        assert!(db.leaves.is_empty(), "an empty wallet keeps no leaves");
+        assert_eq!(db.base_size(), db.size(), "the base is the tip");
+        assert_eq!(db.anchor(), reference.anchor(), "compaction leaves the tree unchanged");
+        assert!(!db.compact_if_holding_nothing(), "nothing left to drop");
+
+        // A note found afterwards is witnessed exactly as by a wallet that never compacted.
+        for b in 30..40u8 {
+            let mut outs = vec![strangers(b)];
+            if b == 33 {
+                outs.push(coinbase_for(address_of(mine), &[b, 9, 9, 9], 5_000));
+            }
+            db.ingest_block(&outs, &[]);
+            reference.ingest_block(&outs, &[]);
+            db.compact_if_holding_nothing();
+        }
+        assert_eq!(db.notes().len(), 1);
+        let pos = db.notes()[0].position;
+        assert!(db.base_size() <= pos, "a held note stops the compaction");
+        let cm = ExtractedNoteCommitment::from(db.notes()[0].note.commitment());
+        let got = db.witness_path_at(pos, db.size()).expect("path after compaction");
+        let want = reference.witness_path_at(pos, reference.size()).expect("reference path");
+        assert_eq!(got.root(cm), want.root(cm));
+        assert_eq!(got.auth_path(), want.auth_path());
+        let restored = WalletDb::from_checkpoint(mine, &db.to_checkpoint()).expect("restore");
+        assert_eq!(restored.anchor(), reference.anchor());
+        assert_eq!(restored.balance(), reference.balance());
+    }
+
+    #[test]
+    fn borrowing_wallet_compacts_only_once_it_adopts_an_exact_frontier() {
+        let mine = [43u8; 32];
+        let mut db = WalletDb::from_seed(mine).unwrap();
+        let mut reference = WalletDb::from_seed(mine).unwrap();
+        db.set_borrow_tree(true);
+        for b in 0..12u8 {
+            let cb = coinbase_for(address_of([b.wrapping_add(7); 32]), &[b, 4, 4, 4], 10 + b as u64);
+            db.ingest_block(std::slice::from_ref(&cb), &[]);
+            reference.ingest_block(&[cb], &[]);
+        }
+        assert!(!db.tree_is_valid(), "skipped hashing leaves no tree");
+        assert!(!db.compact_if_holding_nothing(), "no compaction without an exact tree");
+        assert_eq!(db.leaves.len(), 12, "the leaves stay for a rebuild");
+        let fs = reference.tip_frontier_state().unwrap();
+        assert!(db.adopt_tip_frontier(&fs));
+        assert!(db.compact_if_holding_nothing(), "exact again, and holding nothing");
+        assert!(db.leaves.is_empty());
+        assert_eq!(db.anchor(), reference.anchor());
+    }
+
     /// Rolling the fast-sync base forward (compaction) is representation-only: it must
     /// drop the summarised leaves without changing any witness root, any authentication
     /// path, or the tip anchor — and a checkpoint written from the compacted wallet must
@@ -7022,7 +7276,7 @@ mod tests {
 /// position 0. Here the owned note sits at position 1 behind a decoy, and the
 /// witness comes from [`WalletDb`], so it exercises the general membership path a
 /// live wallet actually walks.
-#[cfg(all(test, feature = "circuit"))]
+#[cfg(all(test, feature = "circuit-core"))]
 mod circuit_tests {
     use super::*;
     use crate::bundle::ShieldedBundle;

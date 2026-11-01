@@ -45,7 +45,7 @@ pub mod wallet;
 pub mod walletdb;
 pub mod witness_chain;
 
-#[cfg(all(test, feature = "circuit"))]
+#[cfg(all(test, feature = "circuit-core"))]
 mod uniform_tests;
 
 // The human-facing wallet facade (keys -> zkas: address -> scan -> pay).

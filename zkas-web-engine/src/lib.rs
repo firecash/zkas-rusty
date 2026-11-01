@@ -290,6 +290,20 @@ impl Manifest {
 }
 
 /// Parse and verify a manifest; returns it as JSON (segments sorted by index).
+/// The mainnet `zkas:` address a full viewing key receives at — the encoding the signer uses
+/// (`address_from_seed`), from the key alone, so a watch-only wallet needs no service for it.
+pub fn address_of_fvk_str(fvk_hex: &str) -> Result<String, String> {
+    let fvk = parse_fvk(fvk_hex)?;
+    let db = WalletDb::from_fvk(&fvk).ok_or("not a valid full viewing key")?;
+    let raw = db.my_address_bytes();
+    Ok(String::from(&kaspa_addresses::Address::new(kaspa_addresses::Prefix::Mainnet, kaspa_addresses::Version::ShieldedOrchard, &raw)))
+}
+
+#[wasm_bindgen]
+pub fn address_of_fvk(fvk_hex: &str) -> Result<String, JsValue> {
+    address_of_fvk_str(fvk_hex).map_err(err)
+}
+
 pub fn verify_manifest_str(json: &str) -> Result<String, String> {
     let mut m: Manifest = serde_json::from_str(json).map_err(|e| e.to_string())?;
     m.verify()?;
@@ -320,6 +334,9 @@ pub struct Engine {
     low: [u8; 32],
     scanned: u64,
     birthday: u64,
+    /// Hash every leaf even where a segment's signed frontier could be adopted (tests compare
+    /// the two paths). Not persisted; off by default.
+    hash_every_leaf: bool,
 }
 
 #[derive(Serialize)]
@@ -358,7 +375,7 @@ impl Engine {
         let fs = b.frontier()?;
         let mut db = WalletDb::from_fvk(&fvk).ok_or("not a valid full viewing key")?;
         db.apply_frontier(&fs).ok_or("the boundary frontier does not build a tree")?;
-        Ok(Engine { db, low: h32_hex(&b.block)?, scanned: b.daa, birthday })
+        Ok(Engine { db, low: h32_hex(&b.block)?, scanned: b.daa, birthday, hash_every_leaf: false })
     }
 
     pub fn restore_from(fvk_hex: &str, bytes: &[u8]) -> Result<Engine, String> {
@@ -373,16 +390,23 @@ impl Engine {
         let len = r.u64()? as usize;
         let body = r.take(len)?;
         let db = WalletDb::from_checkpoint_fvk(&fvk, body).ok_or("checkpoint does not restore for this key")?;
-        Ok(Engine { db, low, scanned, birthday })
+        Ok(Engine { db, low, scanned, birthday, hash_every_leaf: false })
+    }
+
+    /// See [`Engine::hash_every_leaf`].
+    pub fn set_hash_every_leaf(&mut self, on: bool) {
+        self.hash_every_leaf = on;
     }
 
     /// Ingest segment `index` (whose manifest `from` block is `from_block_hex`) from its first
     /// block after this wallet's cursor, so a segment already partly ingested resumes exactly.
     /// Refused unless the cursor IS `from` or a block inside the segment: a segment the wallet
     /// has passed, or one that does not continue it, would otherwise be ingested twice.
-    pub fn segment(&mut self, bytes: &[u8], index: u64, from_block_hex: &str) -> Result<String, String> {
+    pub fn segment(&mut self, bytes: &[u8], index: u64, from_block_hex: &str, to_boundary_json: &str) -> Result<String, String> {
         let blocks = parse_segment(bytes, index)?;
         let from = h32_hex(from_block_hex)?;
+        let to: Boundary = serde_json::from_str(to_boundary_json).map_err(|e| format!("segment end: {e}"))?;
+        let to_block = h32_hex(&to.block)?;
         let start = if self.low == from {
             0
         } else {
@@ -391,7 +415,22 @@ impl Engine {
                 None => return Err("this segment does not continue the wallet's cursor".into()),
             }
         };
-        let n = self.ingest(&blocks[start..], None)?;
+        // A wallet holding no note needs its tree exact only at the end, and the segment's signed
+        // `to` frontier IS the tree there: skip hashing (~60% of a scan) and adopt it. The leaves
+        // are kept, so a note found inside the segment — or a segment not ingested to its end —
+        // rebuilds the tree from them instead.
+        let skip = !self.hash_every_leaf && self.db.notes().is_empty() && self.db.pending_spends().is_empty();
+        self.db.set_borrow_tree(skip);
+        let res = self.ingest(&blocks[start..], None);
+        self.db.set_borrow_tree(false);
+        if !self.db.tree_is_valid() {
+            let adopted = self.low == to_block && to.frontier().is_ok_and(|fs| self.db.adopt_tip_frontier(&fs));
+            if !adopted && !self.db.rebuild_tree_from_leaves() {
+                return Err("the wallet tree could not be rebuilt after a segment".into());
+            }
+            self.db.compact_if_holding_nothing();
+        }
+        let n = res?;
         serde_json::to_string(&Ingested { ingested: n, low: self.low(), scanned: self.scanned, at_margin: false, sink_blue_score: 0 }).map_err(|e| e.to_string())
     }
 
@@ -444,8 +483,8 @@ impl Engine {
     }
 
     /// See [`Engine::segment`].
-    pub fn ingest_segment(&mut self, bytes: &[u8], index: u64, from_block_hex: &str) -> Result<String, JsValue> {
-        self.segment(bytes, index, from_block_hex).map_err(err)
+    pub fn ingest_segment(&mut self, bytes: &[u8], index: u64, from_block_hex: &str, to_boundary_json: &str) -> Result<String, JsValue> {
+        self.segment(bytes, index, from_block_hex, to_boundary_json).map_err(err)
     }
 
     /// See [`Engine::page`].
@@ -532,6 +571,9 @@ impl Engine {
             n += 1;
         }
         self.db.end_page();
+        // Holding no note, the wallet needs none of these leaves: drop them (O(1)), so the
+        // checkpoint in IndexedDB stays small for a wallet with nothing in it yet.
+        self.db.compact_if_holding_nothing();
         Ok(n)
     }
 }
