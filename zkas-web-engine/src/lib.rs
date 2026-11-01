@@ -299,6 +299,11 @@ pub fn address_of_fvk_str(fvk_hex: &str) -> Result<String, String> {
     Ok(String::from(&kaspa_addresses::Address::new(kaspa_addresses::Prefix::Mainnet, kaspa_addresses::Version::ShieldedOrchard, &raw)))
 }
 
+/// The thread pool for the multi-threaded build: `await initThreadPool(navigator.hardwareConcurrency)`
+/// once, before any other call. Absent from the default build.
+#[cfg(all(feature = "threads", target_arch = "wasm32"))]
+pub use wasm_bindgen_rayon::init_thread_pool;
+
 /// Build the Halo 2 proving key now (a few seconds, once per page): called when the wallet is
 /// idle at the tip, so the first payment does not pay for it. Later calls return at once.
 #[wasm_bindgen]
@@ -353,6 +358,9 @@ pub struct Engine {
     /// The matured anchor (see [`Engine::set_anchor`]): leaf count, block, tree root.
     anchor: Option<(u64, [u8; 32], [u8; 32])>,
 }
+
+/// Blocks decoded and trial-decrypted per batch (walletd's page size).
+const INGEST_CHUNK: usize = 1_000;
 
 /// A spend parked this long (DAA) without its nullifier appearing goes back to the wallet
 /// (walletd's PENDING_SPEND_EXPIRY_DAA): the send was lost.
@@ -737,22 +745,32 @@ impl Engine {
 
 impl Engine {
     fn ingest(&mut self, blocks: &[Block], blue_limit: Option<u64>) -> Result<usize, String> {
+        use rayon::prelude::*;
+        let take = blocks.iter().take_while(|b| blue_limit.is_none_or(|l| b.blue_score <= l)).count();
         let mut n = 0;
-        for b in blocks {
-            if blue_limit.is_some_and(|l| b.blue_score > l) {
-                break;
+        // In chunks, as walletd pages: every block of a chunk decoded in parallel (each coinbase
+        // commitment is re-derived — the costly part), every action of it trial-decrypted in one
+        // parallel batch (`predecrypt_page`), then applied in chain order. Block by block, both
+        // ran on one core even in the multi-threaded build. The single-threaded build runs the
+        // same code on one core.
+        for chunk in blocks[..take].chunks(INGEST_CHUNK) {
+            let decoded: Vec<(Coinbase, Vec<Vec<CompactActionRecord>>)> =
+                chunk.par_iter().map(|b| decode(b).map_err(|e| format!("block {}: {e}", hex::encode(b.hash)))).collect::<Result<_, _>>()?;
+            let all: Vec<CompactActionRecord> = decoded.iter().flat_map(|(_, compact)| compact.iter().flatten().copied()).collect();
+            self.db.predecrypt_page(&all);
+            for (b, (coinbase, compact)) in chunk.iter().zip(&decoded) {
+                let meta = BlockMeta { coinbase_txid: b.coinbase_txid, txids: b.txids.clone(), timestamp_ms: b.timestamp, daa_score: b.daa_score };
+                self.db.ingest_block_compact_precomputed_with_meta(coinbase, compact, Some(&meta));
+                if self.db.poisoned() {
+                    self.db.end_page();
+                    return Err(format!("block {} repeats a nullifier: inconsistent data", hex::encode(b.hash)));
+                }
+                self.low = b.hash;
+                self.scanned = b.daa_score;
+                n += 1;
             }
-            let (coinbase, compact) = decode(b).map_err(|e| format!("block {}: {e}", hex::encode(b.hash)))?;
-            let meta = BlockMeta { coinbase_txid: b.coinbase_txid, txids: b.txids.clone(), timestamp_ms: b.timestamp, daa_score: b.daa_score };
-            self.db.ingest_block_compact_precomputed_with_meta(&coinbase, &compact, Some(&meta));
-            if self.db.poisoned() {
-                return Err(format!("block {} repeats a nullifier: inconsistent data", hex::encode(b.hash)));
-            }
-            self.low = b.hash;
-            self.scanned = b.daa_score;
-            n += 1;
+            self.db.end_page();
         }
-        self.db.end_page();
         // Holding no note, the wallet needs none of these leaves: drop them (O(1)), so the
         // checkpoint in IndexedDB stays small for a wallet with nothing in it yet.
         self.db.compact_if_holding_nothing();
