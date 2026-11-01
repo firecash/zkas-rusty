@@ -3660,6 +3660,37 @@ impl ScoutCost {
     }
 }
 
+/// Is this page at the chain tip? A full page never is. A short one used to be taken as the tip
+/// every time, but chain-file pages end at their segment's last block (where a hash-skipping
+/// wallet adopts the signed frontier), so read-ahead stopped at every segment boundary of a
+/// catch-up. Short and well below the sink is a segment end, not the tip.
+fn page_at_tip(page: &DecodedPage) -> bool {
+    at_tip(page.blocks.len(), page.blocks.last().map(|b| b.blue_score), page.sink_blue_score)
+}
+
+fn at_tip(blocks: usize, last_blue: Option<u64>, sink_blue: u64) -> bool {
+    if blocks as u64 >= SHIELDED_PAGE {
+        return false;
+    }
+    match last_blue {
+        Some(b) => b.saturating_add(4 * SYNC_TIP_MARGIN) >= sink_blue,
+        None => true,
+    }
+}
+
+#[cfg(test)]
+mod page_at_tip_tests {
+    use super::*;
+
+    #[test]
+    fn a_segment_end_is_not_the_tip() {
+        assert!(!at_tip(SHIELDED_PAGE as usize, Some(5_000), 5_000), "a full page never is");
+        assert!(!at_tip(37, Some(1_000_000), 8_000_000), "short, far below the sink: a chain-file segment end");
+        assert!(at_tip(37, Some(7_999_900), 8_000_000), "short, at the sink: the tip");
+        assert!(at_tip(0, None, 8_000_000), "empty");
+    }
+}
+
 /// Read-ahead without scouting: fetch the page at `anchor`, take its last block as the next
 /// cursor, and repeat, up to `remaining` pages. Each fetch goes through the shared cache, so it
 /// dedups against the sync loop's own fetch and its one-page prefetch. This keeps the node busy
@@ -3669,11 +3700,11 @@ async fn chain_ahead(state: std::sync::Arc<AppState>, client: GrpcClient, mut an
     while remaining > 0 {
         let fetched = tokio::time::timeout(SYNC_RPC_TIMEOUT, fetch_shielded_page(&client, &state.page_cache, anchor, SHIELDED_PAGE)).await;
         match fetched {
-            Ok(Ok(page)) if !page.reorged && page.blocks.len() as u64 == SHIELDED_PAGE => {
+            Ok(Ok(page)) if !page.reorged && !page.blocks.is_empty() && !page_at_tip(&page) => {
                 anchor = page.blocks.last().map(|b| b.hash).unwrap_or(anchor);
                 remaining -= 1;
             }
-            // Error, reorg, or a short page (the tip): nothing further to read ahead.
+            // Error, reorg, or the tip: nothing further to read ahead.
             _ => return,
         }
     }
