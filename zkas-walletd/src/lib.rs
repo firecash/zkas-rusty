@@ -5071,7 +5071,14 @@ impl WalletEntry {
                     && (shared_tree_covers > 0 && shared_tree_covers >= matured)
                     && matured > 0
                     && shared_tree_base <= oldest_note;
+                // A wallet holding no note and no pending spend has nothing to witness: a cache
+                // for it is minutes of 8-thread folding for nothing (logged on a phone: a 0-note
+                // wallet built a 10.7M-leaf cache), and the build freezes base compaction, so its
+                // checkpoint stayed at 650 MB. Notes it receives later land above the compacted
+                // base and get their cache then.
+                let has_spendables = !self.db.notes().is_empty() || !self.db.pending_spends().is_empty();
                 let needs_cache = span >= SUBTREE_CACHE_MIN_SPAN
+                    && has_spendables
                     && !self.db.subtree_cache_ready(matured)
                     && !self.db.subtree_cache_failed()
                     && !shared_serves;
@@ -9678,6 +9685,14 @@ struct StatusResp {
     /// the engine reads only from its node.
     #[serde(skip_serializing_if = "Option::is_none")]
     chain_files: Option<chain_files::Stats>,
+    /// Some wallet in THIS engine is still catching up — not necessarily the one asked about.
+    /// The phone app holds its background-sync service on this, not on the shown wallet's
+    /// `synced`: a second wallet catching up behind a synced one was frozen by Android the
+    /// moment the screen went off (3.7 minutes of nothing in a phone's log). Reported only by
+    /// on-device engines (no shared tree): on a hosted daemon it would tell every user whether
+    /// other users' wallets are syncing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    engine_syncing: Option<bool>,
 }
 
 /// The `/api/status` answer before any wallet is consulted (shared with `engine_host`).
@@ -9720,6 +9735,7 @@ fn status_base(network: &str, node_connected: bool, daa_score: u64) -> StatusRes
         history_from_daa: None,
         watch_only: false,
         chain_files: None,
+        engine_syncing: None,
     }
 }
 
@@ -9740,6 +9756,9 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Json<
 
     let mut resp = status_base(&state.network, node_connected, daa_score);
     resp.chain_files = state.page_cache.lock().await.files.as_ref().map(|f| f.stats());
+    if !state.build_shared_tree {
+        resp.engine_syncing = Some(state.snapshots.lock().await.iter().any(|(t, s)| t != CHAIN_TREE_TOKEN && !s.synced));
+    }
 
     if let Some(token) = token {
         // NEVER load on the request path. A wallet load makes node RPCs and rebuilds a

@@ -48,7 +48,10 @@ const LOADED_SEGMENTS: usize = 4;
 /// node (see `ChainFiles::pause`).
 pub const UNCONFIRMED_PAUSE: std::time::Duration = std::time::Duration::from_secs(120);
 /// A segment no page has read for this long is dropped.
-const SEGMENT_IDLE: std::time::Duration = std::time::Duration::from_secs(120);
+// 10 minutes, not 2: the cap (LOADED_SEGMENTS) already bounds memory, and a phone's engine
+// paused in the background for a few minutes came back to find the segment its wallet was in
+// dropped and downloaded it again (9 MB, 13.6 s, logged 1 Nov).
+const SEGMENT_IDLE: std::time::Duration = std::time::Duration::from_secs(600);
 /// How long a fetched manifest is trusted before it is fetched again.
 const MANIFEST_TTL: std::time::Duration = std::time::Duration::from_secs(600);
 /// After every mirror failed, how long before they are asked again. Without it each page
@@ -384,6 +387,46 @@ fn index_body(body: &[u8], n: usize) -> Result<Vec<(RpcHash, u64, usize)>, Strin
 }
 
 /// Decode a whole segment file (exporter checks and tests; the wallet decodes lazily).
+const PAGE_MAGIC: &[u8; 8] = b"ZKASPG01";
+
+/// One `GetShieldedBlocks` answer in the segment block encoding, for the browser gateway:
+/// gzip( PAGE_MAGIC | genesis 32 | sink_blue_score u64 | reorged u8 | count u32 | blocks ).
+/// A browser cannot speak gRPC, so the gateway serves the node's pages over HTTPS in the same
+/// encoding as the published segments — one decoder for both.
+pub fn encode_page(genesis: &RpcHash, page: &GetShieldedBlocksResponse) -> Vec<u8> {
+    let mut w = Vec::with_capacity(page.blocks.len() * 512 + 64);
+    w.extend_from_slice(PAGE_MAGIC);
+    w.extend_from_slice(&genesis.as_bytes());
+    put_u64(&mut w, page.sink_blue_score);
+    w.push(page.reorged as u8);
+    put_u32(&mut w, page.blocks.len() as u32);
+    encode_blocks(&mut w, &page.blocks);
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(6));
+    gz.write_all(&w).expect("writing to a Vec cannot fail");
+    gz.finish().expect("writing to a Vec cannot fail")
+}
+
+/// The inverse of [`encode_page`]; refuses another network's page.
+pub fn decode_page(bytes: &[u8], genesis: &RpcHash) -> Result<GetShieldedBlocksResponse, String> {
+    let mut raw = Vec::new();
+    flate2::read::GzDecoder::new(bytes).read_to_end(&mut raw).map_err(|e| format!("gzip: {e}"))?;
+    let mut r = Reader { b: &raw, at: 0 };
+    if r.take(8)? != PAGE_MAGIC {
+        return Err("not a page".into());
+    }
+    if &r.hash()? != genesis {
+        return Err("page is for another network".into());
+    }
+    let sink_blue_score = r.u64()?;
+    let reorged = r.take(1)?[0] != 0;
+    let n = r.u32()? as usize;
+    let mut blocks = Vec::with_capacity(n.min(100_000));
+    for _ in 0..n {
+        blocks.push(read_block(&mut r)?);
+    }
+    Ok(GetShieldedBlocksResponse { blocks, reorged, sink_blue_score })
+}
+
 pub fn decode_segment(file: &[u8], genesis: &RpcHash, index: u64) -> Result<Vec<RpcShieldedChainBlock>, String> {
     let (body, n) = segment_body(file, genesis, index)?;
     index_body(&body, n)?;
@@ -1367,4 +1410,18 @@ mod tests {
         assert_eq!(idx(segments_within_reach(&published, 91 * SEGMENT_DAA)), vec![91, 92], "inside: covering + next");
         assert!(segments_within_reach(&published, 96 * SEGMENT_DAA).is_empty(), "past the newest: the node");
     }
+
+    #[test]
+    fn a_gateway_page_round_trips_and_names_its_network() {
+        let g = RpcHash::from_bytes([9; 32]);
+        let page = GetShieldedBlocksResponse { blocks: (0..7u8).map(|i| block(i, (i % 3) as usize, (i % 2) as usize)).collect(), reorged: true, sink_blue_score: 777 };
+        let bytes = encode_page(&g, &page);
+        let back = decode_page(&bytes, &g).unwrap();
+        assert_eq!(back.sink_blue_score, 777);
+        assert!(back.reorged);
+        assert_eq!(blocks_digest(&back.blocks), blocks_digest(&page.blocks));
+        assert!(decode_page(&bytes, &RpcHash::from_bytes([8; 32])).is_err());
+        assert!(decode_page(b"junk", &g).is_err());
+    }
 }
+
