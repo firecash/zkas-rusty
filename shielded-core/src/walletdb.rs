@@ -2397,6 +2397,25 @@ impl WalletDb {
         self.tree_valid
     }
 
+    /// Rebuild this wallet's own tip tree from its base frontier and the leaves it holds,
+    /// making `tree` valid again without any shared tree. For a wallet that borrowed and has
+    /// nobody to borrow from (an on-device engine reading a stale shared-tree size): the
+    /// leaves `base_size..size` are all retained, so the frontier at `size` is a pure
+    /// function of them. Refuses (returns false, nothing changed) when they do not reach
+    /// exactly `size`. Stops borrowing on success.
+    pub fn rebuild_tree_from_leaves(&mut self) -> bool {
+        let leaves = self.decoded_leaves();
+        if self.base_size + leaves.len() as u64 != self.size {
+            return false;
+        }
+        let frontier = frontier_extend(&self.base_frontier, leaves);
+        self.tree = CommitmentTree::from_frontier(&frontier);
+        self.mirror_pending.clear();
+        self.borrow_tree = false;
+        self.tree_valid = true;
+        true
+    }
+
     /// Install a tip frontier taken from the shared tree, making `tree` valid again.
     ///
     /// **Refuses unless the frontier describes exactly this wallet's `size`.** A
@@ -5771,6 +5790,40 @@ mod tests {
         let positions: Vec<u64> = db.notes().iter().map(|n| n.position).collect();
         assert!(!positions.is_empty(), "the wallet must own notes for this to prove anything");
         assert!(db.witness_paths_at(&positions, db.size()).iter().all(Option::is_some));
+    }
+
+    /// A wallet that borrowed with nobody to borrow from (an on-device engine reading a stale
+    /// shared-tree size) gets its own tree back from the leaves it holds — the same tree a
+    /// wallet that never borrowed has — and stops borrowing.
+    #[test]
+    fn a_wallet_that_lost_its_tree_rebuilds_it_from_its_leaves() {
+        let mine = [39u8; 32];
+        let mut honest = WalletDb::from_seed(mine).unwrap();
+        let mut borrowed = WalletDb::from_seed(mine).unwrap();
+        for b in 0..60u32 {
+            let recipient = if b % 7 == 0 { address_of(mine) } else { address_of([(b % 250 + 1) as u8; 32]) };
+            let cb = [coinbase_for(recipient, &b.to_le_bytes(), 1_000 + b as u64)];
+            honest.ingest_block(&cb, &[]);
+            if b == 20 {
+                borrowed.set_borrow_tree(true);
+            }
+            borrowed.ingest_block(&cb, &[]);
+        }
+        assert!(honest.tree_is_valid());
+        assert!(!borrowed.tree_is_valid(), "borrowing invalidated its own tree");
+        assert!(borrowed.tip_frontier_state().is_none());
+        assert!(borrowed.rebuild_tree_from_leaves());
+        assert!(borrowed.tree_is_valid() && !borrowed.is_borrowing());
+        let (a, b) = (honest.tip_frontier_state().unwrap(), borrowed.tip_frontier_state().unwrap());
+        assert_eq!((a.size, a.leaf, a.ommers), (b.size, b.leaf, b.ommers), "the same tree as a wallet that never borrowed");
+        // And it keeps growing correctly afterwards.
+        for b in 60..70u32 {
+            let cb = [coinbase_for(address_of([9; 32]), &b.to_le_bytes(), 5)];
+            honest.ingest_block(&cb, &[]);
+            borrowed.ingest_block(&cb, &[]);
+        }
+        let (a, b) = (honest.tip_frontier_state().unwrap(), borrowed.tip_frontier_state().unwrap());
+        assert_eq!((a.size, a.leaf, a.ommers), (b.size, b.leaf, b.ommers));
     }
 
     /// The gate is only relaxed where it cannot be evaluated. A wallet with its OWN tree

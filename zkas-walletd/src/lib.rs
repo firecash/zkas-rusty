@@ -2120,6 +2120,8 @@ fn sync_concurrency(resources: &ResourceLimits) -> usize {
 /// every wallet sequentially, so an un-timed-out await there is a whole-daemon stall, not
 /// a one-wallet stall (see `sync_chunk`). Generous enough that a merely busy node is never
 /// mistaken for a dead one.
+/// How often a pending tree check against the node (`files_unverified`, chain-files rule 3) is retried.
+const FILES_CHECK_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
 const SYNC_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// How often the sync loop re-checks the chain + mempool once every active wallet is
 /// caught up. This is the floor on how fast an incoming payment can appear, so it is a
@@ -3948,9 +3950,15 @@ struct WalletEntry {
     /// checkpoint is kept, and nothing before it is lost.
     reload_from_checkpoint: bool,
     audit_retire: bool,
-    /// The last block this wallet ingested from published chain files, until the node has
-    /// confirmed the wallet's tree there (`chain_files` rule 3).
-    files_handoff: Option<RpcHash>,
+    /// The wallet's tree has not yet been confirmed equal to the node's (`chain_files` rule 3).
+    /// True from load — a restored checkpoint may hold leaves read from chain files that were
+    /// never vouched for — and whenever a file page advances it; cleared by one match. The
+    /// check runs at the cursor of any page the node can place a frontier at (a pruned node:
+    /// its recent window, so at the latest near the tip), at most every `FILES_CHECK_EVERY`.
+    files_unverified: bool,
+    files_check_at: Option<std::time::Instant>,
+    /// Whether "not checkable yet" was already logged since the last verification.
+    files_check_logged: bool,
     /// Balance effect of the blocks between the settled cutoff and the tip — value
     /// arriving and owned value being spent, seen by trial-decryption without touching
     /// the append-only tree. This is what makes a payment visible ~1 second after it is
@@ -4175,7 +4183,9 @@ impl WalletEntry {
             reorged_strikes: 0,
             reload_from_checkpoint: false,
             audit_retire: false,
-            files_handoff: None,
+            files_unverified: true,
+            files_check_at: None,
+            files_check_logged: false,
             preview: Preview::default(),
             mempool: Preview::default(),
             unsettled_nulls: HashSet::new(),
@@ -4403,7 +4413,21 @@ impl WalletEntry {
         // maintaining its own tree — borrowing would strand those old notes at spend time.
         let oldest_note = self.db.notes().iter().map(|n| n.position).min().unwrap_or(u64::MAX);
         let covered =
-            !self.db.is_leaves_only() && shared_tree_covers >= self.db.size() && shared_tree_base <= oldest_note;
+            !self.db.is_leaves_only() && shared_tree_covers > 0 && shared_tree_covers >= self.db.size() && shared_tree_base <= oldest_note;
+        if !covered && shared_tree_covers == 0 && !self.db.tree_is_valid() && !self.db.is_leaves_only() {
+            // No shared tree to adopt a frontier from, ever: rebuild this wallet's own tree
+            // from the leaves it holds, once. Without it the wallet stays "borrowing" for
+            // good — no anchor of its own for a send, and no tree to check against the node.
+            let t0 = std::time::Instant::now();
+            let ok = tokio::task::block_in_place(|| self.db.rebuild_tree_from_leaves());
+            log::warn!(
+                "wallet {token_p}: rebuilt its own tree from {} leaves in {:.1} s ({}); it had been relying on a shared tree this engine does not build",
+                self.db.size(),
+                t0.elapsed().as_secs_f64(),
+                if ok { "ok" } else { "FAILED: leaves do not reach the tip" },
+                token_p = log_pseudonym(&token)
+            );
+        }
         self.db.set_borrow_tree(covered || !self.db.tree_is_valid());
 
         // Set when a small caught-up page comes back FULL: more blocks than it
@@ -4534,53 +4558,62 @@ impl WalletEntry {
             self.reorged_strikes = 0;
             self.sink_blue = resp.sink_blue_score;
             self.sink_live = true;
-            // Rule 3 of `chain_files`: the tree built from published files must end at the
-            // node's own tree. Checked once, at the first node page that continues it, before
-            // anything from the node is added on top.
-            if resp.file_digest.is_none() && self.files_handoff == Some(self.low) {
-                self.files_handoff = None;
-                let mine = self.db.tip_frontier_state();
-                match tokio::time::timeout(SYNC_RPC_TIMEOUT, client.get_shielded_tree_state(Some(self.low))).await {
-                    Ok(Ok(ts)) if ts.block_hash == self.low => {
-                        let node = kaspa_shielded_core::tree::FrontierState {
-                            size: ts.size,
-                            leaf: (ts.size > 0).then(|| ts.leaf.as_bytes()),
-                            ommers: ts.ommers.iter().map(|o| o.as_bytes()).collect(),
-                        };
-                        let same = mine.as_ref().is_some_and(|m| m.size == node.size && m.leaf == node.leaf && m.ommers == node.ommers);
-                        if same {
-                            log::info!(
-                                "wallet {token_p}: chain files verified: the tree built from them equals the node's at block {} ({} leaves)",
-                                self.low,
-                                node.size,
-                                token_p = log_pseudonym(&token)
-                            );
-                        } else {
-                            if let Some(f) = cache.lock().await.files.clone() {
-                                f.disable("a wallet's tree built from chain files differs from the node's");
-                            }
-                            log::error!(
-                                "wallet {token_p}: the tree built from chain files does NOT equal the node's at block {} (mine {:?} leaves, node {}); rebuilding from the node",
-                                self.low,
-                                mine.as_ref().map(|m| m.size),
-                                node.size,
-                                token_p = log_pseudonym(&token)
-                            );
-                            self.audit_retire = true;
-                            self.error = Some("published chain data disagreed with the node; rebuilding from the node".into());
-                            return;
-                        }
+            // Rule 3 of `chain_files`: the tree built from published files must equal the node's
+            // own. Checked at this page's cursor whenever the node can place a frontier there.
+            // "Cannot be checked" — the node keeps no frontier that far back, the RPC timed out,
+            // or this wallet holds no tree of its own — is never a failure: the check stays
+            // pending and runs again on a later page. Only a real difference rebuilds. (It used
+            // to run once, at the hand-off, and read a missing tree as a different one: a
+            // phone at 88% was rebuilt from 35% for nothing.)
+            if self.files_unverified && self.files_check_at.is_none_or(|t| t.elapsed() >= FILES_CHECK_EVERY) {
+                self.files_check_at = Some(std::time::Instant::now());
+                let not_yet = |why: String, logged: &mut bool| {
+                    if !*logged {
+                        *logged = true;
+                        log::info!(
+                            "wallet {token_p}: tree not checked against the node yet ({why}); checking again on a later page",
+                            token_p = log_pseudonym(&token)
+                        );
                     }
-                    other => log::info!(
-                        "wallet {token_p}: chain-files hand-off at block {} not checkable here ({}); the next checkpoint binds against the node",
-                        self.low,
-                        match other {
-                            Ok(Ok(_)) => "the node answered another block".to_string(),
-                            Ok(Err(e)) => e.to_string(),
-                            Err(_) => "timed out".to_string(),
-                        },
-                        token_p = log_pseudonym(&token)
-                    ),
+                };
+                match self.db.tip_frontier_state() {
+                    None => not_yet("this wallet holds no tree of its own right now".into(), &mut self.files_check_logged),
+                    Some(mine) => match tokio::time::timeout(SYNC_RPC_TIMEOUT, client.get_shielded_tree_state(Some(self.low))).await {
+                        Ok(Ok(ts)) if ts.block_hash == self.low => {
+                            let node = kaspa_shielded_core::tree::FrontierState {
+                                size: ts.size,
+                                leaf: (ts.size > 0).then(|| ts.leaf.as_bytes()),
+                                ommers: ts.ommers.iter().map(|o| o.as_bytes()).collect(),
+                            };
+                            if mine.size == node.size && mine.leaf == node.leaf && mine.ommers == node.ommers {
+                                self.files_unverified = false;
+                                self.files_check_logged = false;
+                                log::info!(
+                                    "wallet {token_p}: tree verified: equals the node's at block {} ({} leaves)",
+                                    self.low,
+                                    node.size,
+                                    token_p = log_pseudonym(&token)
+                                );
+                            } else {
+                                if let Some(f) = cache.lock().await.files.clone() {
+                                    f.disable("a wallet's tree differs from the node's");
+                                }
+                                log::error!(
+                                    "wallet {token_p}: the tree does NOT equal the node's at block {} (mine {} leaves, node {}); rebuilding from the node",
+                                    self.low,
+                                    mine.size,
+                                    node.size,
+                                    token_p = log_pseudonym(&token)
+                                );
+                                self.audit_retire = true;
+                                self.error = Some("this wallet's tree disagreed with the node; rebuilding from the node".into());
+                                return;
+                            }
+                        }
+                        Ok(Ok(_)) => not_yet(format!("the node keeps no frontier at block {}", self.low), &mut self.files_check_logged),
+                        Ok(Err(e)) => not_yet(e.to_string(), &mut self.files_check_logged),
+                        Err(_) => not_yet("the node did not answer in time".into(), &mut self.files_check_logged),
+                    },
                 }
             }
             // PREFETCH the next page while this one is being ingested below. The next
@@ -4849,7 +4882,7 @@ impl WalletEntry {
                     );
                 }
                 if advanced {
-                    self.files_handoff = Some(self.low);
+                    self.files_unverified = true;
                 }
             }
             // Own sends ingested from compact records have no recipient/memo/fee yet — fetch
@@ -5022,7 +5055,7 @@ impl WalletEntry {
                 // shared tree that cannot reach its history.
                 let oldest_note = self.db.notes().iter().map(|n| n.position).min().unwrap_or(u64::MAX);
                 let shared_serves = !self.db.is_leaves_only()
-                    && shared_tree_covers >= matured
+                    && (shared_tree_covers > 0 && shared_tree_covers >= matured)
                     && matured > 0
                     && shared_tree_base <= oldest_note;
                 let needs_cache = span >= SUBTREE_CACHE_MIN_SPAN
@@ -5502,7 +5535,7 @@ impl WalletEntry {
         // positions decline and the spend climbs O(chain) — the consolidation killer).
         let oldest_note = self.db.notes().iter().map(|n| n.position).min().unwrap_or(u64::MAX);
         let shared_serves = !self.db.is_leaves_only()
-            && shared_tree_covers >= matured
+            && (shared_tree_covers > 0 && shared_tree_covers >= matured)
             && matured > 0
             && shared_tree_base <= oldest_note;
         if (self.db.subtree_cache_ready(matured) || shared_serves) && matured > self.db.base_size() {
@@ -5541,7 +5574,7 @@ impl WalletEntry {
         let Some(matured) = self.matured_leaves() else { return false };
         let oldest_note = self.db.notes().iter().map(|n| n.position).min().unwrap_or(u64::MAX);
         let shared_serves = !self.db.is_leaves_only()
-            && shared_tree_covers >= matured
+            && (shared_tree_covers > 0 && shared_tree_covers >= matured)
             && matured > 0
             && shared_tree_base <= oldest_note;
         if (self.db.subtree_cache_ready(matured) || shared_serves) && matured > self.db.base_size() {
@@ -8382,8 +8415,15 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
     // Published, not peeked. A `try_lock` here read 0 nearly always (the shared tree
     // holds its own lock across each page it ingests) and so disabled borrowing entirely.
     // The shared tree itself must not borrow from itself, hence the token check.
-    let shared_tree_covers =
-        if token == CHAIN_TREE_TOKEN { 0 } else { state.chain_tree_size.load(std::sync::atomic::Ordering::Relaxed) };
+    // Nothing to borrow where no shared tree is built (phone, desktop): the chain tree entry
+    // still exists there but is never advanced, so whatever size it reports is frozen — a
+    // stale checkpoint left by an older version reported 15M leaves on a phone, every wallet
+    // below that "borrowed" a tree nobody was building, and lost its own (see below).
+    let shared_tree_covers = if token == CHAIN_TREE_TOKEN || !state.build_shared_tree {
+        0
+    } else {
+        state.chain_tree_size.load(std::sync::atomic::Ordering::Relaxed)
+    };
     let shared_tree_base =
         if token == CHAIN_TREE_TOKEN { u64::MAX } else { state.chain_tree_base.load(std::sync::atomic::Ordering::Relaxed) };
     // No node means no block stream to advance along. Report the wallet as still
@@ -14260,7 +14300,13 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
 
     let resources = cfg.resources.clone();
     log::info!("wallet resource limits: {:?}", resources);
-    let chain_tree = build_chain_tree(&wallet_dir, genesis);
+    // Where no shared tree is built, never load one: a leftover checkpoint would only cost
+    // memory and publish a frozen size (see `sync_one_wallet`).
+    let chain_tree = if cfg.build_shared_tree {
+        build_chain_tree(&wallet_dir, genesis)
+    } else {
+        Arc::new(Mutex::new(chain_tree_from_genesis(genesis)))
+    };
     let state = Arc::new(AppState {
         enable_multiparty: cfg.enable_multiparty,
         bundles: Mutex::new(HashMap::new()),
