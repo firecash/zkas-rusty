@@ -28,6 +28,7 @@ workspace = true
 pasta-asm = ["pasta_curves/x86_64-asm"]
 
 [dependencies]
+libc = "0.2"
 # Only so `pasta-asm` can name the feature; the code uses kaspa_shielded_core::pasta_curves.
 pasta_curves = { package = "zakura-pasta-curves", version = "=2.2.0" }
 # Address parse/format for the wallet's own shielded address + the recipient.

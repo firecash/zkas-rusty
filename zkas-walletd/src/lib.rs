@@ -2196,6 +2196,62 @@ const EVICT_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs
 /// `low` is the last ingested chain block, from which sync resumes. The
 /// matured-anchor ring and sink blue score ride along so a restarted wallet can
 /// select a matured spend anchor without a replay.
+/// Allocator tuning for engines that run inside an app process (desktop, phone, self-host),
+/// where nobody sets the environment the hosted service runs with (MALLOC_ARENA_MAX=4 and a
+/// 128 KiB trim threshold). Measured on a genesis restore in the phone configuration, with the
+/// wallet's own heap at ~220 MB throughout: RSS at t+120 s 1,060 MB on glibc's defaults
+/// against 482 MB with arenas capped at 4, the trim threshold and the periodic trim below;
+/// the rest was freed memory the allocator kept. A 128 KiB mmap threshold as well measured no
+/// smaller and is left at glibc's dynamic default (every large buffer would be an mmap).
+pub mod alloc_tune {
+    /// Cap glibc's arenas and lower its trim threshold, unless the operator set any of
+    /// them in the environment (their choice wins). Call before the runtime starts many threads.
+    pub fn at_start() {
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        {
+            let set = |k: &str| std::env::var_os(k).is_some();
+            if set("MALLOC_ARENA_MAX") || set("MALLOC_TRIM_THRESHOLD_") || set("MALLOC_MMAP_THRESHOLD_") {
+                return;
+            }
+            // SAFETY: mallopt only changes allocator parameters; any value is accepted.
+            unsafe {
+                libc::mallopt(libc::M_ARENA_MAX, 4);
+                libc::mallopt(libc::M_TRIM_THRESHOLD, 128 * 1024);
+            }
+        }
+    }
+
+    static LAST_RELEASE: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+    /// Hand freed memory back to the system after a heavy phase (at most every 20 s):
+    /// glibc's `malloc_trim`, bionic's `M_PURGE`. A no-op elsewhere.
+    pub fn release() {
+        {
+            let mut last = LAST_RELEASE.lock().unwrap_or_else(|p| p.into_inner());
+            if last.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(20)) {
+                return;
+            }
+            *last = Some(std::time::Instant::now());
+        }
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        // SAFETY: malloc_trim only returns free pages to the kernel.
+        unsafe {
+            libc::malloc_trim(0);
+        }
+        #[cfg(target_os = "android")]
+        {
+            extern "C" {
+                fn mallopt(param: libc::c_int, value: libc::c_int) -> libc::c_int;
+            }
+            const M_PURGE: libc::c_int = -101;
+            // SAFETY: bionic's mallopt(M_PURGE) releases free memory; unknown params return 0.
+            unsafe {
+                mallopt(M_PURGE, 0);
+            }
+        }
+    }
+}
+
 fn save_checkpoint(
     dir: &str,
     token: &str,
@@ -2215,6 +2271,9 @@ fn save_checkpoint(
     let parts = checkpoint_bytes(shared_leaf_upto(dir, token, db), genesis, low, scanned, db, boundaries, sink_blue, blind_below);
     write_checkpoint_bytes(dir, token, &parts)?;
     save_anchor_blocks(dir, token, boundary_blocks);
+    // The serialized checkpoint (up to ~250 MB on a genesis restore) was just freed.
+    drop(parts);
+    alloc_tune::release();
     Ok(())
 }
 
@@ -14520,6 +14579,7 @@ pub fn release_memory() -> usize {
 }
 
 pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>) -> Result<(), String> {
+    alloc_tune::at_start();
     let listen = cfg.listen;
     LISTENS_LOOPBACK_ONLY.store(listen.ip().is_loopback(), std::sync::atomic::Ordering::Relaxed);
     // Route node gRPC through Tor/SOCKS when the embedder asked for it, and CLEAR it

@@ -325,6 +325,8 @@ fn main() {
     }
     let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
     let runtime_threads = cli.runtime_threads.filter(|n| *n > 0).unwrap_or_else(|| cores.saturating_mul(2).max(2));
+    // Before the runtime's worker threads exist, so the arena cap applies to all of them.
+    zkas_walletd::alloc_tune::at_start();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(runtime_threads)
         .thread_name("wallet-runtime")
