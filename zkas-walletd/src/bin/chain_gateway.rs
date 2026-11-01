@@ -10,15 +10,19 @@
 //!   GET /blocks?after=<hash>&limit=<n>   one GetShieldedBlocks page, `chain_files::encode_page`
 //!   GET /tree?block=<hash> | ?below=<daa>  the node's tree frontier there (JSON)
 //!   GET /tip                              virtual DAA score and sink (JSON)
+//!   GET /mempool                          the mempool's shielded payloads (JSON hex list)
+//!   POST /submit                          a shielded bundle (raw bytes): wrapped as the
+//!                                         canonical payment transaction and submitted
 //!
 //! Everything it returns is public chain data. It learns what a public node learns from a
 //! phone: the IP and which blocks are asked for. No key, address or wallet state ever reaches
 //! it. Bounded: at most `MAX_IN_FLIGHT` node calls at once and `MAX_LIMIT` blocks a page.
 use axum::{
-    extract::{Query, State},
+    body::Bytes,
+    extract::{DefaultBodyLimit, Query, State},
     http::{header, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use kaspa_rpc_core::{api::rpc::RpcApi, RpcHash};
@@ -95,6 +99,52 @@ async fn tip(State(gw): State<Arc<Gw>>) -> Response {
     }
 }
 
+/// The mempool's shielded transactions, as their bundle payloads. Public data: every node
+/// relays them. A browser wallet trial-decrypts them to show an incoming payment at once.
+async fn mempool(State(gw): State<Arc<Gw>>) -> Response {
+    let Ok(_permit) = gw.gate.try_acquire() else {
+        return bad(StatusCode::SERVICE_UNAVAILABLE, "busy, retry");
+    };
+    match tokio::time::timeout(NODE_TIMEOUT, gw.node.get_mempool_entries(false, false)).await {
+        Ok(Ok(entries)) => {
+            let list: Vec<String> = entries
+                .iter()
+                .filter(|e| e.transaction.version == kaspa_consensus_core::tx::TX_VERSION_SHIELDED)
+                .map(|e| hex::encode(&e.transaction.payload))
+                .collect();
+            let mut r = Json(list).into_response();
+            r.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            r
+        }
+        Ok(Err(e)) => bad(StatusCode::BAD_GATEWAY, &format!("node: {e}")),
+        Err(_) => bad(StatusCode::GATEWAY_TIMEOUT, "node timed out"),
+    }
+}
+
+/// Largest bundle accepted for submission (a 38-spend bundle is ~120 KB).
+const MAX_SUBMIT_BYTES: usize = 512 * 1024;
+
+/// Submit a shielded payment built in a browser: the raw bundle, wrapped here in the one
+/// transaction shape consensus accepts for it (`payment_tx`, as walletd does). The bundle is
+/// already proven and signed; the gateway only relays it, like any node's submit RPC.
+async fn submit(State(gw): State<Arc<Gw>>, body: Bytes) -> Response {
+    if body.is_empty() || body.len() > MAX_SUBMIT_BYTES {
+        return bad(StatusCode::BAD_REQUEST, "expected a shielded bundle");
+    }
+    if kaspa_shielded_core::bundle::ShieldedBundle::from_bytes_at(&body, true).is_err() {
+        return bad(StatusCode::BAD_REQUEST, "not a shielded bundle");
+    }
+    let Ok(_permit) = gw.gate.try_acquire() else {
+        return bad(StatusCode::SERVICE_UNAVAILABLE, "busy, retry");
+    };
+    let tx = kaspa_shielded_wallet::tx::payment_tx(body.to_vec());
+    match tokio::time::timeout(NODE_TIMEOUT, gw.node.submit_transaction((&tx).into(), false)).await {
+        Ok(Ok(id)) => Json(serde_json::json!({ "txid": id.to_string() })).into_response(),
+        Ok(Err(e)) => bad(StatusCode::UNPROCESSABLE_ENTITY, &format!("the node refused the payment: {e}")),
+        Err(_) => bad(StatusCode::GATEWAY_TIMEOUT, "node timed out"),
+    }
+}
+
 #[tokio::main]
 async fn main() {
     kaspa_core::log::try_init_logger("info");
@@ -121,8 +171,19 @@ async fn main() {
     let genesis = RpcHash::from_bytes(kaspa_consensus_core::config::params::MAINNET_PARAMS.genesis.hash.as_bytes());
     let gw = Arc::new(Gw { node, genesis, gate: tokio::sync::Semaphore::new(MAX_IN_FLIGHT) });
     // Public data, read-only: any origin may read it (the browser wallet is one of them).
-    let cors = tower_http::cors::CorsLayer::new().allow_origin(tower_http::cors::Any).allow_methods([axum::http::Method::GET]);
-    let app = Router::new().route("/blocks", get(blocks)).route("/tree", get(tree)).route("/tip", get(tip)).layer(cors).with_state(gw);
+    let cors = tower_http::cors::CorsLayer::new()
+        .allow_origin(tower_http::cors::Any)
+        .allow_methods([axum::http::Method::GET, axum::http::Method::POST])
+        .allow_headers([header::CONTENT_TYPE]);
+    let app = Router::new()
+        .route("/blocks", get(blocks))
+        .route("/tree", get(tree))
+        .route("/tip", get(tip))
+        .route("/mempool", get(mempool))
+        .route("/submit", post(submit))
+        .layer(DefaultBodyLimit::max(MAX_SUBMIT_BYTES))
+        .layer(cors)
+        .with_state(gw);
     let listener = tokio::net::TcpListener::bind(&a[2]).await.unwrap_or_else(|e| {
         eprintln!("bind {}: {e}", a[2]);
         std::process::exit(1);

@@ -9,8 +9,10 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-kaspa-shielded-core.workspace = true
+kaspa-shielded-core = { workspace = true, features = ["circuit-core"] }
+kaspa-shielded-wallet.workspace = true
 kaspa-addresses.workspace = true
+zkas-wallet-engine = { path = "../sdk/wallet-engine" }
 kaspa-consensus-core.workspace = true
 flate2.workspace = true
 sha2.workspace = true

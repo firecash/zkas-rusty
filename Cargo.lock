@@ -10127,11 +10127,13 @@ dependencies = [
  "kaspa-consensus-core",
  "kaspa-rpc-core",
  "kaspa-shielded-core",
+ "kaspa-shielded-wallet",
  "secp256k1",
  "serde",
  "serde_json",
  "sha2",
  "wasm-bindgen",
+ "zkas-wallet-engine",
  "zkas-walletd",
 ]
 
