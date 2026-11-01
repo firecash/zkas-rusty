@@ -31,6 +31,7 @@ members = [
     "shielded-pay",
     "zkas-api",
     "zkas-walletd",
+    "zkas-web-engine",
     "zkas-gpu",
     "zkas-relayer",
     "miner",

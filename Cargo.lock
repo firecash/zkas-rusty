@@ -2652,11 +2652,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0de51e6874e94e7bf76d726fc5d13ba782deca734ff60d5bb2fb2607c7406555"
 dependencies = [
  "cfg-if 1.0.0",
+ "js-sys",
  "libc",
  "r-efi 6.0.0",
  "rand_core 0.10.1",
  "wasip2",
  "wasip3",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -10109,6 +10111,26 @@ dependencies = [
  "zkas-gpu",
  "zkas-sdk",
  "zkas-wallet-engine",
+]
+
+[[package]]
+name = "zkas-web-engine"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "getrandom 0.2.15",
+ "getrandom 0.3.4",
+ "getrandom 0.4.2",
+ "hex",
+ "kaspa-consensus-core",
+ "kaspa-rpc-core",
+ "kaspa-shielded-core",
+ "secp256k1",
+ "serde",
+ "serde_json",
+ "sha2",
+ "wasm-bindgen",
+ "zkas-walletd",
 ]
 
 [[package]]
