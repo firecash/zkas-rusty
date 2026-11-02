@@ -8666,6 +8666,13 @@ struct ScanStats {
     ckpt_write_ns: u64,
     ckpt_bytes: u64,
     deferred: u64,
+    /// Sync passes in the window, wall time inside them, and the part of that spent
+    /// re-taking this wallet's lock between chunks; `first_lock` is the wait for the lock
+    /// at the start of each pass. Window time outside passes is time spent waiting for a lap.
+    passes: u64,
+    pass_ns: u64,
+    relock_ns: u64,
+    first_lock_ns: u64,
 }
 
 /// Minimum spacing of one wallet's `scan_stats` lines.
@@ -8736,7 +8743,7 @@ impl ScanStats {
         let d = |a: u128, b: u128| a.saturating_sub(b) as f64 / 1e6;
         let decrypt_ms = d(cost.decrypt_ns, self.cost0.decrypt_ns);
         format!(
-            "scan_stats v=1 tok={} window_s={} pages={} fetched={} blocks={} actions={} leaves={} wait_ms={:.0} wait_max_ms={:.0} rpc_ms={:.0} decode_ms={:.0} ingest_ms={:.0} decrypt_ms={:.1} decrypt_us_per_action={:.2} tree_ms={:.1} mirror_ms={:.1} subtree_ms={:.1} witness_ms={:.1} ckpt_writes={} ckpt_encode_ms={:.0} ckpt_write_ms={:.0} ckpt_mb={:.1} behind={} deferred={}",
+            "scan_stats v=1 tok={} window_s={} pages={} fetched={} blocks={} actions={} leaves={} wait_ms={:.0} wait_max_ms={:.0} rpc_ms={:.0} decode_ms={:.0} ingest_ms={:.0} decrypt_ms={:.1} decrypt_us_per_action={:.2} tree_ms={:.1} mirror_ms={:.1} subtree_ms={:.1} witness_ms={:.1} ckpt_writes={} ckpt_encode_ms={:.0} ckpt_write_ms={:.0} ckpt_mb={:.1} behind={} deferred={} passes={} pass_ms={:.0} relock_ms={:.0} first_lock_ms={:.0}",
             log_pseudonym(token),
             window.as_secs(),
             self.pages,
@@ -8761,6 +8768,10 @@ impl ScanStats {
             self.ckpt_bytes as f64 / 1e6,
             behind,
             self.deferred,
+            self.passes,
+            ms(self.pass_ns),
+            ms(self.relock_ns),
+            ms(self.first_lock_ns),
         )
     }
 }
@@ -8887,7 +8898,10 @@ fn drop_held_leaves(state: &AppState, token: &str, e: &mut WalletEntry) -> bool 
 }
 
 async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_len: u64) -> SyncOutcome {
+    let t_first_lock = std::time::Instant::now();
     let mut e = w.lock().await;
+    e.stats.first_lock_ns += t_first_lock.elapsed().as_nanos() as u64;
+    let mut relock_ns = 0u64;
     e.chain_len = chain_len;
     // Advance one chunk from `low` (also the cheap tip catch-up once already synced).
     let was_caught_up = e.caught_up;
@@ -8947,7 +8961,9 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
         } else {
             tokio::task::yield_now().await;
         }
+        let t_relock = std::time::Instant::now();
         e = w.lock().await;
+        relock_ns += t_relock.elapsed().as_nanos() as u64;
         e.chain_len = chain_len;
         // A bursting wallet is by definition not at the tip. The chain tree re-loops per
         // PAGE even when it was: keep its verdict, or any lap longer than CAUGHT_UP_PAGE
@@ -8957,6 +8973,9 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
             was_caught_up = false;
         }
     }
+    e.stats.passes += 1;
+    e.stats.pass_ns += pass_started.elapsed().as_nanos() as u64;
+    e.stats.relock_ns += relock_ns;
     // A borrowing wallet's mirror tree is stale by construction; make it current again
     // by taking the shared tree's frontier. `adopt_tip_frontier` REFUSES unless the
     // frontier describes exactly this wallet's leaf count — the frontier at N leaves is
