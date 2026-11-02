@@ -662,11 +662,16 @@ impl Engine {
     /// rooted there is final when mined (the gateway's `/tree?below=<tip - margin>`). Notes
     /// below its leaf count are spendable; the rest are maturing. Witnesses are advanced to it
     /// here, a little at a time, so a send is a lookup.
-    pub fn set_anchor(&mut self, boundary_json: &str) -> Result<(), String> {
+    /// Take `boundary_json` as the matured anchor. Returns why not, if not: "ahead" (beyond what
+    /// this wallet has ingested) or "below_base" (below the leaves it holds); the last anchor stays.
+    pub fn set_anchor(&mut self, boundary_json: &str) -> Result<Option<String>, String> {
         let b: Boundary = serde_json::from_str(boundary_json).map_err(|e| e.to_string())?;
         let fs = b.frontier()?;
-        if fs.size > self.db.size() || fs.size < self.db.base_size() {
-            return Ok(()); // not yet ingested here, or below what this wallet holds: keep the last one
+        if fs.size > self.db.size() {
+            return Ok(Some("ahead".into()));
+        }
+        if fs.size < self.db.base_size() {
+            return Ok(Some("below_base".into()));
         }
         let gt = kaspa_shielded_core::tree::GlobalTree::from_state(&fs).map_err(|e| format!("{e:?}"))?;
         let root = gt.frontier().root().to_bytes();
@@ -678,7 +683,15 @@ impl Engine {
             }
         }
         self.anchor = Some((fs.size, block, root));
-        Ok(())
+        Ok(None)
+    }
+
+    /// Counts only, for the diagnostic log: where the tree, its base and the anchor are, and how
+    /// many leaves the oldest coin not yet under the anchor still needs (0: all spendable).
+    pub fn anchor_debug(&self) -> String {
+        let a = self.anchor.map(|(s, _, _)| s).unwrap_or(0);
+        let waiting = self.db.notes().iter().filter(|n| n.position >= a).map(|n| n.position + 1 - a).min().unwrap_or(0);
+        serde_json::json!({ "tree": self.db.size(), "base": self.db.base_size(), "anchor": a, "unmatured_needs": waiting, "notes": self.db.notes().len() }).to_string()
     }
 
     fn spendable(&self) -> u128 {
