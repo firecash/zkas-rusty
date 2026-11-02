@@ -1683,6 +1683,8 @@ const CHECKPOINT_EVERY: usize = 1000;
 /// for many minutes before its first save, and a process kill in that window (Android
 /// force-stop, no shutdown) threw all of it away.
 const CHECKPOINT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+/// The shared chain tree's own time rule (see where it is used).
+const CHAIN_TREE_CHECKPOINT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1800);
 
 /// Minimum block lead a twin must have over THIS wallet's own checkpoint before it is
 /// worth cloning instead of scanning the gap. Below this, the argon2 + decrypt cost of
@@ -3188,7 +3190,9 @@ struct DecodedPage {
     limit: u64,
     /// `--shared-scan-engine`: the page memo per viewing key (`IvkKey` id), filled by the
     /// first wallet of a cohort to reach the page for every wallet registered at this cursor.
-    cohort: std::sync::Mutex<HashMap<[u8; 64], Arc<Vec<kaspa_shielded_core::wallet::ReceivedNote>>>>,
+    /// Keyed by key id AND the number of leading page actions decided: wallets riding one page
+    /// pre-decrypt only its settled prefix, so a memo for one prefix never answers another.
+    cohort: std::sync::Mutex<HashMap<([u8; 64], usize), Arc<Vec<kaspa_shielded_core::wallet::ReceivedNote>>>>,
     /// Read from published chain files, not the node: the digest of the raw blocks, so a page
     /// that changes a wallet can be compared with the node's answer (`chain_files` rule 2).
     file_digest: Option<[u8; 32]>,
@@ -3503,7 +3507,7 @@ fn cohort_memo_with(
     kernel: &dyn kaspa_shielded_core::engine::AgreeKernel,
     registry: &std::sync::Mutex<HashMap<String, (Arc<kaspa_shielded_core::engine::IvkKey>, RpcHash, u64)>>,
     req: PageReq,
-    memo: &std::sync::Mutex<HashMap<[u8; 64], Arc<Vec<kaspa_shielded_core::wallet::ReceivedNote>>>>,
+    memo: &std::sync::Mutex<HashMap<([u8; 64], usize), Arc<Vec<kaspa_shielded_core::wallet::ReceivedNote>>>>,
     token: &str,
     db: &WalletDb,
     actions: &[CompactActionRecord],
@@ -3526,7 +3530,8 @@ fn cohort_memo_with(
         key
     };
     let mut memo = memo.lock().ok()?;
-    if let Some(found) = memo.get(&id) {
+    let n_actions = actions.len();
+    if let Some(found) = memo.get(&(id, n_actions)) {
         return Some(((**found).clone(), t.elapsed().as_nanos()));
     }
     let cohort: Vec<Arc<IvkKey>> = {
@@ -3535,7 +3540,7 @@ fn cohort_memo_with(
         let mut v: Vec<Arc<IvkKey>> = vec![key.clone()];
         seen.insert(id);
         for (k, low, limit) in reg.values() {
-            if (*low, *limit) == req && !memo.contains_key(&k_id(k)) && seen.insert(k_id(k)) {
+            if (*low, *limit) == req && !memo.contains_key(&(k_id(k), n_actions)) && seen.insert(k_id(k)) {
                 v.push(k.clone());
             }
         }
@@ -3551,9 +3556,9 @@ fn cohort_memo_with(
     };
     let n = cohort.len() as u128;
     for (k, f) in cohort.iter().zip(found) {
-        memo.insert(k_id(k), Arc::new(f));
+        memo.insert((k_id(k), n_actions), Arc::new(f));
     }
-    let mine = memo.get(&id)?.as_ref().clone();
+    let mine = memo.get(&(id, n_actions))?.as_ref().clone();
     // Charge this wallet its share of the pass; the rest of the cohort pays nothing later.
     Some((mine, t.elapsed().as_nanos() / n.max(1)))
 }
@@ -4930,8 +4935,21 @@ impl WalletEntry {
                 // Purely a memo: anything it does not cover is decrypted the old way, so
                 // this can cost time but never a note.
                 {
-                    let page_actions: Vec<kaspa_shielded_core::wallet::CompactActionRecord> =
-                        resp.blocks.iter().flat_map(|b| b.compact.iter().flatten().copied()).collect();
+                    // Only the SETTLED blocks: the memo is read by ingest alone, and the loop
+                    // below previews every block past `settled` with its own decryption (and
+                    // reuses the roll for blocks it already previewed). A caught-up page is
+                    // ~1 settled block and ~15 unsettled ones, so decrypting the whole page
+                    // repeated each unsettled action ~16 times as the window rolled: measured
+                    // 2 Nov, 158 tip wallets decrypting 233k actions/min for ~90 new.
+                    // Settled blocks are a prefix of the page, so their actions are a prefix of
+                    // the page's action order (and of its cached ephemeral keys).
+                    let total_actions: usize = resp.blocks.iter().map(|b| b.compact.iter().map(|t| t.len()).sum::<usize>()).sum();
+                    let page_actions: Vec<kaspa_shielded_core::wallet::CompactActionRecord> = resp
+                        .blocks
+                        .iter()
+                        .take_while(|b| b.blue_score <= settled)
+                        .flat_map(|b| b.compact.iter().flatten().copied())
+                        .collect();
                     self.page_actions += page_actions.len() as u64;
                     if !page_actions.is_empty() {
                         // The page decompressed these ephemeral keys once for the whole
@@ -4939,7 +4957,7 @@ impl WalletEntry {
                         // here — a mismatch means the two orders drifted, and the callee
                         // then decompresses for itself rather than indexing into the
                         // wrong page.
-                        let shared = (resp.epks.len() == page_actions.len()).then_some(resp.epks.as_slice());
+                        let shared = (resp.epks.len() == total_actions).then(|| &resp.epks[..page_actions.len()]);
                         // `--shared-scan-engine`: one multi-key pass for the cohort riding this
                         // page; this wallet gets exactly the memo its own call would compute.
                         let from_engine = shared.and_then(|e| engine_cohort_memo(state, &resp, token, &self.db, &page_actions, e));
@@ -9209,6 +9227,10 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
         secs if bursting_now => std::time::Duration::from_secs(secs.max(state.resources.checkpoint_interval_secs)),
         _ => checkpoint_interval,
     };
+    // The shared chain tree is ~600 MB of leaves: on the 120 s rule it was rewritten 7 times in
+    // 15 minutes (4.2 GB, 16 s of encode+write, measured 2 Nov) for state the node can rebuild
+    // in seconds after a crash. Every 30 minutes, and at shutdown (the flush), is enough.
+    let effective_interval = if token == CHAIN_TREE_TOKEN { effective_interval.max(CHAIN_TREE_CHECKPOINT_INTERVAL) } else { effective_interval };
     let overdue = advanced > 0 && e.last_checkpoint_at.elapsed() >= effective_interval;
     // A wallet far enough behind to burst (see `CATCHUP_BURST_MIN_BEHIND`) ingests
     // several thousand blocks per pass, so the block rule alone would rewrite the
@@ -9217,7 +9239,7 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
     // is the whole growing stream, ~150 MB by the end of a full-chain restore. Bursting
     // wallets checkpoint on the time rule only; the block rule keeps its near-tip role.
     let bursting = chain_len.saturating_sub(e.scanned as u64) >= CATCHUP_BURST_MIN_BEHIND;
-    let due_by_blocks = advanced >= CHECKPOINT_EVERY && !bursting;
+    let due_by_blocks = advanced >= CHECKPOINT_EVERY && !bursting && token != CHAIN_TREE_TOKEN;
     // Serialised under the lock (the bytes must describe one consistent state), but
     // WRITTEN off it, on a blocking thread, below: `fs::write` of a many-MB blob on the
     // async worker stalled every other task and every status/history call on this
@@ -17921,6 +17943,13 @@ mod engine_cohort_tests {
             let (m4, _) = cohort_memo_with(kernel, &registry, here, &memo, "tok4", &dbs[4], &actions, &epks).unwrap();
             assert_eq!(got(&m4), want(&dbs[4]), "{}: late wallet", kernel.name());
             assert_eq!(memo.lock().unwrap().len(), 4);
+            // A wallet that settled only a prefix of the page: the full-page memo must not answer
+            // it; it gets exactly what deciding that prefix alone gives.
+            let k = actions.len() / 2;
+            let (mp, _) = cohort_memo_with(kernel, &registry, here, &memo, "tok1", &dbs[1], &actions[..k], &epks[..k]).unwrap();
+            let want_prefix: Vec<(usize, u64)> = want(&dbs[1]).into_iter().filter(|(i, _)| *i < k).collect();
+            assert_eq!(got(&mp), want_prefix, "{}: prefix memo", kernel.name());
+            assert!(memo.lock().unwrap().len() > 4, "{}: the prefix got its own memo entries", kernel.name());
             // Wallet 3 reaches this page later: its cursor moved here, so it is recomputed, correctly.
             let (m3, _) = cohort_memo_with(kernel, &registry, here, &memo, "tok3", &dbs[3], &actions, &epks).unwrap();
             assert_eq!(got(&m3), want(&dbs[3]), "{}: wallet from another cursor", kernel.name());
