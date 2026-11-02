@@ -3033,15 +3033,28 @@ fn fvk_index_fallback_slot<'a>(
 /// One pass over every wallet file in `dir` → viewing key → tokens map. Argon2 per
 /// encrypted seed file, so this belongs on a blocking thread (startup does ~50 ms ×
 /// wallet count there once; registrations keep the map current after that).
+///
+/// On six threads: one at a time took 280-345 s on 142 (3,957 wallets, 2 Nov), and for that long
+/// after every restart a wallet loading without a checkpoint could not find its twin.
 fn build_fvk_index(dir: &str, secret: Option<&str>) -> HashMap<[u8; 96], HashSet<String>> {
+    use rayon::prelude::*;
     let mut map: HashMap<[u8; 96], HashSet<String>> = HashMap::new();
     let Ok(entries) = std::fs::read_dir(dir) else { return map };
-    for name in entries.flatten().filter_map(|e| e.file_name().into_string().ok()) {
-        let Some(token) = name.strip_suffix(".json") else { continue };
-        let Some((key, ..)) = load_wallet_meta(dir, token, secret) else { continue };
-        if let Some(f) = key.fvk_bytes() {
-            map.entry(f).or_default().insert(token.to_string());
-        }
+    let tokens: Vec<String> = entries
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter_map(|n| n.strip_suffix(".json").map(str::to_string))
+        .collect();
+    let read = |token: &String| -> Option<([u8; 96], String)> {
+        let (key, ..) = load_wallet_meta(dir, token, secret)?;
+        key.fvk_bytes().map(|f| (f, token.clone()))
+    };
+    let found: Vec<([u8; 96], String)> = match rayon::ThreadPoolBuilder::new().num_threads(6).thread_name(|i| format!("fvk-index-{i}")).build() {
+        Ok(pool) => pool.install(|| tokens.par_iter().filter_map(read).collect()),
+        Err(_) => tokens.iter().filter_map(read).collect(),
+    };
+    for (f, token) in found {
+        map.entry(f).or_default().insert(token);
     }
     map
 }
@@ -7577,8 +7590,11 @@ impl AppState {
         let fallback = if candidates.is_empty() { fvk_index_fallback_slot(&self.fvk_index_ready, &FVK_INDEX_FALLBACK) } else { None };
         if let Some(slot) = fallback {
             let (dir, secret) = (self.wallet_dir.clone(), self.wallet_secret.clone());
+            // A twin only saves scanning, and a full genesis scan now takes about a minute: never
+            // hold a load longer than this for it (it held fresh registrations and rescans 30 s
+            // for ~5 minutes after every restart, measured 2 Nov).
             if let Ok(Ok(map)) = tokio::time::timeout(
-                std::time::Duration::from_secs(30),
+                std::time::Duration::from_secs(3),
                 // The slot moves into the pass: the timeout stops the caller waiting, not the pass.
                 tokio::task::spawn_blocking(move || {
                     let _slot = slot;
