@@ -743,7 +743,7 @@ pub struct WalletDb {
 /// How many owned notes keep a live witness. Beyond this, advancing every witness on
 /// every leaf would reintroduce the O(N·k) scan that once made a wallet op take 33
 /// minutes; the excess notes fall back to the on-demand rebuild.
-const MAX_LIVE_WITNESSES: usize = 256;
+pub const MAX_LIVE_WITNESSES: usize = 256;
 
 /// A subtree-cache build detached from the wallet that owns it.
 ///
