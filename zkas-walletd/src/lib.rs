@@ -203,6 +203,17 @@ const UNKNOWN_TOKEN_DELAY: std::time::Duration = std::time::Duration::from_milli
 
 const CATCHUP_BURST_MIN_BEHIND: u64 = 20_000;
 
+/// A wallet at least this far behind keeps taking chunks within one pass (up to
+/// `CATCHUP_BURST_BUDGET`); `CATCHUP_BURST_MIN_BEHIND` still decides the cold lane and the
+/// checkpoint rule.
+///
+/// The pass loop used the 20,000 threshold too, from when a bursting wallet rewrote its whole
+/// leaf set. Below it a wallet took ONE chunk per lap: measured 2 Nov, wallets reopened after
+/// a few hours crawled at ~33 blocks/s (≈4,000 blocks per 120 s, of which ~0.2 s was work),
+/// so 3 hours away meant ~5.5 minutes to reach the tip. Hosted wallets now hold no leaves and
+/// save ~1 MB, so anything more than a few laps' worth of blocks behind just keeps going.
+const PASS_BURST_MIN_BEHIND: u64 = 300;
+
 /// How far behind the tip a wallet may be and still have `warm_priority` buy it the
 /// right to warm *while it is still scanning*.
 ///
@@ -8922,7 +8933,7 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
             }
         } else if e.caught_up
             || e.error.is_some()
-            || behind_by < CATCHUP_BURST_MIN_BEHIND
+            || behind_by < PASS_BURST_MIN_BEHIND
             || pass_started.elapsed() >= CATCHUP_BURST_BUDGET
         {
             break;
