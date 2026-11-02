@@ -6358,6 +6358,9 @@ struct AppState {
     /// wallet paying itself (background note merging) rather than a payment the user is
     /// waiting on. Both are needed to explain a refusal instead of merely issuing one.
     preparing: std::sync::Mutex<HashMap<String, (std::time::Instant, bool)>>,
+    /// Self-merges proved but never submitted, by viewing key → (session, proved at,
+    /// consecutive abandoned rounds). See [`self_merge_cooldown`].
+    self_merges: std::sync::Mutex<HashMap<String, (String, std::time::Instant, u32)>>,
     /// Subtree-cache builds in flight, by token — see [`BuildProgress`]. Kept OUTSIDE
     /// the wallet mutex so `/api/status` and the 429 text can report a build's
     /// percentage while whoever is waiting on that build holds the wallet lock.
@@ -6772,6 +6775,29 @@ const CONSOLIDATE_QUEUE_WAIT: std::time::Duration = std::time::Duration::from_se
 
 /// Releases this wallet's in-flight prepare marker on every exit path, including the
 /// `?` early returns and a panic in the proving task.
+/// How long a wallet that abandoned its last self-merge waits before the next one is proved.
+///
+/// A self-merge (consolidation) costs a Halo 2 proof of up to 38 spends: 20-37 s on the
+/// hosted daemon, which proves one transaction at a time. Older app builds retry a merge every
+/// 60 s whatever happened, and one wallet whose client never submits had the prover busy 42%
+/// of the time (2 Nov: 165 s of 395 s), so every other user's payment queued behind proofs
+/// that were thrown away. 10 minutes after the first abandoned round, doubling to an hour;
+/// a submit clears it. Payments to anyone else are never held back by this.
+fn self_merge_cooldown(abandoned: u32) -> std::time::Duration {
+    std::time::Duration::from_secs((600u64 << abandoned.saturating_sub(1).min(3)).min(3600))
+}
+
+#[cfg(test)]
+mod self_merge_cooldown_tests {
+    use super::self_merge_cooldown;
+
+    #[test]
+    fn an_abandoned_merge_waits_ten_minutes_doubling_to_an_hour() {
+        let mins = |n| self_merge_cooldown(n).as_secs() / 60;
+        assert_eq!([mins(0), mins(1), mins(2), mins(3), mins(4), mins(40)], [10, 10, 20, 40, 60, 60]);
+    }
+}
+
 struct PreparingGuard {
     state: Arc<AppState>,
     key: String,
@@ -12619,6 +12645,33 @@ async fn wallet_prepare(
         .zip(WalletDb::from_fvk(&fvk_bytes))
         .is_some_and(|(recipient, db)| db.my_address_bytes() == recipient);
 
+    if self_payment {
+        let key = hex(&fvk_bytes);
+        let prev = state.self_merges.lock().ok().and_then(|m| m.get(&key).cloned());
+        if let Some((sid, at, abandoned)) = prev {
+            // Still open: the client may yet sign and submit it, so it is not abandoned yet.
+            let open = state.prepared.lock().await.contains_key(&sid);
+            let wait = self_merge_cooldown(abandoned.max(1));
+            if open || at.elapsed() < wait {
+                let left = wait.saturating_sub(at.elapsed()).as_secs();
+                log::info!(
+                    "prepare: self-merge refused without proving: the previous one ({}s ago) was {}; {} abandoned in a row, next in {}s",
+                    at.elapsed().as_secs(),
+                    if open { "not submitted yet" } else { "never submitted" },
+                    abandoned,
+                    left,
+                );
+                return Err(err(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    format!(
+                        "this wallet's last note merge was prepared but never sent, so another is not started yet; the next one can run in {} min. Payments are not affected.",
+                        left.div_ceil(60).max(1)
+                    ),
+                ));
+            }
+        }
+    }
+
     // One preparation per wallet: a second would select the same notes as the one in
     // flight. Rejecting is right; the old wording was not. It said "wait for it to
     // finish before retrying", which reads as an accusation of impatience — while the
@@ -13263,6 +13316,12 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
             PreparedSession { payment, amount, fee, created: now, token: session_token, positions: spent_positions, request_key },
         );
     }
+    if self_payment {
+        if let Ok(mut m) = state.self_merges.lock() {
+            let abandoned = m.get(&hex(&fvk_bytes)).map_or(0, |e| e.2) + 1;
+            m.insert(hex(&fvk_bytes), (session.clone(), std::time::Instant::now(), abandoned));
+        }
+    }
 
     Ok(Json(PrepareResp {
         session,
@@ -13335,6 +13394,10 @@ async fn wallet_submit(
     };
     let PreparedSession { payment, amount, fee, token, positions, request_key, .. } =
         session.ok_or_else(|| err(StatusCode::NOT_FOUND, "no such prepared session (expired or already submitted)"))?;
+    // A submitted self-merge is not an abandoned one (see `self_merge_cooldown`).
+    if let Ok(mut m) = state.self_merges.lock() {
+        m.retain(|_, e| e.0 != req.session);
+    }
 
     // How many actions this transaction actually has, so a client-supplied index cannot
     // reach `actions_mut()[i]` out of range.
@@ -14911,6 +14974,7 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
         // actually waiting on.
         consolidate_gate: tokio::sync::Semaphore::new((cfg.max_concurrent_proves / 2).max(1)),
         preparing: std::sync::Mutex::new(HashMap::new()),
+        self_merges: std::sync::Mutex::new(HashMap::new()),
         cache_builds: std::sync::Mutex::new(HashMap::new()),
         warm_gate: std::sync::Arc::new(tokio::sync::Semaphore::new(resources.warm_wallets.max(1))),
         node_tip: Mutex::new((0, std::time::Instant::now())),
