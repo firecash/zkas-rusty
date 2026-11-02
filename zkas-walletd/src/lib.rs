@@ -214,6 +214,9 @@ const CATCHUP_BURST_MIN_BEHIND: u64 = 20_000;
 /// save ~1 MB, so anything more than a few laps' worth of blocks behind just keeps going.
 const PASS_BURST_MIN_BEHIND: u64 = 300;
 
+/// Pages a deep catch-up keeps in trial decryption ahead of ingest (see `sync_chunk`).
+const DECRYPT_AHEAD: usize = 6;
+
 /// How far behind the tip a wallet may be and still have `warm_priority` buy it the
 /// right to warm *while it is still scanning*.
 ///
@@ -4232,6 +4235,9 @@ struct WalletEntry {
     /// (reorg inside the margin) drops the roll and rebuilds the window once —
     /// the same self-correction the full recompute gave.
     preview_roll: VecDeque<PreviewRollEntry>,
+    /// Pages being trial-decrypted ahead of ingest during a deep catch-up, by the page's
+    /// request cursor (see `DECRYPT_AHEAD`): the actions decided, the notes found, the time.
+    decrypt_ahead: HashMap<RpcHash, std::sync::mpsc::Receiver<(Vec<CompactActionRecord>, Vec<kaspa_shielded_core::wallet::ReceivedNote>, u128)>>,
     /// The LAST page of the previous `sync_chunk` call was a caught-up (16-block) page
     /// that came back FULL, so the next fetch must be a full page. Inside a chunk the
     /// local flag carries that over between iterations; this carries it across calls,
@@ -4438,6 +4444,7 @@ impl WalletEntry {
             mempool: Preview::default(),
             unsettled_nulls: HashSet::new(),
             preview_roll: VecDeque::new(),
+            decrypt_ahead: HashMap::new(),
             need_full_page: false,
             mempool_cache: HashMap::new(),
             last_witness_advance: None,
@@ -4915,6 +4922,45 @@ impl WalletEntry {
                 }
             }
             let settled = resp.sink_blue_score.saturating_sub(SYNC_TIP_MARGIN);
+            // Decrypt ahead (deep catch-up only): trial decryption is ~95% of ingest and the
+            // loop ran it one page at a time between fetch and ingest, on ~3 of 12 cores
+            // (measured 2 Nov: a genesis rescan from local chain files at ~92k blocks/s).
+            // The next pages are usually already in the page cache (the read-ahead put them
+            // there), so hand each fully settled one to the scan pool now; ingest takes the
+            // result when it reaches that page. Purely a memo, as below: it covers exactly the
+            // actions it lists, and ingest decrypts anything it does not.
+            if page_limit == SHIELDED_PAGE && self.preview_roll.is_empty() && resp.blocks.len() as u64 == SHIELDED_PAGE {
+                if self.decrypt_ahead.len() > 4 * DECRYPT_AHEAD {
+                    self.decrypt_ahead.clear(); // cursors that were never reached (a rescan, a reorg)
+                }
+                if let Some(dec) = self.db.page_decryptor() {
+                    let c = cache.lock().await;
+                    let mut cur = resp.blocks.last().map(|b| b.hash);
+                    for _ in 0..DECRYPT_AHEAD {
+                        let Some(low) = cur else { break };
+                        if !self.decrypt_ahead.contains_key(&low) {
+                            let Some((at, ttl, page)) = c.map.get(&(low, SHIELDED_PAGE)) else { break };
+                            let fully_settled = page.blocks.iter().all(|b| b.blue_score <= page.sink_blue_score.saturating_sub(SYNC_TIP_MARGIN));
+                            if at.elapsed() >= *ttl || page.reorged || !fully_settled {
+                                break;
+                            }
+                            let page = page.clone();
+                            let dec = dec.clone();
+                            let (tx, rx) = std::sync::mpsc::channel();
+                            scan_pool().spawn(move || {
+                                let actions: Vec<CompactActionRecord> = page.blocks.iter().flat_map(|b| b.compact.iter().flatten().copied()).collect();
+                                let epks = (page.epks.len() == actions.len()).then_some(page.epks.as_slice());
+                                let t = std::time::Instant::now();
+                                let found = dec.decrypt(&actions, epks);
+                                let _ = tx.send((actions, found, t.elapsed().as_nanos()));
+                            });
+                            self.decrypt_ahead.insert(low, rx);
+                        }
+                        cur = c.next.get(&low).copied();
+                    }
+                }
+            }
+            let ahead = if page_limit == SHIELDED_PAGE { self.decrypt_ahead.remove(&self.low) } else { None };
             // This section is synchronous trial-decryption/tree work. Mark it as
             // blocking so Tokio starts replacement workers for HTTP and RPC tasks
             // while up to three wallets continue ingesting in parallel.
@@ -4934,7 +4980,15 @@ impl WalletEntry {
                 //
                 // Purely a memo: anything it does not cover is decrypted the old way, so
                 // this can cost time but never a note.
-                {
+                let ahead_installed = match ahead.map(|rx| rx.recv()) {
+                    Some(Ok((actions, found, ns))) => {
+                        self.page_actions += actions.len() as u64;
+                        self.db.install_predecrypted(&actions, found, ns);
+                        true
+                    }
+                    _ => false,
+                };
+                if !ahead_installed {
                     // Only the SETTLED blocks: the memo is read by ingest alone, and the loop
                     // below previews every block past `settled` with its own decryption (and
                     // reuses the roll for blocks it already previewed). A caught-up page is

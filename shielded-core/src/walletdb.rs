@@ -443,6 +443,20 @@ impl NullifierInterner {
     }
 }
 
+/// See [`WalletDb::page_decryptor`]. Decides exactly what [`WalletDb::predecrypt_page_cached`]
+/// decides for the same actions and keys.
+#[derive(Clone)]
+pub struct PageDecryptor {
+    prepared: PreparedIncomingViewingKey,
+    scalar: Option<pasta_curves::pallas::Scalar>,
+}
+
+impl PageDecryptor {
+    pub fn decrypt(&self, actions: &[CompactActionRecord], epks: Option<&[Option<pasta_curves::pallas::Point>]>) -> Vec<ReceivedNote> {
+        crate::wallet::scan_compact_auto_prepared(&self.prepared, self.scalar.as_ref(), actions, None, epks)
+    }
+}
+
 static DEFAULT_NF_INTERNER: std::sync::OnceLock<std::sync::Arc<NullifierInterner>> = std::sync::OnceLock::new();
 
 /// Write compact nullifier sections (see [`WalletDb::set_compact_nullifier_checkpoints`]).
@@ -3031,6 +3045,14 @@ impl WalletDb {
             }
         }
         self.predecrypted = Some(map);
+    }
+
+    /// A detached copy of what trial-decrypting a page for this wallet needs, so pages can be
+    /// decrypted ahead on other threads while this wallet ingests (the result goes back in
+    /// through [`Self::install_predecrypted`] with the same action list). `None` for a
+    /// leaves-only wallet, which decrypts nothing.
+    pub fn page_decryptor(&self) -> Option<PageDecryptor> {
+        (!self.leaves_only).then(|| PageDecryptor { prepared: self.prepared_ivk.clone(), scalar: self.agree_scalar })
     }
 
     /// The prepared external viewing key and its agreement scalar — what a multi-wallet
