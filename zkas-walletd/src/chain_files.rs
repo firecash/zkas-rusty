@@ -185,8 +185,8 @@ impl Manifest {
 }
 
 /// Where ZKas publishes its chain files: Cloudflare R2 (a CDN, so a third party that sees the
-/// downloading device's IP — the app says so) and zkas.info itself. Segments are spread across
-/// them by index, each falling back to the other; the manifest must carry the ZKas publisher
+/// downloading device's IP — the app says so) and zkas.info itself. Every segment comes from R2,
+/// zkas.info only when R2 fails; the manifest must carry the ZKas publisher
 /// signature whichever serves it, so neither can substitute files. The node is the last fallback.
 pub const PUBLIC_CHAIN_FILES: &str = "https://pub-ae5ed92258b2437e985b69ab9947ef60.r2.dev,https://zkas.info/shielded-chain";
 
@@ -761,7 +761,7 @@ fn is_http(base: &str) -> bool {
 /// The wallet side: answers page requests from published segments where it can.
 pub struct ChainFiles {
     /// Mirrors, each an `https://…` URL or a local directory. Segment `k` is fetched from
-    /// mirror `k % n` first and from the others if that fails or serves the wrong bytes.
+    /// the first mirror listed (the CDN) and from the others only if that fails or serves the wrong bytes.
     bases: Vec<String>,
     http: Option<reqwest::Client>,
     genesis: RpcHash,
@@ -889,13 +889,12 @@ impl ChainFiles {
         m.as_ref().map(|(_, man)| man.clone())
     }
 
-    /// One segment's bytes, matching the manifest's size and SHA-256, from the first mirror
-    /// (starting at `index % n`, which spreads segments over the mirrors) that serves them.
+    /// One segment's bytes, matching the manifest's size and SHA-256, from the first mirror that
+    /// serves them, in the configured order: the CDN first, the others only when it fails.
+    /// (Rotating the start by segment index sent half of every download to zkas.info.)
     async fn fetch_segment(&self, entry: &SegmentEntry) -> Result<Vec<u8>, String> {
-        let n = self.bases.len().max(1);
         let mut last = String::from("no mirrors configured");
-        for i in 0..self.bases.len() {
-            let base = &self.bases[(entry.index as usize + i) % n];
+        for base in &self.bases {
             match self.get_from(base, &entry.file).await {
                 Ok(bytes) if bytes.len() as u64 == entry.bytes && sha256_hex(&bytes) == entry.sha256 => return Ok(bytes),
                 Ok(bytes) => {
