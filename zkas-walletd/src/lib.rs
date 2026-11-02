@@ -10966,6 +10966,10 @@ async fn wallet_scan_receipt_export(
     })?;
     let notes = e.db.notes().len();
     let anchor = e.db.size();
+    // The chain block the scan stopped at: an importer checks the receipt's frontier against
+    // the node's tree at exactly this block. Through a gateway that only answers "below a DAA
+    // score" (rounded) the block could not be found, so a browser could not adopt a receipt.
+    let low_block = e.low.to_string();
     drop(e);
     Ok(Json(serde_json::json!({
         "receipt": hex(&bytes),
@@ -10973,6 +10977,7 @@ async fn wallet_scan_receipt_export(
         "notes": notes,
         "scannedDaa": scanned,
         "anchorLeaves": anchor,
+        "lowBlock": low_block,
         "genesis": state.genesis.to_string(),
     })))
 }

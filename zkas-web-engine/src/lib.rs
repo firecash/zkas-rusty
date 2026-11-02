@@ -460,6 +460,31 @@ impl Engine {
         Ok(Engine { db, low, scanned, birthday, hash_every_leaf: false, unsettled: Preview::default(), unsettled_nfs: Default::default(), mempool: Preview::default(), anchor: None })
     }
 
+    /// A wallet adopted from a wallet service's scan receipt (`GET /api/wallet/scan-receipt`)
+    /// instead of rescanning from its birthday: what moving a "Public service" wallet onto this
+    /// device costs - kilobytes, not a scan of everything since the birthday.
+    ///
+    /// Checked as walletd's import checks it: every note must pay THIS key and root to the
+    /// receipt's frontier (`WalletDb::from_scan_receipt_fvk`, nullifiers recomputed here), and
+    /// that frontier - size and root - must be the node's own at the block the receipt resumes
+    /// from (`node_boundary_json`, the gateway's `/tree?block=`), at the receipt's DAA. So a
+    /// service cannot invent a coin; it can only omit one, which a rescan would show.
+    pub fn from_receipt(fvk_hex: &str, receipt: &[u8], node_boundary_json: &str, birthday: u64) -> Result<Engine, String> {
+        let fvk = parse_fvk(fvk_hex)?;
+        let (db, meta) = WalletDb::from_scan_receipt_fvk(&fvk, genesis(), receipt).ok_or("this receipt is malformed, for another chain, or not this wallet's")?;
+        let b: Boundary = serde_json::from_str(node_boundary_json).map_err(|e| e.to_string())?;
+        if b.daa != meta.scanned_daa {
+            return Err(format!("the node's block is at DAA {}, the receipt resumes at {}", b.daa, meta.scanned_daa));
+        }
+        let fs = b.frontier()?;
+        use kaspa_shielded_core::tree::NoteCommitmentTree;
+        let node_anchor = kaspa_shielded_core::tree::GlobalTree::from_state(&fs).map_err(|e| format!("{e:?}"))?.anchor().to_bytes();
+        if db.size() != fs.size || db.anchor() != node_anchor {
+            return Err("this receipt's commitment tree does not match the chain at the block it resumes from".into());
+        }
+        Ok(Engine { db, low: h32_hex(&b.block)?, scanned: meta.scanned_daa, birthday, hash_every_leaf: false, unsettled: Preview::default(), unsettled_nfs: Default::default(), mempool: Preview::default(), anchor: None })
+    }
+
     /// See [`Engine::hash_every_leaf`].
     pub fn set_hash_every_leaf(&mut self, on: bool) {
         self.hash_every_leaf = on;
@@ -554,6 +579,11 @@ impl Engine {
     /// A wallet restored from `checkpoint()` bytes.
     pub fn restore(fvk_hex: &str, bytes: &[u8]) -> Result<Engine, JsValue> {
         Engine::restore_from(fvk_hex, bytes).map_err(err)
+    }
+
+    /// A wallet adopted from a wallet service's scan receipt (see [`Engine::from_receipt`]).
+    pub fn adopt_receipt(fvk_hex: &str, receipt: &[u8], node_boundary_json: &str, birthday: u64) -> Result<Engine, JsValue> {
+        Engine::from_receipt(fvk_hex, receipt, node_boundary_json, birthday).map_err(err)
     }
 
     /// Everything needed to resume: kept by the page (IndexedDB) and given to `restore`.
@@ -1058,6 +1088,39 @@ mod send_tests {
         e.mark_sent(&r["positions"].to_string(), &hex::encode([7u8; 32]), fee).unwrap();
         let st: serde_json::Value = serde_json::from_str(&e.status()).unwrap();
         assert_eq!(st["pending_change_sompi"], (3_000_000_000 - fee).to_string());
+    }
+
+    /// A wallet service's scan receipt adopted by the browser engine: same balance and coins,
+    /// spendable; refused against a different chain frontier, or for another key.
+    #[test]
+    fn a_service_scan_receipt_is_adopted_and_checked() {
+        let sk = [27u8; 32];
+        let (e, _) = funded(sk);
+        let receipt = e.db.to_scan_receipt(genesis(), 1000).expect("witnessed at the anchor");
+        let fs = e.db.tip_frontier_state().unwrap();
+        let node = Boundary { block: hex::encode([79u8; 32]), daa: 1000, size: fs.size, leaf: hex::encode(fs.leaf.unwrap()), ommers: fs.ommers.iter().map(hex::encode).collect() };
+        let fvk = hex::encode(e.db.fvk().to_bytes());
+        let mut got = Engine::from_receipt(&fvk, &receipt, &serde_json::to_string(&node).unwrap(), 900).unwrap();
+        assert_eq!(got.db.balance(), e.db.balance());
+        assert_eq!(got.db.notes().len(), e.db.notes().len());
+        assert_eq!(got.low(), hex::encode([79u8; 32]));
+        assert_eq!(got.scanned(), 1000);
+        // Spendable: the adopted coins prove a payment at the same anchor.
+        got.set_anchor(&serde_json::to_string(&node).unwrap()).unwrap();
+        let to = zkas(&address_bytes_from_seed([97u8; 32]).unwrap());
+        let r: serde_json::Value = serde_json::from_str(&got.prepare_send(&hex::encode(sk), &to, 100_000_000, "").unwrap()).unwrap();
+        verified(&r);
+        // A frontier that is not the chain's at that block: refused.
+        let mut wrong = node.clone();
+        wrong.size += 1;
+        assert!(Engine::from_receipt(&fvk, &receipt, &serde_json::to_string(&wrong).unwrap(), 900).is_err());
+        // The block at another DAA: refused.
+        let mut other = node.clone();
+        other.daa = 999;
+        assert!(Engine::from_receipt(&fvk, &receipt, &serde_json::to_string(&other).unwrap(), 900).is_err());
+        // Another key: refused.
+        let stranger = hex::encode(WalletDb::from_seed([3u8; 32]).unwrap().fvk().to_bytes());
+        assert!(Engine::from_receipt(&stranger, &receipt, &serde_json::to_string(&node).unwrap(), 900).is_err());
     }
 
     /// Several payees in one browser payment, and private sends (not readable back from the seed).
