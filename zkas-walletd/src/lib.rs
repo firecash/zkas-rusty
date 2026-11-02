@@ -910,6 +910,24 @@ const CHAIN_TREE_SEED: [u8; 32] = *b"zkas-shared-chain-tree-v1-notele";
 /// `ResourceLimits`, because the writers include the offline `--graft` tool and the
 /// shutdown flush, which never see an `AppState`. Set once, by `serve`.
 static SHARED_LEAF_STORE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The rayon pool scan work runs in: a page's trial decryption and the off-lock subtree-cache
+/// fold. NOT the global pool, because `--proof-threads N` sizes the global pool (Halo2 proves
+/// there) — and on the hosted daemon `--proof-threads 1` silently made every rayon-parallel
+/// scan step single-threaded too. Measured 2 Nov: a genesis scan decrypting at 100-136 us per
+/// action on ONE `wallet-runtime` thread at 99.5% while 7 of 12 cores sat idle; the page batch
+/// it splits across cores (`scan_compact_auto_cached`) was asking a one-thread pool.
+fn scan_pool() -> &'static rayon::ThreadPool {
+    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let n = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(n)
+            .thread_name(|i| format!("wallet-scan-{i}"))
+            .build()
+            .expect("build the wallet scan pool")
+    })
+}
 /// Hosted wallets whose leaves were dropped at the end of a pass (see `sync_one_wallet`), and
 /// shared frontiers a wallet refused because its own leaf at that position differed.
 static HOSTED_LEAF_DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -4910,7 +4928,7 @@ impl WalletEntry {
                         let from_engine = shared.and_then(|e| engine_cohort_memo(state, &resp, token, &self.db, &page_actions, e));
                         match from_engine {
                             Some((found, ns)) => self.db.install_predecrypted(&page_actions, found, ns),
-                            None => tokio::task::block_in_place(|| self.db.predecrypt_page_cached(&page_actions, shared)),
+                            None => tokio::task::block_in_place(|| scan_pool().install(|| self.db.predecrypt_page_cached(&page_actions, shared))),
                         }
                     }
                 }
@@ -6032,7 +6050,7 @@ async fn run_subtree_build(
         m.insert(token.to_string(), progress.clone());
     }
     let counter = progress.done.clone();
-    let mut fold = tokio::task::spawn_blocking(move || job.run_with_progress(&counter));
+    let mut fold = tokio::task::spawn_blocking(move || scan_pool().install(|| job.run_with_progress(&counter)));
     let built = loop {
         tokio::select! {
             r = &mut fold => break r.ok().flatten(),
