@@ -6889,6 +6889,10 @@ const CONSOLIDATE_QUEUE_WAIT: std::time::Duration = std::time::Duration::from_se
 /// of the time (2 Nov: 165 s of 395 s), so every other user's payment queued behind proofs
 /// that were thrown away. 10 minutes after the first abandoned round, doubling to an hour;
 /// a submit clears it. Payments to anyone else are never held back by this.
+/// A self-merge prepared this soon after the previous one is the same consolidation re-preparing
+/// (see `wallet_prepare`); the looping clients this guards against come back every 60 s.
+const SELF_MERGE_REPREPARE: std::time::Duration = std::time::Duration::from_secs(30);
+
 fn self_merge_cooldown(abandoned: u32) -> std::time::Duration {
     std::time::Duration::from_secs((600u64 << abandoned.saturating_sub(1).min(3)).min(3600))
 }
@@ -12786,10 +12790,14 @@ async fn wallet_prepare(
         let key = hex(&fvk_bytes);
         let prev = state.self_merges.lock().ok().and_then(|m| m.get(&key).cloned());
         if let Some((sid, at, abandoned)) = prev {
-            // Still open: the client may yet sign and submit it, so it is not abandoned yet.
+            // Within one consolidation the app may prepare, look at the result and prepare a
+            // different round at once (a split it decides against, a dust guard): that is the same
+            // flow re-preparing, not an abandoned merge, and refusing it broke every split
+            // consolidation. Only a self-merge arriving later, with the last one never sent, counts.
+            let same_flow = at.elapsed() < SELF_MERGE_REPREPARE;
             let open = state.prepared.lock().await.contains_key(&sid);
             let wait = self_merge_cooldown(abandoned.max(1));
-            if open || at.elapsed() < wait {
+            if !same_flow && (open || at.elapsed() < wait) {
                 let left = wait.saturating_sub(at.elapsed()).as_secs();
                 log::info!(
                     "prepare: self-merge refused without proving: the previous one ({}s ago) was {}; {} abandoned in a row, next in {}s",
@@ -13455,7 +13463,8 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
     }
     if self_payment {
         if let Ok(mut m) = state.self_merges.lock() {
-            let abandoned = m.get(&hex(&fvk_bytes)).map_or(0, |e| e.2) + 1;
+            // A re-prepare within the same flow (see SELF_MERGE_REPREPARE) is not another abandonment.
+            let abandoned = m.get(&hex(&fvk_bytes)).map_or(0, |e| if e.1.elapsed() < SELF_MERGE_REPREPARE { e.2.saturating_sub(1) } else { e.2 }) + 1;
             m.insert(hex(&fvk_bytes), (session.clone(), std::time::Instant::now(), abandoned));
         }
     }
