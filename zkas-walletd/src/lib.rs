@@ -910,6 +910,12 @@ const CHAIN_TREE_SEED: [u8; 32] = *b"zkas-shared-chain-tree-v1-notele";
 /// `ResourceLimits`, because the writers include the offline `--graft` tool and the
 /// shutdown flush, which never see an `AppState`. Set once, by `serve`.
 static SHARED_LEAF_STORE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Hosted wallets whose leaves were dropped at the end of a pass (see `sync_one_wallet`), and
+/// shared frontiers a wallet refused because its own leaf at that position differed.
+static HOSTED_LEAF_DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static HOSTED_REBASE_REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Below this many droppable leaves (~128 KB) a rebase is not worth the shared-tree peek.
+const HOSTED_REBASE_MIN_LEAVES: u64 = 4096;
 
 /// Leaves a v11 blob keeps INLINE below the end of what the shared file held when it was
 /// written: 262,144 leaves = 8 MiB per blob, ~1.9 days at the measured ~140 K leaves/day.
@@ -8815,6 +8821,74 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
         if let Some(fs) = fs {
             if e.db.adopt_tip_frontier(&fs) {
                 log::debug!("wallet adopted the shared tree's frontier at {} leaves", fs.size);
+            }
+        }
+    }
+
+    // Hosted: drop the leaves a borrowing wallet holds for nothing. Its spends are witnessed by
+    // the shared tree (`batch_witness_paths`), its anchor IS the shared tree's, and the only
+    // per-leaf reader left was the compaction that could not run: `compact_if_holding_nothing`
+    // is tried per page, while the wallet is mid-borrow and its tree invalid, so it always
+    // refused, and nothing tried again after the frontier adoption just above made it valid.
+    // Measured 2 Nov on 142: 3,568 checkpoints, 750 GB, half of it leaves — a wallet holding
+    // ZERO notes at 240 MB, one holding 15 at 13 M leaves (~420 MB resident) — which is what
+    // filled the resident budget at ~110 wallets and drove the eviction/"Opening" churn.
+    //
+    // Holding nothing: the tip frontier becomes the base, O(1). Holding notes: the base rolls up
+    // to the oldest one held or pending, adopting the SHARED tree's frontier at that size
+    // (O(depth) from its subtree cache, verified to root) instead of re-hashing every leaf
+    // below it — `rebase_to` binds it to this wallet's own leaf at that position and never
+    // passes a held note. `try_lock` only: never wait on the shared tree from here.
+    if token != CHAIN_TREE_TOKEN && state.build_shared_tree && !e.build_in_flight && !e.db.is_leaves_only() {
+        let base = e.db.base_size();
+        let target = e.db.earliest_held_position();
+        if target >= e.db.size() {
+            if e.db.tree_is_valid() && e.db.compact_if_holding_nothing() {
+                HOSTED_LEAF_DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                log::debug!("wallet {}: compacted (holds nothing) at {} leaves", log_pseudonym(&token), e.db.size());
+            }
+        } else if e.db.size() >= base.saturating_add(HOSTED_REBASE_MIN_LEAVES) {
+            // Every held note gets a live witness minted by the shared tree at this wallet's
+            // size (O(depth) each, checked against its root and the note's own commitment), and
+            // then no leaf is needed at all — what a device engine holds after a receipt. An old
+            // unspent note no longer pins the stream below it.
+            let size = e.db.size();
+            let positions = e.db.held_positions();
+            let minted = state.chain_tree.try_lock().ok().and_then(|ct| {
+                let fs = ct.db.frontier_state_at(size)?;
+                let ws: Option<Vec<_>> = positions.iter().map(|&p| ct.db.witness_for(p, size).map(|w| (p, w))).collect();
+                Some((fs, ws?))
+            });
+            if let Some((fs, ws)) = minted {
+                let n = ws.len();
+                if e.db.adopt_witnesses_dropping_leaves(&fs, ws) {
+                    HOSTED_LEAF_DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    log::info!(
+                        "wallet {}: {} leaves dropped; {n} note(s) carry shared-tree witnesses at {size}",
+                        log_pseudonym(&token),
+                        size - base
+                    );
+                } else {
+                    HOSTED_REBASE_REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    log::warn!("wallet {}: shared-tree witnesses at {size} REFUSED; keeping its leaves", log_pseudonym(&token));
+                }
+            }
+        } else if target >= base.saturating_add(HOSTED_REBASE_MIN_LEAVES) {
+            let fs = state.chain_tree.try_lock().ok().and_then(|ct| ct.db.frontier_state_at(target));
+            match fs {
+                Some(fs) if e.db.rebase_to(&fs) => {
+                    HOSTED_LEAF_DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    log::info!(
+                        "wallet {}: base rolled {base} -> {target} from the shared tree's frontier ({} leaves dropped, notes untouched)",
+                        log_pseudonym(&token),
+                        target - base
+                    );
+                }
+                Some(_) => {
+                    HOSTED_REBASE_REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    log::warn!("wallet {}: shared frontier at {target} REFUSED (leaf differs from this wallet's stream); keeping its leaves", log_pseudonym(&token));
+                }
+                None => {}
             }
         }
     }

@@ -2269,6 +2269,7 @@ impl WalletDb {
         self.base_size = step_target;
         // Drop the now-summarised prefix (the stream is held once; see `leaves`).
         self.leaves.drain(..rel);
+        self.release_dropped_leaves();
         // CRUCIAL: the live witnesses are self-contained (their own inner tree + filled +
         // cursor, at absolute positions ≥ the earliest note ≥ the new base), so compacting
         // the base BELOW them does not invalidate them — keep them. Wiping them here (the
@@ -2304,6 +2305,235 @@ impl WalletDb {
         let before = self.base_size;
         self.advance_base_capped(self.size, u64::MAX);
         self.base_size > before
+    }
+
+    /// The tree's frontier at `n` leaves (`base_size < n <= size`), read off the subtree cache
+    /// in O(depth): the frontier's ommers are exactly the LEFT siblings in the authentication
+    /// path of leaf `n - 1` at anchor `n`, and every one of them is a complete subtree below
+    /// `n` (cached at and above `CACHE_LEVEL`, folded from one window below it). The path is
+    /// verified to the tree's root at `n` before it is used (see `subtree_paths`), so a cache
+    /// that disagrees with the stream answers `None`, never a wrong frontier.
+    ///
+    /// What a hosted daemon's shared chain tree hands to wallets that want to roll their base up
+    /// to their oldest note without re-hashing every leaf below it (see [`Self::rebase_to`]).
+    pub fn frontier_state_at(&self, n: u64) -> Option<FrontierState> {
+        if n == 0 || n <= self.base_size || n > self.size {
+            return None;
+        }
+        let p = n - 1;
+        let path = self.subtree_paths(&[p], n)?.into_iter().next().flatten()?;
+        let auth = path.auth_path();
+        let ommers: Vec<[u8; 32]> =
+            (0..TREE_DEPTH as usize).filter(|l| (p >> l) & 1 == 1).map(|l| auth[l].to_bytes()).collect();
+        let fs = FrontierState { size: n, leaf: self.leaf_at(p), ommers };
+        // Structural check (position/ommer count) by the same reconstruction the node uses.
+        GlobalTree::from_state(&fs).ok()?;
+        Some(fs)
+    }
+
+    /// Roll the base up to `fs.size` by ADOPTING that frontier instead of hashing every leaf
+    /// below it (what [`Self::advance_base_capped`] does: ~10 us/leaf, minutes for a wallet
+    /// holding millions). `fs` must come from the same leaf stream — on a hosted daemon, the
+    /// shared chain tree this wallet borrows (see [`Self::frontier_state_at`]).
+    ///
+    /// Refuses (false, nothing changed) unless: this is not a shared tree; the new base is
+    /// above the current one and not above the earliest note held OR parked in a pending spend
+    /// (a note below the base can never be witnessed again — the stranded-note rule
+    /// `advance_base_capped` keeps); the frontier is well-formed; and its last leaf is THIS
+    /// wallet's own leaf at that position, which binds it to this stream rather than any tree
+    /// of the right size. Live witnesses are kept exactly as `advance_base_capped` keeps them.
+    pub fn rebase_to(&mut self, fs: &FrontierState) -> bool {
+        if self.leaves_only || fs.size <= self.base_size || fs.size > self.size {
+            return false;
+        }
+        let earliest = self
+            .notes
+            .iter()
+            .map(|n| n.position)
+            .chain(self.pending_spends.iter().map(|p| p.note.position))
+            .min()
+            .unwrap_or(self.size);
+        if fs.size > earliest {
+            return false;
+        }
+        let Some(leaf) = fs.leaf else { return false };
+        if self.leaf_at(fs.size - 1) != Some(leaf) {
+            return false;
+        }
+        let Ok(t) = GlobalTree::from_state(fs) else { return false };
+        let rel = (fs.size - self.base_size) as usize;
+        if rel > self.leaves.len() {
+            return false;
+        }
+        self.base_frontier = t.frontier().clone();
+        self.base_size = fs.size;
+        self.leaves.drain(..rel);
+        self.release_dropped_leaves();
+        if self.witnessed_upto < self.base_size {
+            self.witnessed_upto = self.base_size;
+            self.lag_tree = CommitmentTree::from_frontier(&self.base_frontier);
+            self.witnesses.retain(|(p, _)| *p >= self.base_size);
+        }
+        true
+    }
+
+    /// A live witness for leaf `p` with the tree at `n` leaves, assembled from this tree's
+    /// subtree cache in O(depth) — no replay of the `n - p` leaves between them. Meant for a
+    /// hosted daemon's SHARED chain tree, handing each wallet witnesses for its notes so the
+    /// wallet need hold no leaves (see [`Self::adopt_witnesses_dropping_leaves`]).
+    ///
+    /// An `IncrementalWitness` is three parts, and each is something this tree already has:
+    /// * `tree`: the commitment tree at `p + 1` leaves — the frontier at `p + 1`;
+    /// * `filled`: the roots of the COMPLETE subtrees to the right of `p`, lowest first —
+    ///   exactly the right-hand siblings in `p`'s authentication path at anchor `n` that lie
+    ///   wholly below `n`;
+    /// * `cursor`: the one right-hand sibling `n` falls inside, partly filled — a tree whose
+    ///   frontier is the global frontier at `n` restricted to the levels below it (the sibling
+    ///   is aligned to its own size, so `n - 1` and its offset inside it share those bits).
+    ///
+    /// The result is CHECKED, not trusted: its path must equal the cache's path (which
+    /// `subtree_paths` has already verified to the root at `n`) and its root must equal the
+    /// frontier's root. Anything else answers `None`.
+    pub fn witness_for(&self, p: u64, n: u64) -> Option<IncrementalWitness<MerkleHashOrchard, TREE_DEPTH>> {
+        if p >= n || n > self.size {
+            return None;
+        }
+        let path = self.subtree_paths(&[p], n)?.into_iter().next().flatten()?;
+        let auth = path.auth_path();
+        let at_p1 = GlobalTree::from_state(&self.frontier_state_at(p + 1)?).ok()?;
+        let tree = CommitmentTree::from_frontier(at_p1.frontier());
+        let mut filled = Vec::new();
+        let mut cursor = None;
+        for l in 0..TREE_DEPTH as usize {
+            if (p >> l) & 1 == 1 {
+                continue; // left sibling: part of `tree`
+            }
+            let start = ((p >> l) | 1) << l;
+            let end = start + (1u64 << l);
+            if end <= n {
+                filled.push(auth[l]);
+            } else {
+                if start < n {
+                    // The straddling sibling: the global frontier at `n`, below level `l`.
+                    let at_n = self.frontier_state_at(n)?;
+                    let m = n - start;
+                    let ommers_n: Vec<MerkleHashOrchard> = {
+                        let all = GlobalTree::from_state(&at_n).ok()?;
+                        all.frontier().value()?.ommers().to_vec()
+                    };
+                    // Ommers are stored for the set bits of `n - 1`, lowest level first; keep
+                    // those below `l` (the low bits of `m - 1` are the low bits of `n - 1`).
+                    let below = ((n - 1) & ((1u64 << l) - 1)).count_ones() as usize;
+                    let leaf = MerkleHashOrchard::from_bytes(&at_n.leaf?).into_option()?;
+                    let f = Frontier::from_parts(incrementalmerkletree::Position::from(m - 1), leaf, ommers_n[..below].to_vec()).ok()?;
+                    cursor = Some(CommitmentTree::from_frontier(&f));
+                }
+                break; // every later right-hand sibling lies wholly at or above `n`: empty
+            }
+        }
+        let w = IncrementalWitness::from_parts(tree, filled, cursor)?;
+        let wp = w.path()?;
+        let elems: Vec<MerkleHashOrchard> = wp.path_elems().to_vec();
+        if u64::from(wp.position()) != p || elems.as_slice() != &auth[..] {
+            return None;
+        }
+        let root = GlobalTree::from_state(&self.frontier_state_at(n)?).ok()?.frontier().root();
+        (w.root() == root).then_some(w)
+    }
+
+    /// Install shared-tree witnesses for EVERY note this wallet holds or has parked in a pending
+    /// spend, at its own size, and drop every leaf: the base becomes `tip`. The wallet then
+    /// holds what a device engine's receipt holds — notes, their witnesses, the frontier — and
+    /// none of the stream (hosted: up to 16.6 M leaves, ~530 MB, for one unspent note mined in
+    /// the chain's first hour, which the stranded-note rule otherwise pins forever).
+    ///
+    /// Refuses (false, nothing changed) unless `tip` is this wallet's own frontier at its size
+    /// (its last leaf is this wallet's, and its root is this wallet's anchor when the wallet's
+    /// tree is valid), there are at most `MAX_LIVE_WITNESSES` positions, and every position
+    /// has a witness at that position, rooted at `tip`, whose leaf is the note's own
+    /// commitment. Notes below the new base keep a live witness, so they are not stranded
+    /// (`stranded_notes`), stay spendable, and travel in a scan receipt.
+    pub fn adopt_witnesses_dropping_leaves(
+        &mut self,
+        tip: &FrontierState,
+        mut ws: Vec<(u64, IncrementalWitness<MerkleHashOrchard, TREE_DEPTH>)>,
+    ) -> bool {
+        if self.leaves_only || tip.size != self.size || tip.size <= self.base_size {
+            return false;
+        }
+        let Some(leaf) = tip.leaf else { return false };
+        if self.leaf_at(tip.size - 1) != Some(leaf) {
+            return false;
+        }
+        let Ok(t) = GlobalTree::from_state(tip) else { return false };
+        let root = t.frontier().root();
+        if self.tree_valid && self.mirror().root() != root {
+            return false;
+        }
+        let held: Vec<(u64, &orchard::Note)> = self
+            .notes
+            .iter()
+            .map(|n| (n.position, &n.note))
+            .chain(self.pending_spends.iter().map(|p| (p.note.position, &p.note.note)))
+            .collect();
+        ws.sort_by_key(|(p, _)| *p);
+        ws.dedup_by_key(|(p, _)| *p);
+        if ws.len() > MAX_LIVE_WITNESSES || ws.len() != self.held_positions().len() {
+            return false;
+        }
+        for (pos, note) in &held {
+            let Some((_, w)) = ws.iter().find(|(p, _)| p == pos) else { return false };
+            let Some(path) = w.path() else { return false };
+            if u64::from(path.position()) != *pos || w.root() != root {
+                return false;
+            }
+            let cmx = MerkleHashOrchard::from_cmx(&ExtractedNoteCommitment::from(note.commitment()));
+            if path.root(cmx) != root {
+                return false;
+            }
+        }
+        self.witnesses = ws;
+        self.witness_budget = self.witness_budget.max(self.witnesses.len()).min(MAX_LIVE_WITNESSES);
+        self.base_frontier = t.frontier().clone();
+        self.base_size = tip.size;
+        self.lag_tree = CommitmentTree::from_frontier(&self.base_frontier);
+        self.witnessed_upto = tip.size;
+        self.leaves.clear();
+        self.release_dropped_leaves();
+        // The wallet's own subtree cache folds every new leaf (~21 us each) to serve paths from
+        // leaves it no longer holds; the shared tree serves them. Mark it given up, so it is
+        // neither maintained nor rebuilt.
+        self.subtree = SubtreeCache { failed: true, ..Default::default() };
+        true
+    }
+
+    /// `drain` keeps a Vec's capacity, so a compaction that dropped millions of leaves freed
+    /// none of the 32 B each until the next checkpoint reload. Give it back once the held
+    /// stream is well under half its allocation.
+    fn release_dropped_leaves(&mut self) {
+        if self.leaves.capacity() > 2 * self.leaves.len() + 65_536 {
+            self.leaves.shrink_to_fit();
+        }
+    }
+
+    /// Positions of every note held or parked in a pending spend (what needs a witness).
+    pub fn held_positions(&self) -> Vec<u64> {
+        let mut v: Vec<u64> =
+            self.notes.iter().map(|n| n.position).chain(self.pending_spends.iter().map(|p| p.note.position)).collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
+    /// The earliest absolute position this wallet must keep a leaf for: its oldest unspent
+    /// note or note parked in a pending spend, else its size. A base can roll up to here.
+    pub fn earliest_held_position(&self) -> u64 {
+        self.notes
+            .iter()
+            .map(|n| n.position)
+            .chain(self.pending_spends.iter().map(|p| p.note.position))
+            .min()
+            .unwrap_or(self.size)
     }
 
     /// Repair a wallet whose base compacted past a still-held note (see
@@ -5540,6 +5770,193 @@ mod tests {
             assert_eq!(a.auth_path(), b.auth_path(), "auth path differs at note {i}");
             assert_eq!(a.position(), b.position(), "position differs at note {i}");
         }
+    }
+
+    /// A hosted wallet rolls its base up to its oldest note by adopting the SHARED tree's
+    /// frontier at that size, and the result is exactly what hashing every leaf would give:
+    /// the same base frontier as `advance_base_capped`, the same witnesses, the same anchor.
+    /// It never passes a held note, and refuses a frontier from a different stream.
+    #[test]
+    fn rebase_from_the_shared_frontier_equals_hashing_the_prefix() {
+        // Outside the filler recipients' 1..=250 seeds, so only blocks 173 and 251 are ours.
+        let mine = [254u8; 32];
+        let nobody = [253u8; 32];
+        let mut wallet = WalletDb::from_seed(mine).unwrap();
+        let mut hashed = WalletDb::from_seed(mine).unwrap();
+        let mut shared = WalletDb::from_seed(nobody).unwrap();
+        shared.set_leaves_only(true);
+        for b in 0..300u32 {
+            let recipient = if b == 173 || b == 251 { address_of(mine) } else { address_of([(b % 250 + 1) as u8; 32]) };
+            let block = [coinbase_for(recipient, &b.to_le_bytes(), 1_000 + b as u64)];
+            wallet.ingest_block(&block, &[]);
+            hashed.ingest_block(&block, &[]);
+            shared.ingest_block(&block, &[]);
+        }
+        shared.build_subtree_cache();
+        let positions: Vec<u64> = wallet.notes().iter().map(|n| n.position).collect();
+        assert_eq!(positions.len(), 2);
+        let oldest = wallet.earliest_held_position();
+        assert_eq!(oldest, positions[0]);
+        let anchor = wallet.anchor();
+        let before = wallet.witness_paths_at(&positions, wallet.size());
+
+        // Past the oldest note: refused, nothing changed.
+        let too_far = shared.frontier_state_at(oldest + 1).expect("frontier past the note");
+        assert!(!wallet.rebase_to(&too_far), "must never roll past a held note");
+        assert_eq!(wallet.base_size(), 0);
+
+        // A frontier of the right size from another stream: refused.
+        let mut stranger = WalletDb::from_seed(nobody).unwrap();
+        stranger.set_leaves_only(true);
+        for b in 0..300u32 {
+            stranger.ingest_block(&[coinbase_for(address_of([7u8; 32]), &(b + 9_000).to_le_bytes(), 5)], &[]);
+        }
+        stranger.build_subtree_cache();
+        let foreign = stranger.frontier_state_at(oldest).expect("foreign frontier");
+        assert!(!wallet.rebase_to(&foreign), "a frontier from another stream is refused");
+
+        // The real one.
+        let fs = shared.frontier_state_at(oldest).expect("the shared tree serves a frontier at any size");
+        assert!(wallet.rebase_to(&fs));
+        assert_eq!(wallet.base_size(), oldest);
+        hashed.advance_base_capped(oldest, u64::MAX);
+        assert_eq!(hashed.base_size(), oldest);
+        assert_eq!(wallet.base_frontier, hashed.base_frontier, "same base frontier as hashing the prefix");
+        assert_eq!(wallet.leaves.len(), hashed.leaves.len());
+        assert_eq!(wallet.anchor(), anchor, "tip anchor unchanged");
+        let after = wallet.witness_paths_at(&positions, wallet.size());
+        for (a, b) in before.iter().zip(after.iter()) {
+            let (a, b) = (a.as_ref().unwrap(), b.as_ref().unwrap());
+            assert_eq!(a.auth_path(), b.auth_path());
+            assert_eq!(a.position(), b.position());
+        }
+        // Both notes still witness from the shared tree too.
+        assert!(shared.witness_paths_at(&positions, wallet.size()).iter().all(Option::is_some));
+        // A checkpoint round trip keeps the rolled base.
+        let back = WalletDb::from_checkpoint(mine, &wallet.to_checkpoint()).unwrap();
+        assert_eq!(back.base_size(), oldest);
+        assert_eq!(back.notes().len(), 2);
+    }
+
+    /// `witness_for` builds, from the subtree cache alone, exactly the witness a full replay
+    /// builds — for every position against many tip sizes, including a tip inside the note's
+    /// own window, on a power-of-two boundary, and one leaf past the note.
+    #[test]
+    fn witness_from_the_cache_equals_the_replayed_witness() {
+        let nobody = [253u8; 32];
+        let mut shared = WalletDb::from_seed(nobody).unwrap();
+        shared.set_leaves_only(true);
+        for b in 0..300u32 {
+            shared.ingest_block(&[coinbase_for(address_of([(b % 250 + 1) as u8; 32]), &b.to_le_bytes(), 9)], &[]);
+        }
+        shared.build_subtree_cache();
+        let leaves: Vec<MerkleHashOrchard> = shared.leaves.clone();
+        let size = shared.size();
+        let mut checked = 0;
+        for p in [0u64, 1, 2, 3, 7, 15, 16, 17, 31, 63, 64, 100, 127, 128, 200, 255, 256, 290] {
+            if p + 1 >= size {
+                continue;
+            }
+            for n in [p + 1, p + 2, p + 16, 128, 256, 257, 299, size] {
+                if n <= p || n > size {
+                    continue;
+                }
+                let mut t = CommitmentTree::<MerkleHashOrchard, TREE_DEPTH>::empty();
+                for l in &leaves[..=p as usize] {
+                    t.append(*l).unwrap();
+                }
+                let mut replay = IncrementalWitness::from_tree(t).unwrap();
+                for l in &leaves[p as usize + 1..n as usize] {
+                    replay.append(*l).unwrap();
+                }
+                let built = shared.witness_for(p, n).unwrap_or_else(|| panic!("no witness for p={p} n={n}"));
+                assert_eq!(built.root(), replay.root(), "root p={p} n={n}");
+                assert_eq!(built.path().unwrap().path_elems(), replay.path().unwrap().path_elems(), "path p={p} n={n}");
+                // And it keeps tracking: both advance identically from here.
+                let (mut a, mut b) = (built.clone(), replay.clone());
+                for l in &leaves[n as usize..size as usize] {
+                    a.append(*l).unwrap();
+                    b.append(*l).unwrap();
+                }
+                assert_eq!(a.root(), b.root(), "advanced root p={p} n={n}");
+                assert_eq!(a.path().unwrap().path_elems(), b.path().unwrap().path_elems(), "advanced path p={p} n={n}");
+                checked += 1;
+            }
+        }
+        assert!(checked > 80, "checked {checked}");
+    }
+
+    /// A hosted wallet holding an old note drops EVERY leaf once the shared tree hands it a
+    /// witness for each note: the notes stay spendable (not stranded), the witnesses root at
+    /// the anchor, a checkpoint keeps them, they keep tracking new blocks, and a receipt
+    /// carries them. A forged witness (another stream) or a missing one is refused.
+    #[test]
+    fn a_wallet_drops_all_leaves_on_shared_tree_witnesses() {
+        let mine = [254u8; 32];
+        let nobody = [253u8; 32];
+        let mut wallet = WalletDb::from_seed(mine).unwrap();
+        let mut shared = WalletDb::from_seed(nobody).unwrap();
+        shared.set_leaves_only(true);
+        let block = |b: u32| {
+            let r = if b == 2 || b == 140 { address_of(mine) } else { address_of([(b % 250 + 1) as u8; 32]) };
+            [coinbase_for(r, &b.to_le_bytes(), 1_000 + b as u64)]
+        };
+        for b in 0..300u32 {
+            wallet.ingest_block(&block(b), &[]);
+            shared.ingest_block(&block(b), &[]);
+        }
+        shared.build_subtree_cache();
+        let positions = wallet.held_positions();
+        assert_eq!(positions.len(), 2);
+        assert!(positions[0] < 5, "an old note pins the base today");
+        let size = wallet.size();
+        let anchor = wallet.anchor();
+        let fs = shared.frontier_state_at(size).unwrap();
+        let ws: Vec<_> = positions.iter().map(|&p| (p, shared.witness_for(p, size).unwrap())).collect();
+
+        // Missing one: refused.
+        assert!(!wallet.adopt_witnesses_dropping_leaves(&fs, ws[..1].to_vec()));
+        // A witness for the right position from another stream: refused.
+        let mut other = WalletDb::from_seed(nobody).unwrap();
+        other.set_leaves_only(true);
+        for b in 0..300u32 {
+            other.ingest_block(&[coinbase_for(address_of([7u8; 32]), &(b + 9_000).to_le_bytes(), 5)], &[]);
+        }
+        other.build_subtree_cache();
+        let forged = vec![ws[0].clone(), (positions[1], other.witness_for(positions[1], size).unwrap())];
+        assert!(!wallet.adopt_witnesses_dropping_leaves(&fs, forged));
+        assert!(!wallet.leaves.is_empty(), "nothing changed on refusal");
+
+        assert!(wallet.adopt_witnesses_dropping_leaves(&fs, ws));
+        assert!(wallet.leaves.is_empty(), "no leaf held");
+        assert_eq!(wallet.base_size(), size);
+        assert_eq!(wallet.anchor(), anchor);
+        assert!(wallet.stranded_notes().is_empty(), "notes below the base carry witnesses");
+        assert_eq!(wallet.notes().len(), 2);
+        let from_shared = shared.witness_paths_at(&positions, size);
+        for (i, &p) in positions.iter().enumerate() {
+            let own = wallet.live_witness_path(p, size).expect("live witness");
+            assert_eq!(own.auth_path(), from_shared[i].as_ref().unwrap().auth_path());
+        }
+        // Checkpoint round trip.
+        let mut back = WalletDb::from_checkpoint(mine, &wallet.to_checkpoint()).unwrap();
+        assert_eq!(back.base_size(), size);
+        assert!(back.stranded_notes().is_empty());
+        assert!(back.to_scan_receipt([0u8; 32], 1).is_ok(), "a receipt carries the witnesses");
+        // New blocks: the witnesses keep tracking, and the shared tree agrees.
+        for b in 300..340u32 {
+            back.ingest_block(&block(b), &[]);
+            shared.ingest_block(&block(b), &[]);
+        }
+        back.advance_witnesses(back.size());
+        shared.build_subtree_cache();
+        let n2 = back.size();
+        let sh2 = shared.witness_paths_at(&positions, n2);
+        for (i, &p) in positions.iter().enumerate() {
+            let own = back.live_witness_path(p, n2).expect("advanced live witness");
+            assert_eq!(own.auth_path(), sh2[i].as_ref().unwrap().auth_path());
+        }
+        assert_eq!(back.anchor(), shared.anchor());
     }
 
     /// The shared tree keeps serving correct paths after the *wallet* has compacted its
