@@ -320,6 +320,23 @@ fn threads_available() -> usize {
 
 /// Build the Halo 2 proving key now (a few seconds, once per page): called when the wallet is
 /// idle at the tip, so the first payment does not pay for it. Later calls return at once.
+/// Where a gateway page ends, read before it is ingested: `{last, count, reorged}` with `last` the
+/// page's final block in the form `Engine::low` uses (null for an empty page). Lets the browser
+/// ask for the next page while this one is ingested, instead of leaving the network idle.
+/// The index of block `hash_hex` in a gateway page, or -1.
+#[wasm_bindgen]
+pub fn page_index_of(bytes: &[u8], hash_hex: &str) -> Result<i32, JsValue> {
+    let want: [u8; 32] = hex::decode(hash_hex.trim()).ok().and_then(|v| v.try_into().ok()).ok_or_else(|| err("not a 32-byte block hash"))?;
+    let (_, _, blocks) = parse_page(bytes).map_err(err)?;
+    Ok(blocks.iter().position(|b| b.hash == want).map(|i| i as i32).unwrap_or(-1))
+}
+
+#[wasm_bindgen]
+pub fn page_cursor(bytes: &[u8]) -> Result<String, JsValue> {
+    let (_, reorged, blocks) = parse_page(bytes).map_err(err)?;
+    Ok(serde_json::json!({ "last": blocks.last().map(|b| hex::encode(b.hash)), "count": blocks.len(), "reorged": reorged }).to_string())
+}
+
 #[wasm_bindgen]
 pub fn warm_prover() {
     let _ = kaspa_shielded_core::wallet::build::proving_key();
@@ -486,7 +503,18 @@ impl Engine {
 
     /// Ingest a gateway page fetched with `after=low()`. Stops at the tip margin.
     pub fn page(&mut self, bytes: &[u8]) -> Result<String, String> {
-        let (sink, reorged, blocks) = parse_page(bytes)?;
+        self.page_until(bytes, None)
+    }
+
+    /// [`Engine::page`], ingesting only up to and including the block `stop` when the page holds
+    /// it: parallel page streams each end exactly where the next one starts.
+    pub fn page_until(&mut self, bytes: &[u8], stop: Option<[u8; 32]>) -> Result<String, String> {
+        let (sink, reorged, mut blocks) = parse_page(bytes)?;
+        if let Some(stop) = stop {
+            if let Some(i) = blocks.iter().position(|b| b.hash == stop) {
+                blocks.truncate(i + 1);
+            }
+        }
         if reorged {
             return Err("reorged: the cursor is no longer on the selected chain".into());
         }
@@ -557,6 +585,12 @@ impl Engine {
     /// See [`Engine::page`].
     pub fn ingest_page(&mut self, bytes: &[u8]) -> Result<String, JsValue> {
         self.page(bytes).map_err(err)
+    }
+
+    /// [`Engine::ingest_page`] up to and including block `stop_hex` (the whole page when absent).
+    pub fn ingest_page_until(&mut self, bytes: &[u8], stop_hex: &str) -> Result<String, JsValue> {
+        let stop: [u8; 32] = hex::decode(stop_hex.trim()).ok().and_then(|v| v.try_into().ok()).ok_or_else(|| err("stop must be a 32-byte block hash"))?;
+        self.page_until(bytes, Some(stop)).map_err(err)
     }
 
     /// This wallet's tree frontier at `low()`, as the gateway's /tree answers it — for the

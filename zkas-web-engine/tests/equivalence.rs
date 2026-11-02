@@ -92,6 +92,54 @@ fn segment_blocks_match_walletd_and_three_segments_rebuild_the_published_frontie
     assert_eq!(back.tip_frontier(), before);
 }
 
+/// Parallel page streams: the browser fetches the range in several streams at once, each ending
+/// exactly where the next one starts (a block in the middle of a page), and ingests them in order.
+/// The wallet must end with exactly the tree a straight run reaches, the segment's signed frontier.
+#[test]
+fn page_streams_that_meet_mid_page_rebuild_the_signed_frontier() {
+    let Some(d) = dir() else { return };
+    let (_, m) = manifest(&d);
+    let genesis = kaspa_rpc_core::RpcHash::from_bytes(kaspa_consensus_core::config::params::MAINNET_PARAMS.genesis.hash.as_bytes());
+    let s = m.segments.iter().find(|s| s.index == 150).expect("segment 150 published");
+    let bytes = std::fs::read(format!("{d}/{}", s.file)).unwrap();
+    let blocks = zkas_walletd::chain_files::decode_segment(&bytes, &genesis, s.index).unwrap();
+    assert!(blocks.len() > 3000);
+    let sink = blocks.last().unwrap().blue_score + 100_000;
+    let page = |from: usize, n: usize| {
+        let end = (from + n).min(blocks.len());
+        zkas_walletd::chain_files::encode_page(
+            &genesis,
+            &kaspa_rpc_core::GetShieldedBlocksResponse { blocks: blocks[from..end].to_vec(), reorged: false, sink_blue_score: sink },
+        )
+    };
+    // Stream A: from the segment start; it must stop at block 1499, inside its second page.
+    // Stream B: the pages after block 1499, to the segment's end.
+    let meet = blocks[1499].hash.to_string();
+    let a2 = page(1000, 1000);
+    assert_eq!(page_index_of(&a2, &meet).unwrap(), 499);
+    assert_eq!(page_index_of(&page(0, 1000), &meet).unwrap(), -1);
+    let fvk = kaspa_shielded_core::walletdb::WalletDb::from_seed([8; 32]).unwrap().fvk().to_bytes();
+    let mut e = Engine::create(&hex::encode(fvk), &serde_json::to_string(&s.from).unwrap(), s.from.daa).unwrap();
+    e.page_until(&page(0, 1000), None).unwrap();
+    e.page_until(&a2, Some(blocks[1499].hash.as_bytes())).unwrap();
+    assert_eq!(e.low(), meet, "stream A ends exactly at the meeting block");
+    let mut at = 1500;
+    while at < blocks.len() {
+        e.page(&page(at, 1000)).unwrap();
+        at += 1000;
+    }
+    assert_eq!(e.low(), s.to.block);
+    let got: serde_json::Value = serde_json::from_str(&e.tip_frontier().expect("own tree")).unwrap();
+    let want = s.to.frontier().unwrap();
+    assert_eq!(got["size"].as_u64().unwrap(), want.size, "every leaf exactly once");
+    assert_eq!(got["leaf"].as_str().map(|x| x.to_string()), want.leaf.map(hex::encode));
+    assert_eq!(got["ommers"].as_array().unwrap().iter().map(|o| o.as_str().unwrap().to_string()).collect::<Vec<_>>(), want.ommers.iter().map(hex::encode).collect::<Vec<_>>());
+    // The page cursor names the last block of a page, as low() does.
+    let c: serde_json::Value = serde_json::from_str(&page_cursor(&page(0, 1000)).unwrap()).unwrap();
+    assert_eq!(c["last"].as_str().unwrap(), blocks[999].hash.to_string());
+    assert_eq!(c["count"], 1000);
+}
+
 #[test]
 fn a_viewing_key_gives_the_address_walletd_gives() {
     // walletd's own answer for this seed (POST /api/wallet/import on 142, 1 Nov).
