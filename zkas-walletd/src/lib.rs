@@ -6608,7 +6608,11 @@ fn snap_from_entry(address: String, e: &WalletEntry, daa_score: u64) -> StatusSn
         // spend paths) — sends work but the first one is slow until this finishes. Lets the
         // UI show "Preparing wallet for fast sends…" instead of a confusing "syncing 100%".
         // Note-heavy wallets skip the eager warm, so they are never reported as warming.
-        warming: e.caught_up && !e.spend_fast_ready,
+        // A wallet holding nothing has nothing to get ready: its matured anchor needs ~600 blocks
+        // (~10 min) past a fresh birthday, and until then a new or just-switched empty wallet
+        // read "Finishing up... before it can pay" with nothing to pay (seen 2 Nov switching a
+        // browser-mode wallet to the Public service; browser mode said "Up to date" at once).
+        warming: e.caught_up && !e.spend_fast_ready && (!e.db.notes().is_empty() || !e.db.pending_spends().is_empty()),
         missing_history: e.blind_below > 0,
         history_from_daa: (e.blind_below > 0 && e.blind_from_daa > 0).then_some(e.blind_from_daa),
         // Whether a spend would be ACCEPTED right now, which is not the same question as
