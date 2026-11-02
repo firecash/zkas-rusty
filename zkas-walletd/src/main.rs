@@ -267,6 +267,11 @@ struct Cli {
     /// `https://` base URL or a local directory with `manifest.json` (see `chain_export`).
     #[arg(long, value_name = "URL_OR_DIR")]
     chain_files: Option<String>,
+    /// Fast checkpoints: persist the shared nullifier table once (`__nullifiers__.nfs` in the
+    /// wallet directory) and store each wallet's bitset over it instead of every nullifier.
+    /// Without it checkpoints keep the full (safe) form; both forms are read either way.
+    #[arg(long)]
+    compact_nullifiers: bool,
     /// Do not build the daemon-wide shared chain tree: every wallet keeps its own, as the
     /// on-device engines (phone, desktop) do. For measuring and running that configuration.
     #[arg(long)]
@@ -410,6 +415,7 @@ async fn run(cli: Cli) {
     if let Some(v) = cli.prefetch_depth.filter(|v| *v > 0) {
         resources.prefetch_depth = v;
     }
+    resources.compact_nullifiers = cli.compact_nullifiers;
     if let Some(v) = cli.chain_files.clone().filter(|v| !v.trim().is_empty()) {
         resources.chain_files = Some(v);
     }

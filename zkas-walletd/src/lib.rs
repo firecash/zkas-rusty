@@ -554,6 +554,11 @@ pub struct ResourceLimits {
     /// holding `manifest.json` and the 12-hour segments. Pages they cover are read from them
     /// instead of the node. `None` (the default) reads everything from the node.
     pub chain_files: Option<String>,
+    /// Fast checkpoints (`--compact-nullifiers`): the shared nullifier table is persisted once
+    /// in the wallet directory and each checkpoint stores its wallet's bitset over it instead
+    /// of every nullifier (see `WalletDb::set_compact_nullifier_checkpoints`). Off = the safe
+    /// full form. Either setting reads both forms.
+    pub compact_nullifiers: bool,
     /// Seconds before a wallet that has advanced is checkpointed on the TIME rule.
     ///
     /// The built-in 60 was chosen for a phone: the comment on `CHECKPOINT_INTERVAL` is about
@@ -620,6 +625,7 @@ impl Default for ResourceLimits {
             subtree_free_floor_mb: 1_200,
             prefetch_depth: 1,
             chain_files: None,
+            compact_nullifiers: false,
             checkpoint_interval_secs: 60,
             catchup_checkpoint_interval_secs: 0,
         }
@@ -9665,7 +9671,12 @@ async fn sync_loop(state: Arc<AppState>) {
     // Splitting the permits fixes it by construction: a cold wallet can never take a
     // tip wallet's slot, whatever the sort says. The furthest-behind ordering is kept,
     // so cohort formation inside each lane is unchanged.
-    let cold_slots = (sync_concurrency(&state.resources) / 7).clamp(1, 4);
+    // A third of the slots, not a seventh capped at 4. The cap dated from cold wallets each
+    // holding their whole leaf stream (hundreds of MB); hosted wallets now hold no leaves,
+    // and with 6 slots it left ONE cold lane: on 2 Nov the ~12 wallets behind after a restart
+    // took turns in it, each idle >90% of its catch-up (one: 479 s for 54,511 blocks of
+    // which ~25 s was work).
+    let cold_slots = (sync_concurrency(&state.resources) / 3).clamp(1, 12);
     let tip_slots = sync_concurrency(&state.resources).saturating_sub(cold_slots).max(1);
     let sync_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(tip_slots));
     let cold_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(cold_slots));
@@ -14864,8 +14875,36 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
     // Exact same semantics (see `NullifierInterner`); the checkpoint format is unchanged.
     // Only where many wallets share the process; `ZKAS_WALLETD_SHARED_NULLIFIERS=0` opts out.
     if cfg.build_shared_tree && std::env::var("ZKAS_WALLETD_SHARED_NULLIFIERS").as_deref() != Ok("0") {
-        let installed = WalletDb::set_default_nullifier_interner(kaspa_shielded_core::walletdb::NullifierInterner::new());
-        log::info!("shared nullifier interner: {}", if installed { "installed (wallets keep a bitset)" } else { "already installed" });
+        // Persistent when fast checkpoints are on, AND whenever the file exists: a daemon
+        // switched back to the safe form must still read the compact checkpoints it wrote.
+        let path = std::path::Path::new(&wallet_dir).join("__nullifiers__.nfs");
+        let interner = if cfg.resources.compact_nullifiers || path.exists() {
+            let t0 = std::time::Instant::now();
+            match kaspa_shielded_core::walletdb::NullifierInterner::open_persistent(&path) {
+                Ok(i) => {
+                    log::info!("nullifier table: {} entries from __nullifiers__.nfs in {:.1?}", i.len(), t0.elapsed());
+                    i
+                }
+                Err(e) => {
+                    // Set aside, never deleted; checkpoints that named it rescan (they refuse to load).
+                    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+                    let aside = path.with_extension(format!("nfs.bad-{stamp}"));
+                    log::error!("nullifier table unreadable ({e}); moved to __nullifiers__.nfs.bad-{stamp} and starting a new one");
+                    let _ = std::fs::rename(&path, &aside);
+                    kaspa_shielded_core::walletdb::NullifierInterner::open_persistent(&path)
+                        .unwrap_or_else(|_| kaspa_shielded_core::walletdb::NullifierInterner::new())
+                }
+            }
+        } else {
+            kaspa_shielded_core::walletdb::NullifierInterner::new()
+        };
+        let installed = WalletDb::set_default_nullifier_interner(interner);
+        WalletDb::set_compact_nullifier_checkpoints(cfg.resources.compact_nullifiers);
+        log::info!(
+            "shared nullifier interner: {}; checkpoints store {}",
+            if installed { "installed (wallets keep a bitset)" } else { "already installed" },
+            if cfg.resources.compact_nullifiers { "the bitset (fast, --compact-nullifiers)" } else { "every nullifier (safe)" },
+        );
     }
     // v11 checkpoints reference the shared chain tree, so they exist only where one does.
     let shared_leaves = cfg.resources.shared_leaf_store && cfg.build_shared_tree;

@@ -287,11 +287,123 @@ impl ScanCost {
 #[derive(Default)]
 pub struct NullifierInterner {
     ids: std::sync::RwLock<HashMap<[u8; 32], u32>>,
+    /// Set by [`Self::open_persistent`]: the table is also an append-only file, so ids are
+    /// stable across restarts and a checkpoint can store a wallet's BITSET instead of its
+    /// nullifiers (see [`WalletDb::set_compact_nullifier_checkpoints`]).
+    log: Option<std::sync::Mutex<NfLog>>,
 }
+
+/// The on-disk side of a persistent [`NullifierInterner`].
+///
+/// File: `ZKNF`, a format byte, a random 16-byte epoch, then 32-byte nullifiers in id order.
+/// A compact checkpoint names the epoch and how many entries it relies on; a file recreated
+/// (new epoch) or shorter than that makes the checkpoint refuse to load, never misread.
+struct NfLog {
+    file: std::fs::File,
+    epoch: [u8; 16],
+    /// Entries on disk (fsynced).
+    persisted: u64,
+    /// Interned since the last [`NullifierInterner::sync`], in id order.
+    pending: Vec<[u8; 32]>,
+}
+
+const NF_LOG_MAGIC: &[u8; 4] = b"ZKNF";
+const NF_LOG_HEADER: usize = 4 + 1 + 16;
 
 impl NullifierInterner {
     pub fn new() -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self::default())
+    }
+
+    /// An interner backed by the append-only file at `path`, created if missing. A torn final
+    /// record (a crash mid-append) is cut off; anything else malformed is an error, and the
+    /// caller decides (the daemon moves the file aside and starts a new epoch, which only costs
+    /// the compact checkpoints that named the old one a rescan).
+    pub fn open_persistent(path: &std::path::Path) -> std::io::Result<std::sync::Arc<Self>> {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let bad = |m: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{}: {m}", path.display()));
+        let mut file = std::fs::OpenOptions::new().read(true).append(true).create(true).open(path)?;
+        let len = file.metadata()?.len();
+        let mut map = HashMap::new();
+        let epoch;
+        if len == 0 {
+            // Unique, not secret: two randomly keyed std hashers over the time and pid.
+            let mut e = [0u8; 16];
+            for (i, half) in e.chunks_exact_mut(8).enumerate() {
+                use std::hash::{BuildHasher, Hasher};
+                let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+                h.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos()));
+                h.write_u32(std::process::id());
+                h.write_usize(i);
+                half.copy_from_slice(&h.finish().to_le_bytes());
+            }
+            let mut h = Vec::with_capacity(NF_LOG_HEADER);
+            h.extend_from_slice(NF_LOG_MAGIC);
+            h.push(1);
+            h.extend_from_slice(&e);
+            file.write_all(&h)?;
+            file.sync_all()?;
+            epoch = e;
+        } else {
+            let mut buf = Vec::with_capacity(len as usize);
+            file.seek(SeekFrom::Start(0))?;
+            file.read_to_end(&mut buf)?;
+            if buf.len() < NF_LOG_HEADER || &buf[..4] != NF_LOG_MAGIC || buf[4] != 1 {
+                return Err(bad("not a nullifier table"));
+            }
+            epoch = buf[5..NF_LOG_HEADER].try_into().expect("16 bytes");
+            let body = &buf[NF_LOG_HEADER..];
+            let whole = body.len() / 32 * 32;
+            map.reserve(whole / 32);
+            for c in body[..whole].chunks_exact(32) {
+                let nf: [u8; 32] = c.try_into().expect("32 bytes");
+                let id = u32::try_from(map.len()).map_err(|_| bad("too many entries"))?;
+                if map.insert(nf, id).is_some() {
+                    return Err(bad("duplicate entry"));
+                }
+            }
+            if whole != body.len() {
+                file.set_len((NF_LOG_HEADER + whole) as u64)?;
+                file.sync_all()?;
+            }
+        }
+        let persisted = map.len() as u64;
+        Ok(std::sync::Arc::new(Self {
+            ids: std::sync::RwLock::new(map),
+            log: Some(std::sync::Mutex::new(NfLog { file, epoch, persisted, pending: Vec::new() })),
+        }))
+    }
+
+    /// Whether ids survive a restart (see [`Self::open_persistent`]).
+    pub fn is_persistent(&self) -> bool {
+        self.log.is_some()
+    }
+
+    /// Append everything interned so far to the file and fsync it. Returns the epoch and the
+    /// number of entries now on disk: every id below that count is durable.
+    pub fn sync(&self) -> std::io::Result<Option<([u8; 16], u64)>> {
+        use std::io::Write;
+        let Some(log) = &self.log else { return Ok(None) };
+        let mut l = log.lock().unwrap_or_else(|e| e.into_inner());
+        if !l.pending.is_empty() {
+            let mut buf = Vec::with_capacity(l.pending.len() * 32);
+            for nf in &l.pending {
+                buf.extend_from_slice(nf);
+            }
+            l.file.write_all(&buf)?;
+            l.file.sync_data()?;
+            l.persisted += l.pending.len() as u64;
+            l.pending.clear();
+        }
+        Ok(Some((l.epoch, l.persisted)))
+    }
+
+    /// Epoch and entries on disk, without writing.
+    fn persisted(&self) -> Option<([u8; 16], u64)> {
+        self.log.as_ref().map(|l| {
+            let l = l.lock().unwrap_or_else(|e| e.into_inner());
+            (l.epoch, l.persisted)
+        })
     }
 
     fn get(&self, nf: &[u8; 32]) -> Option<u32> {
@@ -303,8 +415,16 @@ impl NullifierInterner {
             return id;
         }
         let mut w = self.ids.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(&id) = w.get(nf) {
+            return id;
+        }
         let next = u32::try_from(w.len()).expect("fewer than 2^32 distinct nullifiers");
-        *w.entry(*nf).or_insert(next)
+        w.insert(*nf, next);
+        // Under the write lock, so the log's order IS id order.
+        if let Some(log) = &self.log {
+            log.lock().unwrap_or_else(|e| e.into_inner()).pending.push(*nf);
+        }
+        next
     }
 
     /// Distinct nullifiers interned so far.
@@ -324,6 +444,9 @@ impl NullifierInterner {
 }
 
 static DEFAULT_NF_INTERNER: std::sync::OnceLock<std::sync::Arc<NullifierInterner>> = std::sync::OnceLock::new();
+
+/// Write compact nullifier sections (see [`WalletDb::set_compact_nullifier_checkpoints`]).
+static COMPACT_NF_CHECKPOINTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// A wallet's applied-nullifier set as a bitset over a shared [`NullifierInterner`].
 #[derive(Clone)]
@@ -354,6 +477,11 @@ impl SharedNfSet {
             self.bits[word] |= bit;
             self.count += 1;
         }
+    }
+
+    /// One past the highest id set (0 when empty).
+    fn max_id_bound(&self) -> u64 {
+        self.bits.iter().rposition(|&w| w != 0).map_or(0, |i| i as u64 * 64 + (64 - self.bits[i].leading_zeros() as u64))
     }
 
     /// Every member, as nullifier bytes (order unspecified, like the private `HashSet`).
@@ -3000,6 +3128,21 @@ impl WalletDb {
         DEFAULT_NF_INTERNER.set(i).is_ok()
     }
 
+    /// Fast mode for a multi-wallet daemon: checkpoints store the wallet's applied-nullifier
+    /// set as a bitset over a PERSISTENT interner (versions 12/13) instead of every nullifier.
+    ///
+    /// On the hosted daemon that list was ~43% of every checkpoint (up to 8.2 M nullifiers,
+    /// 260 MB) and all of it public chain data held 3,500 times; with it, each checkpoint
+    /// write and load moved hundreds of MB. Same membership, exactly: the bitset is the set.
+    /// Takes effect only for wallets sharing a persistent interner; any other wallet, or a
+    /// failure to make the interner durable, writes the full form as before. Reading accepts
+    /// both forms whatever this is set to, so turning it off and restarting is the way back
+    /// (each wallet is rewritten in full on its next checkpoint). A build older than this one
+    /// refuses 12/13 blobs, so roll back only after a run with this off.
+    pub fn set_compact_nullifier_checkpoints(on: bool) {
+        COMPACT_NF_CHECKPOINTS.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// The interner installed by [`Self::set_default_nullifier_interner`], if any.
     pub fn default_nullifier_interner() -> Option<std::sync::Arc<NullifierInterner>> {
         DEFAULT_NF_INTERNER.get().cloned()
@@ -4032,7 +4175,29 @@ impl WalletDb {
         let n_shared = usize::try_from(shared_upto.saturating_sub(self.base_size)).unwrap_or(usize::MAX).min(self.leaves.len());
         let inline = &self.leaves[n_shared..];
         let mut out = Vec::with_capacity(64 + inline.len() * 32 + self.notes.len() * 123);
-        out.push(if n_shared > 0 { CHECKPOINT_VERSION_V11 } else { CHECKPOINT_VERSION });
+        // Compact nullifiers need every id this wallet holds to be on disk BEFORE the blob that
+        // names them: sync first, then refuse the compact form if any bit lies past it.
+        let compact = match &self.nf_shared {
+            Some(sh) if COMPACT_NF_CHECKPOINTS.load(std::sync::atomic::Ordering::Relaxed) && sh.interner.is_persistent() => {
+                // Whichever is smaller: the bitset spans every id in the table (~1 MB at 8 M
+                // chain nullifiers), so a young wallet's short list can be the smaller form.
+                if sh.max_id_bound().div_ceil(8) >= (sh.count as u64) * 32 {
+                    None
+                } else {
+                    match sh.interner.sync() {
+                        Ok(Some((epoch, durable))) if sh.max_id_bound() <= durable => Some((epoch, durable)),
+                        _ => None,
+                    }
+                }
+            }
+            _ => None,
+        };
+        out.push(match (n_shared > 0, compact.is_some()) {
+            (false, false) => CHECKPOINT_VERSION,
+            (true, false) => CHECKPOINT_VERSION_V11,
+            (false, true) => CHECKPOINT_VERSION_V12,
+            (true, true) => CHECKPOINT_VERSION_V13,
+        });
         // Fast-sync base: absolute base size, then the base frontier (empty ⇒ tag 0).
         out.extend_from_slice(&self.base_size.to_le_bytes());
         write_frontier(&mut out, &self.base_frontier);
@@ -4076,6 +4241,18 @@ impl WalletDb {
         // already canonical and costs nothing.
         out.extend_from_slice(&(self.nf_len() as u64).to_le_bytes());
         match &self.nf_shared {
+            Some(sh) if compact.is_some() => {
+                // v12/v13: epoch, the entries this relies on, then the bitset (trailing zero
+                // words dropped).
+                let (epoch, durable) = compact.expect("checked");
+                out.extend_from_slice(&epoch);
+                out.extend_from_slice(&durable.to_le_bytes());
+                let words = sh.bits.iter().rposition(|&w| w != 0).map_or(0, |i| i + 1);
+                out.extend_from_slice(&(words as u64).to_le_bytes());
+                for w in &sh.bits[..words] {
+                    out.extend_from_slice(&w.to_le_bytes());
+                }
+            }
             None => {
                 // Sorted run first (already in order), then the few recent ones sorted: a
                 // restore then finds the list ordered and needs no sort (see `NfTable::load`).
@@ -4207,7 +4384,13 @@ impl WalletDb {
         // v3 blobs are still accepted so that shipping v4 does not force every live
         // wallet into a full rescan; they simply pay the old O(N) tree rebuild once and
         // are rewritten as v4 by the next checkpoint.
-        let version = r.u8()?;
+        let raw_version = r.u8()?;
+        // 12/13 are 10/11 with a compact nullifier section; every other gate reads the layout.
+        let (version, compact_nfs) = match raw_version {
+            CHECKPOINT_VERSION_V12 => (CHECKPOINT_VERSION, true),
+            CHECKPOINT_VERSION_V13 => (CHECKPOINT_VERSION_V11, true),
+            v => (v, false),
+        };
         if !(CHECKPOINT_VERSION_V3..=CHECKPOINT_VERSION_V11).contains(&version) {
             return None;
         }
@@ -4295,7 +4478,33 @@ impl WalletDb {
             db.notes.push(note);
         }
         let n_nfs = r.u64()? as usize;
-        if db.nf_shared.is_some() {
+        if compact_nfs {
+            // Only against the same persistent table, holding at least what the writer relied on.
+            let epoch = r.arr::<16>()?;
+            let durable = r.u64()?;
+            let words = r.u64()? as usize;
+            if words > r.remaining() / 8 || (words as u64) * 64 > durable.div_ceil(64) * 64 {
+                return None;
+            }
+            let sh = db.nf_shared.as_mut()?;
+            let (have_epoch, have) = sh.interner.persisted()?;
+            if have_epoch != epoch || have < durable {
+                return None;
+            }
+            let mut bits = Vec::with_capacity(words);
+            for _ in 0..words {
+                bits.push(r.u64()?);
+            }
+            let count: usize = bits.iter().map(|w| w.count_ones() as usize).sum();
+            if count != n_nfs {
+                return None;
+            }
+            sh.bits = bits;
+            sh.count = count;
+            if sh.max_id_bound() > durable {
+                return None;
+            }
+        } else if db.nf_shared.is_some() {
             for _ in 0..n_nfs {
                 let nf = r.arr::<32>()?;
                 db.nf_insert(&nf);
@@ -5237,6 +5446,10 @@ const CHECKPOINT_VERSION: u8 = 10;
 /// blob read with no source, or a source that cannot serve the range, is REFUSED rather than
 /// restored with a hole in its stream.
 const CHECKPOINT_VERSION_V11: u8 = 11;
+/// v10 with a compact nullifier section (see [`WalletDb::set_compact_nullifier_checkpoints`]).
+const CHECKPOINT_VERSION_V12: u8 = 12;
+/// v11 with a compact nullifier section.
+const CHECKPOINT_VERSION_V13: u8 = 13;
 
 /// Supplies the leaves a v11 checkpoint references (see [`CHECKPOINT_VERSION_V11`]).
 ///
@@ -7504,6 +7717,106 @@ mod tests {
         }
         assert!(interner.len() >= 400);
         assert!(moved.approx_heap_bytes() < rp.approx_heap_bytes(), "the bitset is smaller than the table");
+    }
+
+    /// Fast checkpoints (versions 12/13): the bitset over a persistent table restores exactly
+    /// the same set, survives a restart of the table, refuses a recreated or short table, and
+    /// switching the mode off writes the full form again.
+    #[test]
+    fn compact_nullifier_checkpoints_restore_the_same_set_or_refuse() {
+        let dir = std::env::temp_dir().join(format!("zkas-nfs-{}-{:?}", std::process::id(), std::thread::current().id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("__nullifiers__.nfs");
+        let nf = |i: u64| -> [u8; 32] {
+            let mut b = [0u8; 32];
+            b[..8].copy_from_slice(&i.to_le_bytes());
+            b[9] = 0x3c;
+            b
+        };
+        let mine = [5u8; 32];
+        let interner = NullifierInterner::open_persistent(&path).unwrap();
+        let mut private = WalletDb::from_seed(mine).unwrap();
+        let mut shared = WalletDb::from_seed(mine).unwrap();
+        shared.share_nullifiers(&interner);
+        // Another wallet interns ids first, so this wallet's ids are not 0..n.
+        let mut other = WalletDb::from_seed([6u8; 32]).unwrap();
+        other.share_nullifiers(&interner);
+        for i in 1000..1200u64 {
+            other.ingest_block_compact_with_meta(&[], &[vec![nf_rec(i, nf(i))]], None);
+        }
+        for i in 0..300u64 {
+            private.ingest_block_compact_with_meta(&[], &[vec![nf_rec(i, nf(i))]], None);
+            shared.ingest_block_compact_with_meta(&[], &[vec![nf_rec(i, nf(i))]], None);
+        }
+        let full = shared.to_checkpoint();
+        assert_eq!(full[0], CHECKPOINT_VERSION, "mode off: the full form");
+        WalletDb::set_compact_nullifier_checkpoints(true);
+        let blob = shared.to_checkpoint();
+        WalletDb::set_compact_nullifier_checkpoints(false);
+        assert_eq!(blob[0], CHECKPOINT_VERSION_V12);
+        assert!(blob.len() + 300 * 32 - 200 < full.len(), "compact {} vs full {}", blob.len(), full.len());
+
+        let restore = |interner: &std::sync::Arc<NullifierInterner>, bytes: &[u8]| {
+            let mut db = WalletDb::from_seed(mine).unwrap();
+            db.share_nullifiers(interner);
+            WalletDb::restore(db, bytes, None, None)
+        };
+        let check = |db: &WalletDb| {
+            assert_eq!(db.nf_len(), 300);
+            for i in (0..300u64).chain(1000..1200).chain(5000..5010) {
+                assert_eq!(db.nf_contains(&nf(i)), private.nf_contains(&nf(i)), "membership of {i}");
+            }
+            assert_eq!(db.anchor(), private.anchor());
+            assert_eq!(db.size(), private.size());
+        };
+        let mut back = restore(&interner, &blob).expect("same table");
+        check(&back);
+        // A repeat poisons it exactly as it poisons the private set.
+        back.ingest_block_compact_with_meta(&[], &[vec![nf_rec(9_999, nf(7))]], None);
+        assert!(back.poisoned());
+
+        // The table reopened from disk (a restart): same epoch, same ids.
+        drop(other);
+        let reopened = NullifierInterner::open_persistent(&path).unwrap();
+        assert_eq!(reopened.len(), 500);
+        check(&restore(&reopened, &blob).expect("reopened table"));
+
+        // Mode off again: a compact-loaded wallet writes the full form, readable without any table.
+        let again = restore(&reopened, &blob).unwrap();
+        let full_again = again.to_checkpoint();
+        assert_eq!(full_again[0], CHECKPOINT_VERSION);
+        let privately = WalletDb::from_checkpoint(mine, &full_again).unwrap();
+        assert_eq!(privately.spent_nullifiers, WalletDb::from_checkpoint(mine, &private.to_checkpoint()).unwrap().spent_nullifiers);
+
+        // A torn final record is cut off, nothing else changes.
+        {
+            use std::io::Write;
+            std::fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(&[1, 2, 3, 4, 5]).unwrap();
+        }
+        let torn = NullifierInterner::open_persistent(&path).unwrap();
+        assert_eq!(torn.len(), 500);
+        check(&restore(&torn, &blob).expect("torn tail cut"));
+
+        // Shorter than the blob relied on: refused.
+        let len = std::fs::metadata(&path).unwrap().len();
+        std::fs::OpenOptions::new().write(true).open(&path).unwrap().set_len(len - 32 * 250).unwrap();
+        let short = NullifierInterner::open_persistent(&path).unwrap();
+        assert!(restore(&short, &blob).is_none(), "a table shorter than the blob needs is refused");
+
+        // Recreated (new epoch): refused, even with every entry present again.
+        std::fs::remove_file(&path).unwrap();
+        let fresh = NullifierInterner::open_persistent(&path).unwrap();
+        let mut warm = WalletDb::from_seed([7u8; 32]).unwrap();
+        warm.share_nullifiers(&fresh);
+        for i in (1000..1200u64).chain(0..300) {
+            warm.ingest_block_compact_with_meta(&[], &[vec![nf_rec(i, nf(i))]], None);
+        }
+        fresh.sync().unwrap();
+        assert!(restore(&fresh, &blob).is_none(), "another table's ids are never trusted");
+        // No table at all: refused.
+        assert!(WalletDb::from_checkpoint(mine, &blob).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
