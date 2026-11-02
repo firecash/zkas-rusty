@@ -2286,7 +2286,8 @@ pub mod alloc_tune {
         }
         #[cfg(target_os = "android")]
         {
-            extern "C" {
+            // SAFETY: declaring bionic's mallopt with its real C signature.
+            unsafe extern "C" {
                 fn mallopt(param: libc::c_int, value: libc::c_int) -> libc::c_int;
             }
             const M_PURGE: libc::c_int = -101;
