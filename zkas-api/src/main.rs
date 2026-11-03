@@ -1415,21 +1415,70 @@ async fn info_halving(State(s): State<Arc<AppState>>) -> impl IntoResponse {
     .into_response()
 }
 
+/// The node's own shielded books (supply turnstile + tree size + spent-nullifier count),
+/// fetched at most every 30 s. These are consensus state, so they survive an explorer
+/// restart; the follower's counters (`agg`) only count what this process has seen.
+async fn node_shielded_books(s: &AppState) -> Option<Value> {
+    static CACHE: std::sync::OnceLock<tokio::sync::Mutex<Option<(std::time::Instant, Value)>>> = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| tokio::sync::Mutex::new(None));
+    let mut slot = cache.lock().await;
+    if let Some((at, v)) = slot.as_ref() {
+        if at.elapsed() < std::time::Duration::from_secs(30) {
+            return Some(v.clone());
+        }
+    }
+    let t = std::time::Duration::from_secs(10);
+    let supply = tokio::time::timeout(t, s.client.get_shielded_supply(None)).await.ok()?.ok()?;
+    // Tree size near the tip: the birthday locator below the current DAA (with no argument
+    // the node answers at its finality point, about a day behind).
+    let daa = tokio::time::timeout(t, s.client.get_block_dag_info()).await.ok()?.ok()?.virtual_daa_score;
+    let req = kaspa_rpc_core::GetShieldedTreeStateRequest { block_hash: None, below_daa_score: Some(daa) };
+    let tree = tokio::time::timeout(t, s.client.get_shielded_tree_state_call(None, req)).await.ok().and_then(|r| r.ok());
+    let v = json!({
+        "asOfDaaScore": supply.daa_score,
+        "poolValue": supply.pool_value.to_string(),
+        "cumulativeCoinbase": supply.cumulative_coinbase.to_string(),
+        "cumulativeFees": supply.cumulative_fees.to_string(),
+        "cumulativeBurns": supply.cumulative_burns.to_string(),
+        "noteCount": tree.as_ref().map(|t| t.size),
+        "noteCountDaaScore": tree.as_ref().map(|t| t.daa_score),
+        "nullifierCount": tree.as_ref().and_then(|t| t.nullifier_count),
+    });
+    *slot = Some((std::time::Instant::now(), v.clone()));
+    Some(v)
+}
+
 async fn info_shielded(State(s): State<Arc<AppState>>) -> impl IntoResponse {
-    // `turnstileIn` is the value minted into the shielded pool, which on this chain is
-    // exactly the issued supply — so it comes from the emission schedule for the same
-    // reason `circulatingSupply` does, and the two can never disagree.
-    let turnstile_in = match s.client.get_block_dag_info().await {
+    // `scheduleIn` is the value the emission schedule says has been minted by now; the
+    // node's `cumulativeCoinbase` is what consensus actually minted into the pool. A gap
+    // larger than a block's subsidy or so is what a supply alarm should look at.
+    let schedule_in = match s.client.get_block_dag_info().await {
         Ok(d) => circulating_sompi(&s, d.virtual_daa_score).await,
         Err(_) => 0,
     };
+    let node = node_shielded_books(&s).await;
     let agg = s.shielded.read().await;
+    let from_node = |k: &str| node.as_ref().and_then(|n| n.get(k)).filter(|v| !v.is_null()).cloned();
+    let nullifiers_from_node = from_node("nullifierCount");
+    let notes_from_node = from_node("noteCount");
+    let turnstile_out = node.as_ref().and_then(|n| {
+        let f: u64 = n.get("cumulativeFees")?.as_str()?.parse().ok()?;
+        let b: u64 = n.get("cumulativeBurns")?.as_str()?.parse().ok()?;
+        Some((f + b).to_string())
+    });
     Json(json!({
         "anchor": if agg.state_root.is_empty() { Value::Null } else { json!(agg.state_root) },
-        "nullifierCount": agg.nullifier_count,
-        "noteCount": agg.note_count,
-        "turnstileIn": turnstile_in.to_string(),
-        "turnstileOut": "0",
+        // From the node when it can say (tree size; spent-nullifier count from v1.0.13
+        // nodes). Otherwise this explorer's own counts, which restart with the service:
+        // the *Source fields say which one a client is reading.
+        "nullifierCount": nullifiers_from_node.clone().unwrap_or(json!(agg.nullifier_count)),
+        "nullifierCountSource": if nullifiers_from_node.is_some() { "node" } else { "explorer-since-restart" },
+        "noteCount": notes_from_node.clone().unwrap_or(json!(agg.note_count)),
+        "noteCountSource": if notes_from_node.is_some() { "node" } else { "estimate" },
+        "turnstileIn": node.as_ref().and_then(|n| n.get("cumulativeCoinbase").cloned()).unwrap_or(json!(schedule_in.to_string())),
+        "turnstileOut": turnstile_out.map(Value::String).unwrap_or(Value::Null),
+        "scheduleIn": schedule_in.to_string(),
+        "supply": node.unwrap_or(Value::Null),
         "emissionPerBlock": agg.emission_per_block_fc,
         "blueScore": agg.blue_score.to_string(),
     }))
@@ -1451,8 +1500,10 @@ async fn info_marketdata() -> impl IntoResponse {
 }
 
 async fn transactions_count(State(s): State<Arc<AppState>>) -> impl IntoResponse {
-    // Approximate: one coinbase per block; regular ≈ ingested shielded spends.
-    let (blue_score, nullifiers) = {
+    // `coinbase` approximates one coinbase per block. There is no chain-wide count of
+    // regular transactions: the follower's counter counts shielded ACTIONS since this
+    // service started, so it is published under that name, never as `regular`.
+    let (blue_score, actions) = {
         let agg = s.shielded.read().await;
         (agg.blue_score, agg.nullifier_count)
     };
@@ -1460,7 +1511,8 @@ async fn transactions_count(State(s): State<Arc<AppState>>) -> impl IntoResponse
         "timestamp": now_secs() * 1000,
         "dateTime": "",
         "coinbase": blue_score,
-        "regular": nullifiers,
+        "regular": Value::Null,
+        "shieldedActionsSinceRestart": actions,
     }))
 }
 

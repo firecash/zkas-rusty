@@ -3442,6 +3442,14 @@ fn decode_block(b: &kaspa_rpc_core::RpcShieldedChainBlock) -> Result<DecodedBloc
 /// not answer (pruned, or too old to carry `accepted_txids`) — which callers must treat as
 /// "unknown", never as "accepted".
 async fn accepted_txids_at(client: &GrpcClient, chain: RpcHash, daa: u64) -> Option<Vec<[u8; 32]>> {
+    Some(accepted_at(client, chain, daa).await?.into_iter().map(|(t, _)| t).collect())
+}
+
+/// [`accepted_txids_at`] with each accepted transaction's compact action records
+/// (concatenated 148-byte records, parallel to the txids by the RPC's contract). Unlike a
+/// block body these never leave a node's shielded store, so they still answer after the
+/// body is pruned (`/api/proof/verify` falls back to them for recipient and amount).
+async fn accepted_at(client: &GrpcClient, chain: RpcHash, daa: u64) -> Option<Vec<([u8; 32], Vec<u8>)>> {
     let req = kaspa_rpc_core::GetShieldedTreeStateRequest { block_hash: None, below_daa_score: Some(daa) };
     let prev = tokio::time::timeout(SYNC_RPC_TIMEOUT, client.get_shielded_tree_state_call(None, req)).await.ok()?.ok()?;
     let page = tokio::time::timeout(SYNC_RPC_TIMEOUT, client.get_shielded_blocks(prev.block_hash, 1)).await.ok()?.ok()?;
@@ -3450,7 +3458,8 @@ async fn accepted_txids_at(client: &GrpcClient, chain: RpcHash, daa: u64) -> Opt
     if b.accepted_txids.is_empty() {
         return None;
     }
-    Some(b.accepted_txids.iter().map(|h| h.as_bytes()).collect())
+    let mut actions = b.accepted_actions.into_iter();
+    Some(b.accepted_txids.iter().map(|h| (h.as_bytes(), actions.next().unwrap_or_default())).collect())
 }
 
 /// The full shielded bundle of `txid`, **which chain block `chain` accepted**.
@@ -11155,11 +11164,21 @@ async fn proof_verify(
     let chain = chain_block_at_daa(&client, proof.daa)
         .await
         .ok_or_else(|| err(StatusCode::BAD_GATEWAY, "the node cannot serve the block this proof names"))?;
-    let Some(bundle) = fetch_bundle_for_tx(&client, chain, &txid).await else {
-        return Ok(Json(serde_json::json!({
-            "valid": false,
-            "reason": "no such transaction in the block this proof names",
-        })));
+    // The full bundle when the node still holds the block body: recipient, amount and the
+    // memo. Otherwise (a pruned node drops bodies after about 30 hours) the transaction's
+    // compact records, which prove recipient and amount but cannot check a memo.
+    let (result, memo_checked) = match fetch_bundle_for_tx(&client, chain, &txid).await {
+        Some(bundle) => (payproof::verify(&proof, &bundle.actions), !proof.memo.is_empty()),
+        None => {
+            let accepted = accepted_at(&client, chain, proof.daa).await;
+            let Some((_, records)) = accepted.as_ref().and_then(|a| a.iter().find(|(t, _)| *t == txid)) else {
+                return Ok(Json(serde_json::json!({
+                    "valid": false,
+                    "reason": "no such transaction in the block this proof names",
+                })));
+            };
+            (payproof::verify_compact(&proof, records), false)
+        }
     };
     let tip = tokio::time::timeout(SYNC_RPC_TIMEOUT, client.get_block_dag_info())
         .await
@@ -11167,7 +11186,8 @@ async fn proof_verify(
         .and_then(|r| r.ok())
         .map(|i| i.virtual_daa_score)
         .unwrap_or(0);
-    match payproof::verify(&proof, &bundle.actions) {
+    let memo_text = (!proof.memo.is_empty()).then(|| String::from_utf8_lossy(&proof.memo).into_owned());
+    match result {
         Ok(()) => Ok(Json(serde_json::json!({
             "valid": true,
             "txid": proof.txid,
@@ -11177,12 +11197,11 @@ async fn proof_verify(
             "amountSompiExact": proof.value.to_string(),
             "amountZkas": proof.value as f64 / SOMPI_PER_ZKAS as f64,
             "recipient": proof.recipient_bytes().map(|r| String::from(&Address::new(state.prefix, Version::ShieldedOrchard, &r))),
-            // NOT verified, and labelled so. The Orchard note commitment binds
-            // (recipient, value, rho, rseed) — the memo lives in `enc_ciphertext`, which
-            // `payproof::verify` never reads. Anyone can take a genuine proof, rewrite this
-            // string, and it still verifies. Returning it beside `"valid": true` under the
-            // same name as the bound fields invited it to be read as attested.
-            "memoUnverified": (!proof.memo.is_empty()).then(|| String::from_utf8_lossy(&proof.memo).into_owned()),
+            // `memo` only when it was checked against the output's ciphertext (bound: an
+            // edited memo fails above). A memo that could not be checked (the node no
+            // longer holds the block body) is returned under a name that says so.
+            "memo": if memo_checked { memo_text.clone() } else { None },
+            "memoUnverified": if memo_checked { None } else { memo_text },
         }))),
         Err(e) => Ok(Json(serde_json::json!({
             "valid": false,
@@ -11190,6 +11209,7 @@ async fn proof_verify(
                 payproof::ProofError::NoSuchAction => "the transaction has no output at that index",
                 payproof::ProofError::Malformed => "the proof is not a well-formed payment disclosure",
                 payproof::ProofError::CommitmentMismatch => "the disclosed recipient/amount do not match what the chain records",
+                payproof::ProofError::MemoMismatch => "the recipient and amount match, but the memo is not the one this payment carried",
             },
         }))),
     }
