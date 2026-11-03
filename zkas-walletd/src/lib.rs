@@ -9281,6 +9281,14 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
     // it, not that we haven't looked yet.
     if e.caught_up {
         let now_daa = e.scanned as u64;
+        // First, any of them the chain HAS spent (its nullifier is in the shared table although
+        // this wallet's scan missed it): gone for good, never handed back as spendable.
+        for (txid, value) in e.db.settle_expired_seen_on_chain(now_daa, PENDING_SPEND_EXPIRY_DAA) {
+            e.force_checkpoint = true;
+            log::warn!(
+                "wallet '{token_p}': submitted spend {} ({value} sompi) is on-chain (its nullifier is in the shared table) though this wallet's scan did not see it — kept as spent, not returned",
+                RpcHash::from_bytes(txid), token_p = log_pseudonym(&token));
+        }
         for (txid, value) in e.db.reclaim_expired(now_daa, PENDING_SPEND_EXPIRY_DAA) {
             e.force_checkpoint = true; // persist the returned note promptly
             log::warn!(

@@ -2084,6 +2084,33 @@ impl WalletDb {
         reclaimed
     }
 
+    /// Expired pending spends that the CHAIN has spent although this wallet's scan never saw
+    /// it: their nullifier is in the process-wide table (see [`NullifierInterner`]), which holds
+    /// only nullifiers some wallet applied from the chain. Such a note is gone for good, so it
+    /// is dropped as spent instead of being handed back by [`Self::reclaim_expired`]: returned,
+    /// it showed as spendable and every payment that picked it was refused "nullifier already
+    /// claimed" (30 Oct, a send declared lost after an hour that had in fact landed). Call it
+    /// right before `reclaim_expired`, with the same arguments. Reports `(txid, value)` per
+    /// note. Does nothing for a wallet with its own private nullifier set.
+    pub fn settle_expired_seen_on_chain(&mut self, now_daa: u64, max_age_daa: u64) -> Vec<([u8; 32], u64)> {
+        let Some(sh) = &self.nf_shared else { return Vec::new() };
+        let landed: Vec<([u8; 32], [u8; 32], u64)> = self
+            .pending_spends
+            .iter()
+            .filter(|p| p.submitted_daa != 0 && now_daa.saturating_sub(p.submitted_daa) > max_age_daa)
+            .filter(|p| sh.interner.get(&p.note.nullifier).is_some())
+            .map(|p| (p.note.nullifier, p.txid, p.note.value()))
+            .collect();
+        let mut pruned = false;
+        landed
+            .into_iter()
+            .map(|(nf, txid, value)| {
+                self.forget_spent_owned(&nf, &mut pruned);
+                (txid, value)
+            })
+            .collect()
+    }
+
     /// Record what a just-submitted spend `txid` sends AWAY (amount + fee), so the
     /// remainder of its parked input notes can be shown as change coming back.
     /// Call right after the [`Self::mark_spent`] calls for that transaction. A no-op
@@ -8782,6 +8809,48 @@ mod circuit_tests {
     /// serves no block metadata, so it has no clock) must NEVER be reclaimed on
     /// age — otherwise the first dated block un-parks a spend that is still in
     /// flight, and the wallet offers a note the network is about to consume.
+    #[test]
+    fn an_expired_spend_the_chain_has_is_dropped_not_returned() {
+        let seed = [78u8; 32];
+        let addr = address_bytes_from_seed(seed).unwrap();
+        let mk = |interner: &std::sync::Arc<NullifierInterner>| {
+            let mut db = WalletDb::from_seed(seed).unwrap();
+            db.share_nullifiers(interner);
+            db.ingest_block_with_meta(&[cb(addr, b"blk1||0", 4_000)], &[], Some(&BlockMeta { coinbase_txid: [1; 32], txids: vec![], timestamp_ms: 1, daa_score: 100 }));
+            db.ingest_block_with_meta(&[cb(addr, b"blk2||0", 6_000)], &[], Some(&BlockMeta { coinbase_txid: [2; 32], txids: vec![], timestamp_ms: 2, daa_score: 110 }));
+            let pos = db.notes()[0].position;
+            let nf = db.notes()[0].nullifier;
+            db.mark_spent(pos, [0xcc; 32], 110);
+            (db, nf)
+        };
+
+        // The chain spent the note (another wallet's scan applied its nullifier) but this
+        // wallet's never did: after the expiry it is dropped as spent, not handed back.
+        let interner = NullifierInterner::new();
+        let (mut db, nf) = mk(&interner);
+        let mut other = WalletDb::from_seed([79u8; 32]).unwrap();
+        other.share_nullifiers(&interner);
+        other.nf_insert(&nf);
+        assert!(db.settle_expired_seen_on_chain(110 + 3_600, 3_600).is_empty(), "not before the expiry");
+        assert_eq!(db.settle_expired_seen_on_chain(111 + 3_600, 3_600), vec![([0xcc; 32], 4_000)]);
+        assert!(db.pending_spends().is_empty());
+        assert!(db.reclaim_expired(111 + 3_600, 3_600).is_empty());
+        assert_eq!(db.balance(), 6_000, "the spent note never comes back");
+
+        // Not on the chain: untouched here, and reclaim_expired returns it as before.
+        let (mut db, _) = mk(&NullifierInterner::new());
+        assert!(db.settle_expired_seen_on_chain(111 + 3_600, 3_600).is_empty());
+        assert_eq!(db.reclaim_expired(111 + 3_600, 3_600), vec![([0xcc; 32], 4_000)]);
+        assert_eq!(db.balance(), 10_000);
+
+        // A wallet with its own private set is never judged by this.
+        let mut private = WalletDb::from_seed(seed).unwrap();
+        private.ingest_block_with_meta(&[cb(addr, b"blk1||0", 4_000)], &[], Some(&BlockMeta { coinbase_txid: [1; 32], txids: vec![], timestamp_ms: 1, daa_score: 100 }));
+        let pos = private.notes()[0].position;
+        private.mark_spent(pos, [0xcc; 32], 100);
+        assert!(private.settle_expired_seen_on_chain(10_000, 3_600).is_empty());
+    }
+
     #[test]
     fn pending_spend_without_a_clock_is_never_age_reclaimed() {
         let seed = [79u8; 32];
