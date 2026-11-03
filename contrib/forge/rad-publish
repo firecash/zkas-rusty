@@ -19,5 +19,18 @@ fi
 if [ "$(git symbolic-ref --short HEAD)" = "$br" ]; then git merge -q --ff-only $new; else git branch -f $br $new; fi
 git push -q rad $br
 git update-ref -d $in
-rad sync --announce 2>&1 | tail -1
+rad sync --announce --seed z6MkrLMMsiPWUcNPHcRajuMi9mDfYckSoJyPwwnknocNYPm7 --seed z6Mkmqogy2qEM2ummccUthFEaaHvyYmYBYh3dbe9W4ebScxo 2>&1 | tail -1
 echo "published $repo $br = ${new:0:8}"
+# zkas.info/code links point at the public seed iris (rosa as backup): confirm both hold the
+# new head of the default branch, so a published link never shows an old tree.
+if [ "$br" = "$(git symbolic-ref --short HEAD)" ]; then
+  rid=$(rad inspect)
+  for host in iris.radicle.network rosa.radicle.network; do
+    ok=""
+    for i in $(seq 1 24); do
+      h=$(curl -s -m 10 "https://$host/api/v1/repos/$rid" | python3 -c "import sys,json;print(json.load(sys.stdin)[\"payloads\"][\"xyz.radicle.project\"][\"meta\"][\"head\"])" 2>/dev/null || true)
+      [ "$h" = "$new" ] && { ok=1; break; }; sleep 5
+    done
+    [ -n "$ok" ] && echo "  $host: up to date" || echo "  WARNING: $host still shows ${h:0:8} after 2 min (zkas.info/code links show it); rerun rad sync --announce"
+  done
+fi
