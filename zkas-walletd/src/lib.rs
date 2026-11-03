@@ -1160,12 +1160,23 @@ fn require_strong_token(token: &str) -> Result<(), (StatusCode, Json<serde_json:
 }
 
 fn token_from(headers: &HeaderMap, allow_default: bool) -> Result<String, (StatusCode, Json<serde_json::Value>)> {
+    token_from_on(headers, allow_default, LISTENS_LOOPBACK_ONLY.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// [`token_from`] for a daemon that listens on loopback only (`loopback`) or not.
+fn token_from_on(headers: &HeaderMap, allow_default: bool, loopback: bool) -> Result<String, (StatusCode, Json<serde_json::Value>)> {
     match headers.get("x-wallet-token") {
-        Some(raw) => raw
-            .to_str()
-            .ok()
-            .and_then(sanitize_token)
-            .ok_or_else(|| err(StatusCode::BAD_REQUEST, "invalid X-Wallet-Token")),
+        Some(raw) => match raw.to_str().ok().and_then(sanitize_token) {
+            // The single-user wallet's name, sent as a token, reaches it on a daemon that listens
+            // only on loopback (the desktop's). On a daemon reachable from outside it is refused:
+            // it passes the edge's token-shape check, and on 142 it read the custodial "default"
+            // wallet's balance, history and addresses (reveal and send were already refused).
+            Some(t) if t == "default" && !loopback => {
+                Err(err(StatusCode::UNAUTHORIZED, "invalid X-Wallet-Token"))
+            }
+            Some(t) => Ok(t),
+            None => Err(err(StatusCode::BAD_REQUEST, "invalid X-Wallet-Token")),
+        },
         None if allow_default => Ok("default".to_string()),
         None => Err(err(StatusCode::UNAUTHORIZED, "missing X-Wallet-Token")),
     }
@@ -3210,9 +3221,10 @@ struct DecodedPage {
     /// Keyed by key id AND the number of leading page actions decided: wallets riding one page
     /// pre-decrypt only its settled prefix, so a memo for one prefix never answers another.
     cohort: std::sync::Mutex<HashMap<([u8; 64], usize), Arc<Vec<kaspa_shielded_core::wallet::ReceivedNote>>>>,
-    /// Read from published chain files, not the node: the digest of the raw blocks, so a page
-    /// that changes a wallet can be compared with the node's answer (`chain_files` rule 2).
-    file_digest: Option<[u8; 32]>,
+    /// Read from published chain files, not the node: the digest of each raw block, so the
+    /// blocks that change a wallet can be compared with the node's (`chain_files` rule 2).
+    /// Per block, so the check fetches only those blocks, not the whole page again.
+    file_digests: Option<Vec<[u8; 32]>>,
 }
 
 /// Derive every coinbase commitment instead of taking the supplied one (the old default).
@@ -4037,7 +4049,7 @@ async fn fetch_shielded_page_traced(
             }
         },
     };
-    let file_digest = served_by_files.then(|| chain_files::blocks_digest(&raw.blocks));
+    let file_digests = served_by_files.then(|| raw.blocks.iter().map(|b| chain_files::blocks_digest(std::slice::from_ref(b))).collect::<Vec<_>>());
     if let Some(f) = files.as_ref() {
         if !served_by_files {
             f.note_sink(raw.sink_blue_score);
@@ -4096,7 +4108,7 @@ async fn fetch_shielded_page_traced(
             low,
             limit,
             cohort: std::sync::Mutex::new(HashMap::new()),
-            file_digest,
+            file_digests,
         });
     let mut c = cache.lock().await;
     // Re-inserting a key must not leave a second copy in the eviction queue. A page
@@ -4980,6 +4992,9 @@ impl WalletEntry {
             // while up to three wallets continue ingesting in parallel.
             let page_low = self.low;
             let before = (self.db.notes().len(), self.db.history().len(), self.db.balance());
+            // Which blocks of a file page changed this wallet: rule 2 confirms exactly those.
+            let mut changed_blocks: Vec<usize> = Vec::new();
+            let track_changes = resp.file_digests.is_some();
             let t_ingest = std::time::Instant::now();
             let (advanced, at_margin) = tokio::task::block_in_place(|| {
                 let mut advanced = false;
@@ -5115,7 +5130,15 @@ impl WalletEntry {
                         timestamp_ms: b.timestamp,
                         daa_score: b.daa_score,
                     });
+                    // A note received or spent moves the count or the newest position (notes are kept
+                    // in position order, so a spend paid back as change still moves it); a history
+                    // row or a confirmed pending spend moves its own count.
+                    let mark = |db: &WalletDb| (db.notes().len(), db.notes().last().map(|n| n.position), db.history().len(), db.pending_spends().len());
+                    let pre = track_changes.then(|| mark(&self.db));
                     self.db.ingest_block_compact_precomputed_with_meta(&b.coinbase, &b.compact, meta.as_ref());
+                    if pre.is_some_and(|m| m != mark(&self.db)) {
+                        changed_blocks.push(i);
+                    }
                     if self.db.poisoned() {
                         // A repeated nullifier: data consensus could never have applied. Stop here and
                         // never checkpoint this state. The repeat can sit in the CHECKPOINT rather than
@@ -5178,19 +5201,29 @@ impl WalletEntry {
             if self.db.poisoned() {
                 return;
             }
-            if let Some(digest) = resp.file_digest {
-                // Rule 2 of `chain_files`: a page read from files that changed this wallet —
-                // a note received or spent, a history row — must be exactly the node's page
-                // before anything built on it is kept. Pages that change nothing need no check
-                // here; rule 3 covers their leaves.
+            if let Some(digests) = resp.file_digests.as_ref() {
+                // Rule 2 of `chain_files`: the blocks of a file page that changed this wallet —
+                // a note received or spent, a history row — must be exactly the node's blocks
+                // before anything built on them is kept. Only that span is fetched again (it was
+                // the whole page: a wallet paid on most pages, a miner's, re-downloaded nearly
+                // everything and gained little from the files). Blocks that change nothing need
+                // no check here; rule 3 covers their leaves.
                 let after = (self.db.notes().len(), self.db.history().len(), self.db.balance());
                 let local_files = cache.lock().await.files.as_ref().is_some_and(|f| f.all_local());
-                if after != before && !local_files {
+                if (after != before || !changed_blocks.is_empty()) && !local_files {
+                    let (first, last) = match (changed_blocks.first(), changed_blocks.last()) {
+                        (Some(&f), Some(&l)) => (f, l),
+                        _ => (0, resp.blocks.len().saturating_sub(1)),
+                    };
+                    let span_low = if first == 0 { page_low } else { resp.blocks[first - 1].hash };
+                    let span = last + 1 - first;
                     let mut confirmed = None;
                     for _ in 0..2 {
-                        if let Ok(Ok(node)) = tokio::time::timeout(SYNC_RPC_TIMEOUT, client.get_shielded_blocks(page_low, resp.limit)).await {
-                            let n = resp.blocks.len().min(node.blocks.len());
-                            confirmed = Some(n == resp.blocks.len() && chain_files::blocks_digest(&node.blocks[..n]) == digest);
+                        if let Ok(Ok(node)) = tokio::time::timeout(SYNC_RPC_TIMEOUT, client.get_shielded_blocks(span_low, span as u64)).await {
+                            confirmed = Some(
+                                node.blocks.len() >= span
+                                    && (0..span).all(|k| digests.get(first + k) == Some(&chain_files::blocks_digest(std::slice::from_ref(&node.blocks[k])))),
+                            );
                             break;
                         }
                     }
@@ -6272,7 +6305,13 @@ fn with_default_rpc_port(addr: &str) -> String {
     let a = addr.trim().trim_end_matches('/');
     let a = ["grpc://", "http://", "https://"].iter().find_map(|p| a.strip_prefix(p)).unwrap_or(a);
     if a.starts_with('[') {
-        return if a.rsplit_once("]:").is_some_and(|(_, p)| p.parse::<u16>().is_ok()) { a.to_string() } else { format!("{a}:{ZKAS_RPC_PORT}") };
+        // A bracketed host with an unusable port keeps the host, not the bad port:
+        // "[2001:db8::1]:99999" became "[2001:db8::1]:99999:16110", an address that never connects.
+        return match a.rsplit_once("]:") {
+            Some((_, p)) if p.parse::<u16>().is_ok() => a.to_string(),
+            Some((host, _)) => format!("{host}]:{ZKAS_RPC_PORT}"),
+            None => format!("{a}:{ZKAS_RPC_PORT}"),
+        };
     }
     match a.matches(':').count() {
         0 => format!("{a}:{ZKAS_RPC_PORT}"),
@@ -6297,6 +6336,9 @@ mod rpc_port_tests {
         assert_eq!(w("https://seed.zkas.info"), "seed.zkas.info:16110");
         assert_eq!(w(" seed.zkas.info:16110 "), "seed.zkas.info:16110");
         assert_eq!(w("host.onion"), "host.onion:16110");
+        assert_eq!(w("[2001:db8::1]:99999"), "[2001:db8::1]:16110");
+        assert_eq!(w("[2001:db8::1]:"), "[2001:db8::1]:16110");
+        assert_eq!(w("seed.zkas.info:99999"), "seed.zkas.info:16110");
     }
 }
 
@@ -15753,7 +15795,7 @@ mod operator_route_tests {
 
 #[cfg(test)]
 mod token_header_tests {
-    use super::token_from;
+    use super::{token_from, token_from_on};
     use axum::http::{HeaderMap, HeaderValue, StatusCode};
 
     fn with_token(v: HeaderValue) -> HeaderMap {
@@ -15776,6 +15818,19 @@ mod token_header_tests {
         assert_eq!(token_from(&HeaderMap::new(), true).ok().as_deref(), Some("default"), "an absent header still means default");
         assert!(token_from(&HeaderMap::new(), false).is_err());
         assert_eq!(token_from(&with_token(HeaderValue::from_static("abc-DEF_1")), true).ok().as_deref(), Some("abc-DEF_1"));
+    }
+
+    /// The literal token "default" names the single-user wallet only on a loopback daemon; an
+    /// internet-facing one refuses it however `allow_default` is set.
+    #[test]
+    fn the_default_token_is_refused_off_loopback() {
+        let h = with_token(HeaderValue::from_static("default"));
+        for allow_default in [true, false] {
+            assert!(matches!(token_from_on(&h, allow_default, false), Err((StatusCode::UNAUTHORIZED, _))));
+            assert_eq!(token_from_on(&h, allow_default, true).ok().as_deref(), Some("default"));
+        }
+        assert_eq!(token_from_on(&with_token(HeaderValue::from_static("default1")), true, false).ok().as_deref(), Some("default1"));
+        assert_eq!(token_from_on(&HeaderMap::new(), true, false).ok().as_deref(), Some("default"), "an absent header is the edge's to refuse");
     }
 }
 
