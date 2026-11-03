@@ -4374,6 +4374,13 @@ struct WalletEntry {
     /// spend path selects them meanwhile (see [`spend_candidates`]). Not persisted: after a
     /// restart the scheduled sends are gone too, so the notes are free again.
     reserved: HashMap<u64, std::time::Instant>,
+    /// Notes an ordinary `/prepare` session selected, until it is submitted or lapses: a SOFT
+    /// hold. Another prepare of this wallet avoids them when the remaining notes can pay (see
+    /// [`prefer_unheld`]) and uses them otherwise, so a re-prepare of the same payment (edited
+    /// amount, retry) still works on a wallet with one note. Without it two prepares minutes or
+    /// seconds apart picked the same notes and the second submit was refused "nullifier already
+    /// claimed" (3 Nov, a 4,749-note wallet merging). Not persisted.
+    soft_held: HashMap<u64, std::time::Instant>,
 }
 
 /// One block's contribution to the rolling unsettled preview (see
@@ -4493,6 +4500,7 @@ impl WalletEntry {
             blind_below: 0,
             blind_from_daa: 0,
             reserved: HashMap::new(),
+            soft_held: HashMap::new(),
         }
     }
 
@@ -11560,6 +11568,23 @@ fn spend_candidates(e: &WalletEntry, matured: u64) -> Result<(Vec<&OwnedNote>, u
     Ok((c, stranded))
 }
 
+/// The candidates without the notes other open prepare sessions soft-hold, when those that are
+/// left can pay `need_with_fee` (or the caller takes a partial payment); otherwise all of them,
+/// so a payment that works without the holds still works with them.
+fn prefer_unheld<'a>(candidates: Vec<&'a OwnedNote>, held: &HashMap<u64, std::time::Instant>, now: std::time::Instant, need_with_fee: u64, allow_partial: bool) -> Vec<&'a OwnedNote> {
+    let is_held = |n: &OwnedNote| held.get(&n.position).is_some_and(|until| *until > now);
+    if !candidates.iter().any(|n| is_held(n)) {
+        return candidates;
+    }
+    let free: Vec<&OwnedNote> = candidates.iter().copied().filter(|n| !is_held(n)).collect();
+    let free_total: u64 = free.iter().map(|n| n.value()).fold(0u64, |a, v| a.saturating_add(v));
+    if !free.is_empty() && (free_total >= need_with_fee || allow_partial) {
+        free
+    } else {
+        candidates
+    }
+}
+
 fn matured_candidates(db: &WalletDb, matured: u64) -> Result<(Vec<&OwnedNote>, u64), (StatusCode, Json<serde_json::Value>)> {
     let stranded = db.stranded_notes();
     let stranded_value = sum_note_values(stranded.iter().map(|n| n.value()))?;
@@ -12830,7 +12855,11 @@ async fn wallet_prepare(
         let dropped = state.prepared.lock().await.remove(old);
         if let Some(PreparedSession { token: Some(t), positions, .. }) = dropped {
             if let Some(w) = state.get_wallet(&t).await {
-                uniform::unreserve(&mut *w.lock().await, &positions);
+                let mut e = w.lock().await;
+                uniform::unreserve(&mut e, &positions);
+                for p in &positions {
+                    e.soft_held.remove(p);
+                }
             }
         }
     }
@@ -12857,7 +12886,8 @@ async fn wallet_prepare(
             if !same_flow && (open || at.elapsed() < wait) {
                 let left = wait.saturating_sub(at.elapsed()).as_secs();
                 log::info!(
-                    "prepare: self-merge refused without proving: the previous one ({}s ago) was {}; {} abandoned in a row, next in {}s",
+                    "prepare: self-merge refused without proving for wallet {}: the previous one ({}s ago) was {}; {} abandoned in a row, next in {}s",
+                    log_pseudonym(&key),
                     at.elapsed().as_secs(),
                     if open { "not submitted yet" } else { "never submitted" },
                     abandoned,
@@ -13094,7 +13124,8 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
                 let cutoff_blue = e.sink_blue.saturating_sub(DEFAULT_ANCHOR_DEPTH + ANCHOR_SLACK);
                 if let Some(matured) = e.boundaries.iter().rev().find(|(bs, _)| *bs <= cutoff_blue).map(|&(_, lc)| lc) {
                     anchor_block = e.send_anchor_block(matured)?;
-                    let (mut candidates, _stranded) = spend_candidates(&e, matured)?;
+                    let (candidates, _stranded) = spend_candidates(&e, matured)?;
+                    let mut candidates = prefer_unheld(candidates, &e.soft_held, std::time::Instant::now(), amount.saturating_add(chunk_fee(base_fee, max_per_tx)), allow_partial);
                     sort_candidates_for_spend(&mut candidates, amount, base_fee);
                     have_total = Some(sum_note_values(candidates.iter().map(|n| n.value()))?);
                     fast_path = true;
@@ -13166,6 +13197,12 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
                         selected += n.value();
                     }
                     session_token = Some(token.clone());
+                    // Soft-hold them for this session (see `WalletEntry::soft_held`).
+                    let now = std::time::Instant::now();
+                    e.soft_held.retain(|_, until| *until > now);
+                    for p in &spent_positions {
+                        e.soft_held.insert(*p, now + PREPARED_TTL);
+                    }
                     }
                 }
                 }
@@ -13669,6 +13706,7 @@ async fn wallet_submit(
                     let now_daa = submit_clock(&e);
                     for p in &positions {
                         e.db.mark_spent(*p, accepted.as_bytes(), now_daa);
+                        e.soft_held.remove(p);
                     }
                     uniform::unreserve(&mut e, &positions);
                     // The parked notes are worth more than amount + fee: the rest is
@@ -15790,6 +15828,46 @@ mod operator_route_tests {
         assert!(require_local_operator(at("160.187.211.153:5000")).is_err(), "the public proxy is not an operator");
         assert!(require_local_operator(at("[::ffff:160.187.211.153]:5000")).is_err());
         assert!(require_local_operator(None).is_err(), "no connection info is refused, not trusted");
+    }
+}
+
+#[cfg(test)]
+mod soft_hold_tests {
+    use super::prefer_unheld;
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+
+    fn notes(values: &[u64]) -> Vec<kaspa_shielded_core::walletdb::OwnedNote> {
+        let mut db = kaspa_shielded_core::walletdb::WalletDb::from_seed([91u8; 32]).unwrap();
+        for (i, v) in values.iter().enumerate() {
+            let d = kaspa_shielded_core::coinbase::derive_coinbase_note_desc(db.my_address_bytes(), format!("soft-hold-{i}").as_bytes());
+            db.ingest_block(&[(d, *v)], &[]);
+        }
+        db.notes().to_vec()
+    }
+
+    #[test]
+    fn another_sessions_notes_are_avoided_only_when_the_rest_can_pay() {
+        let all = notes(&[100, 200, 300, 400]);
+        let refs: Vec<_> = all.iter().collect();
+        let now = Instant::now();
+        let mut held = HashMap::new();
+        held.insert(all[2].position, now + Duration::from_secs(60));
+        held.insert(all[3].position, now + Duration::from_secs(60));
+        let vals = |v: &Vec<&kaspa_shielded_core::walletdb::OwnedNote>| v.iter().map(|n| n.value()).collect::<Vec<_>>();
+        // The free notes (100 + 200) cover 250: the held ones are left to their session.
+        assert_eq!(vals(&prefer_unheld(refs.clone(), &held, now, 250, false)), vec![100, 200]);
+        // They do not cover 500: everything stays a candidate, as without holds.
+        assert_eq!(vals(&prefer_unheld(refs.clone(), &held, now, 500, false)), vec![100, 200, 300, 400]);
+        // A partial payment (a merge round) takes the free ones whatever the amount.
+        assert_eq!(vals(&prefer_unheld(refs.clone(), &held, now, 5_000, true)), vec![100, 200]);
+        // A lapsed hold is no hold.
+        assert_eq!(vals(&prefer_unheld(refs.clone(), &held, now + Duration::from_secs(61), 250, false)).len(), 4);
+        // Every note held (a one-note wallet re-preparing): all stay candidates.
+        let one = notes(&[100]);
+        let mut h1 = HashMap::new();
+        h1.insert(one[0].position, now + Duration::from_secs(60));
+        assert_eq!(prefer_unheld(one.iter().collect(), &h1, now, 50, true).len(), 1);
     }
 }
 
