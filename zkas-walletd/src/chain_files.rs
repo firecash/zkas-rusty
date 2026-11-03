@@ -44,6 +44,12 @@ const READ_AHEAD_SEGMENTS: usize = 2;
 /// up at different heights each need their current and next segment, so this must be at least
 /// 2 x READ_AHEAD_SEGMENTS or they evict each other's and re-download on every page.
 const LOADED_SEGMENTS: usize = 4;
+/// The same cap when every source is a local directory (the hosted daemon next to its own copy):
+/// effectively all of them. Decoded, the whole history is ~2.2 GB (199 segments, 3 Nov), and at
+/// 4 the hosted daemon's catch-up lanes and rescans, reading at different heights, evicted each
+/// other's segments all day: 22,718 loads in 12 hours, ~66 min spent re-reading and re-decoding
+/// the same files, one segment loaded 397 times. Idle segments still leave after SEGMENT_IDLE.
+const LOCAL_LOADED_SEGMENTS: usize = 1024;
 /// How long the files rest after a page that changed a wallet could not be confirmed with the
 /// node (see `ChainFiles::pause`).
 pub const UNCONFIRMED_PAUSE: std::time::Duration = std::time::Duration::from_secs(120);
@@ -1139,7 +1145,7 @@ impl ChainFiles {
         });
         let mut loaded = self.loaded.lock().unwrap();
         loaded.retain(|s| s.index != index);
-        insert_bounded(&mut loaded, seg, LOADED_SEGMENTS);
+        insert_bounded(&mut loaded, seg, if self.all_local() { LOCAL_LOADED_SEGMENTS } else { LOADED_SEGMENTS });
         self.segments_loaded.fetch_add(1, Ordering::Relaxed);
         Ok(n)
     }
