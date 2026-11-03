@@ -5184,7 +5184,8 @@ impl WalletEntry {
                 // before anything built on it is kept. Pages that change nothing need no check
                 // here; rule 3 covers their leaves.
                 let after = (self.db.notes().len(), self.db.history().len(), self.db.balance());
-                if after != before {
+                let local_files = cache.lock().await.files.as_ref().is_some_and(|f| f.all_local());
+                if after != before && !local_files {
                     let mut confirmed = None;
                     for _ in 0..2 {
                         if let Ok(Ok(node)) = tokio::time::timeout(SYNC_RPC_TIMEOUT, client.get_shielded_blocks(page_low, resp.limit)).await {

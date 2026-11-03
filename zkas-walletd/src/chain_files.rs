@@ -802,6 +802,15 @@ pub struct Stats {
 }
 
 impl ChainFiles {
+    /// Every source is a local directory: files written on this machine by the exporter from the
+    /// same node, under the same signing key. Rule 2 (re-fetching a page that changed a wallet from
+    /// the node) protects against a mirror serving altered data; here there is no other party to
+    /// protect against, and it cost ~150 ms per changed page, one after another (82 for one 13-note
+    /// wallet's rescan). Rule 3, the tree check against the node, still applies.
+    pub fn all_local(&self) -> bool {
+        !self.bases.is_empty() && self.bases.iter().all(|b| !is_http(b))
+    }
+
     /// `bases` is one or more comma-separated mirrors: `https://…` URLs or local directories
     /// holding `manifest-v2.json` (`MANIFEST_FILE`) and the files.
     pub fn new(bases: &str, genesis: RpcHash) -> Arc<Self> {
@@ -1466,3 +1475,16 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod all_local_tests {
+    use super::*;
+
+    #[test]
+    fn only_local_directories_count_as_local() {
+        let g = RpcHash::from_bytes([0u8; 32]);
+        assert!(ChainFiles::new("/root/zkas/chainfiles", g).all_local());
+        assert!(!ChainFiles::new("https://pub-ae5ed92258b2437e985b69ab9947ef60.r2.dev", g).all_local());
+        assert!(!ChainFiles::new("/root/zkas/chainfiles,https://zkas.info/shielded-chain", g).all_local());
+        assert!(!ChainFiles::new(PUBLIC_CHAIN_FILES, g).all_local());
+    }
+}
