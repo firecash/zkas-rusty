@@ -12241,6 +12241,8 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
                     for p in positions {
                         e.db.mark_spent(p, accepted.as_bytes(), now_daa);
                     }
+                    // Saved promptly and never skipped by the exit flush (see wallet_submit).
+                    e.force_checkpoint = true;
                     // Publish the change owed back (parked − pay − fee) so the balance
                     // does not read as if the whole input note were gone, and drop the
                     // cached mempool previews: one computed BEFORE the park classified
@@ -12570,6 +12572,8 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
                 for p in b.positions {
                     e.db.mark_spent(p, accepted.as_bytes(), now_daa);
                 }
+                // Saved promptly and never skipped by the exit flush (see wallet_submit).
+                e.force_checkpoint = true;
                 // Same as /send: surface the change and re-derive stale mempool previews.
                 e.db.note_pending_outflow(accepted.as_bytes(), group_pay.saturating_add(fee));
                 e.forget_stale_outflow_previews();
@@ -12765,6 +12769,8 @@ async fn consolidate_once(
             for p in positions {
                 e.db.mark_spent(p, accepted.as_bytes(), now_daa);
             }
+            // Saved promptly and never skipped by the exit flush (see wallet_submit).
+            e.force_checkpoint = true;
             // Everything but the fee comes back to us: show it as pending change rather
             // than letting the balance drop by the whole merged sum until it is mined.
             e.db.note_pending_outflow(accepted.as_bytes(), fee);
@@ -13786,6 +13792,10 @@ async fn wallet_submit(
                         e.soft_held.remove(p);
                     }
                     uniform::unreserve(&mut e, &positions);
+                    // Saved promptly, and never skipped by the exit flush: a restart (or crash)
+                    // before the next save reloaded the wallet without this payment, its notes
+                    // unspent and offered again until the transaction was mined.
+                    e.force_checkpoint = true;
                     // The parked notes are worth more than amount + fee: the rest is
                     // CHANGE, and until the block carrying it is previewed nothing else
                     // in the status carries it — a one-note wallet read "0" for the
