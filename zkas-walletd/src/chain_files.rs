@@ -58,6 +58,11 @@ pub const UNCONFIRMED_PAUSE: std::time::Duration = std::time::Duration::from_sec
 // paused in the background for a few minutes came back to find the segment its wallet was in
 // dropped and downloaded it again (9 MB, 13.6 s, logged 1 Nov).
 const SEGMENT_IDLE: std::time::Duration = std::time::Duration::from_secs(600);
+/// SEGMENT_IDLE when every source is a local directory. With the cap lifted (see
+/// LOCAL_LOADED_SEGMENTS) the 10-minute drop was the only thing still evicting on the hosted
+/// daemon: wallets returning to old heights reloaded segments 3-6 times (257 loads in 2.5 h).
+/// Memory there is plentiful; a segment nobody has read for 3 hours still leaves.
+const LOCAL_SEGMENT_IDLE: std::time::Duration = std::time::Duration::from_secs(3 * 3600);
 /// How long a fetched manifest is trusted before it is fetched again.
 const MANIFEST_TTL: std::time::Duration = std::time::Duration::from_secs(600);
 /// After every mirror failed, how long before they are asked again. Without it each page
@@ -1079,7 +1084,7 @@ impl ChainFiles {
         }
         {
             let now = self.now_ms();
-            let idle = SEGMENT_IDLE.as_millis() as u64;
+            let idle = if self.all_local() { LOCAL_SEGMENT_IDLE } else { SEGMENT_IDLE }.as_millis() as u64;
             self.loaded.lock().unwrap().retain(|s| now.saturating_sub(s.used_ms.load(Ordering::Relaxed)) < idle);
         }
         let me = self.clone();

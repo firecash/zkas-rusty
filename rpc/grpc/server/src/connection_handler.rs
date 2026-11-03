@@ -147,10 +147,17 @@ impl ConnectionHandler {
                 // of gzip-inflated gigabyte requests (SubmitBlock alone queues 256) and exhaust memory.
                 .max_decoding_message_size(RPC_MAX_REQUEST_SIZE);
 
-            // TODO: check whether we should set tcp_keepalive
+            // TCP keepalive on every client socket. Without it a client that vanished (a phone
+            // that moved networks, a freeze) kept its connection, and its slot, for ever: on 3 Nov
+            // 82 of 94 connections on a public node were idle >10 min, 2,250 after a host freeze,
+            // and once the 256 slots were full every new wallet was refused (one merchant gateway
+            // for 3 days). The kernel answers keepalive probes for a live peer even while its app
+            // sleeps, so only peers that are really gone are dropped (~12 min with Linux defaults).
+            // HTTP/2 pings (below, still off) would also close slow-but-alive apps.
             // const GRPC_KEEP_ALIVE_PING_INTERVAL: Duration = Duration::from_secs(5);
             // const GRPC_KEEP_ALIVE_PING_TIMEOUT: Duration = Duration::from_secs(120);
             let serve_result = TonicServer::builder()
+                .tcp_keepalive(Some(Duration::from_secs(60)))
                 // .http2_keepalive_interval(Some(GRPC_KEEP_ALIVE_PING_INTERVAL))
                 // .http2_keepalive_timeout(Some(GRPC_KEEP_ALIVE_PING_TIMEOUT))
                 .layer(MapRequestBodyLayer::new(move |body| tonic::body::Body::new(CountBytesBody::new(body, bytes_rx.clone()))))
