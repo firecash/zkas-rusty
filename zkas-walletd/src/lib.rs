@@ -11028,6 +11028,11 @@ struct SendReq {
     /// encrypted note — readable only by them (and, with recoverable history,
     /// by this wallet's own OVK).
     memo: Option<String>,
+    /// The caller's id for this payment, kept across its retries: a send whose id this daemon
+    /// already broadcast is answered `409 {already_sent}` instead of paying again (see
+    /// `sent_requests`). A client whose response was lost and retried without one paid twice.
+    #[serde(default)]
+    request_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -11955,6 +11960,16 @@ async fn wallet_send(
     // anything is planned, so the loser waits rather than racing us to the same notes.
     let gate = state.send_gate(&token).await;
     let _spending = gate.lock().await;
+    // Under the per-wallet send gate, so a retry racing its original waits for it and then
+    // finds it here. Keyed by the wallet token (custodial: the token is the wallet).
+    let request_key = req.request_id.as_deref().and_then(|id| sent_request_key(&format!("custodial:{token}"), id));
+    if let Some(done) = request_key.as_deref().and_then(sent_request) {
+        log::info!("send: request already broadcast as {}; returning it instead of paying again", done.txid);
+        return Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": format!("this payment was already sent (transaction {})", done.txid), "already_sent": done })),
+        ));
+    }
     ensure_canonical_checkpoint(&state, &w).await?;
     // Don't select notes a background merge is already proving over, and — for as long
     // as this send runs — keep background CPU work (merges, cache builds) off the box.
@@ -12261,7 +12276,22 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
                 }
                 Err(e) if txids.is_empty() => return Err(err(StatusCode::BAD_GATEWAY, format!("node rejected the payment: {e}"))),
                 Err(e) => {
-                    // Partial success: report what actually went through.
+                    // Partial success: report what actually went through, and remember it, so
+                    // a retry of this request is told what was paid rather than paying it again.
+                    if let Some(k) = request_key.clone() {
+                        record_sent_request(
+                            k,
+                            &SendResp {
+                                txid: txids[0].clone(),
+                                amount_sompi: sent,
+                                fee_sompi: total_fee,
+                                amount_sompi_exact: sent.to_string(),
+                                fee_sompi_exact: total_fee.to_string(),
+                                txids: txids.clone(),
+                                tx_count: txids.len(),
+                            },
+                        );
+                    }
                     return Err((
                         StatusCode::BAD_GATEWAY,
                         Json(serde_json::json!({
@@ -12275,7 +12305,7 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
         }
     }
 
-    Ok(Json(SendResp {
+    let resp = SendResp {
         txid: txids[0].clone(),
         amount_sompi: amount,
         fee_sompi: total_fee,
@@ -12283,7 +12313,11 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
         fee_sompi_exact: total_fee.to_string(),
         txids,
         tx_count,
-    }))
+    };
+    if let Some(k) = request_key {
+        record_sent_request(k, &resp);
+    }
+    Ok(Json(resp))
 }
 
 /// One recipient of a batched payout.
