@@ -7273,6 +7273,9 @@ impl AppState {
     /// balance ("fully synced but missing coins") because their older notes were
     /// behind the fast-sync base.
     async fn fast_sync_entry(&self, key: WalletKey, recoverable: bool, guard: RpcHash, birthday: u64) -> Option<WalletEntry> {
+        // Every placement below starts at or before a settled block (see BIRTHDAY_SETTLED_DAA).
+        let tip = self.node_tip.lock().await.0;
+        let birthday = if tip > BIRTHDAY_SETTLED_DAA { birthday.min(tip - BIRTHDAY_SETTLED_DAA) } else { birthday };
         // Page budgets for the metadata walks (2,000 blocks per page, ~0.3 s each). Headers
         // above the pruning point: generous — the finality window is a few dozen pages.
         // From genesis through the archive (only a node with the archive fallbacks but no
@@ -7456,6 +7459,12 @@ impl AppState {
     }
 
     async fn frontier_below_daa(&self, birthday: u64) -> BirthdayPlacement {
+        // A new wallet's birthday is the tip, so its start block was the newest chain block,
+        // still inside the reorg window: one reorg later the cursor was off the selected chain
+        // and the wallet was retired and rescanned (3 Nov, 50 s after registering). Start below
+        // the settled depth instead; starting earlier never skips a note, it scans ~300 blocks.
+        let tip = self.node_tip.lock().await.0;
+        let birthday = if tip > BIRTHDAY_SETTLED_DAA { birthday.min(tip - BIRTHDAY_SETTLED_DAA) } else { birthday };
         let req = kaspa_rpc_core::GetShieldedTreeStateRequest { block_hash: None, below_daa_score: Some(birthday) };
         let Some(client) = self.request_client().await else { return BirthdayPlacement::Unknown };
         let ts = match tokio::time::timeout(std::time::Duration::from_secs(30), client.get_shielded_tree_state_call(None, req)).await {
@@ -15924,6 +15933,10 @@ mod old_form_tests {
 /// On exit, a wallet less than this many blocks ahead of its file is not rewritten: a restart
 /// re-reads that much in under a second (see `flush_checkpoints`).
 const EXIT_FLUSH_MIN_BLOCKS: usize = 1_000;
+
+/// How far below the node's tip (DAA) a wallet's starting block is placed at the latest: past
+/// the sync margin (SYNC_TIP_MARGIN, 200 blue score), so the block is settled.
+const BIRTHDAY_SETTLED_DAA: u64 = 300;
 
 /// Persist every resident wallet's scan progress on the way out.
 async fn flush_checkpoints_on_exit(state: &Arc<AppState>) {
