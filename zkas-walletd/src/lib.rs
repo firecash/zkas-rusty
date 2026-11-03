@@ -6901,7 +6901,71 @@ fn record_sent_request(key: String, resp: &SendResp) {
     if m.len() > 100_000 {
         m.retain(|_, (at, _)| at.elapsed() < SENT_REQUEST_TTL);
     }
-    m.insert(key, (std::time::Instant::now(), resp.clone()));
+    m.insert(key.clone(), (std::time::Instant::now(), resp.clone()));
+    drop(m);
+    append_sent_request(&key, resp);
+}
+
+/// The broadcast record also lives on disk (`__sent_requests__.jsonl` in the wallet directory),
+/// one line per payment, because it was memory only: a restart emptied it, and a payment whose
+/// response was lost around a restart, retried with the same request id, was built again from
+/// other notes and PAID TWICE. Set once at start by [`load_sent_requests`].
+static SENT_REQUESTS_FILE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+#[derive(Serialize, Deserialize)]
+struct SentRequestLine {
+    key: String,
+    at_unix: u64,
+    resp: SendResp,
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+fn append_sent_request(key: &str, resp: &SendResp) {
+    use std::io::Write;
+    let Some(path) = SENT_REQUESTS_FILE.get() else { return };
+    let line = SentRequestLine { key: key.to_string(), at_unix: unix_now(), resp: resp.clone() };
+    let Ok(mut text) = serde_json::to_string(&line) else { return };
+    text.push('\n');
+    let written = std::fs::OpenOptions::new().create(true).append(true).open(path).and_then(|mut f| {
+        f.write_all(text.as_bytes())?;
+        f.sync_data()
+    });
+    if let Err(e) = written {
+        log::warn!("sent-request record not persisted ({e}); a retry after a restart would not find it");
+    }
+}
+
+/// Read the records younger than [`SENT_REQUEST_TTL`] back into memory and rewrite the file
+/// with only those. Returns how many were loaded.
+fn load_sent_requests(wallet_dir: &str) -> usize {
+    let path = std::path::Path::new(wallet_dir).join("__sent_requests__.jsonl");
+    let _ = SENT_REQUESTS_FILE.set(path.clone());
+    let Ok(text) = std::fs::read_to_string(&path) else { return 0 };
+    let now = unix_now();
+    let ttl = SENT_REQUEST_TTL.as_secs();
+    let mut kept = Vec::new();
+    let mut m = sent_requests().lock().unwrap();
+    for line in text.lines() {
+        let Ok(r) = serde_json::from_str::<SentRequestLine>(line) else { continue };
+        let age = now.saturating_sub(r.at_unix);
+        if age >= ttl {
+            continue;
+        }
+        let at = std::time::Instant::now().checked_sub(std::time::Duration::from_secs(age)).unwrap_or_else(std::time::Instant::now);
+        m.insert(r.key.clone(), (at, r.resp.clone()));
+        kept.push(line.to_string());
+    }
+    let n = m.len();
+    drop(m);
+    let tmp = path.with_extension("jsonl.tmp");
+    let body = if kept.is_empty() { String::new() } else { kept.join("\n") + "\n" };
+    if std::fs::write(&tmp, body).and_then(|()| std::fs::rename(&tmp, &path)).is_err() {
+        log::warn!("could not compact __sent_requests__.jsonl");
+    }
+    n
 }
 
 /// How long a prepared (unsigned) non-custodial payment lives before it is swept.
@@ -10957,7 +11021,7 @@ struct SendReq {
     memo: Option<String>,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 struct SendResp {
     /// First transaction id (kept for callers that expect a single txid).
     txid: String,
@@ -15053,6 +15117,10 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
     let activity_seed: HashMap<String, u64> =
         load_activity(&wallet_dir).into_iter().filter(|(token, _)| wallet_exists(&wallet_dir, token)).collect();
     let snap_seed = load_snaps(&wallet_dir);
+    let sent_loaded = load_sent_requests(&wallet_dir);
+    if sent_loaded > 0 {
+        log::info!("sent-request records: {sent_loaded} payment(s) from the last 24 h reloaded (retries return them, never pay twice)");
+    }
     let _ = std::fs::create_dir_all(&wallet_dir);
 
     // Two node connections: one for the request path, one for the background sync loop,
@@ -15887,6 +15955,37 @@ mod fvk_bytes_tests {
             assert_eq!(WalletKey::Fvk(via_db).fvk_bytes(), Some(via_db));
         }
         assert_eq!(WalletKey::Fvk([0xffu8; 96]).fvk_bytes(), None, "an invalid key is no key");
+    }
+}
+
+#[cfg(test)]
+mod sent_request_file_tests {
+    use super::*;
+
+    /// A broadcast record survives a restart: written as a line, read back by a fresh load, and
+    /// lines older than a day are dropped from the file.
+    #[test]
+    fn broadcast_records_survive_a_restart() {
+        let dir = std::env::temp_dir().join(format!("zkas-sent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_string_lossy().into_owned();
+        let resp = |t: &str| SendResp { txid: t.into(), amount_sompi: 5, fee_sompi: 1, amount_sompi_exact: "5".into(), fee_sompi_exact: "1".into(), txids: vec![t.into()], tx_count: 1 };
+        let old = SentRequestLine { key: "k-old".into(), at_unix: unix_now() - 2 * 86_400, resp: resp("aa") };
+        let fresh = SentRequestLine { key: "k-new".into(), at_unix: unix_now() - 60, resp: resp("bb") };
+        let path = dir.join("__sent_requests__.jsonl");
+        std::fs::write(&path, format!("{}\nnot json\n{}\n", serde_json::to_string(&old).unwrap(), serde_json::to_string(&fresh).unwrap())).unwrap();
+        assert!(load_sent_requests(&d) >= 1);
+        assert_eq!(sent_request("k-new").map(|r| r.txid), Some("bb".to_string()));
+        assert!(sent_request("k-old").is_none(), "older than a day is gone");
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.contains("k-new") && !after.contains("k-old") && !after.contains("not json"));
+        // A new record is appended (when this process's file is the test's; the path is set once).
+        if SENT_REQUESTS_FILE.get() == Some(&path) {
+            record_sent_request("k-third".into(), &resp("cc"));
+            assert!(std::fs::read_to_string(&path).unwrap().contains("k-third"));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
