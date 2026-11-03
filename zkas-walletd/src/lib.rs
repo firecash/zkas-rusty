@@ -8460,6 +8460,11 @@ impl AppState {
         if drop_held_leaves(self, token, &mut entry) {
             entry.force_checkpoint = true;
         }
+        // Fast checkpoints: a file still in an older form is rewritten compact at the next save
+        // (and is not skipped by the exit flush), not only once the wallet next advances.
+        if self.resources.compact_nullifiers && checkpoint_is_old_form(&self.wallet_dir, token) {
+            entry.force_checkpoint = true;
+        }
         let t_entry = t_load0.elapsed();
         // Cumulative marks; each phase is the gap to the one before it.
         log::info!(
@@ -15573,6 +15578,47 @@ async fn flush_checkpoints(state: &Arc<AppState>, only: Option<&str>, throttle: 
     };
     let total = resident.len();
     let (mut saved, mut blocks) = (0usize, 0usize);
+    // On the way out (every wallet, unthrottled) the listener is already closed, so the flush
+    // IS downtime. Measured 3 Nov: 812 wallets saved one after another in 108 s to keep 71,214
+    // blocks, ~88 each, which a restart re-reads in well under a second. Wallets only a little
+    // ahead of their file are left to re-read; a save flagged as needed (`force_checkpoint`,
+    // e.g. a pending rewrite to the compact form) is kept; the rest are written 8 at a time.
+    if only.is_none() && !throttle {
+        let sem = Arc::new(tokio::sync::Semaphore::new(8));
+        let mut set = tokio::task::JoinSet::new();
+        for (token, w) in resident {
+            let dir = state.wallet_dir.clone();
+            let sem = sem.clone();
+            set.spawn(async move {
+                let _permit = sem.acquire_owned().await.ok()?;
+                let mut e = w.lock().await;
+                if e.error.is_some() || e.saved_scanned == e.scanned {
+                    return None;
+                }
+                let advanced = e.scanned.saturating_sub(e.saved_scanned);
+                if advanced < EXIT_FLUSH_MIN_BLOCKS && !e.force_checkpoint {
+                    return None;
+                }
+                let ok = tokio::task::block_in_place(|| {
+                    save_checkpoint(&dir, &token, &e.genesis, &e.low, e.scanned as u64, &e.db, &e.boundaries, &e.boundary_blocks, e.sink_blue, e.blind_below)
+                })
+                .is_ok();
+                if !ok {
+                    return None;
+                }
+                e.saved_scanned = e.scanned;
+                e.last_checkpoint_at = std::time::Instant::now();
+                Some(advanced)
+            });
+        }
+        while let Some(r) = set.join_next().await {
+            if let Ok(Some(b)) = r {
+                saved += 1;
+                blocks += b;
+            }
+        }
+        return (saved, total, blocks);
+    }
     for (token, w) in resident {
         let mut e = w.lock().await;
         if e.error.is_some() || e.saved_scanned == e.scanned {
@@ -15628,6 +15674,47 @@ async fn checkpoint(
     }
     Ok(Json(serde_json::json!({ "saved": saved, "resident": total, "blocks": blocks })))
 }
+
+/// Whether `token`'s checkpoint on disk predates the compact nullifier form (versions 12/13).
+/// Reads the header only; any doubt (no file, unreadable, unknown layout) answers false.
+fn checkpoint_is_old_form(dir: &str, token: &str) -> bool {
+    use std::io::Read;
+    let mut head = [0u8; SCAN_HEADER_LEN + 9];
+    match std::fs::File::open(scan_path(dir, token)).and_then(|mut f| f.read_exact(&mut head)) {
+        Ok(()) => &head[0..4] == SCAN_MAGIC && !matches!(head[SCAN_HEADER_LEN + 8], 12 | 13),
+        Err(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod old_form_tests {
+    use super::*;
+
+    #[test]
+    fn only_a_pre_compact_checkpoint_counts_as_old_form() {
+        let dir = std::env::temp_dir().join(format!("zkas-oldform-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let d = dir.to_string_lossy().into_owned();
+        let write = |tok: &str, version: u8| {
+            let mut b = vec![0u8; SCAN_HEADER_LEN + 9 + 16];
+            b[0..4].copy_from_slice(SCAN_MAGIC);
+            b[SCAN_HEADER_LEN + 8] = version;
+            std::fs::write(scan_path(&d, tok), b).unwrap();
+        };
+        write("aaaa", 10);
+        write("bbbb", 12);
+        write("cccc", 13);
+        assert!(checkpoint_is_old_form(&d, "aaaa"));
+        assert!(!checkpoint_is_old_form(&d, "bbbb"));
+        assert!(!checkpoint_is_old_form(&d, "cccc"));
+        assert!(!checkpoint_is_old_form(&d, "missing"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// On exit, a wallet less than this many blocks ahead of its file is not rewritten: a restart
+/// re-reads that much in under a second (see `flush_checkpoints`).
+const EXIT_FLUSH_MIN_BLOCKS: usize = 1_000;
 
 /// Persist every resident wallet's scan progress on the way out.
 async fn flush_checkpoints_on_exit(state: &Arc<AppState>) {
