@@ -65,6 +65,17 @@ pub mod scan {
         Some(FullViewingKey::from(&sk).address_at(0u32, Scope::External).to_raw_address_bytes())
     }
 
+    /// The 96-byte full viewing key of a wallet seed, without building a wallet.
+    pub fn fvk_bytes_from_seed(seed: [u8; 32]) -> Option<[u8; 96]> {
+        let sk = Option::<SpendingKey>::from(SpendingKey::from_bytes(seed))?;
+        Some(FullViewingKey::from(&sk).to_bytes())
+    }
+
+    /// `fvk` in its canonical encoding, or None when it is not a valid full viewing key.
+    pub fn canonical_fvk_bytes(fvk: &[u8; 96]) -> Option<[u8; 96]> {
+        FullViewingKey::from_bytes(fvk).map(|k| k.to_bytes())
+    }
+
     /// Strip a memo to its meaningful bytes: trailing zeros go (our builders
     /// zero-fill), and the Zcash "no memo" marker (a lone leading `0xF6`) reads
     /// as empty too.
@@ -898,7 +909,7 @@ pub mod scan {
 }
 
 pub use scan::{
-    CompactActionRecord, ReceivedNote, address_bytes_from_seed, gpu_enabled, install_gpu_agree, ivk_agreement_scalar, ivk_from_seed,
+    CompactActionRecord, ReceivedNote, address_bytes_from_seed, canonical_fvk_bytes, fvk_bytes_from_seed, gpu_enabled, install_gpu_agree, ivk_agreement_scalar, ivk_from_seed,
     decompress_epk, scan_bundle, scan_bundle_prepared, scan_compact, scan_compact_auto, scan_compact_auto_cached, scan_compact_cpu, scan_compact_gpu, scan_compact_gpu_cached,
     scan_compact_prepared, trim_memo,
     PreparedEpks, gpu_filter_enabled, install_gpu_filter, prepare_epks, scan_compact_auto_prepared, scan_compact_gpu_filter,

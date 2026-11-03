@@ -1315,7 +1315,13 @@ impl WalletKey {
     /// this key plus the public chain, which is what makes checkpoint adoption
     /// (see [`adopt_twin_checkpoint`]) sound.
     fn fvk_bytes(&self) -> Option<[u8; 96]> {
-        self.empty_db().map(|db| db.fvk().to_bytes())
+        // Parsed or derived directly, never through `empty_db`: building a WalletDb derives its
+        // 256 coinbase addresses, ~180 ms a wallet, and the viewing-key index (every wallet at
+        // start) took ~2 minutes after each restart. Same bytes, and None for an invalid key.
+        match self {
+            WalletKey::Seed(s) => kaspa_shielded_core::wallet::fvk_bytes_from_seed(*s),
+            WalletKey::Fvk(f) => kaspa_shielded_core::wallet::canonical_fvk_bytes(f),
+        }
     }
 }
 
@@ -15835,6 +15841,22 @@ mod operator_route_tests {
         assert!(require_local_operator(at("160.187.211.153:5000")).is_err(), "the public proxy is not an operator");
         assert!(require_local_operator(at("[::ffff:160.187.211.153]:5000")).is_err());
         assert!(require_local_operator(None).is_err(), "no connection info is refused, not trusted");
+    }
+}
+
+#[cfg(test)]
+mod fvk_bytes_tests {
+    use super::WalletKey;
+
+    /// The direct derivation gives exactly the bytes the full WalletDb gives.
+    #[test]
+    fn fvk_bytes_match_the_wallet_db() {
+        for seed in [[1u8; 32], [77u8; 32], [200u8; 32]] {
+            let via_db = WalletKey::Seed(seed).empty_db().unwrap().fvk().to_bytes();
+            assert_eq!(WalletKey::Seed(seed).fvk_bytes(), Some(via_db));
+            assert_eq!(WalletKey::Fvk(via_db).fvk_bytes(), Some(via_db));
+        }
+        assert_eq!(WalletKey::Fvk([0xffu8; 96]).fvk_bytes(), None, "an invalid key is no key");
     }
 }
 
