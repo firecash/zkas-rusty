@@ -12342,6 +12342,10 @@ struct SendManyReq {
     /// See [`SendReq::max_total_fee`]; a payout run splits by payee count *and* by how
     /// many notes it must spend, so the multiplier is even less obvious here.
     max_total_fee: Option<JsonU64>,
+    /// The caller's id for this payout run (see [`SendReq::request_id`]): a retry of a run this
+    /// daemon already broadcast is answered `409 {already_sent}` with its transactions.
+    #[serde(default)]
+    request_id: Option<String>,
 }
 
 /// Which transaction paid one payee. A payout run splits across transactions, and a run
@@ -12399,6 +12403,14 @@ async fn wallet_send_many(
     // not select the same notes.
     let gate = state.send_gate(&token).await;
     let _spending = gate.lock().await;
+    let request_key = req.request_id.as_deref().and_then(|id| sent_request_key(&format!("custodial-many:{token}"), id));
+    if let Some(done) = request_key.as_deref().and_then(sent_request) {
+        log::info!("send_many: request already broadcast as {}; returning it instead of paying again", done.txid);
+        return Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": format!("this payout was already sent (transaction {})", done.txid), "already_sent": done })),
+        ));
+    }
     ensure_canonical_checkpoint(&state, &w).await?;
     // Same span guard as `wallet_send`: no merge selects the notes this batch is
     // about to spend, and no background CPU work runs while the batch is proving.
@@ -12623,6 +12635,9 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
             }
             Err(e) if txids.is_empty() => return Err(err(StatusCode::BAD_GATEWAY, format!("node rejected the payout: {e}"))),
             Err(e) => {
+                if let Some(k) = request_key.clone() {
+                    record_sent_request(k, &SendResp { txid: txids[0].clone(), amount_sompi: paid, fee_sompi: total_fee, amount_sompi_exact: paid.to_string(), fee_sompi_exact: total_fee.to_string(), txids: txids.clone(), tx_count: txids.len() });
+                }
                 return Err((
                     StatusCode::BAD_GATEWAY,
                     Json(serde_json::json!({
@@ -12639,6 +12654,9 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
         }
     }
 
+    if let Some(k) = request_key {
+        record_sent_request(k, &SendResp { txid: txids.first().cloned().unwrap_or_default(), amount_sompi: paid, fee_sompi: total_fee, amount_sompi_exact: paid.to_string(), fee_sompi_exact: total_fee.to_string(), txids: txids.clone(), tx_count: txids.len() });
+    }
     Ok(Json(SendManyResp {
         tx_count: txids.len(),
         payee_txids,
