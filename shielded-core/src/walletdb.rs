@@ -2135,6 +2135,22 @@ impl WalletDb {
             .collect()
     }
 
+    /// Unspent notes at `positions` whose nullifier the chain has spent (it is in the
+    /// process-wide table, see [`Self::settle_expired_seen_on_chain`]) are dropped as spent.
+    /// For a payment the node refused as "nullifier already claimed": if this wallet's scan
+    /// missed the spend that claimed them, they were offered again on every retry, and every
+    /// retry was refused. Returns how many were dropped; nothing for a private-set wallet.
+    pub fn settle_positions_seen_on_chain(&mut self, positions: &[u64]) -> usize {
+        let Some(sh) = &self.nf_shared else { return 0 };
+        let spent: Vec<[u8; 32]> =
+            self.notes.iter().filter(|n| positions.contains(&n.position) && sh.interner.get(&n.nullifier).is_some()).map(|n| n.nullifier).collect();
+        let mut pruned = false;
+        for nf in &spent {
+            self.forget_spent_owned(nf, &mut pruned);
+        }
+        spent.len()
+    }
+
     /// Record what a just-submitted spend `txid` sends AWAY (amount + fee), so the
     /// remainder of its parked input notes can be shown as change coming back.
     /// Call right after the [`Self::mark_spent`] calls for that transaction. A no-op
@@ -8926,12 +8942,27 @@ mod circuit_tests {
         assert_eq!(db.reclaim_expired(111 + 3_600, 3_600), vec![([0xcc; 32], 4_000)]);
         assert_eq!(db.balance(), 10_000);
 
+        // A refused payment's notes the chain has spent are dropped; the others stay.
+        let interner = NullifierInterner::new();
+        let mut held = WalletDb::from_seed(seed).unwrap();
+        held.share_nullifiers(&interner);
+        held.ingest_block_with_meta(&[cb(addr, b"blk1||0", 4_000)], &[], Some(&BlockMeta { coinbase_txid: [1; 32], txids: vec![], timestamp_ms: 1, daa_score: 100 }));
+        held.ingest_block_with_meta(&[cb(addr, b"blk2||0", 6_000)], &[], Some(&BlockMeta { coinbase_txid: [2; 32], txids: vec![], timestamp_ms: 2, daa_score: 110 }));
+        let (p0, p1, nf0) = (held.notes()[0].position, held.notes()[1].position, held.notes()[0].nullifier);
+        let mut chain = WalletDb::from_seed([80u8; 32]).unwrap();
+        chain.share_nullifiers(&interner);
+        chain.nf_insert(&nf0);
+        assert_eq!(held.settle_positions_seen_on_chain(&[p0, p1]), 1);
+        assert_eq!(held.balance(), 6_000);
+        assert_eq!(held.notes()[0].position, p1);
+
         // A wallet with its own private set is never judged by this.
         let mut private = WalletDb::from_seed(seed).unwrap();
         private.ingest_block_with_meta(&[cb(addr, b"blk1||0", 4_000)], &[], Some(&BlockMeta { coinbase_txid: [1; 32], txids: vec![], timestamp_ms: 1, daa_score: 100 }));
         let pos = private.notes()[0].position;
         private.mark_spent(pos, [0xcc; 32], 100);
         assert!(private.settle_expired_seen_on_chain(10_000, 3_600).is_empty());
+        assert_eq!(private.settle_positions_seen_on_chain(&[private.notes().first().map_or(0, |n| n.position)]), 0);
     }
 
     #[test]

@@ -13131,6 +13131,9 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
                 if let Some(matured) = e.boundaries.iter().rev().find(|(bs, _)| *bs <= cutoff_blue).map(|&(_, lc)| lc) {
                     anchor_block = e.send_anchor_block(matured)?;
                     let (candidates, _stranded) = spend_candidates(&e, matured)?;
+                    // What the wallet holds, before another open session's notes are set aside:
+                    // a self-payment's fee budget is read from it below.
+                    let holds_total = sum_note_values(candidates.iter().map(|n| n.value()))?;
                     let mut candidates = prefer_unheld(candidates, &e.soft_held, std::time::Instant::now(), amount.saturating_add(chunk_fee(base_fee, max_per_tx)), allow_partial);
                     sort_candidates_for_spend(&mut candidates, amount, base_fee);
                     have_total = Some(sum_note_values(candidates.iter().map(|n| n.value()))?);
@@ -13150,7 +13153,11 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
                     // caller's reserve and stays under the signing ceiling older builds
                     // enforce. A caller that reserves properly is untouched.
                     if self_payment {
-                        let budget = have_total.unwrap_or(0).saturating_sub(amount);
+                        // The budget is what the caller held back from everything it holds, so
+                        // it is read from all of it: with another session's notes set aside the
+                        // remaining total was below the request, the budget read 0 and the round
+                        // shrank to 2 notes, which the app then abandons.
+                        let budget = holds_total.saturating_sub(amount);
                         while take > 2 && dyn_fee > budget {
                             take -= 1;
                             dyn_fee = chunk_fee(base_fee, take);
@@ -13745,6 +13752,29 @@ async fn wallet_submit(
         }
         Err(e) => {
             log::error!("submit REJECTED by the node for session {}: {e}", req.session);
+            // The session is gone; so must its holds be. A uniform session's notes stayed
+            // reserved for up to the session TTL, and a retry after the refusal was told the
+            // wallet could not pay. Notes the node says are already spent are instead dropped
+            // when the chain's table confirms it, or every retry would pick them again.
+            if let Some(t) = token.as_deref() {
+                if let Some(w) = state.get_wallet(t).await {
+                    let mut we = w.lock().await;
+                    uniform::unreserve(&mut we, &positions);
+                    for p in &positions {
+                        we.soft_held.remove(p);
+                    }
+                    if e.to_string().contains("nullifier already claimed") {
+                        let dropped = we.db.settle_positions_seen_on_chain(&positions);
+                        if dropped > 0 {
+                            we.force_checkpoint = true;
+                            log::warn!(
+                                "wallet '{}': {dropped} note(s) of the refused payment are spent on-chain though this wallet's scan did not see it; dropped as spent",
+                                log_pseudonym(t)
+                            );
+                        }
+                    }
+                }
+            }
             Err(err(StatusCode::BAD_GATEWAY, format!("The node would not accept this payment: {e}. No coins moved.")))
         }
     }
