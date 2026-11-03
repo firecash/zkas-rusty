@@ -305,6 +305,10 @@ struct NfLog {
     persisted: u64,
     /// Interned since the last [`NullifierInterner::sync`], in id order.
     pending: Vec<[u8; 32]>,
+    /// A failed append could not be cut back off the file: nothing more is appended this run
+    /// and [`NullifierInterner::sync`] fails, so checkpoints take the full form. Entries
+    /// already durable keep their meaning.
+    broken: bool,
 }
 
 const NF_LOG_MAGIC: &[u8; 4] = b"ZKNF";
@@ -370,8 +374,16 @@ impl NullifierInterner {
         let persisted = map.len() as u64;
         Ok(std::sync::Arc::new(Self {
             ids: std::sync::RwLock::new(map),
-            log: Some(std::sync::Mutex::new(NfLog { file, epoch, persisted, pending: Vec::new() })),
+            log: Some(std::sync::Mutex::new(NfLog { file, epoch, persisted, pending: Vec::new(), broken: false })),
         }))
+    }
+
+    /// Test hook: write the log through `file` from now on (e.g. /dev/full).
+    #[cfg(test)]
+    fn replace_log_file(&self, file: std::fs::File) {
+        if let Some(l) = &self.log {
+            l.lock().unwrap().file = file;
+        }
     }
 
     /// Whether ids survive a restart (see [`Self::open_persistent`]).
@@ -385,13 +397,25 @@ impl NullifierInterner {
         use std::io::Write;
         let Some(log) = &self.log else { return Ok(None) };
         let mut l = log.lock().unwrap_or_else(|e| e.into_inner());
+        if l.broken {
+            return Err(std::io::Error::other("nullifier table: an earlier append could not be undone"));
+        }
         if !l.pending.is_empty() {
             let mut buf = Vec::with_capacity(l.pending.len() * 32);
             for nf in &l.pending {
                 buf.extend_from_slice(nf);
             }
-            l.file.write_all(&buf)?;
-            l.file.sync_data()?;
+            let durable_len = NF_LOG_HEADER as u64 + l.persisted * 32;
+            if let Err(e) = l.file.write_all(&buf).and_then(|()| l.file.sync_data()) {
+                // A partial append (disk full) or an unsynced one must not stay: the next sync
+                // appends the whole batch again, and bytes left here would shift every later
+                // record off the 32-byte grid, so a restart read the wrong nullifiers. Cut back
+                // to what is durable and keep the batch pending; if even that fails, stop.
+                if l.file.set_len(durable_len).and_then(|()| l.file.sync_all()).is_err() {
+                    l.broken = true;
+                }
+                return Err(e);
+            }
             l.persisted += l.pending.len() as u64;
             l.pending.clear();
         }
@@ -7766,6 +7790,65 @@ mod tests {
         }
         assert!(interner.len() >= 400);
         assert!(moved.approx_heap_bytes() < rp.approx_heap_bytes(), "the bitset is smaller than the table");
+    }
+
+    /// A failed append leaves no partial records: the file is cut back to what was durable, the
+    /// batch stays pending and goes out whole on the next sync, and a reopen reads every id as
+    /// it was. If the cut-back itself fails, syncing stops and checkpoints take the full form.
+    #[test]
+    fn a_failed_append_never_shifts_the_table() {
+        let dir = std::env::temp_dir().join(format!("zkas-nfs-fail-{}-{:?}", std::process::id(), std::thread::current().id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("__nullifiers__.nfs");
+        let nf = |i: u64| -> [u8; 32] {
+            let mut b = [0u8; 32];
+            b[..8].copy_from_slice(&i.to_le_bytes());
+            b[31] = 0x77;
+            b
+        };
+        let t = NullifierInterner::open_persistent(&path).unwrap();
+        for i in 0..10 {
+            t.intern(&nf(i));
+        }
+        assert_eq!(t.sync().unwrap().unwrap().1, 10);
+        for i in 10..20 {
+            t.intern(&nf(i));
+        }
+        // The append fails (disk full) and the file cannot be cut back either: stop.
+        t.replace_log_file(std::fs::OpenOptions::new().write(true).open("/dev/full").unwrap());
+        assert!(t.sync().is_err());
+        assert!(t.sync().is_err(), "nothing more is appended this run");
+        assert_eq!(t.persisted().unwrap().1, 10);
+        // The file still holds exactly the durable prefix, with the same ids.
+        let again = NullifierInterner::open_persistent(&path).unwrap();
+        assert_eq!(again.len(), 10);
+        for i in 0..10 {
+            assert_eq!(again.get(&nf(i)), Some(i as u32));
+        }
+
+        // A failure the file CAN be cut back from (bytes appended, then the error): the batch
+        // is written once, whole, by the next sync.
+        let t = NullifierInterner::open_persistent(&path).unwrap();
+        for i in 10..20 {
+            t.intern(&nf(i));
+        }
+        {
+            use std::io::Write;
+            // What a partial append leaves behind before its error.
+            std::fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(&nf(10)[..13]).unwrap();
+        }
+        let len_before = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(len_before, (NF_LOG_HEADER + 10 * 32 + 13) as u64);
+        // sync's failure path cuts back to the durable length; emulate the cut, then sync whole.
+        std::fs::OpenOptions::new().write(true).open(&path).unwrap().set_len((NF_LOG_HEADER + 10 * 32) as u64).unwrap();
+        assert_eq!(t.sync().unwrap().unwrap().1, 20);
+        let reopened = NullifierInterner::open_persistent(&path).unwrap();
+        assert_eq!(reopened.len(), 20);
+        for i in 0..20 {
+            assert_eq!(reopened.get(&nf(i)), Some(i as u32));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Fast checkpoints (versions 12/13): the bitset over a persistent table restores exactly

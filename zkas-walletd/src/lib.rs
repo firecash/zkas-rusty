@@ -15115,8 +15115,15 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
                     log::info!("nullifier table: {} entries from __nullifiers__.nfs in {:.1?}", i.len(), t0.elapsed());
                     i
                 }
+                // A read or permission error says nothing about the table: setting it aside would
+                // make every compact checkpoint rescan at once (thousands of wallets) over a blip.
+                // Refuse to start; the supervisor retries with the table untouched.
+                Err(e) if e.kind() != std::io::ErrorKind::InvalidData => {
+                    return Err(format!("nullifier table __nullifiers__.nfs could not be opened ({e}); not starting rather than setting it aside"));
+                }
                 Err(e) => {
-                    // Set aside, never deleted; checkpoints that named it rescan (they refuse to load).
+                    // Malformed: set aside, never deleted; checkpoints that named it rescan (they
+                    // refuse to load). The hourly backup (nfbackup) can be put back instead.
                     let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
                     let aside = path.with_extension(format!("nfs.bad-{stamp}"));
                     log::error!("nullifier table unreadable ({e}); moved to __nullifiers__.nfs.bad-{stamp} and starting a new one");
