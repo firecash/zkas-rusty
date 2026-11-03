@@ -18,8 +18,12 @@
 //!
 //! ## Disclosure
 //!
-//! Because the address has no standalone verifying key, a verifiable proof of
-//! ownership is *mathematically forced* to reveal the FVK (96 bytes). The FVK grants
+//! Because the address has no standalone verifying key, THIS scheme (a plain RedPallas
+//! signature checked against a key derived from the disclosed FVK) has to reveal the FVK
+//! (96 bytes). That is a limit of this construction, not of Orchard: an off-chain
+//! "statement bundle" (the ZIP-304 technique: a domain-tagged bundle that spends a note
+//! of the address and can never be a valid transaction) proves the same ownership with
+//! the existing circuit and reveals no viewing key. It is not built yet. The FVK grants
 //! **incoming/outgoing viewing** capability (someone holding it can detect this
 //! wallet's notes) but **not** spend authority. This disclosure happens only when
 //! the holder chooses to sign — it is opt-in, and no funds can move. Callers must
