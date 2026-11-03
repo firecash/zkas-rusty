@@ -64,6 +64,8 @@ const MANIFEST_TTL: std::time::Duration = std::time::Duration::from_secs(600);
 /// re-asked: 72 manifest requests and 144 warnings in 90 s against a refused mirror.
 const MANIFEST_RETRY: std::time::Duration = std::time::Duration::from_secs(60);
 const MAGIC: &[u8; 8] = b"ZKASSEG1";
+/// Largest manifest accepted from a mirror (0.5 MB for 199 segments on 3 Nov; ~2.6 KB a segment).
+const MAX_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
 /// 2 since the signed manifest. The segment files did not change; the number did so that the
 /// 1.0.52-rc20 client — whose shared-cursor cache re-downloaded segments in a loop when two
 /// wallets synced at different heights — refuses the published manifest and reads from the
@@ -846,14 +848,28 @@ impl ChainFiles {
         })
     }
 
-    async fn get_from(&self, base: &str, name: &str) -> Result<Vec<u8>, String> {
+    /// At most `max` bytes: a mirror is never trusted with the size of what it sends. The whole
+    /// body was read before anything was checked, so a broken or hostile mirror (a user can enter
+    /// their own) could stream until a phone ran out of memory; the manifest is even parsed before
+    /// its signature is checked. A body that passes `max` is cut off and refused.
+    async fn get_from(&self, base: &str, name: &str, max: u64) -> Result<Vec<u8>, String> {
         if is_http(base) {
             let c = self.http.as_ref().ok_or("no HTTP client")?;
-            let r = c.get(format!("{base}/{name}")).send().await.map_err(|e| e.to_string())?;
+            let mut r = c.get(format!("{base}/{name}")).send().await.map_err(|e| e.to_string())?;
             if !r.status().is_success() {
                 return Err(format!("HTTP {}", r.status()));
             }
-            Ok(r.bytes().await.map_err(|e| e.to_string())?.to_vec())
+            if r.content_length().is_some_and(|n| n > max) {
+                return Err(format!("{name} is larger than {max} bytes"));
+            }
+            let mut out = Vec::new();
+            while let Some(chunk) = r.chunk().await.map_err(|e| e.to_string())? {
+                if out.len() as u64 + chunk.len() as u64 > max {
+                    return Err(format!("{name} is larger than {max} bytes"));
+                }
+                out.extend_from_slice(&chunk);
+            }
+            Ok(out)
         } else {
             tokio::fs::read(format!("{base}/{name}")).await.map_err(|e| e.to_string())
         }
@@ -862,7 +878,7 @@ impl ChainFiles {
     /// The manifest one mirror serves, if it is well formed, for this network and — when it
     /// came over HTTP — signed by the publisher.
     async fn manifest_from(&self, base: &str) -> Result<Manifest, String> {
-        let b = self.get_from(base, MANIFEST_FILE).await?;
+        let b = self.get_from(base, MANIFEST_FILE, MAX_MANIFEST_BYTES).await?;
         let man = serde_json::from_slice::<Manifest>(&b).map_err(|e| e.to_string())?;
         man.check(&self.genesis)?;
         if is_http(base) {
@@ -910,7 +926,7 @@ impl ChainFiles {
     async fn fetch_segment(&self, entry: &SegmentEntry) -> Result<Vec<u8>, String> {
         let mut last = String::from("no mirrors configured");
         for base in &self.bases {
-            match self.get_from(base, &entry.file).await {
+            match self.get_from(base, &entry.file, entry.bytes).await {
                 Ok(bytes) if bytes.len() as u64 == entry.bytes && sha256_hex(&bytes) == entry.sha256 => return Ok(bytes),
                 Ok(bytes) => {
                     self.bytes_downloaded.fetch_add(bytes.len() as u64, Ordering::Relaxed);
@@ -1184,6 +1200,49 @@ fn insert_bounded(loaded: &mut VecDeque<Arc<Loaded>>, seg: Arc<Loaded>, cap: usi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A mirror sending more than asked for is cut off, whether it announces the size or not.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_oversized_download_is_refused() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                tokio::spawn(async move {
+                    let mut req = [0u8; 1024];
+                    let n = sock.read(&mut req).await.unwrap_or(0);
+                    let path = String::from_utf8_lossy(&req[..n]).split_whitespace().nth(1).unwrap_or("").to_string();
+                    let body = vec![b'x'; 3 * 1024 * 1024];
+                    let head = if path.ends_with("/sized") {
+                        format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len())
+                    } else {
+                        "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n".to_string()
+                    };
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    if path.ends_with("/sized") {
+                        let _ = sock.write_all(&body).await;
+                    } else {
+                        for c in body.chunks(64 * 1024) {
+                            if sock.write_all(format!("{:x}\r\n", c.len()).as_bytes()).await.is_err() { return; }
+                            if sock.write_all(c).await.is_err() { return; }
+                            if sock.write_all(b"\r\n").await.is_err() { return; }
+                        }
+                        let _ = sock.write_all(b"0\r\n\r\n").await;
+                    }
+                });
+            }
+        });
+        let files = ChainFiles::new(&format!("http://127.0.0.1:{port}"), RpcHash::from_bytes([1u8; 32]));
+        let base = format!("http://127.0.0.1:{port}");
+        for name in ["sized", "unsized"] {
+            let got = files.get_from(&base, name, 1024 * 1024).await;
+            assert!(got.as_ref().is_err_and(|e| e.contains("larger than")), "{name}: {:?}", got.map(|b| b.len()));
+            let whole = files.get_from(&base, name, 4 * 1024 * 1024).await;
+            assert_eq!(whole.map(|b| b.len()).ok(), Some(3 * 1024 * 1024), "{name} within the cap is read whole");
+        }
+    }
 
     fn block(i: u8, cb: usize, acts: usize) -> RpcShieldedChainBlock {
         RpcShieldedChainBlock {
