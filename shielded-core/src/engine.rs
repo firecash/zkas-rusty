@@ -1060,7 +1060,8 @@ impl WalletLite {
             amount: received_value,
             fee: 0,
             amount_is_net_outflow: false,
-            fee_known: true,
+            // As `WalletDb::record_history_compact`: memo not read yet (compact records carry none).
+            fee_known: false,
             recipient: received.first().map(|note| note.note.recipient().to_raw_address_bytes()),
             memo: Vec::new(),
             credits: crate::walletdb::credits_from_received(received),

@@ -1797,7 +1797,10 @@ impl WalletDb {
             amount: received_value,
             fee: 0,
             amount_is_net_outflow: false,
-            fee_known: true,
+            // On a Received row (which pays no fee) this means "the full transaction has been
+            // read": compact records carry no memo, so the row waits for
+            // `recover_received_from_bundle` (see `unrecovered_receipts`).
+            fee_known: false,
             recipient: received.first().map(|note| note.note.recipient().to_raw_address_bytes()),
             memo: Vec::new(),
             credits: credits_from_received(received),
@@ -1969,6 +1972,50 @@ impl WalletDb {
             }
         };
         self.push_history(entry);
+    }
+
+    /// Received rows whose memos have not been read yet, oldest-first as `(txid, daa)`.
+    ///
+    /// Compact records carry the first 52 bytes of each note ciphertext — enough to find the
+    /// note and its value, not its memo — so a payment's memo (an invoice number, an exchange
+    /// deposit reference) never reached the row or its `credits`. Rows ingested that way are
+    /// written with `fee_known == false` (meaningless on a Received row otherwise); the daemon
+    /// fetches each transaction's full bundle and calls [`Self::recover_received_from_bundle`],
+    /// which marks the row read whatever it finds. Rows stored before this existed read as
+    /// already examined, so an upgrade never re-fetches a wallet's whole history.
+    pub fn unrecovered_receipts(&self, from: usize) -> Vec<([u8; 32], u64)> {
+        self.history
+            .iter()
+            .skip(from)
+            .filter(|h| h.kind == HistoryKind::Received && !h.fee_known)
+            .map(|h| (h.txid, h.daa_score))
+            .collect()
+    }
+
+    /// Fill in the memos of a compact-ingested Received row from the transaction's full
+    /// bundle, decrypted with this wallet's incoming viewing key. The full transaction may
+    /// only ADD memos: its notes are kept only if they are exactly the notes the row already
+    /// records (same recipients, same values), so a mismatched or substituted bundle changes
+    /// nothing about what was received. Marks the row read either way. Returns whether a memo
+    /// was recovered.
+    pub fn recover_received_from_bundle(&mut self, txid: &[u8; 32], bundle: &ShieldedBundle) -> bool {
+        let full = credits_from_received(&scan_bundle_prepared(&self.prepared_ivk, bundle));
+        let Some(h) = self.history.iter_mut().rev().find(|h| h.kind == HistoryKind::Received && &h.txid == txid) else {
+            return false;
+        };
+        h.fee_known = true;
+        let shape = |c: &[Credit]| {
+            let mut v: Vec<([u8; 43], u64)> = c.iter().map(|c| (c.recipient, c.value)).collect();
+            v.sort_unstable();
+            v
+        };
+        if full.is_empty() || shape(&full) != shape(&h.credits) {
+            return false;
+        }
+        let recovered = full.iter().any(|c| !c.memo.is_empty());
+        h.memo = full.iter().find(|c| !c.memo.is_empty()).map(|c| c.memo.clone()).unwrap_or_default();
+        h.credits = full;
+        recovered
     }
 
     /// Sent rows still missing what only the full transaction can tell: recipient, paid
@@ -8713,6 +8760,71 @@ mod circuit_tests {
     /// receiver's row carries the amount+memo from IVK decryption; a checkpoint
     /// round-trip (v6) preserves every row; and a NON-recoverable send still
     /// yields a correct Sent row, just without a recipient.
+    #[test]
+    fn a_compact_receipt_gets_its_memo_from_the_full_transaction() {
+        // The daemon ingests compact records, which carry no memo: the deposit reference a
+        // payer attached never reached the recipient's history until the full transaction was
+        // read. Mirrors walletd: compact ingest, then `unrecovered_receipts` →
+        // `recover_received_from_bundle`.
+        let payer = [51u8; 32];
+        let exchange = [52u8; 32];
+        let net = [0x5au8; 32];
+        let ctx = b"zkas-walletdb-receipt-memo";
+        let mut a = WalletDb::from_seed(payer).unwrap();
+        let mut b = WalletDb::from_seed(exchange).unwrap();
+        let mine = cb(address_bytes_from_seed(payer).unwrap(), b"blk1||0", 8_000);
+        let meta1 = BlockMeta { coinbase_txid: [0xa1; 32], txids: vec![], timestamp_ms: 1_000, daa_score: 10 };
+        a.ingest_block_with_meta(&[mine.clone()], &[], Some(&meta1));
+        b.ingest_block_with_meta(&[mine], &[], Some(&meta1));
+
+        let mut memo = [0u8; 512];
+        memo[..12].copy_from_slice(b"deposit 4711");
+        let inputs = vec![(a.notes()[0].note.clone(), a.witness_path(a.notes()[0].position).unwrap())];
+        let payload = crate::wallet::build::build_wallet_payment(payer, inputs, address_bytes_from_seed(exchange).unwrap(), 5_000, 1_000, &net, ctx, true, memo)
+            .expect("payment builds");
+        let wire = ShieldedBundle::from_bytes(&payload).unwrap();
+        let compact: Vec<CompactActionRecord> = wire.actions.iter().map(CompactActionRecord::from_wire).collect();
+        let meta2 = BlockMeta { coinbase_txid: [0xb2; 32], txids: vec![[0xc3; 32]], timestamp_ms: 2_000, daa_score: 20 };
+        b.ingest_block_compact_with_meta(&[], &[compact], Some(&meta2));
+
+        let row = b.history().last().unwrap().clone();
+        assert_eq!((row.kind, row.amount, row.txid), (HistoryKind::Received, 5_000, [0xc3; 32]));
+        assert!(row.memo.is_empty() && row.credits.iter().all(|c| c.memo.is_empty()), "compact records carry no memo");
+        assert_eq!(b.unrecovered_receipts(0), vec![([0xc3; 32], 20)]);
+
+        // A transaction that does not pay exactly what the row records changes nothing.
+        let other = {
+            let mut c = WalletDb::from_seed([53u8; 32]).unwrap();
+            let m = cb(address_bytes_from_seed([53u8; 32]).unwrap(), b"blk9||0", 8_000);
+            c.ingest_block_with_meta(&[m], &[], None);
+            let ins = vec![(c.notes()[0].note.clone(), c.witness_path(c.notes()[0].position).unwrap())];
+            let mut fake = [0u8; 512];
+            fake[..12].copy_from_slice(b"deposit 9999");
+            let p = crate::wallet::build::build_wallet_payment([53u8; 32], ins, address_bytes_from_seed(exchange).unwrap(), 4_000, 1_000, &net, ctx, true, fake)
+                .expect("payment builds");
+            ShieldedBundle::from_bytes(&p).unwrap()
+        };
+        let mut probe = WalletDb::from_checkpoint(exchange, &b.to_checkpoint()).expect("restores");
+        assert_eq!(probe.unrecovered_receipts(0).len(), 1, "'not read yet' survives a checkpoint");
+        assert!(!probe.recover_received_from_bundle(&[0xc3; 32], &other));
+        assert!(probe.history().last().unwrap().memo.is_empty(), "a mismatched bundle adds no memo");
+        assert!(probe.unrecovered_receipts(0).is_empty(), "the row is marked read either way");
+
+        // The real transaction: the memo arrives, on the row and on its credit.
+        assert!(b.recover_received_from_bundle(&[0xc3; 32], &wire));
+        let row = b.history().last().unwrap();
+        assert_eq!(row.memo, b"deposit 4711".to_vec());
+        assert_eq!(row.credits.len(), 1);
+        assert_eq!((row.credits[0].value, row.credits[0].memo.as_slice()), (5_000, &b"deposit 4711"[..]));
+        assert_eq!(row.credits[0].recipient, address_bytes_from_seed(exchange).unwrap());
+        assert!(b.unrecovered_receipts(0).is_empty(), "read once, never fetched again");
+
+        // And it survives a checkpoint.
+        let b2 = WalletDb::from_checkpoint(exchange, &b.to_checkpoint()).expect("restores");
+        assert_eq!(b2.history().last().unwrap().memo, b"deposit 4711".to_vec());
+        assert!(b2.unrecovered_receipts(0).is_empty());
+    }
+
     #[test]
     fn history_records_mint_send_receive_and_survives_checkpoint() {
         let miner = [33u8; 32];

@@ -3608,6 +3608,12 @@ async fn fetch_bundle_for_tx(client: &GrpcClient, chain: RpcHash, txid: &[u8; 32
             // A transparent transaction's payload is arbitrary bytes that may well parse
             // as a bundle; only version 2 carries one that consensus verified.
             .filter(|t| t.version == TX_VERSION_SHIELDED)
+            // The id above is the node's own label. Recompute it from the transaction itself,
+            // so a node cannot hand over a different transaction under this id: the bundle feeds
+            // payment proofs and the memos of a wallet's receipts (an exchange's deposit
+            // reference), and a substituted one could pay the same address the same value
+            // under another memo.
+            .filter(|t| Transaction::try_from((*t).clone()).is_ok_and(|tx| tx.id().as_bytes() == *txid))
             .and_then(|t| ShieldedBundle::from_bytes(&t.payload).ok())
     };
     if let Some(b) = find(&first) {
@@ -4321,10 +4327,13 @@ struct WalletEntry {
     /// checkpoint rule in `sync_one_wallet` is measured from here.
     last_checkpoint_at: std::time::Instant,
     /// How many history rows have been examined for send-detail recovery (see
-    /// `recover_sent_details`). Rows below this index are not re-examined in this
+    /// `recover_history_details`). Rows below this index are not re-examined in this
     /// process — a failed fetch (block body pruned, node without the locator) is retried
     /// only on the next load, never every pass.
     history_examined: usize,
+    /// History rows whose full transaction could not be fetched this session (block body
+    /// pruned, no locator): skipped by `recover_history_details` until the next load.
+    details_skipped: HashSet<[u8; 32]>,
     /// `(blue_score, absolute leaf count)` after each ingested chain block,
     /// oldest→newest, capped at [`MATURED_RING`]. `send` picks the newest entry
     /// at least `anchor_depth + slack` blue units below the sink to root a spend
@@ -4594,6 +4603,7 @@ impl WalletEntry {
             saved_scanned: scanned,
             last_checkpoint_at: std::time::Instant::now(),
             history_examined: 0,
+            details_skipped: HashSet::new(),
             boundaries,
             boundary_blocks: HashMap::new(),
             sink_blue,
@@ -4636,34 +4646,50 @@ impl WalletEntry {
         }
     }
 
-    /// Recover recipient / paid amount / memo / fee for this wallet's own sends whose history
-    /// rows were written from compact scan records (no `out_ciphertext` there). For each
-    /// such row not yet examined: find its chain block — by DAA in the page just ingested,
-    /// else through the node's DAA locator for rows recorded before this daemon could do
-    /// this — fetch that block and its mergeset with transactions, locate the txid, and let
-    /// the wallet decrypt the outputs with its outgoing viewing key. A view-key wallet thus
-    /// sees where its money went, just like the spending wallet does. Bounded per pass;
-    /// a row whose block body is gone (pruned) or whose node lacks the locator stays as it
-    /// was and is retried on the next load only.
-    async fn recover_sent_details(&mut self, client: &GrpcClient, page: &[DecodedBlock]) {
+    /// Complete history rows written from compact scan records, from each transaction's full
+    /// bundle. Compact records carry neither `out_ciphertext` nor the memo part of a note, so:
+    ///
+    /// * **own sends** get recipient, paid amount, memo and fee, decrypted with the outgoing
+    ///   viewing key (a view-key wallet sees where its money went, like the spending wallet);
+    /// * **receipts** get the memo of every note the transaction paid this wallet (an invoice
+    ///   number, an exchange's deposit reference), decrypted with the incoming viewing key.
+    ///   Without this a payer's memo never reached the recipient's history at all.
+    ///
+    /// For each row: find its chain block — by DAA in the page just ingested, else through the
+    /// node's DAA locator — fetch that block and its mergeset, locate the txid, and decrypt.
+    /// At most `MAX_PER_PASS` fetches per pass; the cursor advances only once everything
+    /// pending has been handled, so a busy page's rows are reached on the next passes rather
+    /// than the next load. A row whose block body is gone (pruned) or whose node lacks the
+    /// locator is skipped for this session.
+    async fn recover_history_details(&mut self, client: &GrpcClient, page: &[DecodedBlock]) {
         const MAX_PER_PASS: usize = 8;
-        let from = self.history_examined.min(self.db.history().len());
-        let pending = self.db.unrecovered_sends(from);
-        self.history_examined = self.db.history().len();
+        let len = self.db.history().len();
+        let from = self.history_examined.min(len);
+        let mut pending: Vec<([u8; 32], u64, bool)> = self
+            .db
+            .unrecovered_sends(from)
+            .into_iter()
+            .map(|(t, d)| (t, d, false))
+            .chain(self.db.unrecovered_receipts(from).into_iter().map(|(t, d)| (t, d, true)))
+            .filter(|(t, _, _)| !self.details_skipped.contains(t))
+            .collect();
+        pending.sort_by_key(|(_, d, _)| *d);
+        if pending.len() <= MAX_PER_PASS {
+            self.history_examined = len;
+        }
         if pending.is_empty() {
             return;
         }
         let mut done = 0usize;
-        for (txid, daa) in pending.into_iter().take(MAX_PER_PASS) {
+        for (txid, daa, receipt) in pending.into_iter().take(MAX_PER_PASS) {
             // The chain block that accepted the tx: same DAA as the row (rows are dated by
             // the accepting chain block's metadata).
             let chain = match page.iter().find(|b| b.daa_score == daa) {
                 Some(b) => Some(b.hash),
                 None => {
-                    // Backfill: rows from before this daemon could recover details. Ask the
-                    // node for the chain block at this DAA (locator: last block strictly
-                    // below daa+1). A node without the locator answers its finality point,
-                    // whose DAA will not match — skipped.
+                    // Rows from an earlier page or load: ask the node for the chain block at this
+                    // DAA (locator: last block strictly below daa+1). A node without the locator
+                    // answers its finality point, whose DAA will not match — skipped.
                     // Saturating: a corrupt row's DAA must not overflow under release overflow checks
                     // (fatal when walletd is embedded in the node); the answer then simply won't match.
                     let req = kaspa_rpc_core::GetShieldedTreeStateRequest { block_hash: None, below_daa_score: Some(daa.saturating_add(1)) };
@@ -4673,15 +4699,27 @@ impl WalletEntry {
                     }
                 }
             };
-            let Some(chain) = chain else { continue };
-            let Some(bundle) = fetch_bundle_for_tx(client, chain, &txid).await else { continue };
-            let recovered = self.db.recover_sent_from_bundle(&txid, &bundle);
+            let Some(chain) = chain else {
+                self.details_skipped.insert(txid);
+                continue;
+            };
+            let Some(bundle) = fetch_bundle_for_tx(client, chain, &txid).await else {
+                self.details_skipped.insert(txid);
+                continue;
+            };
             done += 1;
-            log::info!(
-                "history: own send {} at daa {daa} — {}",
-                hex(&txid[..8]),
-                if recovered { "recipient/amount/memo/fee recovered from the full transaction" } else { "fee recovered; no recipient (sent without this wallet's OVK)" }
-            );
+            if receipt {
+                if self.db.recover_received_from_bundle(&txid, &bundle) {
+                    log::info!("history: receipt {} at daa {daa} — memo recovered from the full transaction", hex(&txid[..8]));
+                }
+            } else {
+                let recovered = self.db.recover_sent_from_bundle(&txid, &bundle);
+                log::info!(
+                    "history: own send {} at daa {daa} — {}",
+                    hex(&txid[..8]),
+                    if recovered { "recipient/amount/memo/fee recovered from the full transaction" } else { "fee recovered; no recipient (sent without this wallet's OVK)" }
+                );
+            }
         }
         if done > 0 {
             // Persist what was recovered on the next checkpoint rather than waiting 1000 blocks.
@@ -5425,7 +5463,7 @@ impl WalletEntry {
             // per wallet (one fetch per own send), bounded, best-effort; async, so it lives
             // outside the blocking ingest section above.
             if advanced && self.recoverable_history && !self.db.is_leaves_only() {
-                self.recover_sent_details(client, &resp.blocks).await;
+                self.recover_history_details(client, &resp.blocks).await;
             }
             // Publish what this pass has reached so far. Without this the only progress
             // report is the one after the pass ENDS, which for an initial scan means the
