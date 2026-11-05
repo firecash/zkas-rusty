@@ -883,7 +883,8 @@ ExecStart=/usr/local/bin/zkas-walletd \
   --listen 127.0.0.1:8501 \
   --wallet-dir /var/lib/zkas/wallets \
   --auto-consolidate 200 \
-  --warm-always 3
+  --warm-always 3 \
+  --no-shared-tree
 KillSignal=SIGTERM
 TimeoutStopSec=120
 Restart=on-failure
@@ -899,6 +900,7 @@ WantedBy=multi-user.target
 | `ZKAS_WALLET_SECRET` (environment file) | Seeds are encrypted at rest. Without it they are stored in plaintext. Passed through the environment, it never appears in the process list or shell history. |
 | `--auto-consolidate 200` | Every deposit is a note; the ceiling keeps withdrawals at 1–3 spends (~2–7 s) instead of drifting into minutes (§0). |
 | `--warm-always 3` | The hot wallet (and the watch-only cold wallet) stay resident and fully prepared, so the first withdrawal after a quiet period does not wait for the wallet to reopen. ~100–190 MiB each. |
+| `--no-shared-tree` | The shared chain tree exists so that many wallets can borrow one copy of the public commitment stream. An exchange daemon serves two or three; each keeps its own tree and witness cache, exactly as the phone and desktop engines do, and the daemon skips building and maintaining a second full copy from genesis. |
 | `--rpc-server 127.0.0.1:16810` | Your own node, next to the daemon. |
 | `TimeoutStopSec=120` | A stop flushes every wallet's checkpoint; give it time to finish. |
 
@@ -921,7 +923,8 @@ zkas-walletd \
   --listen 127.0.0.1:8501 \
   --wallet-dir /var/lib/zkas/wallets \
   --no-custodial \
-  --warm-always 3
+  --warm-always 3 \
+  --no-shared-tree
 ```
 
 Register each wallet with its viewing key (`POST /api/wallet/watch` with `fvk_hex` and a
