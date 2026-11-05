@@ -1074,8 +1074,11 @@ const SHARED_LEAF_TAIL_MARGIN: u64 = 1 << 18;
 /// `(base, n_leaves, file offset of leaf base)`. Reads only the head of the file (the scan
 /// header, then the db blob's version, base size, base frontier, size and leaf count), and
 /// checks every bound against the declared blob length and the real file length. `None` if
-/// the file is absent, malformed, or not a full-form (≤ v10) blob — the shared tree never
-/// writes v11, and a stream it does not carry cannot be served from it.
+/// the file is absent, malformed, or not a full-form blob — v3 to v10, or v12 (v10 with a
+/// compact nullifier section, which is what the chain tree writes under
+/// `--compact-nullifiers`; everything up to the end of the leaves is laid out exactly as in
+/// v10). The shared tree never writes v11/v13 (it is never given a `shared_upto`), and a
+/// stream it does not carry cannot be served from it.
 fn shared_tree_extent(dir: &str) -> Option<(u64, u64, u64)> {
     shared_tree_extent_of(&mut std::fs::File::open(scan_path(dir, CHAIN_TREE_TOKEN)).ok()?)
 }
@@ -1096,7 +1099,10 @@ fn shared_tree_extent_of(f: &mut std::fs::File) -> Option<(u64, u64, u64)> {
     let db_len = u64_at(SCAN_HEADER_LEN)?;
     let blob0 = SCAN_HEADER_LEN + 8;
     let version = *head.get(blob0)?;
-    if !(3..=10).contains(&version) {
+    // v12 accepted: with `--compact-nullifiers` the chain tree is written as v12, and refusing
+    // it made `--shared-leaf-store` share nothing and every v11/v13 wallet unloadable
+    // ("unverifiable", then rebuilt from its birthday).
+    if !((3..=10).contains(&version) || version == 12) {
         return None;
     }
     let mut p = blob0 + 1;
@@ -1167,7 +1173,36 @@ fn shared_leaf_upto(dir: &str, token: &str, db: &WalletDb) -> u64 {
         return 0;
     }
     let Some((base, n_leaves, _)) = shared_tree_extent(dir) else { return 0 };
-    shared_leaf_upto_for(db.leaf_span(), base, n_leaves)
+    let upto = shared_leaf_upto_for(db.leaf_span(), base, n_leaves);
+    if upto == 0 {
+        return 0;
+    }
+    // The blob will say "my leaves [lo, upto) are the shared file's". Check it at both ends
+    // before saying so: the restore installs the FILE's leaves for that range, so a wallet whose
+    // stream differed (an off-by-one after a rebase, a diverged tree) would otherwise be silently
+    // given another stream. Two 32-byte reads; on any doubt the full form is written instead.
+    let lo = db.leaf_span().0;
+    let file_leaf = |pos: u64| -> Option<[u8; 32]> {
+        let mut out = None;
+        shared_tree_leaves(dir, pos, 1, &mut |c: &[u8]| {
+            out = c.try_into().ok();
+            Some(())
+        })?;
+        out
+    };
+    for pos in [lo, upto - 1] {
+        match (db.leaf_at(pos), file_leaf(pos)) {
+            (Some(mine), Some(theirs)) if mine == theirs => {}
+            _ => {
+                log::warn!(
+                    "wallet {}: leaf {pos} differs from the shared chain tree file (or is unreadable); writing the full checkpoint",
+                    log_pseudonym(token)
+                );
+                return 0;
+            }
+        }
+    }
+    upto
 }
 
 /// What a wallet's checkpoint will cost in RAM once loaded, estimated from its file: the
@@ -1190,10 +1225,13 @@ fn scan_resident_estimate(dir: &str, token: &str) -> Option<u64> {
     Some(len + v11_shared_leaves(&head[..got]).unwrap_or(0).saturating_mul(32))
 }
 
-/// `n_shared` of a scan file whose head is `head`, if its db blob is v11.
+/// `n_shared` of a scan file whose head is `head`, if its db blob is v11 or v13 (v11 with a
+/// compact nullifier section, written when `--compact-nullifiers` is also on). Counting v11
+/// only, a v13 wallet was admitted against the resident budget at its ~8 MB file size while
+/// bringing ~480 MB of leaves.
 fn v11_shared_leaves(head: &[u8]) -> Option<u64> {
     let blob0 = SCAN_HEADER_LEN + 8;
-    if head.len() < blob0 + 1 || &head[0..4] != SCAN_MAGIC || *head.get(blob0)? != 11 {
+    if head.len() < blob0 + 1 || &head[0..4] != SCAN_MAGIC || !matches!(*head.get(blob0)?, 11 | 13) {
         return None;
     }
     let u64_at = |p: usize| -> Option<u64> { Some(u64::from_le_bytes(head.get(p..p + 8)?.try_into().ok()?)) };
@@ -17081,6 +17119,52 @@ mod sdk_api_tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[test]
+    fn the_shared_range_is_referenced_only_where_the_file_holds_this_wallets_leaves() {
+        // 300,000 distinct canonical leaves (leaf i = i as u32, little-endian, then zeros), so
+        // the range clears SHARED_LEAF_TAIL_MARGIN and a one-leaf difference is visible.
+        const N: u32 = 300_000;
+        fn blob(n: u32, flip: Option<u32>) -> Vec<u8> {
+            let mut b = vec![3u8];
+            b.extend_from_slice(&0u64.to_le_bytes());
+            b.push(0);
+            b.extend_from_slice(&(n as u64).to_le_bytes());
+            b.extend_from_slice(&(n as u64).to_le_bytes());
+            for i in 0..n {
+                let mut leaf = [0u8; 32];
+                let v = if Some(i) == flip { i ^ 0x00ff_ffff } else { i };
+                leaf[..4].copy_from_slice(&v.to_le_bytes());
+                b.extend_from_slice(&leaf);
+            }
+            b.extend_from_slice(&0u64.to_le_bytes());
+            b.extend_from_slice(&0u64.to_le_bytes());
+            b
+        }
+        let tmp = std::env::temp_dir().join(format!("zkas-v11-guard-{}", std::process::id()));
+        let dir = tmp.to_string_lossy().to_string();
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let (genesis, low) = (RpcHash::from_bytes([3u8; 32]), RpcHash::from_bytes([4u8; 32]));
+        let none: VecDeque<(u64, u64)> = VecDeque::new();
+        let seed = [12u8; 32];
+        let wallet = WalletDb::from_checkpoint(seed, &blob(N, None)).expect("restores");
+        let expect = (N as u64) - SHARED_LEAF_TAIL_MARGIN;
+        let with_tree = |flip: Option<u32>| -> u64 {
+            let tree = WalletDb::from_checkpoint(seed, &blob(N, flip)).expect("restores");
+            save_checkpoint(&dir, CHAIN_TREE_TOKEN, &genesis, &low, N as u64, &tree, &none, &HashMap::new(), 0, 0).unwrap();
+            shared_leaf_upto(&dir, "w", &wallet)
+        };
+        SHARED_LEAF_STORE.store(true, std::sync::atomic::Ordering::Relaxed);
+        let same = with_tree(None);
+        let first_differs = with_tree(Some(0));
+        let last_differs = with_tree(Some((expect - 1) as u32));
+        SHARED_LEAF_STORE.store(false, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(same, expect, "identical stream: everything below the tail margin is shared");
+        assert_eq!(first_differs, 0, "the file differs at the wallet's first leaf: full form");
+        assert_eq!(last_differs, 0, "the file differs at the last referenced leaf: full form");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// F5 / v11 through the daemon: a wallet blob that references the shared chain tree's
     /// leaves restores the same wallet from a real chain-tree file at its real offsets; a
     /// range the file does not hold is refused; and a v11 blob whose shared file is missing
@@ -17161,6 +17245,26 @@ mod sdk_api_tests {
         assert_eq!(scan_resident_estimate(&dir, "fat"), Some(fat_len));
         // With the flag off (the default, and this test never sets it) the writer shares nothing.
         assert_eq!(shared_leaf_upto(&dir, "thin", &w), 0);
+
+        // The forms production writes under --compact-nullifiers: a v12 chain tree and v13 wallet
+        // blobs. Their layout up to the end of the leaves is v10's / v11's; only the version byte
+        // and the nullifier section after the leaves differ, so relabelling exercises the readers.
+        let blob_version_at = SCAN_HEADER_LEN + 8;
+        std::fs::rename(format!("{dir}/moved"), scan_path(&dir, CHAIN_TREE_TOKEN)).unwrap();
+        let mut tree = std::fs::read(scan_path(&dir, CHAIN_TREE_TOKEN)).unwrap();
+        tree[blob_version_at] = 12;
+        std::fs::write(scan_path(&dir, CHAIN_TREE_TOKEN), &tree).unwrap();
+        assert_eq!(shared_tree_extent(&dir).map(|(b, n, _)| (b, n)), Some((0, 64)), "a v12 chain tree is a shared stream");
+        let got = read(10, 54).expect("served from a v12 chain tree");
+        assert_eq!((&got[..32], &got[got.len() - 32..]), (&[10u8; 32][..], &[63u8; 32][..]));
+        let mut thin13 = std::fs::read(scan_path(&dir, "thin")).unwrap();
+        thin13[blob_version_at] = 13;
+        std::fs::write(scan_path(&dir, "thin13"), &thin13).unwrap();
+        assert_eq!(scan_resident_estimate(&dir, "thin13"), Some(thin_len + 40 * 32), "a v13 file counts its referenced leaves");
+        // A v11/v13 file is never accepted AS the shared stream.
+        tree[blob_version_at] = 13;
+        std::fs::write(scan_path(&dir, CHAIN_TREE_TOKEN), &tree).unwrap();
+        assert!(shared_tree_extent(&dir).is_none());
         std::fs::remove_dir_all(&dir).ok();
     }
 
