@@ -150,6 +150,9 @@ const CAUGHT_UP_PAGE: u64 = 16;
 /// that much. A reorg deeper than this margin triggers a rescan.
 const SYNC_TIP_MARGIN: u64 = 200;
 
+/// How long a history row whose full transaction could not be fetched waits before the next try.
+const DETAILS_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(600);
+
 /// How often a sync pass republishes its progress snapshot WHILE the pass is running.
 ///
 /// The snapshot used to be written once, at the end of a pass. Between those writes the
@@ -4326,14 +4329,10 @@ struct WalletEntry {
     /// When the checkpoint was last written (or the entry created) — the time-based
     /// checkpoint rule in `sync_one_wallet` is measured from here.
     last_checkpoint_at: std::time::Instant,
-    /// How many history rows have been examined for send-detail recovery (see
-    /// `recover_history_details`). Rows below this index are not re-examined in this
-    /// process — a failed fetch (block body pruned, node without the locator) is retried
-    /// only on the next load, never every pass.
-    history_examined: usize,
-    /// History rows whose full transaction could not be fetched this session (block body
-    /// pruned, no locator): skipped by `recover_history_details` until the next load.
-    details_skipped: HashSet<[u8; 32]>,
+    /// History rows whose full transaction could not be fetched, and when: skipped by
+    /// `recover_history_details` for `DETAILS_RETRY_AFTER`, then tried again (a node timeout is
+    /// transient; a pruned block body is not, and costs one fetch per interval).
+    details_skipped: HashMap<[u8; 32], std::time::Instant>,
     /// `(blue_score, absolute leaf count)` after each ingested chain block,
     /// oldest→newest, capped at [`MATURED_RING`]. `send` picks the newest entry
     /// at least `anchor_depth + slack` blue units below the sink to root a spend
@@ -4602,8 +4601,7 @@ impl WalletEntry {
             error: None,
             saved_scanned: scanned,
             last_checkpoint_at: std::time::Instant::now(),
-            history_examined: 0,
-            details_skipped: HashSet::new(),
+            details_skipped: HashMap::new(),
             boundaries,
             boundary_blocks: HashMap::new(),
             sink_blue,
@@ -4657,26 +4655,26 @@ impl WalletEntry {
     ///
     /// For each row: find its chain block — by DAA in the page just ingested, else through the
     /// node's DAA locator — fetch that block and its mergeset, locate the txid, and decrypt.
-    /// At most `MAX_PER_PASS` fetches per pass; the cursor advances only once everything
-    /// pending has been handled, so a busy page's rows are reached on the next passes rather
-    /// than the next load. A row whose block body is gone (pruned) or whose node lacks the
-    /// locator is skipped for this session.
+    /// At most `MAX_PER_PASS` fetches per pass, oldest first; the rest follow on the next
+    /// passes. A row whose transaction cannot be fetched (block body pruned, node without the
+    /// locator, a timeout) is tried again after `DETAILS_RETRY_AFTER`.
     async fn recover_history_details(&mut self, client: &GrpcClient, page: &[DecodedBlock]) {
         const MAX_PER_PASS: usize = 8;
-        let len = self.db.history().len();
-        let from = self.history_examined.min(len);
+        // The whole history, every pass: rows still to complete are marked in the row itself
+        // (`fee_known`, persisted) and failures in `details_skipped`, so this is a filter over at
+        // most `HISTORY_CAP` rows. An index cursor broke when history reached its cap and dropped
+        // its oldest half: the cursor then pointed past the end and no new row was completed
+        // until the next restart.
+        let from = 0;
         let mut pending: Vec<([u8; 32], u64, bool)> = self
             .db
             .unrecovered_sends(from)
             .into_iter()
             .map(|(t, d)| (t, d, false))
             .chain(self.db.unrecovered_receipts(from).into_iter().map(|(t, d)| (t, d, true)))
-            .filter(|(t, _, _)| !self.details_skipped.contains(t))
+            .filter(|(t, _, _)| self.details_skipped.get(t).is_none_or(|at| at.elapsed() >= DETAILS_RETRY_AFTER))
             .collect();
         pending.sort_by_key(|(_, d, _)| *d);
-        if pending.len() <= MAX_PER_PASS {
-            self.history_examined = len;
-        }
         if pending.is_empty() {
             return;
         }
@@ -4700,13 +4698,14 @@ impl WalletEntry {
                 }
             };
             let Some(chain) = chain else {
-                self.details_skipped.insert(txid);
+                self.details_skipped.insert(txid, std::time::Instant::now());
                 continue;
             };
             let Some(bundle) = fetch_bundle_for_tx(client, chain, &txid).await else {
-                self.details_skipped.insert(txid);
+                self.details_skipped.insert(txid, std::time::Instant::now());
                 continue;
             };
+            self.details_skipped.remove(&txid);
             done += 1;
             if receipt {
                 if self.db.recover_received_from_bundle(&txid, &bundle) {
@@ -7092,20 +7091,46 @@ fn sent_requests() -> &'static std::sync::Mutex<HashMap<String, (std::time::Inst
 
 const SENT_REQUEST_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
 
-fn sent_request_key(fvk_hex: &str, request_id: &str) -> Option<String> {
+/// The record key of a payment request: the wallet, the caller's id, and WHAT is paid
+/// (`payment_fingerprint`). A retry of the same payment — same id, same recipient(s), same
+/// amount(s) — finds the record; an id reused for a DIFFERENT payment does not. Keyed on the id
+/// alone, a reused id (a counter reset, a recycled batch id) was answered "already sent" with
+/// the earlier payment's transaction: the caller marked a withdrawal paid that never went out.
+fn sent_request_key(fvk_hex: &str, request_id: &str, what: &str) -> Option<String> {
     let id = request_id.trim();
     if id.is_empty() || id.len() > 128 {
         return None;
     }
     let mut h = <sha2::Sha256 as sha2::Digest>::new();
     sha2::Digest::update(&mut h, fvk_hex.trim().to_ascii_lowercase().as_bytes());
-    Some(format!("{}:{id}", hex(&sha2::Digest::finalize(h)[..16])))
+    Some(format!("{}:{id}#{what}", hex(&sha2::Digest::finalize(h)[..16])))
 }
 
+/// What a request pays, for its key: the recipient(s) and amount(s), hashed.
+fn payment_fingerprint(parts: &[String]) -> String {
+    let mut h = <sha2::Sha256 as sha2::Digest>::new();
+    for p in parts {
+        sha2::Digest::update(&mut h, p.as_bytes());
+        sha2::Digest::update(&mut h, b"\n");
+    }
+    hex(&sha2::Digest::finalize(h)[..8])
+}
+
+/// A request amount as the fingerprint sees it: integer sompi, however it was given.
+fn fingerprint_amount(sompi: Option<u64>, fc: Option<f64>) -> String {
+    match (sompi, fc) {
+        (Some(s), _) => s.to_string(),
+        (None, Some(fc)) => ((fc * SOMPI_PER_ZKAS as f64).round() as u64).to_string(),
+        (None, None) => String::new(),
+    }
+}
+
+/// The record for `key`, or for the same request recorded before keys carried a fingerprint
+/// (records live 24 h, so a retry across the upgrade still finds its payment).
 fn sent_request(key: &str) -> Option<SendResp> {
     let mut m = sent_requests().lock().unwrap();
     m.retain(|_, (at, _)| at.elapsed() < SENT_REQUEST_TTL);
-    m.get(key).map(|(_, r)| r.clone())
+    m.get(key).or_else(|| key.rsplit_once('#').and_then(|(legacy, _)| m.get(legacy))).map(|(_, r)| r.clone())
 }
 
 fn record_sent_request(key: String, resp: &SendResp) {
@@ -12266,7 +12291,8 @@ async fn wallet_send(
     let _spending = gate.lock().await;
     // Under the per-wallet send gate, so a retry racing its original waits for it and then
     // finds it here. Keyed by the wallet token (custodial: the token is the wallet).
-    let request_key = req.request_id.as_deref().and_then(|id| sent_request_key(&format!("custodial:{token}"), id));
+    let what = payment_fingerprint(&[req.to.trim().to_string(), fingerprint_amount(req.amount_sompi, req.amount_fc)]);
+    let request_key = req.request_id.as_deref().and_then(|id| sent_request_key(&format!("custodial:{token}"), id, &what));
     if let Some(done) = request_key.as_deref().and_then(sent_request) {
         log::info!("send: request already broadcast as {}; returning it instead of paying again", done.txid);
         return Err((
@@ -12722,7 +12748,16 @@ async fn wallet_send_many(
     // not select the same notes.
     let gate = state.send_gate(&token).await;
     let _spending = gate.lock().await;
-    let request_key = req.request_id.as_deref().and_then(|id| sent_request_key(&format!("custodial-many:{token}"), id));
+    let what = payment_fingerprint(
+        &req.payees
+            .iter()
+            .map(|p| {
+                let sompi = p.amount_sompi.as_ref().and_then(|a| a.parse("amount_sompi").ok());
+                format!("{}|{}", p.to.trim(), fingerprint_amount(sompi, p.amount_fc))
+            })
+            .collect::<Vec<_>>(),
+    );
+    let request_key = req.request_id.as_deref().and_then(|id| sent_request_key(&format!("custodial-many:{token}"), id, &what));
     if let Some(done) = request_key.as_deref().and_then(sent_request) {
         log::info!("send_many: request already broadcast as {}; returning it instead of paying again", done.txid);
         return Err((
@@ -13311,7 +13346,11 @@ async fn wallet_prepare(
         .ok_or_else(|| err(StatusCode::BAD_REQUEST, "fvk_hex must be 96 bytes of hex"))?;
 
     // A retry of a payment this daemon already broadcast: answer with it, build nothing.
-    let request_key = req.request_id.as_deref().and_then(|id| sent_request_key(&req.fvk_hex, id));
+    let what = payment_fingerprint(&[
+        req.to.trim().to_string(),
+        fingerprint_amount(req.amount_sompi.as_ref().and_then(|a| a.parse("amount_sompi").ok()), req.amount_fc),
+    ]);
+    let request_key = req.request_id.as_deref().and_then(|id| sent_request_key(&req.fvk_hex, id, &what));
     if let Some(done) = request_key.as_deref().and_then(sent_request) {
         log::info!("prepare: request already broadcast as {}; returning it instead of paying again", done.txid);
         return Err((
@@ -17732,9 +17771,10 @@ mod sdk_api_tests {
     fn a_broadcast_request_is_remembered_per_wallet() {
         let fvk_a = "ab".repeat(96);
         let fvk_b = "cd".repeat(96);
-        let ka = sent_request_key(&fvk_a, "rid-1").unwrap();
-        assert_ne!(Some(ka.clone()), sent_request_key(&fvk_b, "rid-1"), "another wallet's id is another key");
-        assert!(sent_request_key(&fvk_a, "").is_none() && sent_request_key(&fvk_a, &"x".repeat(129)).is_none());
+        let pay = payment_fingerprint(&["zkas:dest".into(), fingerprint_amount(Some(5), None)]);
+        let ka = sent_request_key(&fvk_a, "rid-1", &pay).unwrap();
+        assert_ne!(Some(ka.clone()), sent_request_key(&fvk_b, "rid-1", &pay), "another wallet's id is another key");
+        assert!(sent_request_key(&fvk_a, "", &pay).is_none() && sent_request_key(&fvk_a, &"x".repeat(129), &pay).is_none());
         assert!(sent_request(&ka).is_none());
         let resp = SendResp {
             txid: "t1".into(),
@@ -17747,7 +17787,18 @@ mod sdk_api_tests {
         };
         record_sent_request(ka.clone(), &resp);
         assert_eq!(sent_request(&ka).map(|r| r.txid), Some("t1".to_string()));
-        assert_eq!(sent_request_key(&fvk_a.to_uppercase(), " rid-1 "), Some(ka), "hex case and spaces do not split a payment");
+        assert_eq!(sent_request_key(&fvk_a.to_uppercase(), " rid-1 ", &pay), Some(ka.clone()), "hex case and spaces do not split a payment");
+        // The same id for a DIFFERENT payment is a different request: never answered with this one.
+        let other = payment_fingerprint(&["zkas:someone-else".into(), fingerprint_amount(Some(5), None)]);
+        let more = payment_fingerprint(&["zkas:dest".into(), fingerprint_amount(Some(6), None)]);
+        assert!(sent_request(&sent_request_key(&fvk_a, "rid-1", &other).unwrap()).is_none());
+        assert!(sent_request(&sent_request_key(&fvk_a, "rid-1", &more).unwrap()).is_none());
+        // amount_fc and amount_sompi name the same payment.
+        assert_eq!(fingerprint_amount(None, Some(0.00000005)), fingerprint_amount(Some(5), None));
+        // A record written before keys carried a fingerprint still answers its own retry.
+        let legacy = ka.rsplit_once('#').unwrap().0.to_string();
+        record_sent_request(legacy.replace("rid-1", "rid-legacy"), &resp);
+        assert!(sent_request(&sent_request_key(&fvk_a, "rid-legacy", &pay).unwrap()).is_some());
     }
 
     #[test]

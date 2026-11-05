@@ -2012,9 +2012,18 @@ impl WalletDb {
         if full.is_empty() || shape(&full) != shape(&h.credits) {
             return false;
         }
-        let recovered = full.iter().any(|c| !c.memo.is_empty());
-        h.memo = full.iter().find(|c| !c.memo.is_empty()).map(|c| c.memo.clone()).unwrap_or_default();
-        h.credits = full;
+        // Keep the row's own order: each existing entry takes its memo from the matching full
+        // one. Integrators key credits on `(txid, index)`; reordering them here would move a
+        // customer's deposit to another index after it was credited.
+        let mut pool = full;
+        let mut merged = Vec::with_capacity(h.credits.len());
+        for c in &h.credits {
+            let Some(i) = pool.iter().position(|f| f.recipient == c.recipient && f.value == c.value) else { return false };
+            merged.push(pool.swap_remove(i));
+        }
+        let recovered = merged.iter().any(|c| !c.memo.is_empty());
+        h.memo = merged.iter().find(|c| !c.memo.is_empty()).map(|c| c.memo.clone()).unwrap_or_default();
+        h.credits = merged;
         recovered
     }
 
