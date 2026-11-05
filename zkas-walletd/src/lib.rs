@@ -7931,6 +7931,22 @@ impl AppState {
         self.activity.lock().await.insert(token.to_string(), now_unix());
     }
 
+    /// [`Self::touch`] for the daemon's OWN visits (warm pin, rotation, cache sweep, operator
+    /// warm, background load): refreshes the in-memory `last_touch` the sync loop and evictor
+    /// read, but not the durable request ledger, which records when a PERSON last asked
+    /// (`ACTIVITY_FILE`). Stamping it from internal loads made the ledger self-perpetuating:
+    /// the rotation revisits every wallet up to the "week" tier about every 58 h, each visit
+    /// re-stamped it "requested now", and so no wallet — abandoned duplicate tokens included —
+    /// ever aged out. All ~3,600 hosted tokens kept syncing and rewriting their checkpoints
+    /// (measured 5 Nov: 1.07 GB/min of checkpoint writes).
+    async fn touch_internal(&self, token: &str) {
+        let loaded = self.wallets.lock().await.contains_key(token);
+        if !loaded && !wallet_exists(&self.wallet_dir, token) {
+            return;
+        }
+        self.last_touch.lock().await.insert(token.to_string(), std::time::Instant::now());
+    }
+
     /// The wallet if it is already loaded in memory — never loads. For the request path,
     /// which must not block on a load.
     async fn cached_wallet(&self, token: &str) -> Option<Wallet> {
@@ -7963,7 +7979,7 @@ impl AppState {
             // and the log said nothing at all — leaving "it just says Opening forever"
             // with no thread to pull. One line here is the difference between a diagnosis
             // and a guess.
-            if state.get_wallet(&token).await.is_none() {
+            if state.get_wallet_internal(&token).await.is_none() {
                 let wait = load_backoff_failed(&token);
                 log::warn!(
                     "wallet {token_p}: load did not complete; it stays 'opening' and the next attempt waits {}s",
@@ -8270,18 +8286,32 @@ impl AppState {
     /// takes the resident fast path. The per-token `loading` lock still coalesces, so the
     /// retry does not start a second load of the same wallet.
     async fn get_wallet(self: &Arc<Self>, token: &str) -> Option<Wallet> {
+        self.get_wallet_for(token, true).await
+    }
+
+    /// [`Self::get_wallet`] for the daemon's own loads: never counts as a person's request
+    /// (see [`Self::touch_internal`]).
+    async fn get_wallet_internal(self: &Arc<Self>, token: &str) -> Option<Wallet> {
+        self.get_wallet_for(token, false).await
+    }
+
+    async fn get_wallet_for(self: &Arc<Self>, token: &str, by_request: bool) -> Option<Wallet> {
         let state = self.clone();
         let token = token.to_string();
         // A JoinHandle dropped without being awaited DETACHES the task rather than
         // aborting it, which is the whole point: cancelling this await cannot cancel the
         // load. Only a panic inside the task yields Err, and that is not a loaded wallet.
-        tokio::spawn(async move { state.get_wallet_inner(&token).await }).await.ok().flatten()
+        tokio::spawn(async move { state.get_wallet_inner(&token, by_request).await }).await.ok().flatten()
     }
 
-    async fn get_wallet_inner(self: &Arc<Self>, token: &str) -> Option<Wallet> {
+    async fn get_wallet_inner(self: &Arc<Self>, token: &str, by_request: bool) -> Option<Wallet> {
         // Mark the wallet active so the sync loop keeps it current; idle wallets are
-        // parked (see `sync_loop`).
-        self.touch(token).await;
+        // parked (see `sync_loop`). Only a request counts as a person's activity.
+        if by_request {
+            self.touch(token).await;
+        } else {
+            self.touch_internal(token).await;
+        }
         {
             let map = self.wallets.lock().await;
             if let Some(w) = map.get(token) {
@@ -14694,7 +14724,7 @@ async fn warm_wallet(
     require_local_operator(peer)?;
     let token = token_from(&headers, state.allow_default_token)?;
     let w = state
-        .get_wallet(&token)
+        .get_wallet_internal(&token)
         .await
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "wallet is not loaded; open it first, then retry"))?;
     let started = std::time::Instant::now();
@@ -15083,18 +15113,6 @@ async fn warm_sweep_loop(state: Arc<AppState>) {
             let act = state.activity.lock().await;
             sweep_candidates_tiered(&state.wallet_dir, &act)
         };
-        if proving_now() || CONSOLIDATING.load(std::sync::atomic::Ordering::Relaxed) > 0 {
-            continue;
-        }
-        if let Some(free) = mem_available_mb() {
-            // The wallet is not chosen yet, so size the floor to nothing: on a
-            // single-wallet daemon that is the 256 MB minimum, on the hosted one the
-            // configured floor.
-            if free < subtree_build_floor_now_mb(state.resources.subtree_free_floor_mb, 0, !state.build_shared_tree) {
-                continue;
-            }
-        }
-
         // ---- MAINTENANCE: keep the recently-active wallets OPEN and AT THE TIP -------
         //
         // The half of "prepare completely" that a user actually feels. A cache makes the
@@ -15152,7 +15170,7 @@ async fn warm_sweep_loop(state: Arc<AppState>) {
                     if mem_available_mb().unwrap_or(u64::MAX) <= MAINTAIN_LOAD_FLOOR_MB {
                         break;
                     }
-                    if state.get_wallet(token).await.is_some() {
+                    if state.get_wallet_internal(token).await.is_some() {
                         pulled += 1;
                     }
                 }
@@ -15182,7 +15200,7 @@ async fn warm_sweep_loop(state: Arc<AppState>) {
                 if !pool.is_empty() {
                     rotate_cursor = rotate_cursor.wrapping_add(1);
                     let token = pool[rotate_cursor % pool.len()].clone();
-                    if state.get_wallet(&token).await.is_some() {
+                    if state.get_wallet_internal(&token).await.is_some() {
                         rotated = Some(token);
                     }
                 }
@@ -15195,6 +15213,24 @@ async fn warm_sweep_loop(state: Arc<AppState>) {
                     rotated.as_deref().map(|t| format!(" (now {})", log_pseudonym(t))).unwrap_or_default(),
                     headroom
                 );
+            }
+        }
+
+        // The build gates, for the PREPARATION below only. They used to sit above MAINTENANCE,
+        // which its own comment says must never be gated: while any payment proved or a merge
+        // ran, or free memory sat under the subtree floor, a resident pinned wallet's
+        // `last_touch` was not refreshed, so after `--active-sync-window` it stopped syncing
+        // (deposits stalled until the next request) and could be evicted. Maintenance's own
+        // loads (pull-in, rotation) carry their own proving and memory checks.
+        if proving_now() || CONSOLIDATING.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+            continue;
+        }
+        if let Some(free) = mem_available_mb() {
+            // The wallet is not chosen yet, so size the floor to nothing: on a
+            // single-wallet daemon that is the 256 MB minimum, on the hosted one the
+            // configured floor.
+            if free < subtree_build_floor_now_mb(state.resources.subtree_free_floor_mb, 0, !state.build_shared_tree) {
+                continue;
             }
         }
 
@@ -15240,7 +15276,7 @@ async fn warm_sweep_loop(state: Arc<AppState>) {
             );
             last_tier_log = Some(tier);
         }
-        let Some(w) = state.get_wallet(&token).await else {
+        let Some(w) = state.get_wallet_internal(&token).await else {
             done.insert(token);
             continue;
         };
