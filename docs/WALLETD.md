@@ -398,7 +398,9 @@ answer always says truthfully whether money moved. The daemon provides both.
 
 Give every payment a `request_id` (1–128 characters, unique per payment). The daemon records
 each broadcast under it — per wallet, persisted across restarts (`__sent_requests__.jsonl`),
-kept for 24 hours — and answers a repeat accordingly:
+kept for 24 hours — and answers a repeat accordingly. A repeat is the same id **for the same
+payment** (same recipient or recipients, same amounts): an id reused for a different payment is
+treated as a new payment, never answered with the old one.
 
 | Situation | Answer |
 | --- | --- |
@@ -939,80 +941,123 @@ split payments, request ids and unknown outcomes.
 #### Deposit attribution
 
 A wallet has one key but **unlimited addresses**. `GET /api/wallet/address?index=N` returns the
-wallet's N-th Orchard *diversified* address (index 0 is the default address). Every diversified
-address pays into the same wallet and is found by the same scan — trial decryption is keyed on
-the incoming viewing key, independent of the diversifier — so scanning costs the same for ten
-customers or ten million. On chain the addresses are unlinkable: no one but the wallet can tell
-that two of them share a key.
+wallet's N-th Orchard *diversified* address. Every diversified address pays into the same
+wallet and is found by the same scan — trial decryption is keyed on the incoming viewing key,
+independent of the diversifier — so scanning costs the same for ten customers or ten million.
+On chain the addresses are unlinkable. An address is bound into each note's commitment, so the
+address a deposit reports is the address it was actually paid to; it cannot be forged.
 
 | Design | How | Verdict |
 | --- | --- | --- |
-| **One wallet, one diversified address per customer** | `address?index=<customer id>` at signup; attribute each deposit by the address it paid | **Recommended.** Nothing for the customer to type, nothing to get wrong. |
+| **One wallet, one diversified address per customer** | `address?index=<customer index>` at signup; attribute each deposit by the address it paid | **Recommended.** Nothing for the customer to type, nothing to get wrong. |
 | **One wallet per customer** | a token and seed per customer, swept to a hot wallet | Works for hundreds of customers; beyond that it is the design above with extra scans, backups and a proof per sweep. |
-| **Memo references** | one address; the customer must enter a reference | Possible (memos are delivered, see below), but a forgotten or mistyped reference becomes a support case. Use addresses. |
+| **Memo references** | one address; the customer must enter a reference | Possible, but a forgotten or mistyped reference becomes a support case. Use addresses. |
 
 ```bash
-# at signup: customer 4711's own deposit address (store the index with the customer)
+# at signup: customer 4711's own deposit address
 curl -H "X-Wallet-Token: $TOK" "http://127.0.0.1:8501/api/wallet/address?index=4711"
 ```
 
-The index is a `u32`; use your customer id or a counter and keep the mapping. Derivation is
-deterministic, so the same index always returns the same address.
+Rules for the address book:
+
+- **Store the exact address string** returned for each index, mapped to its customer. Derivation
+  is deterministic: the same index always returns the same address.
+- **Reserve indexes for the exchange itself** — for example `0` for top-ups from cold storage —
+  and never issue them to a customer. Payments into the hot wallet from your own cold wallet
+  arrive as ordinary receipts; issued to a customer, a top-up would be credited to them.
+- **A deposit to an address you never issued** (or a reserved one you did not expect) is held
+  for review, never credited automatically.
 
 #### Crediting deposits
 
-Read deposits from `GET /api/wallet/history`. Each `received` row is one transaction, and its
-**`credits[]`** array has one entry per output that paid this wallet — `recipient`,
-`amountSompi`, `memo`. **Attribute from `credits[]`**, never from the row's top-level fields: a
-single transaction can pay several of your customers (a payer settling two invoices, another
-exchange's batched payout), and then the row's `amountSompi` is their **sum** while its
-`recipient` is only the **first** address. When `credits[]` is empty (rows written by older
-daemon versions), fall back to the row's `recipient` and `amountSompi`.
+Read deposits from `GET /api/wallet/history`, rows of `kind: "received"`. Each row is one
+transaction; its **`credits[]`** array has one entry per output that paid this wallet:
+`recipient`, `amountSompiExact`, `memo`.
+
+1. **Attribute from `credits[]`, never from the row's top-level fields.** One transaction can
+   pay several of your customers (a payer settling two invoices, another exchange's batched
+   payout); the row's `amountSompi` is then their **sum** and its `recipient` only the
+   **first** address.
+2. **Use `amountSompiExact`** (a decimal string). The numeric `amountSompi` is a JSON number,
+   which JavaScript and many JSON libraries round above 2^53 sompi.
+3. **Check the row before crediting it:** the credits must sum to the row's `amountSompiExact`.
+   A received row with an **empty** `credits[]` (written by a daemon older than the breakdown)
+   or with a sum that does not match is held for **manual review**, never credited from its
+   top-level fields.
+4. **Credit each entry exactly once.** Key it on `(txid, index in credits[])` and store the key
+   with the ledger entry. The order of `credits[]` never changes once a row exists.
+5. **`coinbase` rows are not deposits.** A mining payout directed to a deposit address arrives as
+   a `coinbase` row with no address and cannot be attributed; tell customers not to mine to a
+   deposit address.
 
 ```bash
-curl -s -H "X-Wallet-Token: $TOK" "http://127.0.0.1:8501/api/wallet/history?limit=500" \
-  | jq -c '.rows[] | select(.kind=="received") | .txid as $t | .daaScore as $d
-           | .credits | to_entries[] | {txid: $t, i: .key, daaScore: $d,
-                                       recipient: .value.recipient, amountSompi: .value.amountSompi, memo: .value.memo}'
+# one object per received transaction: its total and each credit with its key
+curl -s -H "X-Wallet-Token: $TOK" "http://127.0.0.1:8501/api/wallet/history?limit=500" | jq -c '
+  .rows[] | select(.kind == "received") | .txid as $t
+  | { txid: $t, daaScore, totalSompi: .amountSompiExact,
+      credits: [ .credits | to_entries[] | { key: "\($t):\(.key)", address: .value.recipient, sompi: .value.amountSompiExact, memo: .value.memo } ] }'
 ```
 
-**Make crediting idempotent.** Key every credit on `(txid, index in credits[])` and store the key
-with the ledger entry, so processing a row twice can never credit twice.
+Do the sum check and all amounts in integer arithmetic in your own code (`jq` uses floating
+point).
 
-**Polling.** History is returned newest first and the response carries `total`, the number of
-rows. Remember the `total` you have processed; on each poll, new rows are the first
-`total − processed` rows at `offset=0` (page with `limit`, up to 5 000, and `offset` from that
-same starting point). If `total` ever decreases — a wallet rescan rebuilds history — re-read
-everything; the idempotent keys make that safe.
+**When a deposit is final.** The daemon writes a row only once its block is at least
+`SYNC_TIP_MARGIN` (200 blue units, about three minutes) below the tip, and only for
+transactions the chain actually **applied** — the node's shielded records exclude any spend
+consensus dropped (an immature anchor, an already-spent nullifier). A row is therefore safe to
+credit when it appears. For large deposits you may require more depth:
+`/api/status.chain_len − row.daaScore ≥` your threshold.
 
-**When to credit.** A row appears only once its block is at least `SYNC_TIP_MARGIN` (200 blue
-units, about three minutes) below the tip, where it can no longer be reorganised, and only for
-spends the chain actually **applied**. That makes the row itself the confirmation: credit it
-when it appears.
+Never credit from anything else. A shielded transaction can be mined, carry a txid and gain
+confirmations while having moved nothing — consensus drops the spend during the state
+transition instead of rejecting the block. Block or txid inclusion, an explorer, or
+"N confirmations" do not show that; the daemon's history does. If you read the chain directly
+(`GetShieldedBlocks`), its records are the applied set, but you must apply the settlement depth
+yourself.
 
-Do not credit from anything else. A shielded spend can be mined, carry a txid and gain
-confirmations while having moved nothing: if its anchor is not yet mature, or its nullifier was
-already spent, consensus **drops** the spend during the state transition instead of rejecting
-the block. The block stays valid, no value moves, and no fee is charged. So never credit from
-block or txid inclusion, an explorer, or "N confirmations" — the daemon's history already
-accounts for this. If you read the chain directly (`GetShieldedBlocks`), those records are
-authoritative about what was applied, but you must add the 200-unit settlement depth yourself.
+**Polling.** History is newest first: `GET /api/wallet/history?limit=<≤5000>&offset=<n>`.
+Keep a watermark: the highest `daaScore` you have fully processed.
+
+1. Read pages from `offset=0` until a page's oldest row has a `daaScore` below the watermark (or
+   the history ends).
+2. Process every received row at or above the watermark, idempotently (rule 4 above); rows you
+   have already credited are skipped by their keys.
+3. Set the watermark to the highest `daaScore` processed.
+
+New rows arriving while you page only shift later pages, which the keys make harmless. Do not
+track progress by `total`: history keeps the most recent 20 000 rows and drops the oldest
+10 000 in one step when it reaches that size, so `total` is not monotonic. Poll at least every
+few minutes, far inside that window.
+
+**Reconciliation.** Once an hour, with `/api/status` showing `synced: true` and
+`missing_history: false`, read the complete history and check that every key you credited at
+or above the oldest row's `daaScore` is still present. A credited deposit that is missing is a
+reorganisation deeper than the settlement margin — the wallet rebuilds itself after one — and
+must go to review. Do not reconcile while the wallet is rebuilding (`synced: false`): its
+history is incomplete until it catches up.
 
 **Credited is not yet spendable.** A received note can be spent once it is past the matured
-anchor (~10 minutes). Customer balances can be credited immediately; the exchange's own ability
-to pay withdrawals is `spendable_sompi` in `/api/status`, with recent deposits shown in
-`maturing_sompi`.
+anchor (~10 minutes). Customer balances can be credited at once; what the exchange can pay out
+is `spendable_sompi` in `/api/status`, with recent deposits in `maturing_sompi`.
 
 The mempool preview (`pending_in_sompi`) shows an incoming payment about a second after the
-sender presses send. It is suitable for a "deposit detected" notice, never for credit.
+sender presses send. Use it for a "deposit detected" notice, never for credit.
 
-**Memos.** Each credit carries the memo the payer attached to that output. The daemon reads
-memos from the full transaction just after the row is written — normally within the same sync
-pass. A received row shows `feeKnown: false` until that read is done; if you attribute by memo,
-wait for `feeKnown: true` before deciding a deposit has none. (A row whose block body the node
-no longer holds keeps `feeKnown: false` and no memo — another reason to attribute by address.)
+**Memos.** Each credit carries the memo the payer attached to that output, read from the full
+transaction just after the row is written — normally within the same sync pass. A received row
+shows `feeKnown: false` until that read is done (retried every 10 minutes if the node does not
+answer). Memos are written by the payer and prove nothing about who sent the payment; if you
+attribute by memo, wait for `feeKnown: true`.
 
 #### Withdrawals
+
+Book a withdrawal on your ledger **before** sending it, and settle it from the answer:
+
+1. Debit the customer and mark the withdrawal *pending* under a unique, never-reused id.
+2. **If the destination is one of your own deposit addresses, do not broadcast.** Settle it as
+   an internal transfer on your ledger. A payment from your hot wallet to your own address is
+   recorded as your own send, so the receiving customer would never see a `received` credit.
+3. Send it with that id as `request_id`:
 
 ```bash
 curl -X POST -H "X-Wallet-Token: $TOK" -H 'Content-Type: application/json' \
@@ -1021,25 +1066,28 @@ curl -X POST -H "X-Wallet-Token: $TOK" -H 'Content-Type: application/json' \
   http://127.0.0.1:8501/api/wallet/send
 ```
 
-- **`request_id` = your withdrawal id, always.** A retry after a timeout or a crash returns the
-  original result instead of paying again (§4). Records survive daemon restarts for 24 hours.
-- **Act on the status code** (§4):
-  - **200**: paid. Record every id in `txids`; a payment needing more than 38 notes is split,
-    and `tx_count` exceeds 1.
-  - **409 `already_sent`**: paid earlier. Record the transaction from the body.
-  - **409 `in_progress`**: still being sent. Retry later with the same id.
-  - **502 without `txids`, 400, 503**: not paid. Safe to retry or to fail the withdrawal.
-  - **502 with `txids`**: a split payment that was partly paid. The listed parts went out.
-  - **504 `outcome_unknown`**: possibly paid. Keep the withdrawal pending and retry with the
-    **same** `request_id`; never re-issue it under a new id.
-- **`max_total_fee`** caps what one withdrawal may pay in fees. It is refused before proving if
-  the plan would exceed it.
-- **Validate addresses up front.** An invalid or non-shielded address is refused (400) before
-  any work is done.
+4. Settle it from the status (§4):
+
+| Answer | Withdrawal state |
+| --- | --- |
+| **200** | **Paid.** Record every id in `txids` (a payment needing more than 38 notes is split; `tx_count` > 1). |
+| **409 `already_sent`** | **Paid earlier** by this same request. Compare `already_sent.amount_sompi_exact` with the amount: if it is lower, an earlier attempt paid only part of it (the listed transactions); settle the remainder as a new withdrawal with a new id. |
+| **409 `in_progress`** | **Pending.** The same request is still being sent; retry later with the same id. |
+| **400, 503, or 502 without `txids`** | **Not paid.** Return the funds to the customer or retry. |
+| **502 with `txids`** | **Partly paid**: the listed transactions went out; settle the remainder as a new withdrawal with a new id. |
+| **504 `outcome_unknown`**, a timeout, or no answer | **Possibly paid.** Keep it pending and retry with the **same** `request_id` until you get one of the answers above. Never re-issue it under a new id, and never return the funds on a timeout. |
+
+- **Request ids are unique per payment, forever** — your withdrawal id is ideal. The daemon
+  answers a repeated id from its record only when the recipient and amount also match, so an
+  id accidentally reused for a different payment is treated as a new payment rather than
+  reported as already paid. Records survive restarts for 24 hours; retry within that window.
+- **`max_total_fee`** caps what one withdrawal may pay in fees; a plan above it is refused
+  before proving.
+- **Invalid or non-shielded addresses** are refused (400) before any work is done.
 - **Throughput.** Payments from one wallet run one at a time, so a consolidated hot wallet
   handles a withdrawal every few seconds. For more volume, batch queued withdrawals with
-  `send_many` — up to 37 per transaction, one proof — on a short timer (each payee keeps its own
-  memo, and `payee_txids` reports which transaction paid whom), or run several hot wallets.
+  `send_many` (up to 37 per transaction, one proof; each payee keeps its own memo, and
+  `payee_txids` reports which transaction paid whom), or run several hot wallets.
 - **Prefer `amount_sompi`** (an integer) to `amount_fc` (a floating-point number).
 
 #### Proof of payment for disputes
@@ -1073,11 +1121,14 @@ funding.
 | `GET /health` | not 200 |
 | `/api/status` → `node_connected`, `error` | false / set |
 | `/api/status` → `synced`, `blocks_behind` | not synced, or behind for more than a few minutes |
+| `/api/status` → `missing_history` | true: the node could not serve part of the wallet's history; its balance and history are incomplete — pause automated crediting decisions |
 | `/api/status` → `note_count` | climbing steadily (consolidation is not keeping up) |
 | `/api/status` → `spendable_sompi` | below your withdrawal float |
 | `/api/wallet/history` → `pendingOutgoing` | a withdrawal pending for more than an hour |
 | log: `OUTCOME UNKNOWN` | always (reconcile that withdrawal) |
 | log: `auto-consolidate: merge failed`, `tree does NOT equal the node's` | always |
+| reconciliation (above) | a credited deposit missing from history |
+| a received row with empty or mismatched `credits[]`, or an unknown address | always (manual review) |
 
 Reconcile daily: the sum of credited deposits minus withdrawals and fees, against the hot
 wallet's `balance_sompi` plus the cold wallet's.
