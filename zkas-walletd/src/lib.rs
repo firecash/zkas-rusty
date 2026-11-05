@@ -713,7 +713,56 @@ const FORK_BOUNDARY_HOLD: u64 = 600;
 /// it entered the mempool, was refused by every post-fork template, and its notes stayed parked for
 /// an hour. Refused here, nothing is parked; the error takes each caller's ordinary rejection path
 /// (with its partial-send report).
-async fn submit_guarded(client: &GrpcClient, tx: &Transaction) -> kaspa_rpc_core::RpcResult<kaspa_rpc_core::RpcTransactionId> {
+/// A broadcast's result. `presumed`: the node never gave a verdict — the connection failed while
+/// it was receiving the transaction and resending did not settle it — so it may be on the network.
+/// Callers treat a presumed broadcast like a sent one for the wallet's own state (its coins are
+/// parked; `reclaim_expired` returns them if it never lands) and tell the client the outcome is
+/// unknown instead of reporting success. Never "nothing was sent".
+struct Submitted {
+    id: kaspa_rpc_core::RpcTransactionId,
+    presumed: bool,
+}
+
+/// Further sends of the IDENTICAL transaction after a transport failure. Resending is always
+/// safe — same transaction, same nullifiers, same id — and the node's answer settles what the
+/// failed attempt could not.
+const SUBMIT_REBROADCASTS: u64 = 3;
+
+/// Whether a submit error came from the gRPC client's TRANSPORT after the request may already have
+/// been written, rather than from the node. Every client-side failure reaches us as
+/// `RpcError::General(<the client error's text>)`, exactly like a node's refusal, so the texts of
+/// `kaspa_grpc_client::error::Error` are the only discriminator (pinned by a test). Not here:
+/// `Not connected to server` / `RPC: channel send error` fail before anything is written.
+fn submit_transport_unknown(e: &kaspa_rpc_core::RpcError) -> bool {
+    let s = e.to_string();
+    s == "RPC request timeout" || s == "RPC: channel receive error" || s.starts_with("GRPC client error")
+}
+
+/// A node verdict saying THIS transaction is already in: an earlier attempt got through.
+fn submit_already_in(e: &kaspa_rpc_core::RpcError, txid: &str) -> bool {
+    let s = e.to_string();
+    s.contains(txid) && (s.contains("is already in the mempool") || s.contains("was already accepted by the consensus"))
+}
+
+/// The answer to a client whose broadcast is [`Submitted::presumed`].
+fn submit_outcome_unknown_body(txid: &str, what: &str) -> serde_json::Value {
+    serde_json::json!({
+        "error": format!(
+            "The connection to the node failed while it was receiving this {what}, and sending it again got no clear answer, so it is not \
+             known whether it went out (transaction {txid}). Its coins stay set aside and come back on their own if it never lands. \
+             Check History before paying again."
+        ),
+        "outcome_unknown": true,
+        "txid": txid,
+    })
+}
+
+/// Deadline for the first send of a transaction: the node verifies its proofs before answering.
+const SUBMIT_FIRST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+/// Deadline for each resend.
+const SUBMIT_RESEND_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
+
+async fn submit_guarded(state: &AppState, client: &GrpcClient, tx: &Transaction) -> kaspa_rpc_core::RpcResult<Submitted> {
     const SUBMIT_FORK_MARGIN: u64 = 60;
     let named = ShieldedBundle::from_bytes_at(&tx.payload, true).is_ok_and(|b| b.anchor_block.is_some());
     let tip = NODE_TIP_DAA.load(std::sync::atomic::Ordering::Relaxed);
@@ -722,7 +771,60 @@ async fn submit_guarded(client: &GrpcClient, tx: &Transaction) -> kaspa_rpc_core
             "a network upgrade activates before this payment could be mined; nothing was sent, prepare it again".to_string(),
         ));
     }
-    client.submit_transaction(RpcTransaction::from(tx), false).await
+    // Every transport failure used to come back as an ordinary error, which each caller reported
+    // as the node refusing ("No coins moved") and answered by releasing the coins — while the node
+    // may have taken the transaction before the connection broke. The client was then told a
+    // payment in flight had failed, and its retry paid again from other coins.
+    let txid = tx.id();
+    let txid_text = txid.to_string();
+    let mut unknown: Option<String> = None;
+    for attempt in 0..=SUBMIT_REBROADCASTS {
+        // A resend takes the CURRENT channel: the one that failed may be the dead one the health
+        // monitor is replacing. Without its own deadline a send on a dropped connection waited for
+        // the client's 500 s timeout, so no resend ever happened before the app gave up.
+        let fresh;
+        let (c, deadline) = if attempt == 0 {
+            (client, SUBMIT_FIRST_DEADLINE)
+        } else {
+            tokio::time::sleep(std::time::Duration::from_secs(2 * attempt)).await;
+            match state.request_client().await {
+                Some(c) => {
+                    fresh = c;
+                    (&fresh, SUBMIT_RESEND_DEADLINE)
+                }
+                None => {
+                    log::warn!("submit: transaction {txid_text}: no node connection for resend {attempt}");
+                    continue;
+                }
+            }
+        };
+        let sent = tokio::time::timeout(deadline, c.submit_transaction(RpcTransaction::from(tx), false))
+            .await
+            .unwrap_or_else(|_| Err(kaspa_rpc_core::RpcError::General("RPC request timeout".into())));
+        match sent {
+            Ok(id) => return Ok(Submitted { id, presumed: false }),
+            Err(e) if submit_already_in(&e, &txid_text) => {
+                log::info!("submit: transaction {txid_text} is already with the node (attempt {}); an earlier send got through", attempt + 1);
+                return Ok(Submitted { id: txid, presumed: false });
+            }
+            Err(e) if submit_transport_unknown(&e) => {
+                log::warn!("submit: transaction {txid_text}: transport failure on attempt {} ({e}); sending the same transaction again", attempt + 1);
+                unknown = Some(e.to_string());
+            }
+            // A refusal of the very first send is the node's verdict. After a failed attempt it
+            // proves nothing about that attempt (a node that took it may refuse the copy by its
+            // nullifiers), so it stays unknown.
+            Err(e) => match unknown {
+                None => return Err(e),
+                Some(first) => {
+                    log::error!("submit: transaction {txid_text}: OUTCOME UNKNOWN — first attempt failed in transport ({first}), a resend was refused ({e})");
+                    return Ok(Submitted { id: txid, presumed: true });
+                }
+            },
+        }
+    }
+    log::error!("submit: transaction {txid_text}: OUTCOME UNKNOWN after {} sends ({})", SUBMIT_REBROADCASTS + 1, unknown.unwrap_or_default());
+    Ok(Submitted { id: txid, presumed: true })
 }
 
 /// DAA scores after the security fork during which sends are held: from the fork a spend must name a
@@ -2229,6 +2331,21 @@ fn sync_concurrency(resources: &ResourceLimits) -> usize {
 /// How often a pending tree check against the node (`files_unverified`, chain-files rule 3) is retried.
 const FILES_CHECK_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
 const SYNC_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A node call with a deadline ([`SYNC_RPC_TIMEOUT`]).
+///
+/// The gRPC client fails a pending request only at its own request timeout (500 s here): when the
+/// connection drops or goes silent mid-request, its receiver task reconnects but leaves requests
+/// already in flight waiting. A call without its own deadline therefore hung up to 8 min 20 s —
+/// the node-health probe among them, so a half-open channel was only replaced after three such
+/// probes (~25 min), and a sync pass that probed the node while holding a wallet's lock froze that
+/// wallet's status, balance and sends for as long.
+async fn node_call<T>(call: impl std::future::Future<Output = kaspa_rpc_core::RpcResult<T>>) -> kaspa_rpc_core::RpcResult<T> {
+    match tokio::time::timeout(SYNC_RPC_TIMEOUT, call).await {
+        Ok(r) => r,
+        Err(_) => Err(kaspa_rpc_core::RpcError::General(format!("the node did not answer within {} s", SYNC_RPC_TIMEOUT.as_secs()))),
+    }
+}
 /// How often the sync loop re-checks the chain + mempool once every active wallet is
 /// caught up. This is the floor on how fast an incoming payment can appear, so it is a
 /// UX number, not a throughput one.
@@ -6087,13 +6204,13 @@ async fn replay_matured(
     // ever minted was below the anchor. Here that is worse than a wrong balance —
     // both callers are SPEND paths, so an unseen note is a note the plan cannot select
     // and the user gets "insufficient funds" while holding the coins.
-    let (start, ts, short) = match client.get_shielded_tree_state(Some(genesis)).await {
+    let (start, ts, short) = match node_call(client.get_shielded_tree_state(Some(genesis))).await {
         Ok(ts) if ts.block_hash == genesis => {
             log::info!("matured replay anchored at GENESIS — this node serves the complete shielded history");
             (genesis, ts, None)
         }
         _ => {
-            let dag = client.get_block_dag_info().await.map_err(|e| format!("get_block_dag_info failed: {e}"))?;
+            let dag = node_call(client.get_block_dag_info()).await.map_err(|e| format!("get_block_dag_info failed: {e}"))?;
             let start = dag.pruning_point_hash;
             let ts = client
                 .get_shielded_tree_state(Some(start))
@@ -6122,7 +6239,7 @@ async fn replay_matured(
 
     let mut low = start;
     loop {
-        let resp = client.get_shielded_blocks(low, SHIELDED_PAGE).await.map_err(|e| format!("get_shielded_blocks failed: {e}"))?;
+        let resp = node_call(client.get_shielded_blocks(low, SHIELDED_PAGE)).await.map_err(|e| format!("get_shielded_blocks failed: {e}"))?;
         if resp.reorged {
             return Err("chain reorged during the matured replay; retry".into());
         }
@@ -9358,7 +9475,7 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
         // paths, so those notes become "insufficient funds" while the user holds the coins.
         let serves_genesis = matches!(
             match state.request_client().await {
-                Some(c) => c.get_shielded_tree_state(Some(e.genesis)).await,
+                Some(c) => node_call(c.get_shielded_tree_state(Some(e.genesis))).await,
                 None => Err(kaspa_rpc_core::RpcError::General("node unavailable".into())),
             },
             Ok(ts) if ts.block_hash == e.genesis
@@ -9432,6 +9549,37 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
             log::warn!(
                 "wallet '{token_p}': submitted spend {} ({value} sompi) is on-chain (its nullifier is in the shared table) though this wallet's scan did not see it — kept as spent, not returned",
                 RpcHash::from_bytes(txid), token_p = log_pseudonym(&token));
+        }
+        // Then ask the node about the rest: an hour unobserved is not lost while the node still
+        // holds the transaction — its mempool keeps one for 24 h, and a low-fee or congested
+        // payment waits. Handed back regardless, its coins showed as spendable and the next
+        // payment that picked them was refused as a double spend. Still in the mempool: the
+        // clock restarts. No clear answer (timeout, no connection): judged again next pass.
+        // Only a definite "not found" lets the reclaim below hand the coins back. Rare (a spend
+        // must have expired) and bounded, though it runs under the wallet lock.
+        let expiring = e.db.expiring_spend_txids(now_daa, PENDING_SPEND_EXPIRY_DAA);
+        if !expiring.is_empty() {
+            let client = state.request_client().await;
+            for txid in expiring {
+                let id = RpcHash::from_bytes(txid);
+                let answer = match &client {
+                    Some(c) => tokio::time::timeout(std::time::Duration::from_secs(5), c.get_mempool_entry(id, true, false)).await.ok(),
+                    None => None,
+                };
+                let lost = matches!(&answer, Some(Err(err)) if { let t = err.to_string(); t.contains("not found") && t.contains(&id.to_string()) });
+                if lost {
+                    continue;
+                }
+                let since = match answer {
+                    Some(Ok(_)) => {
+                        log::info!("wallet '{token_p}': submitted spend {id} is still in the node's mempool after ~{PENDING_SPEND_EXPIRY_DAA}s; kept pending", token_p = log_pseudonym(&token));
+                        now_daa
+                    }
+                    // Re-judged in ~60 s of chain time.
+                    _ => now_daa.saturating_sub(PENDING_SPEND_EXPIRY_DAA).saturating_add(60),
+                };
+                e.db.renew_pending_spend(&txid, since);
+            }
         }
         for (txid, value) in e.db.reclaim_expired(now_daa, PENDING_SPEND_EXPIRY_DAA) {
             e.force_checkpoint = true; // persist the returned note promptly
@@ -10618,7 +10766,7 @@ async fn wallet_create(
     // the whole chain (measured 2026-10-31 on the phone engine). Refuse instead; nothing
     // has been written yet, so the client simply retries.
     let tip = match state.request_client().await {
-        Some(c) => c.get_block_dag_info().await.map(|d| d.virtual_daa_score).unwrap_or(0),
+        Some(c) => node_call(c.get_block_dag_info()).await.map(|d| d.virtual_daa_score).unwrap_or(0),
         None => 0,
     };
     if tip == 0 {
@@ -11565,7 +11713,7 @@ async fn wallet_rescan(
     if !force {
         let serves_genesis = matches!(
             match state.request_client().await {
-                Some(c) => c.get_shielded_tree_state(Some(state.genesis)).await,
+                Some(c) => node_call(c.get_shielded_tree_state(Some(state.genesis))).await,
                 None => Err(kaspa_rpc_core::RpcError::General("node unavailable".into())),
             },
             Ok(ts) if ts.block_hash == state.genesis
@@ -11573,11 +11721,11 @@ async fn wallet_rescan(
         if !serves_genesis {
             let node = state.request_client().await;
             let pp = match &node {
-                Some(c) => c.get_block_dag_info().await.ok().map(|d| d.pruning_point_hash),
+                Some(c) => node_call(c.get_block_dag_info()).await.ok().map(|d| d.pruning_point_hash),
                 None => None,
             };
             let below = match (&node, pp) {
-                (Some(c), Some(pp)) => c.get_shielded_tree_state(Some(pp)).await.ok().map(|ts| (ts.daa_score, ts.size)),
+                (Some(c), Some(pp)) => node_call(c.get_shielded_tree_state(Some(pp))).await.ok().map(|ts| (ts.daa_score, ts.size)),
                 _ => None,
             };
             let detail = match below {
@@ -12279,8 +12427,8 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
             log::info!("send: tx {}/{tx_count} proven in {:.0?}", idx + 1, took);
 
             let tx: Transaction = payment_tx(payload);
-            match submit_guarded(&client, &tx).await {
-                Ok(accepted) => {
+            match submit_guarded(&state, &client, &tx).await {
+                Ok(Submitted { id: accepted, presumed }) => {
                     txids.push(accepted.to_string());
                     sent += pay;
                     total_fee += cfee;
@@ -12299,6 +12447,16 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
                     // this tx as `outgoing`, which would now double-subtract.
                     e.db.note_pending_outflow(accepted.as_bytes(), pay.saturating_add(cfee));
                     e.forget_stale_outflow_previews();
+                    if presumed {
+                        // Recorded as sent: a retry of this request must be told, not pay again.
+                        if let Some(k) = request_key.clone() {
+                            record_sent_request(k, &SendResp { txid: txids[0].clone(), amount_sompi: sent, fee_sompi: total_fee, amount_sompi_exact: sent.to_string(), fee_sompi_exact: total_fee.to_string(), txids: txids.clone(), tx_count: txids.len() });
+                        }
+                        let mut body = submit_outcome_unknown_body(&accepted.to_string(), "payment");
+                        body["txids"] = serde_json::json!(txids);
+                        body["sent_sompi"] = serde_json::json!(sent);
+                        return Err((StatusCode::GATEWAY_TIMEOUT, Json(body)));
+                    }
                 }
                 Err(e) if txids.is_empty() => return Err(err(StatusCode::BAD_GATEWAY, format!("node rejected the payment: {e}"))),
                 Err(e) => {
@@ -12635,8 +12793,8 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
         log::info!("send_many: tx {}/{tx_count} proven in {:.0?}", bi + 1, started.elapsed());
 
         let tx: Transaction = payment_tx(payload);
-        match submit_guarded(&client, &tx).await {
-            Ok(accepted) => {
+        match submit_guarded(&state, &client, &tx).await {
+            Ok(Submitted { id: accepted, presumed }) => {
                 txids.push(accepted.to_string());
                 // `groups` was built by `resolved.chunks(per_tx)`, so batch `bi` is
                 // exactly payees [bi*per_tx .. bi*per_tx + len).
@@ -12658,6 +12816,16 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
                 // Same as /send: surface the change and re-derive stale mempool previews.
                 e.db.note_pending_outflow(accepted.as_bytes(), group_pay.saturating_add(fee));
                 e.forget_stale_outflow_previews();
+                if presumed {
+                    if let Some(k) = request_key.clone() {
+                        record_sent_request(k, &SendResp { txid: txids[0].clone(), amount_sompi: paid, fee_sompi: total_fee, amount_sompi_exact: paid.to_string(), fee_sompi_exact: total_fee.to_string(), txids: txids.clone(), tx_count: txids.len() });
+                    }
+                    let mut body = submit_outcome_unknown_body(&accepted.to_string(), "payout");
+                    body["txids"] = serde_json::json!(txids);
+                    body["paid_sompi"] = serde_json::json!(paid);
+                    body["payee_txids"] = serde_json::json!(payee_txids);
+                    return Err((StatusCode::GATEWAY_TIMEOUT, Json(body)));
+                }
             }
             Err(e) if txids.is_empty() => return Err(err(StatusCode::BAD_GATEWAY, format!("node rejected the payout: {e}"))),
             Err(e) => {
@@ -12849,8 +13017,8 @@ async fn consolidate_once(
         .request_client()
         .await
         .ok_or_else(|| err(StatusCode::SERVICE_UNAVAILABLE, "the wallet service cannot reach its node to broadcast; nothing was sent"))?;
-    match submit_guarded(&node, &tx).await {
-        Ok(accepted) => {
+    match submit_guarded(&state, &node, &tx).await {
+        Ok(Submitted { id: accepted, presumed }) => {
             let mut e = w.lock().await;
             let now_daa = submit_clock(&e);
             for p in positions {
@@ -12862,6 +13030,9 @@ async fn consolidate_once(
             // than letting the balance drop by the whole merged sum until it is mined.
             e.db.note_pending_outflow(accepted.as_bytes(), fee);
             e.forget_stale_outflow_previews();
+            if presumed {
+                return Err((StatusCode::GATEWAY_TIMEOUT, Json(submit_outcome_unknown_body(&accepted.to_string(), "consolidation"))));
+            }
             let notes_remaining = e.db.notes().len();
             Ok(ConsolidateResp { txid: accepted.to_string(), consolidated, value_sompi: value, notes_remaining })
         }
@@ -13862,9 +14033,9 @@ async fn wallet_submit(
         .request_client()
         .await
         .ok_or_else(|| err(StatusCode::SERVICE_UNAVAILABLE, "the wallet service cannot reach its node to broadcast; nothing was sent"))?;
-    match submit_guarded(&node, &tx).await {
-        Ok(accepted) => {
-            // The node has the transaction: park the notes it spends so they leave the
+    match submit_guarded(&state, &node, &tx).await {
+        Ok(Submitted { id: accepted, presumed }) => {
+            // The node has the transaction (or may have it: `presumed`): park the notes it spends so they leave the
             // unspent set NOW rather than ~3 minutes from now when the block carrying
             // them clears the reorg holdback. Parking (not deleting) is what makes this
             // safe — `reclaim_expired` returns the notes if the transaction never lands.
@@ -13908,6 +14079,9 @@ async fn wallet_submit(
             };
             if let Some(k) = request_key {
                 record_sent_request(k, &resp);
+            }
+            if presumed {
+                return Err((StatusCode::GATEWAY_TIMEOUT, Json(submit_outcome_unknown_body(&resp.txid, "payment"))));
             }
             Ok(Json(resp))
         }
@@ -14136,7 +14310,7 @@ async fn warm_chain_tree(
 
     // Fresh tip so we know the target and don't stop short of it.
     let chain_len = match state.sync_client().await {
-        Some(c) => match c.get_block_dag_info().await {
+        Some(c) => match node_call(c.get_block_dag_info()).await {
             Ok(d) => d.virtual_daa_score,
             Err(_) => state.node_tip.lock().await.0,
         },
@@ -15562,7 +15736,12 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
                     None => {
                         // No channel yet; the connector is working on it.
                     }
-                    Some(c) => match c.get_block_dag_info().await {
+                    // Its own deadline, far below the client's 500 s: this probe is what detects a
+                    // dead channel, so it must fail rather than hang on one (see `node_call`).
+                    Some(c) => match tokio::time::timeout(std::time::Duration::from_secs(10), c.get_block_dag_info())
+                        .await
+                        .unwrap_or_else(|_| Err(kaspa_rpc_core::RpcError::General("the node did not answer the health probe within 10 s".into())))
+                    {
                         Ok(d) => {
                             failures = 0;
                             *state.node_error.lock().unwrap_or_else(|p| p.into_inner()) = None;
@@ -17353,6 +17532,36 @@ mod sdk_api_tests {
     }
 
     #[test]
+    fn submit_outcome_classification_matches_the_grpc_client_and_node_texts() {
+        use kaspa_grpc_client::error::Error as ClientError;
+        use kaspa_rpc_core::RpcError;
+        // The client's own failures reach walletd as RpcError::General(<its text>), like a node
+        // refusal. These must classify as "maybe sent"; a wording change upstream fails here.
+        assert!(submit_transport_unknown(&RpcError::from(ClientError::Timeout)));
+        assert!(submit_transport_unknown(&RpcError::from(ClientError::ChannelRecvError)));
+        assert!(submit_transport_unknown(&RpcError::General("GRPC client error status: Unavailable, message: \"reset\"".into())));
+        // Failures before anything is written are not.
+        assert!(!submit_transport_unknown(&RpcError::from(ClientError::NotConnected)));
+        assert!(!submit_transport_unknown(&RpcError::from(ClientError::ChannelSendError)));
+        // A node verdict arrives as General(<the node's text>) (rpc/grpc/core convert/error.rs).
+        let id = kaspa_consensus_core::tx::TransactionId::from_bytes([7u8; 32]);
+        let other = kaspa_consensus_core::tx::TransactionId::from_bytes([8u8; 32]);
+        // Texts of mining/errors/src/mempool.rs RejectDuplicate / RejectAlreadyAccepted.
+        let dup = RpcError::General(format!("Rejected transaction {id}: transaction {id} is already in the mempool"));
+        let acc = RpcError::General(format!("Rejected transaction {id}: transaction {id} was already accepted by the consensus"));
+        let refused = RpcError::General(format!("Rejected transaction {id}: nullifier already claimed (double spend)"));
+        assert!(!submit_transport_unknown(&dup) && !submit_transport_unknown(&refused));
+        assert!(submit_already_in(&dup, &id.to_string()) && submit_already_in(&acc, &id.to_string()));
+        assert!(!submit_already_in(&refused, &id.to_string()));
+        // Another transaction's duplicate is not ours.
+        let dup_other = RpcError::General(format!("Rejected transaction {other}: transaction {other} is already in the mempool"));
+        assert!(!submit_already_in(&dup_other, &id.to_string()));
+        let body = submit_outcome_unknown_body(&id.to_string(), "payment");
+        assert_eq!(body["outcome_unknown"], serde_json::json!(true));
+        assert!(!body["error"].as_str().unwrap().contains("No coins moved"));
+    }
+
+    #[test]
     fn a_broadcast_request_is_remembered_per_wallet() {
         let fvk_a = "ab".repeat(96);
         let fvk_b = "cd".repeat(96);
@@ -17882,8 +18091,9 @@ async fn bundle_submit(
         .request_client()
         .await
         .ok_or_else(|| err(StatusCode::SERVICE_UNAVAILABLE, "cannot reach the node to broadcast; nothing was sent"))?;
-    match submit_guarded(&node, &tx).await {
-        Ok(_) => Ok(Json(BundleSubmitResp { complete: true, pending: Vec::new(), txid: Some(tx.id().to_string()) })),
+    match submit_guarded(&state, &node, &tx).await {
+        Ok(Submitted { presumed: true, .. }) => Err((StatusCode::GATEWAY_TIMEOUT, Json(submit_outcome_unknown_body(&tx.id().to_string(), "transaction")))),
+        Ok(Submitted { presumed: false, .. }) => Ok(Json(BundleSubmitResp { complete: true, pending: Vec::new(), txid: Some(tx.id().to_string()) })),
         Err(e) => {
             log::error!("multiparty broadcast failed for session {}: {e}", req.session);
             Err(err(StatusCode::BAD_GATEWAY, format!("the node refused the bundle: {e}")))

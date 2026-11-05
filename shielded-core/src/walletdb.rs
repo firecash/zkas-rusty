@@ -2087,6 +2087,30 @@ impl WalletDb {
     /// A spend parked with `submitted_daa == 0` (submitted before the caller had a
     /// chain score) is never reclaimed on age: the countdown has no origin, so it
     /// waits for its nullifier rather than risk un-parking an in-flight spend.
+    /// Transaction ids (deduplicated, known ids only) of the pending spends that
+    /// [`Self::reclaim_expired`] with the same arguments would hand back. A caller asks the node
+    /// about each first: a transaction still in its mempool is not lost (see
+    /// [`Self::renew_pending_spend`]).
+    pub fn expiring_spend_txids(&self, now_daa: u64, max_age_daa: u64) -> Vec<[u8; 32]> {
+        let mut out: Vec<[u8; 32]> = Vec::new();
+        for p in &self.pending_spends {
+            if p.submitted_daa != 0 && now_daa.saturating_sub(p.submitted_daa) > max_age_daa && p.txid != [0u8; 32] && !out.contains(&p.txid) {
+                out.push(p.txid);
+            }
+        }
+        out
+    }
+
+    /// Restart the expiry clock of every pending spend of `txid` at `since_daa`. Returns how many.
+    pub fn renew_pending_spend(&mut self, txid: &[u8; 32], since_daa: u64) -> usize {
+        let mut n = 0;
+        for p in self.pending_spends.iter_mut().filter(|p| &p.txid == txid) {
+            p.submitted_daa = since_daa;
+            n += 1;
+        }
+        n
+    }
+
     pub fn reclaim_expired(&mut self, now_daa: u64, max_age_daa: u64) -> Vec<([u8; 32], u64)> {
         let now = now_daa;
         let mut reclaimed = Vec::new();
@@ -8841,6 +8865,33 @@ mod circuit_tests {
     /// The vanishing-balance regression (live report 2026-07-18): a submitted
     /// spend's notes must PARK — not vanish — until the chain shows the spend,
     /// survive a restart parked, and come back if the transaction is lost.
+    #[test]
+    fn a_spend_still_in_the_mempool_is_renewed_not_reclaimed() {
+        let seed = [78u8; 32];
+        let addr = address_bytes_from_seed(seed).unwrap();
+        let mut db = WalletDb::from_seed(seed).unwrap();
+        db.ingest_block_with_meta(
+            &[cb(addr, b"blk1||0", 4_000), cb(addr, b"blk1||1", 5_000)],
+            &[],
+            Some(&BlockMeta { coinbase_txid: [1; 32], txids: vec![], timestamp_ms: 1, daa_score: 100 }),
+        );
+        let (a, b) = (db.notes()[0].position, db.notes()[1].position);
+        db.mark_spent(a, [0xaa; 32], 100);
+        db.mark_spent(b, [0xaa; 32], 100);
+        assert!(db.expiring_spend_txids(200, 3_600).is_empty(), "too fresh");
+        assert_eq!(db.expiring_spend_txids(5_000, 3_600), vec![[0xaa; 32]], "one id for both notes of the transaction");
+        // The node still holds it: the clock restarts and nothing comes back.
+        assert_eq!(db.renew_pending_spend(&[0xaa; 32], 5_000), 2);
+        assert!(db.expiring_spend_txids(5_000, 3_600).is_empty());
+        assert!(db.reclaim_expired(5_000, 3_600).is_empty());
+        assert_eq!(db.balance(), 0);
+        // Another hour with the node saying "not found": handed back.
+        assert_eq!(db.expiring_spend_txids(9_000, 3_600), vec![[0xaa; 32]]);
+        assert_eq!(db.reclaim_expired(9_000, 3_600).len(), 2);
+        assert_eq!(db.balance(), 9_000);
+        assert_eq!(db.renew_pending_spend(&[0xaa; 32], 9_000), 0, "nothing left to renew");
+    }
+
     #[test]
     fn pending_spend_parks_reclaims_and_survives_checkpoint() {
         let seed = [77u8; 32];

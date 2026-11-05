@@ -392,8 +392,8 @@ async fn release_one(r: &Release, id: &str, mut job: Job) -> Result<String, Stri
     let tx: Transaction = payment_tx(job.payload);
     let client = r.state.request_client().await.ok_or("the wallet service cannot reach its node to broadcast")?;
     let pay: u64 = job.payees.iter().map(|p| p.1).sum();
-    match submit_guarded(&client, &tx).await {
-        Ok(accepted) => {
+    match submit_guarded(&r.state, &client, &tx).await {
+        Ok(Submitted { id: accepted, presumed }) => {
             let mut e = r.w.lock().await;
             let now_daa = e.scanned as u64;
             for p in &job.positions {
@@ -402,6 +402,11 @@ async fn release_one(r: &Release, id: &str, mut job: Job) -> Result<String, Stri
             unreserve(&mut e, &job.positions);
             e.db.note_pending_outflow(accepted.as_bytes(), pay.saturating_add(UNIFORM_FEE_V1));
             e.forget_stale_outflow_previews();
+            if presumed {
+                // Its coins stay parked (returned by the reclaim if it never lands): releasing them
+                // as for a refusal would let the next payment spend coins that may already be gone.
+                return Err(format!("outcome unknown: the connection to the node failed while sending transaction {accepted}; check History"));
+            }
             Ok(accepted.to_string())
         }
         Err(err) => {
