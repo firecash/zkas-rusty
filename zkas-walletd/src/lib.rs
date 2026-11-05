@@ -7005,6 +7005,48 @@ struct PreparedSession {
 /// spent already parked, so a retry selected OTHER notes and paid a second time. A client that
 /// retries a payment with the same request id now gets the original result instead. Keyed by
 /// wallet (a hash of the viewing key) and id, so one client cannot read another's payments.
+/// Device-signed requests whose submit is broadcasting right now. `/submit` records its request in
+/// [`sent_requests`] only once the broadcast is over (up to ~90 s with resends), and the
+/// prepare/submit pair has no per-wallet gate (custodial sends do: `send_gate`, with the record
+/// checked under it): a prepare retrying the same request inside that window found no record and
+/// built a second payment from other coins. While its key is here, a prepare or submit with it
+/// is answered "still being sent". [`InFlightSend`] releases the key on every exit path.
+fn sends_in_flight() -> &'static std::sync::Mutex<HashSet<String>> {
+    static S: std::sync::OnceLock<std::sync::Mutex<HashSet<String>>> = std::sync::OnceLock::new();
+    S.get_or_init(Default::default)
+}
+
+struct InFlightSend(String);
+
+impl Drop for InFlightSend {
+    fn drop(&mut self) {
+        sends_in_flight().lock().unwrap_or_else(|p| p.into_inner()).remove(&self.0);
+    }
+}
+
+/// Claim `key` for one send; `Err` (409, `in_progress`) when it is already being sent.
+fn begin_send(key: Option<&str>) -> Result<Option<InFlightSend>, (StatusCode, Json<serde_json::Value>)> {
+    let Some(key) = key else { return Ok(None) };
+    if !sends_in_flight().lock().unwrap_or_else(|p| p.into_inner()).insert(key.to_string()) {
+        return Err(send_in_progress_err());
+    }
+    Ok(Some(InFlightSend(key.to_string())))
+}
+
+fn send_in_flight(key: Option<&str>) -> bool {
+    key.is_some_and(|k| sends_in_flight().lock().unwrap_or_else(|p| p.into_inner()).contains(k))
+}
+
+fn send_in_progress_err() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({
+            "error": "This payment is still being sent. Check History in a minute before trying again.",
+            "in_progress": true,
+        })),
+    )
+}
+
 fn sent_requests() -> &'static std::sync::Mutex<HashMap<String, (std::time::Instant, SendResp)>> {
     static S: std::sync::OnceLock<std::sync::Mutex<HashMap<String, (std::time::Instant, SendResp)>>> = std::sync::OnceLock::new();
     S.get_or_init(Default::default)
@@ -13184,6 +13226,10 @@ async fn wallet_prepare(
             Json(serde_json::json!({ "error": format!("this payment was already sent (transaction {})", done.txid), "already_sent": done })),
         ));
     }
+    // Its submit is still broadcasting (or resending): not recorded yet, and not to be paid again.
+    if send_in_flight(request_key.as_deref()) {
+        return Err(send_in_progress_err());
+    }
 
     if let Some(old) = req.replace_session.as_deref() {
         let dropped = state.prepared.lock().await.remove(old);
@@ -13975,6 +14021,8 @@ async fn wallet_submit(
     };
     let PreparedSession { payment, amount, fee, token, positions, request_key, .. } =
         session.ok_or_else(|| err(StatusCode::NOT_FOUND, "no such prepared session (expired or already submitted)"))?;
+    // Held until this handler returns, i.e. until the broadcast is recorded or refused.
+    let _in_flight = begin_send(request_key.as_deref())?;
     // A submitted self-merge is not an abandoned one (see `self_merge_cooldown`).
     if let Ok(mut m) = state.self_merges.lock() {
         m.retain(|_, e| e.0 != req.session);
@@ -17559,6 +17607,20 @@ mod sdk_api_tests {
         let body = submit_outcome_unknown_body(&id.to_string(), "payment");
         assert_eq!(body["outcome_unknown"], serde_json::json!(true));
         assert!(!body["error"].as_str().unwrap().contains("No coins moved"));
+    }
+
+    #[test]
+    fn a_request_being_sent_cannot_be_sent_again_until_it_is_over() {
+        let key = "test-in-flight-key".to_string();
+        let first = begin_send(Some(&key)).expect("free").expect("claimed");
+        assert!(send_in_flight(Some(&key)));
+        let dup = begin_send(Some(&key)).err().expect("a second send of the same request is refused");
+        assert_eq!(dup.0, StatusCode::CONFLICT);
+        assert_eq!(dup.1["in_progress"], serde_json::json!(true));
+        assert!(begin_send(None).expect("no id, no claim").is_none());
+        drop(first);
+        assert!(!send_in_flight(Some(&key)), "released on drop");
+        assert!(begin_send(Some(&key)).expect("free again").is_some());
     }
 
     #[test]
