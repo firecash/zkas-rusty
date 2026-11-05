@@ -9853,6 +9853,16 @@ fn warm_pins(touches: &HashMap<String, std::time::Instant>, n: usize) -> HashSet
 
 /// Apply the hard resident rules now, evicting as needed, optionally reserving room for a
 /// wallet about to load. Returns whether the limits are met (with that wallet admitted).
+/// Wallets with a prepared payment waiting for the device's signatures (an unexpired session).
+/// Never evicted: `/submit` parks the spent coins in the wallet only `if get_wallet(..)` returns
+/// it, and an evicted wallet's reload can be refused by memory admission — the payment then
+/// went out with nothing parked and the coins stayed spendable, so the next payment picked them
+/// and was refused as a double spend. Bounded by the session TTL (5 min).
+async fn awaiting_signature(state: &AppState) -> HashSet<String> {
+    let now = std::time::Instant::now();
+    state.prepared.lock().await.values().filter(|s| now.duration_since(s.created) < PREPARED_TTL).filter_map(|s| s.token.clone()).collect()
+}
+
 async fn enforce_resident_budget(state: &Arc<AppState>, incoming: Option<u64>) -> bool {
     let hard = state.resources.hard_max_resident_wallets;
     let budget = resident_budget_bytes(&state.resources);
@@ -9861,6 +9871,7 @@ async fn enforce_resident_budget(state: &Arc<AppState>, incoming: Option<u64>) -
     }
     let touches: HashMap<String, std::time::Instant> = state.last_touch.lock().await.clone();
     let pins = warm_pins(&touches, state.resources.warm_always);
+    let awaiting = awaiting_signature(state).await;
     let resident: Vec<(String, Wallet)> = state.wallets.lock().await.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
     let mut infos: Vec<ResidentInfo> = Vec::with_capacity(resident.len() + 1);
     for (t, w) in &resident {
@@ -9870,7 +9881,7 @@ async fn enforce_resident_budget(state: &Arc<AppState>, incoming: Option<u64>) -
         };
         // The chain tree is shared by everyone and never a victim, but its bytes count.
         let never = t.as_str() == CHAIN_TREE_TOKEN;
-        infos.push(ResidentInfo { token: t.clone(), bytes, busy: busy || never, protected: pins.contains(t), last_touch: touches.get(t).copied() });
+        infos.push(ResidentInfo { token: t.clone(), bytes, busy: busy || never, protected: pins.contains(t) || awaiting.contains(t), last_touch: touches.get(t).copied() });
     }
     if let Some(i) = WalletDb::default_nullifier_interner() {
         infos.push(ResidentInfo { token: String::new(), bytes: i.approx_heap_bytes() as u64, busy: true, protected: true, last_touch: None });
@@ -10005,9 +10016,10 @@ async fn evict_idle_wallets(state: &Arc<AppState>) {
             let _ = token; // busy: it is being worked on, which is the state we wanted
         }
     }
+    let awaiting = awaiting_signature(state).await;
     let mut victims: Vec<String> = resident
         .iter()
-        .filter(|(t, _)| !protected.contains(t))
+        .filter(|(t, _)| !protected.contains(t) && !awaiting.contains(t))
         .filter(|(t, _)| {
             touches
                 .get(t)
@@ -10027,7 +10039,7 @@ async fn evict_idle_wallets(state: &Arc<AppState>) {
         let active_window = std::time::Duration::from_secs(state.resources.active_sync_secs);
         let mut by_touch: Vec<(String, std::time::Instant)> = resident
             .iter()
-            .filter(|(t, _)| !protected.contains(t))
+            .filter(|(t, _)| !protected.contains(t) && !awaiting.contains(t))
             .filter_map(|(t, _)| {
                 let at = touches.get(t).copied().unwrap_or(now);
                 (now.duration_since(at) >= active_window).then(|| (t.clone(), at))
@@ -14113,6 +14125,12 @@ async fn wallet_submit(
                     e.db.note_pending_outflow(accepted.as_bytes(), amount.saturating_add(fee));
                     e.forget_stale_outflow_previews();
                     log::info!("submit: parked {} spent note(s) for tx {}", positions.len(), accepted);
+                } else {
+                    log::error!(
+                        "submit: tx {accepted} broadcast but wallet {} could not be loaded to park its {} note(s); they read as spendable until the scan sees it",
+                        log_pseudonym(&token),
+                        positions.len()
+                    );
                 }
             }
             let txid = accepted.to_string();
