@@ -7091,6 +7091,31 @@ struct SentRequestLine {
     key: String,
     at_unix: u64,
     resp: SendResp,
+    /// A tombstone: the request's only transaction never landed (see [`forget_sent_requests_for`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    forgotten: bool,
+}
+
+/// Forget the requests whose ONLY transaction is `txid`, because it never landed: its coins were
+/// just handed back by the reclaim. Recorded as sent (a presumed broadcast whose answer was lost,
+/// see [`Submitted::presumed`]), a retry of that payment was told "already sent" for 24 h with a
+/// transaction that does not exist, and the recipient was never paid. A record spanning several
+/// transactions is kept: forgetting it would make a retry pay again for the parts that landed.
+fn forget_sent_requests_for(txid: &str) -> usize {
+    let mut m = sent_requests().lock().unwrap_or_else(|p| p.into_inner());
+    let gone: Vec<(String, SendResp)> = m
+        .iter()
+        .filter(|(_, (_, r))| r.txid == txid && r.txids.iter().all(|t| t == txid))
+        .map(|(k, (_, r))| (k.clone(), r.clone()))
+        .collect();
+    for (k, _) in &gone {
+        m.remove(k);
+    }
+    drop(m);
+    for (k, r) in &gone {
+        append_sent_request_line(&SentRequestLine { key: k.clone(), at_unix: unix_now(), resp: r.clone(), forgotten: true });
+    }
+    gone.len()
 }
 
 fn unix_now() -> u64 {
@@ -7098,10 +7123,12 @@ fn unix_now() -> u64 {
 }
 
 fn append_sent_request(key: &str, resp: &SendResp) {
+    append_sent_request_line(&SentRequestLine { key: key.to_string(), at_unix: unix_now(), resp: resp.clone(), forgotten: false });
+}
+fn append_sent_request_line(line: &SentRequestLine) {
     use std::io::Write;
     let Some(path) = SENT_REQUESTS_FILE.get() else { return };
-    let line = SentRequestLine { key: key.to_string(), at_unix: unix_now(), resp: resp.clone() };
-    let Ok(mut text) = serde_json::to_string(&line) else { return };
+    let Ok(mut text) = serde_json::to_string(line) else { return };
     text.push('\n');
     let written = std::fs::OpenOptions::new().create(true).append(true).open(path).and_then(|mut f| {
         f.write_all(text.as_bytes())?;
@@ -7120,18 +7147,25 @@ fn load_sent_requests(wallet_dir: &str) -> usize {
     let Ok(text) = std::fs::read_to_string(&path) else { return 0 };
     let now = unix_now();
     let ttl = SENT_REQUEST_TTL.as_secs();
-    let mut kept = Vec::new();
+    // The last line per key wins; a tombstone removes the key (and its earlier lines).
+    let mut kept: Vec<(String, String)> = Vec::new();
     let mut m = sent_requests().lock().unwrap();
     for line in text.lines() {
         let Ok(r) = serde_json::from_str::<SentRequestLine>(line) else { continue };
+        if r.forgotten {
+            m.remove(&r.key);
+            kept.retain(|(k, _)| k != &r.key);
+            continue;
+        }
         let age = now.saturating_sub(r.at_unix);
         if age >= ttl {
             continue;
         }
         let at = std::time::Instant::now().checked_sub(std::time::Duration::from_secs(age)).unwrap_or_else(std::time::Instant::now);
         m.insert(r.key.clone(), (at, r.resp.clone()));
-        kept.push(line.to_string());
+        kept.push((r.key.clone(), line.to_string()));
     }
+    let kept: Vec<String> = kept.into_iter().map(|(_, l)| l).collect();
     let n = m.len();
     drop(m);
     let tmp = path.with_extension("jsonl.tmp");
@@ -9625,6 +9659,10 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
         }
         for (txid, value) in e.db.reclaim_expired(now_daa, PENDING_SPEND_EXPIRY_DAA) {
             e.force_checkpoint = true; // persist the returned note promptly
+            let forgotten = forget_sent_requests_for(&RpcHash::from_bytes(txid).to_string());
+            if forgotten > 0 {
+                log::warn!("wallet '{}': forgot {forgotten} request record(s) of never-landed tx {}; a retry pays afresh", log_pseudonym(&token), RpcHash::from_bytes(txid));
+            }
             log::warn!(
                 "wallet '{token_p}': submitted spend {} ({value} sompi) never appeared on-chain within ~{PENDING_SPEND_EXPIRY_DAA}s of chain time — note returned to the spendable balance",
                 RpcHash::from_bytes(txid), token_p = log_pseudonym(&token));
@@ -16317,8 +16355,8 @@ mod sent_request_file_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let d = dir.to_string_lossy().into_owned();
         let resp = |t: &str| SendResp { txid: t.into(), amount_sompi: 5, fee_sompi: 1, amount_sompi_exact: "5".into(), fee_sompi_exact: "1".into(), txids: vec![t.into()], tx_count: 1 };
-        let old = SentRequestLine { key: "k-old".into(), at_unix: unix_now() - 2 * 86_400, resp: resp("aa") };
-        let fresh = SentRequestLine { key: "k-new".into(), at_unix: unix_now() - 60, resp: resp("bb") };
+        let old = SentRequestLine { key: "k-old".into(), at_unix: unix_now() - 2 * 86_400, resp: resp("aa"), forgotten: false };
+        let fresh = SentRequestLine { key: "k-new".into(), at_unix: unix_now() - 60, resp: resp("bb"), forgotten: false };
         let path = dir.join("__sent_requests__.jsonl");
         std::fs::write(&path, format!("{}\nnot json\n{}\n", serde_json::to_string(&old).unwrap(), serde_json::to_string(&fresh).unwrap())).unwrap();
         assert!(load_sent_requests(&d) >= 1);
@@ -17661,6 +17699,39 @@ mod sdk_api_tests {
         record_sent_request(ka.clone(), &resp);
         assert_eq!(sent_request(&ka).map(|r| r.txid), Some("t1".to_string()));
         assert_eq!(sent_request_key(&fvk_a.to_uppercase(), " rid-1 "), Some(ka), "hex case and spaces do not split a payment");
+    }
+
+    #[test]
+    fn a_never_landed_transaction_is_forgotten_but_a_multi_transaction_record_is_kept() {
+        let one = |txid: &str, txids: &[&str]| SendResp {
+            txid: txid.into(),
+            amount_sompi: 5,
+            fee_sompi: 1,
+            amount_sompi_exact: "5".into(),
+            fee_sompi_exact: "1".into(),
+            txids: txids.iter().map(|t| t.to_string()).collect(),
+            tx_count: txids.len(),
+        };
+        record_sent_request("forget-test-single".into(), &one("lost-tx", &["lost-tx"]));
+        record_sent_request("forget-test-multi".into(), &one("lost-tx", &["lost-tx", "landed-tx"]));
+        assert_eq!(forget_sent_requests_for("lost-tx"), 1);
+        assert!(sent_request("forget-test-single").is_none(), "a retry pays afresh");
+        assert!(sent_request("forget-test-multi").is_some(), "the landed part must not be paid again");
+
+        // The loader honours a tombstone: the key is gone and its lines are compacted away.
+        let dir = std::env::temp_dir().join(format!("zkas-sent-req-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let line = |key: &str, forgotten: bool| {
+            serde_json::to_string(&SentRequestLine { key: key.into(), at_unix: unix_now(), resp: one("x", &["x"]), forgotten }).unwrap()
+        };
+        let body = [line("load-test-a", false), line("load-test-b", false), line("load-test-a", true)].join("\n") + "\n";
+        std::fs::write(dir.join("__sent_requests__.jsonl"), body).unwrap();
+        load_sent_requests(dir.to_str().unwrap());
+        assert!(sent_request("load-test-a").is_none());
+        assert!(sent_request("load-test-b").is_some());
+        let compacted = std::fs::read_to_string(dir.join("__sent_requests__.jsonl")).unwrap();
+        assert!(!compacted.contains("load-test-a") && compacted.contains("load-test-b"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
