@@ -884,6 +884,8 @@ ExecStart=/usr/local/bin/zkas-walletd \
   --wallet-dir /var/lib/zkas/wallets \
   --auto-consolidate 200 \
   --warm-always 3 \
+  --active-sync-window 86400 \
+  --idle-evict 86400 \
   --no-shared-tree
 KillSignal=SIGTERM
 TimeoutStopSec=120
@@ -900,6 +902,7 @@ WantedBy=multi-user.target
 | `ZKAS_WALLET_SECRET` (environment file) | Seeds are encrypted at rest. Without it they are stored in plaintext. Passed through the environment, it never appears in the process list or shell history. |
 | `--auto-consolidate 200` | Every deposit is a note; the ceiling keeps withdrawals at 1–3 spends (~2–7 s) instead of drifting into minutes (§0). |
 | `--warm-always 3` | The hot wallet (and the watch-only cold wallet) stay resident and fully prepared, so the first withdrawal after a quiet period does not wait for the wallet to reopen. ~100–190 MiB each. |
+| `--active-sync-window 86400`, `--idle-evict 86400` | A wallet is synced only while it was requested within the active-sync window (default 90 s) and stays in memory only until it has been idle for `--idle-evict` (default 30 min). With a day for both, the hot wallet keeps following the chain between polls, so a deposit is in history when you next look rather than after the poll that wakes the wallet. |
 | `--no-shared-tree` | The shared chain tree exists so that many wallets can borrow one copy of the public commitment stream. An exchange daemon serves two or three; each keeps its own tree and witness cache, exactly as the phone and desktop engines do, and the daemon skips building and maintaining a second full copy from genesis. |
 | `--rpc-server 127.0.0.1:16810` | Your own node, next to the daemon. |
 | `TimeoutStopSec=120` | A stop flushes every wallet's checkpoint; give it time to finish. |
@@ -924,6 +927,8 @@ zkas-walletd \
   --wallet-dir /var/lib/zkas/wallets \
   --no-custodial \
   --warm-always 3 \
+  --active-sync-window 86400 \
+  --idle-evict 86400 \
   --no-shared-tree
 ```
 
