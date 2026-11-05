@@ -12487,8 +12487,13 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
                 inputs.len()
             );
             let ctx2 = ctx.clone();
-            // The memo rides on the first chunk only — one memo per logical payment.
-            let chunk_memo = if idx == 0 { memo } else { [0u8; 512] };
+            // The memo rides on EVERY transaction of the payment. It used to ride on the first only
+            // ("one memo per logical payment"), but the recipient cannot link the parts — they are
+            // separate shielded transactions — so an exchange or gateway crediting deposits by memo
+            // received the rest as unattributable deposits. Memos are encrypted to the recipient,
+            // who receives every part anyway: repeating it reveals nothing. The device-signed path
+            // already sends it with each part.
+            let chunk_memo = memo;
             proving.push(tokio::task::spawn_blocking(move || {
                 let _proving = ProvingGuard::new();
                 let started = std::time::Instant::now();
