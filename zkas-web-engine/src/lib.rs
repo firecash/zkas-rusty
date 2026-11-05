@@ -706,14 +706,33 @@ impl Engine {
         let gt = kaspa_shielded_core::tree::GlobalTree::from_state(&fs).map_err(|e| format!("{e:?}"))?;
         let root = gt.frontier().root().to_bytes();
         let block = h32_hex(&b.block)?;
-        if !self.db.notes().is_empty() {
-            self.db.set_witness_budget(self.db.notes().len().clamp(1, 32));
-            if self.db.witnessed_upto() < fs.size {
-                self.db.advance_witnesses(fs.size);
-            }
-        }
+        // Taking the anchor no longer advances the coins' witnesses to it. That climb is every
+        // leaf since the wallet last ran, three Sinsemilla appends each (~0.3 ms in wasm): 113 s
+        // for a wallet back after two days (3 Nov), all of it inside this call, with the worker
+        // blocked and the wallet "up to date" but unable to spend. Which coins are spendable
+        // does not depend on the witnesses; they now climb in bounded steps
+        // (`advance_witnesses_step`), and a payment made before they arrive takes the batch path.
         self.anchor = Some((fs.size, block, root));
         Ok(None)
+    }
+
+    /// Build (or extend) the wallet's spend index, the subtree cache, for at most `budget_ms`;
+    /// returns true once it covers the anchor. With it a payment's witnesses are O(tree depth)
+    /// lookups: without it the first payment after time away rebuilt every coin's witness
+    /// over every leaf since (69 s of proving in the browser after two days away, 3 Nov). One
+    /// hash per leaf, resumable, so it runs in slices between tip polls and never holds the
+    /// worker for long. A wallet with no coins has nothing to index.
+    pub fn build_spend_index_step(&mut self, budget_ms: f64) -> bool {
+        let Some((size, _, _)) = self.anchor else { return false };
+        if self.db.notes().is_empty() || self.db.subtree_cache_failed() {
+            return false;
+        }
+        if self.db.subtree_cache_ready(size) {
+            return true;
+        }
+        let start = kaspa_shielded_core::clock::Instant::now();
+        self.db.build_subtree_cache_until(|| start.elapsed().as_secs_f64() * 1000.0 > budget_ms);
+        self.db.subtree_cache_ready(size)
     }
 
     /// Counts only, for the diagnostic log: where the tree, its base and the anchor are, and how
@@ -735,7 +754,7 @@ impl Engine {
     /// wallet's matured notes, rooted at the matured anchor. `sk_hex` is the wallet's 32-byte
     /// spending key; it is used for this call only. Returns the bundle to submit, the leaf
     /// positions it spends and the fee. Nothing is marked spent until [`Engine::mark_sent`].
-    pub fn prepare_send(&self, sk_hex: &str, to: &str, amount: u64, memo: &str) -> Result<String, String> {
+    pub fn prepare_send(&mut self, sk_hex: &str, to: &str, amount: u64, memo: &str) -> Result<String, String> {
         let payees = serde_json::json!([{ "to": to, "amount_sompi": amount.to_string(), "memo": memo }]).to_string();
         self.prepare_payment(sk_hex, &payees, "{}")
     }
@@ -746,7 +765,7 @@ impl Engine {
     /// `opts.recoverable` (default true) choosing whether the payment can be read back from
     /// the seed (false = the wallet's "private sends"). Returns the same shape as prepare_send,
     /// plus `merged` (coins merged) for a consolidation.
-    pub fn prepare_payment(&self, sk_hex: &str, payees_json: &str, opts_json: &str) -> Result<String, String> {
+    pub fn prepare_payment(&mut self, sk_hex: &str, payees_json: &str, opts_json: &str) -> Result<String, String> {
         use zkas_wallet_engine::payment::{max_payees_per_tx, max_spends_per_tx, min_relay_fee_for_actions, select_spend_count, single_note_target, spend_order_key, DEFAULT_FEE_SOMPI};
         #[derive(Deserialize)]
         struct PayeeIn {
@@ -767,6 +786,12 @@ impl Engine {
             return Err("this wallet received inconsistent chain data; it is being rebuilt".into());
         }
         let (s, block, root) = self.anchor.ok_or("the wallet is still finding a settled point in the chain to pay from; try again in a moment")?;
+        // Finish the spend index first if the background slices have not: what is left costs one
+        // hash per leaf, never more than the batch rebuild below would (which would be thrown away
+        // after this payment), and every later payment then witnesses in O(depth).
+        if !self.db.notes().is_empty() && !self.db.subtree_cache_ready(s) && !self.db.subtree_cache_failed() {
+            self.db.build_subtree_cache_until(|| false);
+        }
         let sk: [u8; 32] = hex::decode(sk_hex.trim()).ok().and_then(|v| v.try_into().ok()).ok_or("the spending key must be 32 bytes of hex")?;
         let owner = WalletDb::from_seed(sk).ok_or("not a valid spending key")?;
         if owner.my_address_bytes() != self.db.my_address_bytes() {
@@ -1095,7 +1120,11 @@ mod send_tests {
     #[test]
     fn a_service_scan_receipt_is_adopted_and_checked() {
         let sk = [27u8; 32];
-        let (e, _) = funded(sk);
+        let (mut e, _) = funded(sk);
+        // A service writes its receipt with its coins witnessed at the tip; taking the anchor no
+        // longer advances them as a side effect, so the fixture does it as the service would.
+        let size = e.db.size();
+        e.db.advance_witnesses(size);
         let receipt = e.db.to_scan_receipt(genesis(), 1000).expect("witnessed at the anchor");
         let fs = e.db.tip_frontier_state().unwrap();
         let node = Boundary { block: hex::encode([79u8; 32]), daa: 1000, size: fs.size, leaf: hex::encode(fs.leaf.unwrap()), ommers: fs.ommers.iter().map(hex::encode).collect() };
@@ -1127,7 +1156,7 @@ mod send_tests {
     #[test]
     fn a_browser_payment_pays_several_and_can_be_private() {
         let sk = [26u8; 32];
-        let (e, notes) = funded(sk);
+        let (mut e, notes) = funded(sk);
         let (a, b) = (address_bytes_from_seed([91u8; 32]).unwrap(), address_bytes_from_seed([92u8; 32]).unwrap());
         let payees = serde_json::json!([
             { "to": zkas(&a), "amount_sompi": "100000000", "memo": "one" },
