@@ -411,6 +411,11 @@ treated as a new payment, never answered with the old one.
 For the non-custodial flow the key is the `request_id` passed to `prepare`; the same id on a
 later `prepare` is answered from the record.
 
+A request is recorded the moment each of its transactions is accepted, not when the whole
+payment finishes. If the daemon stops part-way through a split payment, a retry is answered
+with exactly the parts that went out — `already_sent` with an amount below the request — and
+the remainder is paid as a new payment with a new id.
+
 ### What each answer means
 
 | Status | Meaning | Did money move? |
@@ -419,7 +424,8 @@ later `prepare` is answered from the record.
 | **400** | Invalid request, or (non-custodial) signatures that do not match the session. | No. |
 | **404** (`submit`) | No such session: it expired (5 minutes) or was already submitted. | No new payment; check history if it was already submitted. |
 | **409** | `already_sent`, `in_progress`, a fee over `max_total_fee`, or a wallet not yet ready (§8). | See the body. |
-| **502** | The node refused the transaction. | **No** — unless the body carries `txids` (a later part of a split payment was refused): those parts were paid. |
+| **502** | The node refused the transaction. | **No** — unless the body carries `txids`: a later part of a split payment was refused or could not be built, and the listed parts were paid. |
+| **500** | An internal error before anything was broadcast. | No. (Once any part is on the network, a failure is always reported as the 502 above, with `txids`.) |
 | **503** | The daemon cannot reach its node; nothing was broadcast. | No. |
 | **504** `{ "outcome_unknown": true, "txid" }` | See below. | **Unknown — treat as possibly paid.** |
 
