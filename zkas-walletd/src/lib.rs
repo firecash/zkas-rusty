@@ -13389,6 +13389,12 @@ async fn wallet_prepare(
         (None, Some(fc)) => (fc * SOMPI_PER_ZKAS as f64).round() as u64,
         (None, None) => return Err(err(StatusCode::BAD_REQUEST, "specify amount_sompi or amount_fc")),
     };
+    // As /send and /send_many refuse it: a zero payment is a proof and a fee for nothing, and the
+    // device's checks pass it (the amount does match what was asked). Also catches amount_fc
+    // negative or NaN, which the float-to-integer cast turns into 0.
+    if requested == 0 {
+        return Err(err(StatusCode::BAD_REQUEST, "amount must be positive"));
+    }
     // A standard transaction spends at most `max_spends_per_tx()` notes, so a wallet
     // whose balance is spread over many small notes (a miner's per-block coinbase, say)
     // cannot pay a large amount in one transaction. `allow_partial` lets the caller ask
