@@ -271,7 +271,7 @@ Key `/api/status` fields (amounts are decimal strings in sompi, with `_fc` twins
 | `POST` | `/api/wallet/watch` | Register a **watch-only** wallet from a full viewing key. Re-registering the same key never moves its birthday later. |
 | `GET` | `/api/wallet/address` | Shielded `zkas:` receive address. `?index=N` returns the N-th **diversified** address — a distinct, unlinkable address paying into the same wallet (§7b). |
 | `GET` | `/api/wallet/reveal` | Return the seed (custodial wallets only). |
-| `GET` | `/api/wallet/history` | Chain-derived history: mints, receipts, and own sends with recipient, amount and memo. |
+| `GET` | `/api/wallet/history` | Chain-derived history, newest first (`limit` ≤ 5 000, `offset`, `total`): mints, receipts and own sends. Each row's `credits[]` lists every output with its address, amount and memo — attribute payments from it (§7b). `pendingOutgoing` lists sends not yet seen on chain. |
 | `POST` | `/api/wallet/rescan` | Retire the checkpoint and rescan from the birthday. Refused unless the node can serve the chain from genesis (§8). |
 | `POST` | `/api/wallet/settings` | Retained for older clients; history is always recorded. |
 | `POST` | `/api/wallet/warm` | Mark the wallet active and start any witness preparation now, so the send path is fast when the user reaches it. Returns readiness. |
@@ -814,34 +814,97 @@ being starved — look for a payment that is permanently in flight.
 
 ### 7b. Exchange / custodial service
 
-#### Deposit attribution — design this first
+An exchange needs four things from a wallet backend: deposits attributed to the right
+customer, withdrawals that are never paid twice, a hot balance that stays small and fast to
+spend, and an audit trail it can show a customer or an auditor. This section is a launch guide
+for exactly that.
 
-A wallet has one key but **unlimited addresses**. `GET /api/wallet/address?index=N` returns the
-wallet's N-th Orchard *diversified* address (index 0 is the default address). Every
-diversified address pays into the same wallet and is found by the same scan — trial
-decryption is keyed on the incoming viewing key, which does not depend on the diversifier —
-and each received note reports the address it was paid to as `recipient` in history. On chain
-the addresses are unlinkable: no one but the wallet can tell that two of them share a key.
+#### Choose where the spend key lives
 
-| Design | How | Verdict |
+| | **A. Custodial daemon** | **B. Split key** |
 | --- | --- | --- |
-| **One wallet, one diversified address per customer** | `address?index=<customer id>` at signup; attribute deposits by `recipient` in history | **Recommended.** The standard exchange model: one wallet, one scan, one seed, nothing for the customer to type. |
-| **One wallet per customer** | a token and seed per customer, swept to a hot wallet | Works for hundreds of customers; beyond that it is the design above with extra scans, backups and sweep proofs. |
+| Spend key | encrypted on the daemon host (`ZKAS_WALLET_SECRET`) | on a separate signing host; the daemon runs `--no-custodial` and holds **viewing keys only** |
+| Withdrawal path | `send` / `send_many` | `prepare` → signer verifies and signs → `submit` |
+| Signer | the daemon | `@zkas/sdk` with the ZKas signer (TypeScript), or the `zkas-signer` crate (Rust) |
+| Batched payouts | `send_many`: up to 37 recipients per transaction, one proof | one recipient per `prepare` |
+| Consolidation | automatic (`--auto-consolidate`) | performed by the signer as a payment to the wallet's own address; the daemon cannot merge a wallet it holds no seed for |
+| If the daemon host is compromised | the hot balance can be spent | wallet activity is visible; **no funds can move** — the signer independently checks recipient, amount and fee before every signature |
 
-```bash
-# at signup: customer 4711's own deposit address (store the index with the customer)
-curl -H "X-Wallet-Token: $TOK" "http://127.0.0.1:8501/api/wallet/address?index=4711"
+**B** keeps the spend key off the networked host entirely and is the stronger design. **A** is
+simpler to operate. With **A**, keep the hot balance small and sweep the rest to cold storage.
 
-# deposits: every received row names the address it was paid to
-curl -s -H "X-Wallet-Token: $TOK" "http://127.0.0.1:8501/api/wallet/history?limit=500" \
-  | jq '.rows[] | select(.kind=="received") | {txid, daaScore, amountSompi, recipient, memo}'
+#### Wallet topology
+
+- **One hot wallet** receives every deposit — one diversified address per customer — and pays
+  withdrawals. Deposits fund withdrawals directly, with no per-deposit sweep: one key, one
+  scan, one backup.
+- **One cold wallet**, generated offline and never imported into a networked daemon.
+  Register its viewing key watch-only (`POST /api/wallet/watch`) to monitor its balance.
+- **Additional hot wallets** only for throughput: payments from one wallet run one at a time,
+  while separate wallets pay in parallel.
+
+#### The node
+
+- Run your **own node** on the same host or private network, and point `--rpc-server` at it.
+  Every scan page, broadcast and proof check is a request to it.
+- Prefer a node that keeps the **full shielded history and block bodies**. The daemon refuses
+  a rescan against a node that cannot serve the chain from genesis, and payment proofs and memo
+  reads need the body of the block that carried the transaction. A pruned node serves recent
+  bodies only.
+
+#### Launch configuration — A (custodial daemon)
+
+```ini
+# /etc/zkas/walletd.env  (owner root, mode 0600; never put the secret on the command line)
+ZKAS_WALLET_SECRET=<long random secret, stored in your secrets manager>
 ```
 
-The index is a `u32`; use your customer id or a counter and keep the mapping (derivation is
-deterministic, so nothing is lost if you do not). Withdrawals pay the customer's address like
-any other.
+```ini
+# /etc/systemd/system/zkas-walletd.service
+[Unit]
+Description=ZKas wallet daemon
+After=network-online.target zkas-node.service
+Wants=zkas-node.service
 
-#### Recommended exchange configuration
+[Service]
+User=zkas
+EnvironmentFile=/etc/zkas/walletd.env
+ExecStart=/usr/local/bin/zkas-walletd \
+  --network mainnet \
+  --rpc-server 127.0.0.1:16810 \
+  --listen 127.0.0.1:8501 \
+  --wallet-dir /var/lib/zkas/wallets \
+  --auto-consolidate 200 \
+  --warm-always 3
+KillSignal=SIGTERM
+TimeoutStopSec=120
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+| Setting | Why |
+| --- | --- |
+| `--listen 127.0.0.1:8501` | The API is reachable only from the host. Put your own authenticated service in front of it; never expose the daemon itself. |
+| `ZKAS_WALLET_SECRET` (environment file) | Seeds are encrypted at rest. Without it they are stored in plaintext. Passed through the environment, it never appears in the process list or shell history. |
+| `--auto-consolidate 200` | Every deposit is a note; the ceiling keeps withdrawals at 1–3 spends (~2–7 s) instead of drifting into minutes (§0). |
+| `--warm-always 3` | The hot wallet (and the watch-only cold wallet) stay resident and fully prepared, so the first withdrawal after a quiet period does not wait for the wallet to reopen. ~100–190 MiB each. |
+| `--rpc-server 127.0.0.1:16810` | Your own node, next to the daemon. |
+| `TimeoutStopSec=120` | A stop flushes every wallet's checkpoint; give it time to finish. |
+
+If the node shares the machine, add `--proof-threads $(( $(nproc) - 2 ))` so proving never
+starves it. Everything else stays at its default.
+
+**Never pass** on an exchange daemon: `--allow-remote`, `--allow-origin`, `--serve-public`,
+`--allow-default-token`, `--no-auto-consolidate`, `--enable-multiparty`, `--uniform-v1`,
+`--idle-timeout`, or the one-way `--shared-leaf-store`.
+
+#### Launch configuration — B (split key)
+
+The daemon is configured as in **A**, plus `--no-custodial`, and without
+`ZKAS_WALLET_SECRET` — it holds no seeds:
 
 ```bash
 zkas-walletd \
@@ -849,50 +912,105 @@ zkas-walletd \
   --rpc-server 127.0.0.1:16810 \
   --listen 127.0.0.1:8501 \
   --wallet-dir /var/lib/zkas/wallets \
-  --wallet-secret "$ZKAS_WALLET_SECRET" \
-  --auto-consolidate 200
+  --no-custodial \
+  --warm-always 3
 ```
 
-`--wallet-secret` is **mandatory** for an exchange: without it seeds are stored in plaintext.
-Never pass `--allow-default-token` on a custodial daemon.
+Register each wallet with its viewing key (`POST /api/wallet/watch` with `fvk_hex` and a
+`birthday`). The signing host holds the seed, accepts no inbound connections, and runs the
+withdrawal loop: `prepare` on the daemon with the withdrawal's `request_id`, verify and sign
+locally (the signer rebuilds the transaction from the disclosure, confirms it pays exactly
+the approved recipient and amount with everything else returned as change, and refuses any
+fee above its ceiling), then `submit`. The SDK's `send()` implements this loop, including
+split payments, request ids and unknown outcomes.
 
-#### An exchange needs consolidation even more than a pool does
+#### Before going live
 
-Every customer deposit is one note. A hot wallet with 10 000 deposits holds 10 000 notes, so
-without consolidation a withdrawal grows to hundreds of spends and minutes of proving.
-`--auto-consolidate` keeps withdrawals at 1–3 spends (~2–7 s). Use a **lower** ceiling than a
-pool (200), because withdrawal latency is visible to customers.
+1. The node is synced and `GET /health` answers.
+2. Create the hot wallet (`POST /api/wallet/create`, born at the tip) and back up the returned
+   `seed_hex` offline **before** funding it — or, for **B**, register its viewing key.
+3. Register the cold wallet watch-only.
+4. Wait for `synced: true` and `spend_ready: true` in `/api/status`.
+5. Rehearse with small amounts: a deposit to a per-customer address appears in history under
+   that address; a withdrawal returns `txids`; repeating it with the same `request_id` returns
+   **409 `already_sent`** and pays nothing; its payment proof verifies.
+6. Back up the wallet directory and the tokens.
+
+#### Deposit attribution
+
+A wallet has one key but **unlimited addresses**. `GET /api/wallet/address?index=N` returns the
+wallet's N-th Orchard *diversified* address (index 0 is the default address). Every diversified
+address pays into the same wallet and is found by the same scan — trial decryption is keyed on
+the incoming viewing key, independent of the diversifier — so scanning costs the same for ten
+customers or ten million. On chain the addresses are unlinkable: no one but the wallet can tell
+that two of them share a key.
+
+| Design | How | Verdict |
+| --- | --- | --- |
+| **One wallet, one diversified address per customer** | `address?index=<customer id>` at signup; attribute each deposit by the address it paid | **Recommended.** Nothing for the customer to type, nothing to get wrong. |
+| **One wallet per customer** | a token and seed per customer, swept to a hot wallet | Works for hundreds of customers; beyond that it is the design above with extra scans, backups and a proof per sweep. |
+| **Memo references** | one address; the customer must enter a reference | Possible (memos are delivered, see below), but a forgotten or mistyped reference becomes a support case. Use addresses. |
+
+```bash
+# at signup: customer 4711's own deposit address (store the index with the customer)
+curl -H "X-Wallet-Token: $TOK" "http://127.0.0.1:8501/api/wallet/address?index=4711"
+```
+
+The index is a `u32`; use your customer id or a counter and keep the mapping. Derivation is
+deterministic, so the same index always returns the same address.
 
 #### Crediting deposits
 
-The daemon reports what the chain **applied**, not merely what it included — and on ZKas that
-distinction matters.
+Read deposits from `GET /api/wallet/history`. Each `received` row is one transaction, and its
+**`credits[]`** array has one entry per output that paid this wallet — `recipient`,
+`amountSompi`, `memo`. **Attribute from `credits[]`**, never from the row's top-level fields: a
+single transaction can pay several of your customers (a payer settling two invoices, another
+exchange's batched payout), and then the row's `amountSompi` is their **sum** while its
+`recipient` is only the **first** address. When `credits[]` is empty (rows written by older
+daemon versions), fall back to the row's `recipient` and `amountSompi`.
 
-A shielded spend can be mined, carry a txid and gain confirmations while having moved
-nothing: if its anchor is not yet mature, or its nullifier was already spent, consensus
-**drops** the spend during the state transition instead of rejecting the block. The block
-stays valid, no value moves, and no fee is charged. This keeps a single invalid spend from
-ever invalidating the blocks that merge it.
+```bash
+curl -s -H "X-Wallet-Token: $TOK" "http://127.0.0.1:8501/api/wallet/history?limit=500" \
+  | jq -c '.rows[] | select(.kind=="received") | .txid as $t | .daaScore as $d
+           | .credits | to_entries[] | {txid: $t, i: .key, daaScore: $d,
+                                       recipient: .value.recipient, amountSompi: .value.amountSompi, memo: .value.memo}'
+```
 
-So:
+**Make crediting idempotent.** Key every credit on `(txid, index in credits[])` and store the key
+with the ledger entry, so processing a row twice can never credit twice.
 
-1. **Never credit from block or txid inclusion** — not `getBlock`, not a txid lookup, not
-   "N confirmations".
-2. **Credit from the daemon.** Its history and balances count only notes that survived the
-   state transition, ingested 200 blue units behind the tip where they can no longer be
-   reorganised.
-3. **Use `spendable_sompi` for what can be withdrawn.** A received note needs ~10 minutes
-   (the matured anchor) before it can be spent; `balance_sompi` includes notes still
-   maturing (`maturing_sompi`). Allowing withdrawals against `balance_sompi` leads to
-   `insufficient matured funds`.
+**Polling.** History is returned newest first and the response carries `total`, the number of
+rows. Remember the `total` you have processed; on each poll, new rows are the first
+`total − processed` rows at `offset=0` (page with `limit`, up to 5 000, and `offset` from that
+same starting point). If `total` ever decreases — a wallet rescan rebuilds history — re-read
+everything; the idempotent keys make that safe.
 
-The mempool preview (`pending_in_sompi`) shows an incoming payment within about a second of
-the sender pressing send. Treat it as a display hint, never as credit.
+**When to credit.** A row appears only once its block is at least `SYNC_TIP_MARGIN` (200 blue
+units, about three minutes) below the tip, where it can no longer be reorganised, and only for
+spends the chain actually **applied**. That makes the row itself the confirmation: credit it
+when it appears.
 
-If you read the chain directly (`GetShieldedBlocks`) instead of using the daemon, those
-records are authoritative about what was applied, but you must add settlement depth yourself:
-the daemon treats anything within `SYNC_TIP_MARGIN` (200 blue units) of the sink as preview
-only.
+Do not credit from anything else. A shielded spend can be mined, carry a txid and gain
+confirmations while having moved nothing: if its anchor is not yet mature, or its nullifier was
+already spent, consensus **drops** the spend during the state transition instead of rejecting
+the block. The block stays valid, no value moves, and no fee is charged. So never credit from
+block or txid inclusion, an explorer, or "N confirmations" — the daemon's history already
+accounts for this. If you read the chain directly (`GetShieldedBlocks`), those records are
+authoritative about what was applied, but you must add the 200-unit settlement depth yourself.
+
+**Credited is not yet spendable.** A received note can be spent once it is past the matured
+anchor (~10 minutes). Customer balances can be credited immediately; the exchange's own ability
+to pay withdrawals is `spendable_sompi` in `/api/status`, with recent deposits shown in
+`maturing_sompi`.
+
+The mempool preview (`pending_in_sompi`) shows an incoming payment about a second after the
+sender presses send. It is suitable for a "deposit detected" notice, never for credit.
+
+**Memos.** Each credit carries the memo the payer attached to that output. The daemon reads
+memos from the full transaction just after the row is written — normally within the same sync
+pass. A received row shows `feeKnown: false` until that read is done; if you attribute by memo,
+wait for `feeKnown: true` before deciding a deposit has none. (A row whose block body the node
+no longer holds keeps `feeKnown: false` and no memo — another reason to attribute by address.)
 
 #### Withdrawals
 
@@ -903,26 +1021,74 @@ curl -X POST -H "X-Wallet-Token: $TOK" -H 'Content-Type: application/json' \
   http://127.0.0.1:8501/api/wallet/send
 ```
 
-- **Use the withdrawal id as `request_id`.** A retry after a timeout then returns the
-  original result instead of paying again (§4).
-- **Handle every answer in §4.** In particular a **504 `outcome_unknown`** is a possibly paid
-  withdrawal: retry with the same `request_id`, or reconcile against `txid`; never re-issue it
-  under a new id.
-- **`tx_count` may exceed 1.** A payment needing more than 38 notes is split; record every
-  id in `txids`. A 502 that carries `txids` means those parts were paid.
-- **Set `max_total_fee`** so a fragmented wallet or a mistaken fee can never cost more than
-  you intend.
-- **Concurrency.** Payments on one wallet run one at a time inside the daemon, so concurrent
-  calls are safe but gain nothing; across different wallets they run in parallel.
-- **Prefer `amount_sompi`** (integer) to `amount_fc` (floating point). The response's
-  `amount_sompi_exact` is the authoritative string form.
+- **`request_id` = your withdrawal id, always.** A retry after a timeout or a crash returns the
+  original result instead of paying again (§4). Records survive daemon restarts for 24 hours.
+- **Act on the status code** (§4):
+  - **200**: paid. Record every id in `txids`; a payment needing more than 38 notes is split,
+    and `tx_count` exceeds 1.
+  - **409 `already_sent`**: paid earlier. Record the transaction from the body.
+  - **409 `in_progress`**: still being sent. Retry later with the same id.
+  - **502 without `txids`, 400, 503**: not paid. Safe to retry or to fail the withdrawal.
+  - **502 with `txids`**: a split payment that was partly paid. The listed parts went out.
+  - **504 `outcome_unknown`**: possibly paid. Keep the withdrawal pending and retry with the
+    **same** `request_id`; never re-issue it under a new id.
+- **`max_total_fee`** caps what one withdrawal may pay in fees. It is refused before proving if
+  the plan would exceed it.
+- **Validate addresses up front.** An invalid or non-shielded address is refused (400) before
+  any work is done.
+- **Throughput.** Payments from one wallet run one at a time, so a consolidated hot wallet
+  handles a withdrawal every few seconds. For more volume, batch queued withdrawals with
+  `send_many` — up to 37 per transaction, one proof — on a short timer (each payee keeps its own
+  memo, and `payee_txids` reports which transaction paid whom), or run several hot wallets.
+- **Prefer `amount_sompi`** (an integer) to `amount_fc` (a floating-point number).
 
-#### Cold storage
+#### Proof of payment for disputes
 
-Sweep hot → cold with an ordinary `send`. Because cost tracks notes, sweeping a large balance
-from a *fragmented* wallet is the most expensive operation in the system — one more reason to
-keep the hot wallet consolidated. Back the cold seed up as `seed_hex` (or your own mnemonic
-encoding of it) and verify the restore before funding.
+When a customer says a withdrawal never arrived, produce a proof:
+
+```bash
+curl -s -H "X-Wallet-Token: $TOK" "http://127.0.0.1:8501/api/wallet/proof?txid=<txid>"   # → { "proofs": [ … ] }
+```
+
+Each proof discloses one output — recipient, amount, memo — and nothing else about the
+transaction or the wallet. Anyone can check one against the chain with
+`POST /api/proof/verify`, which needs no wallet or token and answers `valid`, the recipient,
+amount, memo and confirmations. Generate and store the proof when the withdrawal settles: it
+needs the node to still hold that block's body. Sends are provable because the daemon encrypts
+each payment's details to the wallet's own outgoing key; leave `private_sends` off (the
+default) on exchange wallets.
+
+#### Cold storage and sweeps
+
+Sweep the hot wallet's excess to the cold address with an ordinary `send`, using a
+`request_id` such as `sweep-2026-11-05`. Keep the hot wallet consolidated: sweeping a large
+balance out of a fragmented wallet is the most expensive operation in the system. Back up the
+cold seed as `seed_hex` (or your own mnemonic encoding of it) and verify the restore before
+funding.
+
+#### Monitoring
+
+| Signal | Alert when |
+| --- | --- |
+| `GET /health` | not 200 |
+| `/api/status` → `node_connected`, `error` | false / set |
+| `/api/status` → `synced`, `blocks_behind` | not synced, or behind for more than a few minutes |
+| `/api/status` → `note_count` | climbing steadily (consolidation is not keeping up) |
+| `/api/status` → `spendable_sompi` | below your withdrawal float |
+| `/api/wallet/history` → `pendingOutgoing` | a withdrawal pending for more than an hour |
+| log: `OUTCOME UNKNOWN` | always (reconcile that withdrawal) |
+| log: `auto-consolidate: merge failed`, `tree does NOT equal the node's` | always |
+
+Reconcile daily: the sum of credited deposits minus withdrawals and fees, against the hot
+wallet's `balance_sompi` plus the cold wallet's.
+
+#### Backups and recovery
+
+Back up `--wallet-dir` — it holds each wallet's (encrypted) seed file, its scan checkpoint and
+the request-id records — together with the tokens, and keep `ZKAS_WALLET_SECRET` in a separate
+secrets store: the encrypted seed files are unreadable without it. The seed alone always
+recovers the funds: import it with a `birthday` before the wallet's first deposit, and the
+daemon rebuilds balance and history from the chain.
 
 ---
 
