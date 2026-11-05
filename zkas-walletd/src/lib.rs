@@ -5571,7 +5571,13 @@ impl WalletEntry {
                 //
                 // The question was never "do I have a cache", it is "can somebody
                 // witness for me".
-                let cache_serves = (self.db.subtree_cache_ready(matured) || shared_serves) && matured > self.db.base_size();
+                // `matured > base` is the wallet's OWN cache's precondition (`subtree_paths`), not the
+                // shared tree's: a hosted wallet that dropped its leaves has its base at its size,
+                // ~1,000 leaves above the matured anchor after every pass, so with the precondition
+                // applied to both it read "warming" for ever and the app said "Almost ready ... getting
+                // ready to pay" on a wallet paying fine from the shared tree (3 Nov, every hosted
+                // wallet holding coins).
+                let cache_serves = (self.db.subtree_cache_ready(matured) && matured > self.db.base_size()) || shared_serves;
                 // Surface the true "can I pay without climbing?" answer to status.
                 self.spend_fast_ready = cache_serves;
                 // A wallet whose cache is still building must not ALSO run the warm. Both
@@ -5963,7 +5969,7 @@ impl WalletEntry {
             && (shared_tree_covers > 0 && shared_tree_covers >= matured)
             && matured > 0
             && shared_tree_base <= oldest_note;
-        if (self.db.subtree_cache_ready(matured) || shared_serves) && matured > self.db.base_size() {
+        if (self.db.subtree_cache_ready(matured) && matured > self.db.base_size()) || shared_serves {
             return;
         }
         let climb = matured.saturating_sub(self.db.witnessed_upto());
