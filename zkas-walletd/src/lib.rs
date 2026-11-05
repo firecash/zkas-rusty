@@ -152,6 +152,10 @@ const SYNC_TIP_MARGIN: u64 = 200;
 
 /// How long a history row whose full transaction could not be fetched waits before the next try.
 const DETAILS_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(600);
+/// Fetch attempts per history row per session. A timeout heals within a few tries; a block body
+/// the node has pruned never will, and retrying it every 10 minutes forever, for every such row
+/// of every wallet, is node load for nothing. The next load tries again.
+const DETAILS_MAX_TRIES: u8 = 3;
 
 /// How often a sync pass republishes its progress snapshot WHILE the pass is running.
 ///
@@ -2873,6 +2877,12 @@ enum CheckpointReject {
     /// days later: the node then returned exactly the size the wallet had been destroyed
     /// for claiming.
     Unverifiable,
+    /// A v11/v13 blob whose referenced leaf range the shared chain tree's file does not cover
+    /// right now — absent, or shorter than the range (a chain-tree reset rebuilding it, a file
+    /// mid-replacement). Says nothing about the WALLET's checkpoint, and the chain tree always
+    /// rebuilds its file: wait, never strike. Striking let a large wallet polled by its app use
+    /// up its three attempts inside one rebuild window and be rescanned from its birthday.
+    SharedLeavesPending,
 }
 
 /// Consecutive times a token's checkpoint could not be VERIFIED (not contradicted). After
@@ -2971,7 +2981,16 @@ fn parse_scan_bytes_why(
         // Only a v11 blob ever calls the source; older ones restore exactly as before.
         Some(dir) => {
             let source_failed = std::cell::Cell::new(false);
+            let source_pending = std::cell::Cell::new(false);
             let src = |lo: u64, n: usize, sink: &mut dyn FnMut(&[u8]) -> Option<()>| -> Option<()> {
+                // Does the file cover the range at all? If not, the shared stream is not ready
+                // (pending); a covered range that still fails to read is a real failure.
+                let covered = shared_tree_extent(dir)
+                    .is_some_and(|(b, len, _)| lo >= b && (lo - b).checked_add(n as u64).is_some_and(|end| end <= len));
+                if !covered {
+                    source_pending.set(true);
+                    return None;
+                }
                 let r = shared_tree_leaves(dir, lo, n, sink);
                 source_failed.set(r.is_none());
                 r
@@ -2983,7 +3002,10 @@ fn parse_scan_bytes_why(
                     // tree being rebuilt, a file mid-replacement). That says nothing against
                     // the WALLET'S checkpoint: keep it and retry, like a node that cannot verify
                     // a cursor yet, and rebuild only after UNVERIFIED_STRIKES_MAX attempts.
-                    if source_failed.get() {
+                    if source_pending.get() {
+                        *why = CheckpointReject::SharedLeavesPending;
+                        log::warn!("v11 checkpoint: the shared chain tree file does not cover its referenced leaves yet; waiting for it");
+                    } else if source_failed.get() {
                         *why = CheckpointReject::Unverifiable;
                         log::warn!("v11 checkpoint: the shared chain tree cannot serve its referenced leaves yet; keeping it");
                     }
@@ -4367,10 +4389,10 @@ struct WalletEntry {
     /// When the checkpoint was last written (or the entry created) — the time-based
     /// checkpoint rule in `sync_one_wallet` is measured from here.
     last_checkpoint_at: std::time::Instant,
-    /// History rows whose full transaction could not be fetched, and when: skipped by
-    /// `recover_history_details` for `DETAILS_RETRY_AFTER`, then tried again (a node timeout is
-    /// transient; a pruned block body is not, and costs one fetch per interval).
-    details_skipped: HashMap<[u8; 32], std::time::Instant>,
+    /// History rows whose full transaction could not be fetched: when last tried, and how often.
+    /// `recover_history_details` waits `DETAILS_RETRY_AFTER` between tries and gives up for the
+    /// session after `DETAILS_MAX_TRIES` (a node timeout heals; a pruned block body does not).
+    details_skipped: HashMap<[u8; 32], (std::time::Instant, u8)>,
     /// `(blue_score, absolute leaf count)` after each ingested chain block,
     /// oldest→newest, capped at [`MATURED_RING`]. `send` picks the newest entry
     /// at least `anchor_depth + slack` blue units below the sink to root a spend
@@ -4695,7 +4717,7 @@ impl WalletEntry {
     /// node's DAA locator — fetch that block and its mergeset, locate the txid, and decrypt.
     /// At most `MAX_PER_PASS` fetches per pass, oldest first; the rest follow on the next
     /// passes. A row whose transaction cannot be fetched (block body pruned, node without the
-    /// locator, a timeout) is tried again after `DETAILS_RETRY_AFTER`.
+    /// locator, a timeout) is tried again after `DETAILS_RETRY_AFTER`, at most `DETAILS_MAX_TRIES` times per session.
     async fn recover_history_details(&mut self, client: &GrpcClient, page: &[DecodedBlock]) {
         const MAX_PER_PASS: usize = 8;
         // The whole history, every pass: rows still to complete are marked in the row itself
@@ -4710,7 +4732,9 @@ impl WalletEntry {
             .into_iter()
             .map(|(t, d)| (t, d, false))
             .chain(self.db.unrecovered_receipts(from).into_iter().map(|(t, d)| (t, d, true)))
-            .filter(|(t, _, _)| self.details_skipped.get(t).is_none_or(|at| at.elapsed() >= DETAILS_RETRY_AFTER))
+            .filter(|(t, _, _)| {
+                self.details_skipped.get(t).is_none_or(|(at, tries)| *tries < DETAILS_MAX_TRIES && at.elapsed() >= DETAILS_RETRY_AFTER)
+            })
             .collect();
         pending.sort_by_key(|(_, d, _)| *d);
         if pending.is_empty() {
@@ -4735,12 +4759,16 @@ impl WalletEntry {
                     }
                 }
             };
+            let failed = |skipped: &mut HashMap<[u8; 32], (std::time::Instant, u8)>| {
+                let tries = skipped.get(&txid).map_or(0, |(_, n)| *n).saturating_add(1);
+                skipped.insert(txid, (std::time::Instant::now(), tries));
+            };
             let Some(chain) = chain else {
-                self.details_skipped.insert(txid, std::time::Instant::now());
+                failed(&mut self.details_skipped);
                 continue;
             };
             let Some(bundle) = fetch_bundle_for_tx(client, chain, &txid).await else {
-                self.details_skipped.insert(txid, std::time::Instant::now());
+                failed(&mut self.details_skipped);
                 continue;
             };
             self.details_skipped.remove(&txid);
@@ -8676,6 +8704,12 @@ impl AppState {
                     unverified_strikes().lock().unwrap_or_else(|p| p.into_inner()).remove(token);
                     Some(r)
                 }
+                Err(CheckpointReject::SharedLeavesPending) => {
+                    // No strike, no quarantine copy, no rebuild: the file is left as it is and
+                    // the next request loads it once the chain tree's file covers its range.
+                    set_load_reason(token, "shared_tree_pending");
+                    return None;
+                }
                 Err(CheckpointReject::Unverifiable) => {
                     let strikes = {
                         let mut m = unverified_strikes().lock().unwrap_or_else(|p| p.into_inner());
@@ -9767,12 +9801,19 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
         let expiring = e.db.expiring_spend_txids(now_daa, PENDING_SPEND_EXPIRY_DAA);
         if !expiring.is_empty() {
             let client = state.request_client().await;
+            // One unanswered question means the node is not answering: the rest are deferred
+            // without asking, so this lock is held for at most one timeout per pass however many
+            // spends expire together (after an outage, dozens can).
+            let mut node_answering = client.is_some();
             for txid in expiring {
                 let id = RpcHash::from_bytes(txid);
-                let answer = match &client {
-                    Some(c) => tokio::time::timeout(std::time::Duration::from_secs(5), c.get_mempool_entry(id, true, false)).await.ok(),
-                    None => None,
+                let answer = match (&client, node_answering) {
+                    (Some(c), true) => tokio::time::timeout(std::time::Duration::from_secs(5), c.get_mempool_entry(id, true, false)).await.ok(),
+                    _ => None,
                 };
+                if answer.is_none() {
+                    node_answering = false;
+                }
                 let lost = matches!(&answer, Some(Err(err)) if { let t = err.to_string(); t.contains("not found") && t.contains(&id.to_string()) });
                 if lost {
                     continue;
@@ -17228,12 +17269,22 @@ mod sdk_api_tests {
         assert!(parse_scan_bytes(&buf, WalletKey::Seed(seed), None, Some(&dir)).is_some());
         assert!(parse_scan_bytes(&buf, WalletKey::Seed(seed), None, None).is_none());
 
-        // The shared file gone (a chain-tree rebuild, a file mid-replacement): kept, not destroyed.
+        // The shared file gone (a chain-tree rebuild, a file mid-replacement): kept, not destroyed,
+        // and PENDING rather than unverifiable, so no load strike is spent waiting for it.
         std::fs::rename(scan_path(&dir, CHAIN_TREE_TOKEN), format!("{dir}/moved")).unwrap();
         assert!(matches!(
             load_checkpoint_why(&dir, "thin", WalletKey::Seed(seed), &genesis, None),
-            Err(CheckpointReject::Unverifiable)
+            Err(CheckpointReject::SharedLeavesPending)
         ));
+        // A file that exists but is SHORTER than the referenced range (a rebuild in progress)
+        // is pending too.
+        let short = WalletDb::from_checkpoint(seed, &v3_blob_with_leaves(20)).expect("v3 restores");
+        save_checkpoint(&dir, CHAIN_TREE_TOKEN, &genesis, &low, 20, &short, &none, &HashMap::new(), 0, 0).unwrap();
+        assert!(matches!(
+            load_checkpoint_why(&dir, "thin", WalletKey::Seed(seed), &genesis, None),
+            Err(CheckpointReject::SharedLeavesPending)
+        ));
+        std::fs::remove_file(scan_path(&dir, CHAIN_TREE_TOKEN)).unwrap();
         // A v10 blob does not care.
         write_checkpoint_bytes(&dir, "fat", &checkpoint_bytes(0, &genesis, &low, 64, &w, &none, 0, 0)).unwrap();
         assert!(load_checkpoint(&dir, "fat", WalletKey::Seed(seed), &genesis, None).is_some());
