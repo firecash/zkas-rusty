@@ -12578,13 +12578,26 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
         // reports exactly which prefix of the payment went through.
         let mut done = Vec::with_capacity(proving.len());
         for h in proving {
-            done.push(h.await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("proof task failed: {e}")))?);
+            match h.await {
+                Ok(d) => done.push(d),
+                Err(e) if txids.is_empty() => return Err(err(StatusCode::INTERNAL_SERVER_ERROR, format!("proof task failed: {e}"))),
+                // Earlier transactions of this payment are already on the network: a bare 500
+                // here read as "nothing was paid", the request was never recorded, and a retry
+                // paid the whole amount again.
+                Err(e) => return Err(partial_send_err(request_key.as_deref(), &txids, sent, total_fee, tx_count, &format!("proof task failed: {e}"))),
+            }
         }
         done.sort_by_key(|(idx, ..)| *idx);
         ci += done.len();
 
         for (idx, pay, positions, cfee, built, took) in done {
-            let payload = built.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to build payment: {e:?}")))?;
+            let payload = match built {
+                Ok(p) => p,
+                Err(e) if txids.is_empty() => return Err(err(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to build payment: {e:?}"))),
+                Err(e) => {
+                    return Err(partial_send_err(request_key.as_deref(), &txids, sent, total_fee, tx_count, &format!("failed to build payment: {e:?}")));
+                }
+            };
             log::info!("send: tx {}/{tx_count} proven in {:.0?}", idx + 1, took);
 
             let tx: Transaction = payment_tx(payload);
@@ -12593,6 +12606,13 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
                     txids.push(accepted.to_string());
                     sent += pay;
                     total_fee += cfee;
+                    // Recorded the moment each transaction is accepted, not when the whole payment
+                    // ends: a crash or restart after part 1 of 3 left no record, and the caller's
+                    // retry with the same id paid all three again. A retry now gets exactly what
+                    // went out (amount below the request = partly paid).
+                    if let Some(k) = request_key.clone() {
+                        record_sent_request(k, &SendResp { txid: txids[0].clone(), amount_sompi: sent, fee_sompi: total_fee, amount_sompi_exact: sent.to_string(), fee_sompi_exact: total_fee.to_string(), txids: txids.clone(), tx_count: txids.len() });
+                    }
                     let mut e = w.lock().await;
                     // The wallet's scan cursor is its chain clock — available whether or
                     // not the node serves block metadata, unlike WalletDb's own.
@@ -12663,6 +12683,36 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
         record_sent_request(k, &resp);
     }
     Ok(Json(resp))
+}
+
+/// The answer to a `send` that fails after some of its transactions were broadcast: those parts
+/// were paid, so the request is recorded with exactly them (a retry is answered, never paid
+/// again) and the answer lists them, as for a node refusal of a later part.
+fn partial_send_err(request_key: Option<&str>, txids: &[String], sent: u64, total_fee: u64, tx_count: usize, why: &str) -> (StatusCode, Json<serde_json::Value>) {
+    if let Some(k) = request_key {
+        record_sent_request(
+            k.to_string(),
+            &SendResp {
+                txid: txids[0].clone(),
+                amount_sompi: sent,
+                fee_sompi: total_fee,
+                amount_sompi_exact: sent.to_string(),
+                fee_sompi_exact: total_fee.to_string(),
+                txids: txids.to_vec(),
+                tx_count: txids.len(),
+            },
+        );
+    }
+    log::error!("send: payment partially sent ({}/{tx_count} txs) then failed: {why}", txids.len());
+    (
+        StatusCode::BAD_GATEWAY,
+        Json(serde_json::json!({
+            "error": format!("payment partially sent: {}/{tx_count} txs accepted, then: {why}", txids.len()),
+            "txids": txids,
+            "sent_sompi": sent,
+            "sent_sompi_exact": sent.to_string(),
+        })),
+    )
 }
 
 /// One recipient of a batched payout.
@@ -12958,8 +13008,30 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
             build_wallet_payment_multi_anchored(seed, inputs, &payees, fee, &net, &ctx2, recoverable, anchor_block)
         })
         .await
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("proof task failed: {e}")))?
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to build payment: {e:?}")))?;
+        .map_err(|e| format!("proof task failed: {e}"))
+        .and_then(|r| r.map_err(|e| format!("failed to build payment: {e:?}")));
+        let payload = match payload {
+            Ok(p) => p,
+            Err(why) if txids.is_empty() => return Err(err(StatusCode::INTERNAL_SERVER_ERROR, why)),
+            // Earlier batches already paid their payees: report exactly which, and record the
+            // request with them, or a retry of the payout pays every one of them again.
+            Err(why) => {
+                if let Some(k) = request_key.clone() {
+                    record_sent_request(k, &SendResp { txid: txids[0].clone(), amount_sompi: paid, fee_sompi: total_fee, amount_sompi_exact: paid.to_string(), fee_sompi_exact: total_fee.to_string(), txids: txids.clone(), tx_count: txids.len() });
+                }
+                log::error!("send_many: payout partially sent ({}/{tx_count} txs) then failed: {why}", txids.len());
+                return Err((
+                    StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({
+                        "error": format!("payout partially sent: {}/{tx_count} txs accepted, then: {why}", txids.len()),
+                        "txids": txids,
+                        "paid_sompi": paid,
+                        "paid_sompi_exact": paid.to_string(),
+                        "payee_txids": payee_txids,
+                    })),
+                ));
+            }
+        };
         log::info!("send_many: tx {}/{tx_count} proven in {:.0?}", bi + 1, started.elapsed());
 
         let tx: Transaction = payment_tx(payload);
@@ -12976,6 +13048,11 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
                 }
                 paid += group_pay;
                 total_fee += fee;
+                // Recorded per accepted batch, as in `wallet_send`: a crash mid-payout must not
+                // leave the paid batches unrecorded for a retry to pay again.
+                if let Some(k) = request_key.clone() {
+                    record_sent_request(k, &SendResp { txid: txids[0].clone(), amount_sompi: paid, fee_sompi: total_fee, amount_sompi_exact: paid.to_string(), fee_sompi_exact: total_fee.to_string(), txids: txids.clone(), tx_count: txids.len() });
+                }
                 let mut e = w.lock().await;
                 let now_daa = submit_clock(&e);
                 for p in b.positions {
@@ -14221,6 +14298,20 @@ async fn wallet_submit(
         .ok_or_else(|| err(StatusCode::SERVICE_UNAVAILABLE, "the wallet service cannot reach its node to broadcast; nothing was sent"))?;
     match submit_guarded(&state, &node, &tx).await {
         Ok(Submitted { id: accepted, presumed }) => {
+            // Record first: the park below awaits a wallet load, and a crash in between left a
+            // broadcast payment unrecorded for the device's retry to pay again.
+            let resp = SendResp {
+                txid: accepted.to_string(),
+                amount_sompi: amount,
+                fee_sompi: fee,
+                amount_sompi_exact: amount.to_string(),
+                fee_sompi_exact: fee.to_string(),
+                txids: vec![accepted.to_string()],
+                tx_count: 1,
+            };
+            if let Some(k) = request_key {
+                record_sent_request(k, &resp);
+            }
             // The node has the transaction (or may have it: `presumed`): park the notes it spends so they leave the
             // unspent set NOW rather than ~3 minutes from now when the block carrying
             // them clears the reorg holdback. Parking (not deleting) is what makes this
@@ -14258,19 +14349,6 @@ async fn wallet_submit(
                         positions.len()
                     );
                 }
-            }
-            let txid = accepted.to_string();
-            let resp = SendResp {
-                txid: txid.clone(),
-                amount_sompi: amount,
-                fee_sompi: fee,
-                amount_sompi_exact: amount.to_string(),
-                fee_sompi_exact: fee.to_string(),
-                txids: vec![txid],
-                tx_count: 1,
-            };
-            if let Some(k) = request_key {
-                record_sent_request(k, &resp);
             }
             if presumed {
                 return Err((StatusCode::GATEWAY_TIMEOUT, Json(submit_outcome_unknown_body(&resp.txid, "payment"))));
@@ -17765,6 +17843,19 @@ mod sdk_api_tests {
         drop(first);
         assert!(!send_in_flight(Some(&key)), "released on drop");
         assert!(begin_send(Some(&key)).expect("free again").is_some());
+    }
+
+    #[test]
+    fn a_send_failing_after_a_broadcast_reports_and_records_what_went_out() {
+        // Two of three transactions went out, then the third's proof failed: the answer must list
+        // them (never a bare 500 that reads as "nothing paid") and a retry must find the record.
+        let txids = vec!["tx-a".to_string(), "tx-b".to_string()];
+        let (status, body) = partial_send_err(Some("partial-test-key"), &txids, 700, 20, 3, "failed to build payment: x");
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body["txids"], serde_json::json!(["tx-a", "tx-b"]));
+        assert_eq!(body["sent_sompi_exact"], serde_json::json!("700"));
+        let rec = sent_request("partial-test-key").expect("recorded, so a retry is answered");
+        assert_eq!((rec.txids, rec.amount_sompi), (txids, 700));
     }
 
     #[test]
