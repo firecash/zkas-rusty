@@ -9184,7 +9184,11 @@ async fn consolidate_loop(state: Arc<AppState>) {
                     skip_busy += 1;
                     continue;
                 };
-                let notes = e.db.notes().len();
+                // Dust is never merged (see `dust_floor_sompi`), so it does not count: a few hundred
+                // 1-sompi notes from a stranger would otherwise hold the wallet over its ceiling for
+                // good and merge every deposit as it arrived, at the wallet's expense.
+                let floor = dust_floor_sompi();
+                let notes = e.db.notes().iter().filter(|n| n.value() > floor).count();
                 if notes <= ceiling {
                     continue;
                 }
@@ -12151,6 +12155,19 @@ fn matured_candidates(db: &WalletDb, matured: u64) -> Result<(Vec<&OwnedNote>, u
     Ok((candidates, stranded_value))
 }
 
+/// The value at or below which a note costs more to merge than it holds: what one more spend adds
+/// to the fee of a full-size merge (about 0.007 ZKAS). Merges leave such notes alone.
+///
+/// Anyone can send a wallet notes, at about that same cost each. Merging them anyway let a
+/// stranger jam or drain an exchange's hot wallet: 38 one-sompi outputs in one transaction sit at
+/// consecutive positions, the oldest-first merge reached them, their sum never cleared the fee, and
+/// every later pass was refused the same way (at debug level), so the wallet never merged again.
+/// Payments still spend such a note when it is needed: they take the largest notes first.
+fn dust_floor_sompi() -> u64 {
+    let n = max_spends_per_tx().max(3);
+    chunk_fee(0, n).saturating_sub(chunk_fee(0, 2)) / (n as u64 - 2)
+}
+
 /// The total of a set of note values, refused past `u64::MAX` instead of overflowing.
 ///
 /// Chain state cannot get there -- every value is a committed note and the supply is far
@@ -13334,6 +13351,9 @@ async fn consolidate_once(
         };
         let anchor_block = e.send_anchor_block(matured)?;
         let (mut candidates, _stranded) = spend_candidates(&e, matured)?;
+        // Never merge dust: see `dust_floor_sompi`.
+        let floor = dust_floor_sompi();
+        candidates.retain(|n| n.value() > floor);
         if heal {
             // Oldest first: spending the lowest-position notes lets the fast-sync base
             // roll forward past them (`advance_base_capped`), shortening every later
@@ -18100,6 +18120,21 @@ mod sdk_api_tests {
         let legacy = ka.rsplit_once('#').unwrap().0.to_string();
         record_sent_request(legacy.replace("rid-1", "rid-legacy"), &resp);
         assert!(sent_request(&sent_request_key(&fvk_a, "rid-legacy", &pay).unwrap()).is_some());
+    }
+
+    /// A stranger's 1-sompi outputs must never be what a merge picks: 38 of them in one transaction
+    /// jammed the oldest-first merge for good (their sum never clears the fee).
+    #[test]
+    fn dust_costs_more_to_merge_than_it_holds_and_is_left_alone() {
+        let floor = dust_floor_sompi();
+        let n = max_spends_per_tx();
+        // About 0.007 ZKAS: what one more spend adds to a full merge.
+        assert!((100_000..5_000_000).contains(&floor), "floor {floor}");
+        // 38 notes at the floor do not pay a full merge's fee: merging them can only lose.
+        assert!(floor.saturating_mul(n as u64) <= chunk_fee(DEFAULT_FEE_SOMPI, n) + floor);
+        // A mining reward or any ordinary deposit is far above it.
+        assert!(57 * 100_000_000 > floor);
+        assert!(uniform::merge_dust_floor_for_test() > 0);
     }
 
     #[test]

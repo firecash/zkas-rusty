@@ -228,6 +228,17 @@ fn witness_inputs(
 
 /// The candidate notes of a uniform plan: matured, unreserved, non-zero (a zero-value change
 /// note pays nothing and must not count against the 4-spend limit or the merge trigger).
+/// A note worth no more than its share of a 4 -> 1 merge's fee is never merged, nor counted
+/// toward the merge trigger (see `dust_floor_sompi`).
+fn merge_dust_floor() -> u64 {
+    UNIFORM_FEE_V1 / zkas_wallet_engine::uniform::MERGE_INPUTS as u64
+}
+
+#[cfg(test)]
+pub(crate) fn merge_dust_floor_for_test() -> u64 {
+    merge_dust_floor()
+}
+
 fn uniform_candidates<'a>(e: &'a WalletEntry, leaves: u64) -> Result<Vec<&'a OwnedNote>, (StatusCode, Json<serde_json::Value>)> {
     let (mut c, _stranded) = spend_candidates(e, leaves)?;
     c.retain(|n| n.value() > 0);
@@ -1090,7 +1101,10 @@ async fn merge_once(state: &Arc<AppState>, w: &Wallet, token: &str, urgent_amoun
     let choice = pick_anchor_waiting(w).await?;
     let (positions, sum, own) = {
         let mut e = w.lock().await;
-        let cands = uniform_candidates(&e, choice.leaves)?;
+        let mut cands = uniform_candidates(&e, choice.leaves)?;
+        // Dust is never merged: `plan_merge` pays a dusty group's fee out of a real note, so a
+        // stranger's tiny notes cost the wallet more to merge than they cost to send.
+        cands.retain(|n| n.value() > merge_dust_floor());
         let values: Vec<u64> = cands.iter().map(|n| n.value()).collect();
         let pick = match urgent_amount {
             Some(a) => plan_urgent_merges(&values, a).into_iter().next(),
@@ -1223,7 +1237,7 @@ pub(crate) async fn merge_loop(state: Arc<AppState>) {
                 if e.key.seed().is_err() || !e.caught_up {
                     continue;
                 }
-                e.db.notes().iter().filter(|n| n.value() > 0).count()
+                e.db.notes().iter().filter(|n| n.value() > merge_dust_floor()).count()
             };
             let now = now_ms();
             let urgent = URGENT.lock().unwrap_or_else(|e| e.into_inner()).get(&token).copied();

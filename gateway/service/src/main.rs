@@ -218,6 +218,38 @@ async fn node_tip_daa(state: &AppState) -> Result<(u64, bool), String> {
     Ok((tip, synced))
 }
 
+/// What one `received` history row paid each of our addresses, summed per address.
+///
+/// One transaction can pay several invoices (a payer settling two at once). walletd lists each
+/// output in `credits`; the row's own `amountSompiExact` is their SUM and its `recipient` names
+/// one address (or none, on newer walletd). Crediting the row-level pair put the whole sum on one
+/// invoice and nothing on the other. A row without a breakdown (a walletd older than the credits)
+/// falls back to that pair, as before: exact only for a payment to one address. A breakdown that
+/// does not add up to the row is not credited at all.
+fn row_payments(row: &Value) -> Option<Vec<([u8; 43], u64)>> {
+    let exact = |v: &Value| v.get("amountSompiExact").and_then(Value::as_str).and_then(|s| s.parse::<u64>().ok());
+    let address = |v: &Value| {
+        let a = Address::try_from(v.get("recipient")?.as_str()?).ok()?;
+        <[u8; 43]>::try_from(a.payload.as_slice()).ok()
+    };
+    let total = exact(row).or_else(|| row.get("amountSompi").and_then(Value::as_u64))?;
+    let credits = row.get("credits").and_then(Value::as_array).filter(|c| !c.is_empty());
+    let Some(credits) = credits else {
+        return Some(vec![(address(row)?, total)]);
+    };
+    let mut parts: Vec<([u8; 43], u64)> = Vec::new();
+    let mut sum: u64 = 0;
+    for credit in credits {
+        let (raw, amount) = (address(credit)?, exact(credit)?);
+        sum = sum.checked_add(amount)?;
+        match parts.iter_mut().find(|(r, _)| *r == raw) {
+            Some((_, a)) => *a = a.checked_add(amount)?,
+            None => parts.push((raw, amount)),
+        }
+    }
+    (sum == total).then_some(parts)
+}
+
 async fn poll_wallet(state: &AppState) -> Result<(), String> {
     // Fetch the tip first: without a real reference every payment would confirm
     // instantly (the old code fabricated `daa + 10_000` / `u64::MAX` as the
@@ -244,21 +276,12 @@ async fn poll_wallet(state: &AppState) -> Result<(), String> {
             if row.get("kind").and_then(Value::as_str) != Some("received") {
                 continue;
             }
-            let Some(recipient) = row.get("recipient").and_then(Value::as_str) else { continue };
-            let Ok(address) = Address::try_from(recipient) else { continue };
-            let Ok(raw) = <[u8; 43]>::try_from(address.payload.as_slice()) else { continue };
             let Some(txid) = row.get("txid").and_then(Value::as_str).and_then(|v| hex::decode(v).ok()).and_then(|v| v.try_into().ok())
             else {
                 continue;
             };
-            let amount = row
-                .get("amountSompiExact")
-                .and_then(Value::as_str)
-                .and_then(|v| v.parse().ok())
-                .or_else(|| row.get("amountSompi").and_then(Value::as_u64))
-                .unwrap_or(0);
-            // The row is on chain, so record it for reconciliation even if the depth below is
-            // unreadable — otherwise this cycle would retract a payment that never went away.
+            // The row is on chain, so record it for reconciliation even if it cannot be attributed
+            // below — otherwise this cycle would retract a payment that never went away.
             seen_txids.insert(txid);
             // A missing or non-numeric score must SKIP the row, never default to 0: at 0 the depth
             // test `tip - 0 >= required` is trivially true and the payment confirms instantly.
@@ -269,8 +292,14 @@ async fn poll_wallet(state: &AppState) -> Result<(), String> {
                 eprintln!("gateway: history row {} has no numeric daaScore; skipping", hex::encode(txid));
                 continue;
             };
-            if let Ok(Some(event)) = gateway.observe_payment(raw, txid, amount, daa, daa, tip_daa, now()) {
-                events.push(event);
+            let Some(parts) = row_payments(row) else {
+                eprintln!("gateway: history row {} cannot be attributed (credits do not add up to the row); not credited", hex::encode(txid));
+                continue;
+            };
+            for (raw, amount) in parts {
+                if let Ok(Some(event)) = gateway.observe_payment(raw, txid, amount, daa, daa, tip_daa, now()) {
+                    events.push(event);
+                }
             }
         }
         // Withdraw shallow payments the chain no longer shows (reorg / double-spend) BEFORE
@@ -352,4 +381,37 @@ async fn main() -> Result<(), String> {
     let listener = tokio::net::TcpListener::bind(config.listen).await.map_err(|error| error.to_string())?;
     println!("ZKas gateway listening on {}", config.listen);
     axum::serve(listener, app).await.map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kaspa_addresses::Version;
+
+    fn addr(b: u8) -> String {
+        String::from(&Address::new(Prefix::Mainnet, Version::ShieldedOrchard, &[b; 43]))
+    }
+
+    #[test]
+    fn one_transaction_paying_two_invoices_credits_each_its_own_part() {
+        let row = json!({
+            "amountSompiExact": "5000", "recipient": null,
+            "credits": [
+                {"recipient": addr(1), "amountSompiExact": "1000"},
+                {"recipient": addr(2), "amountSompiExact": "3000"},
+                {"recipient": addr(1), "amountSompiExact": "1000"},
+            ]
+        });
+        assert_eq!(row_payments(&row), Some(vec![([1; 43], 2000), ([2; 43], 3000)]));
+        // The old reading: the first address got the whole 5000.
+        let legacy = json!({ "amountSompiExact": "5000", "recipient": addr(1), "credits": [] });
+        assert_eq!(row_payments(&legacy), Some(vec![([1; 43], 5000)]));
+        // Parts that do not add up to the row, or a part without an address: not credited.
+        let short = json!({ "amountSompiExact": "5000", "credits": [{"recipient": addr(1), "amountSompiExact": "1000"}] });
+        assert_eq!(row_payments(&short), None);
+        let blind = json!({ "amountSompiExact": "1000", "credits": [{"amountSompiExact": "1000"}] });
+        assert_eq!(row_payments(&blind), None);
+        // No breakdown and no address: nothing to credit.
+        assert_eq!(row_payments(&json!({ "amountSompiExact": "1000", "recipient": null })), None);
+    }
 }
