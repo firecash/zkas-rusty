@@ -1229,9 +1229,12 @@ async fn engine_address(State(host): HostState, headers: HeaderMap, Query(query)
     let h = host.lock().unwrap_or_else(|p| p.into_inner());
     let token = engine_token(&h, &headers)?;
     let e = h.entry(&token).ok_or_else(|| err(StatusCode::SERVICE_UNAVAILABLE, "wallet not yet registered in the engine"))?;
-    let index = query.index.unwrap_or(0);
-    let address = if index == 0 { h.address(&e) } else { String::from(&Address::new(h.prefix, Version::ShieldedOrchard, &e.db.address_bytes_at(index))) };
-    Ok(Json(AddressResp { address, index }))
+    let index = match query.index.as_ref() {
+        Some(i) => i.parse("index")?,
+        None => 0,
+    };
+    let address = if index == 0 { h.address(&e) } else { String::from(&Address::new(h.prefix, Version::ShieldedOrchard, &e.db.address_bytes_at_index(index))) };
+    Ok(Json(AddressResp { address, index, index_exact: index.to_string() }))
 }
 
 /// Process and engine counters, by pseudonym only.

@@ -848,6 +848,8 @@ pub struct WalletDb {
     /// not anything about the stream it holds, and a checkpoint written by a
     /// shared tree must stay loadable as an ordinary (if noteless) wallet.
     leaves_only: bool,
+    /// Notes worth no more than this do not hold the base back (see `set_base_floor_value`).
+    base_floor_value: u64,
     /// Set when an ingested page repeated a nullifier this database already appended a leaf for.
     /// Consensus never applies a second spend of one nullifier, and the node serves only applied
     /// transactions, so a repeat proves the data source is faulty or lying. The bundle is still
@@ -1297,6 +1299,7 @@ impl WalletDb {
             agree_scalar,
             predecrypted: None,
             leaves_only: false,
+            base_floor_value: 0,
             poisoned: false,
             borrow_tree: false,
             tree_valid: true,
@@ -1406,7 +1409,28 @@ impl WalletDb {
     /// it was sent to (recorded in its history row). So a service can hand each customer
     /// their own address and attribute deposits by address — no memo required.
     pub fn address_bytes_at(&self, index: u32) -> [u8; 43] {
+        self.address_bytes_at_index(u64::from(index))
+    }
+
+    /// The external address at diversifier index `index` (the full 64-bit range an exchange
+    /// may use as a customer id; indexes are 88 bits wide, 2^64 of them is plenty).
+    pub fn address_bytes_at_index(&self, index: u64) -> [u8; 43] {
         self.fvk().address_at(index, Scope::External).to_raw_address_bytes()
+    }
+
+    /// The diversifier index at which this wallet's incoming viewing key derived `address`, as
+    /// a decimal string, or `None` for an address that is not this wallet's. Recovered from the
+    /// address itself (the diversifier decrypts to its index, and the re-derived address must
+    /// match), so an exchange needs no address book to attribute a deposit to its customer.
+    pub fn address_index_of(&self, address: &[u8; 43]) -> Option<String> {
+        let addr = Option::<Address>::from(Address::from_raw_address_bytes(address))?;
+        let j = self.incoming_viewing_key().diversifier_index(&addr)?;
+        let b: &[u8; 11] = j.as_bytes();
+        let mut v: u128 = 0;
+        for (i, x) in b.iter().enumerate() {
+            v |= (*x as u128) << (8 * i);
+        }
+        Some(v.to_string())
     }
 
     /// Build a wallet that **fast-syncs** from a checkpoint frontier: the tree starts
@@ -2522,13 +2546,7 @@ impl WalletDb {
         // again (its leaves are gone), leaving its value permanently unspendable.
         // Ignoring pending spends here is exactly how live note@564934 was
         // stranded: submit → compact past it → tx lost → reclaim → below base.
-        let earliest = self
-            .notes
-            .iter()
-            .map(|n| n.position)
-            .chain(self.pending_spends.iter().map(|p| p.note.position))
-            .min()
-            .unwrap_or(self.size);
+        let earliest = self.earliest_held_position();
         let full_target = target.min(earliest).min(self.size);
         if full_target <= self.base_size {
             return false;
@@ -2817,12 +2835,23 @@ impl WalletDb {
     /// The earliest absolute position this wallet must keep a leaf for: its oldest unspent
     /// note or note parked in a pending spend, else its size. A base can roll up to here.
     pub fn earliest_held_position(&self) -> u64 {
+        let floor = self.base_floor_value;
         self.notes
             .iter()
+            .filter(|n| n.value() > floor)
             .map(|n| n.position)
             .chain(self.pending_spends.iter().map(|p| p.note.position))
             .min()
             .unwrap_or(self.size)
+    }
+
+    /// Notes worth no more than `value` no longer pin the base: compaction rolls past them and
+    /// they become stranded (unspendable, reported by `stranded_notes`). Anyone can send a wallet
+    /// a 1-sompi note; one such note at an old position made the wallet keep every leaf after
+    /// it for good (RAM, and the whole stream in every checkpoint). The caller passes what a
+    /// note must be worth to be worth spending (walletd's dust floor); 0 keeps every note.
+    pub fn set_base_floor_value(&mut self, value: u64) {
+        self.base_floor_value = value;
     }
 
     /// Repair a wallet whose base compacted past a still-held note (see
@@ -7357,6 +7386,39 @@ mod tests {
         // Even with free slots, the warm loop must never be handed the impossible note.
         db.witnesses.clear();
         assert_ne!(db.next_note_needing_witness(), Some(p0), "warm loop must not busy-retry an impossible install");
+    }
+
+    /// Anyone can send a wallet a 1-sompi note. With it counted as held, compaction stopped at
+    /// its position for good: every leaf after it stayed in memory and in every checkpoint.
+    #[test]
+    fn dust_below_the_floor_does_not_hold_the_base_back() {
+        let mine = [53u8; 32];
+        let mut db = WalletDb::from_seed(mine).unwrap();
+        let dust = coinbase_for(address_of(mine), b"dust", 1);
+        db.ingest_block(&[dust], &[]);
+        for b in 0..15u8 {
+            let theirs = coinbase_for(address_of([b.wrapping_add(140); 32]), &[b, 5, 5, 5], 77);
+            db.ingest_block(&[theirs], &[]);
+        }
+        let real = coinbase_for(address_of(mine), b"real", 4_000);
+        db.ingest_block(&[real], &[]);
+        let (p_dust, p_real) = (db.notes()[0].position, db.notes()[1].position);
+        // Without a floor the dust pins the base.
+        assert!(!db.advance_base_capped(db.size(), u64::MAX) || db.base_size() <= p_dust);
+        assert_eq!(db.earliest_held_position(), p_dust);
+        // With one, compaction rolls to the real note; the dust is stranded, the real note spendable.
+        db.set_base_floor_value(1);
+        assert_eq!(db.earliest_held_position(), p_real);
+        while db.advance_base_capped(db.size(), u64::MAX) {}
+        assert_eq!(db.base_size(), p_real);
+        let matured = db.size();
+        db.advance_witnesses(matured);
+        let stranded: Vec<u64> = db.stranded_notes().iter().map(|n| n.position).collect();
+        assert_eq!(stranded, vec![p_dust]);
+        assert!(db.witness_path_at(p_real, matured).is_some());
+        // A pending spend always pins, whatever its value.
+        db.set_base_floor_value(10_000);
+        assert_eq!(db.earliest_held_position(), db.size(), "nothing above the floor and nothing parked: free to roll");
     }
 
     /// Grafting an older snapshot's leaf stream un-strands the note: the base

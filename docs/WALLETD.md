@@ -168,7 +168,7 @@ The daemon raises any fee you pass to this floor automatically (`chunk_fee`). Pa
 | `--hard-max-resident-wallets N` | `0` (none) | **Hard** cap: a load first evicts the least recently used idle wallet, otherwise it is deferred. |
 | `--resident-budget-mb MIB` | `0` = 70 % of the cgroup's `memory.high`/`memory.max` | Byte budget for resident wallets; `--no-resident-budget` disables it. |
 | `--subtree-free-floor-mb MIB` | `1200` | Defer optional subtree-cache builds while `MemAvailable` is below this floor. |
-| `--checkpoint-interval SECONDS` | `60` | Time rule for checkpointing a wallet that has advanced. |
+| `--checkpoint-interval SECONDS` | `60` | Time rule for checkpointing a wallet that has advanced by at least 1 000 blocks (or by anything, once an hour). Parked spends and other state that must not be lost are written at once regardless. |
 | `--catchup-checkpoint-interval SECONDS` | same as above | The same rule for wallets still far behind the tip, where most write volume is. |
 
 ### Chain data
@@ -569,7 +569,9 @@ symptoms until someone tries to spend; there is no cheaper moment to start than 
 - **It converges and stops**: each merge removes 37 notes, so once a wallet is under the
   ceiling no further merges happen.
 - **Dust is left alone**: a note worth no more than one spend's share of a full merge's fee
-  (about 0.007 ZKAS) is never merged and does not count toward the ceiling. Anyone can send a
+  (about 0.007 ZKAS) is never merged and does not count toward the ceiling. Nor does it hold a
+  wallet's leaf stream back: the stream is kept from the oldest unspent note worth more than
+  that, and smaller notes below it become unspendable (listed by `--diagnose` as stranded). Anyone can send a
   wallet notes, and merging a stranger's tiny ones would cost more than they hold; before
   6 November 2026, 38 one-sompi outputs in one transaction could stop a wallet's merges for
   good. Payments still spend such notes when they need them.
@@ -890,8 +892,7 @@ ExecStart=/usr/local/bin/zkas-walletd \
   --auto-consolidate 200 \
   --warm-always 3 \
   --active-sync-window 86400 \
-  --idle-evict 86400 \
-  --no-shared-tree
+  --idle-evict 86400
 KillSignal=SIGTERM
 TimeoutStopSec=120
 Restart=on-failure
@@ -908,7 +909,7 @@ WantedBy=multi-user.target
 | `--auto-consolidate 200` | Every deposit is a note; the ceiling keeps withdrawals at 1–3 spends (~2–7 s) instead of drifting into minutes (§0). |
 | `--warm-always 3` | The hot wallet (and the watch-only cold wallet) stay resident and fully prepared, so the first withdrawal after a quiet period does not wait for the wallet to reopen. ~100–190 MiB each. |
 | `--active-sync-window 86400`, `--idle-evict 86400` | A wallet is synced only while it was requested within the active-sync window (default 90 s) and stays in memory only until it has been idle for `--idle-evict` (default 30 min). With a day for both, the hot wallet keeps following the chain between polls, so a deposit is in history when you next look rather than after the poll that wakes the wallet. |
-| `--no-shared-tree` | The shared chain tree exists so that many wallets can borrow one copy of the public commitment stream. An exchange daemon serves two or three; each keeps its own tree and witness cache, exactly as the phone and desktop engines do, and the daemon skips building and maintaining a second full copy from genesis. |
+| shared chain tree (default on) | Keep it on. Without it each wallet carries every leaf since its oldest unspent note in memory and in every checkpoint; a hot wallet holding one old note grows by ~4 MB a day and rewrites hundreds of MB per checkpoint. With it, wallets keep only their notes and witnesses, and the daemon's one copy of the chain serves them all. The tree costs one scan from genesis at first start (minutes with `--chain-files`). |
 | `--rpc-server 127.0.0.1:16810` | Your own node, next to the daemon. |
 | `TimeoutStopSec=120` | A stop flushes every wallet's checkpoint; give it time to finish. |
 
@@ -933,8 +934,7 @@ zkas-walletd \
   --no-custodial \
   --warm-always 3 \
   --active-sync-window 86400 \
-  --idle-evict 86400 \
-  --no-shared-tree
+  --idle-evict 86400
 ```
 
 Register each wallet with its viewing key (`POST /api/wallet/watch` with `fvk_hex` and a
@@ -979,8 +979,9 @@ curl -H "X-Wallet-Token: $TOK" "http://127.0.0.1:8501/api/wallet/address?index=4
 
 Rules for the address book:
 
-- **Store the exact address string** returned for each index, mapped to its customer. Derivation
-  is deterministic: the same index always returns the same address.
+- **Use the customer id as the index** (`?index=` takes a JSON number or a decimal string up to
+  2^64-1; the answer carries `index_exact`). Derivation is deterministic: the same index always
+  returns the same address, and every credit names its index, so the mapping need not be stored.
 - **Reserve indexes for the exchange itself** — for example `0` for top-ups from cold storage —
   and never issue them to a customer. Payments into the hot wallet from your own cold wallet
   arrive as ordinary receipts; issued to a customer, a top-up would be credited to them.
@@ -991,7 +992,11 @@ Rules for the address book:
 
 Read deposits from `GET /api/wallet/history`, rows of `kind: "received"`. Each row is one
 transaction; its **`credits[]`** array has one entry per output that paid this wallet:
-`recipient`, `amountSompiExact`, `memo`.
+`recipient`, `index`, `amountSompiExact`, `memo`. **`index`** is the diversifier index the
+address was issued at (`GET /api/wallet/address?index=N`), as a decimal string, recovered
+from the address itself; with one customer per index it is the customer id, and no address
+book is needed to attribute a deposit. `index` is `null` only for an address that is not this
+wallet's (impossible for a credit) and on `sent` rows.
 
 1. **Attribute from `credits[]`, never from the row's top-level fields.** One transaction can
    pay several of your customers (a payer settling two invoices, another exchange's batched
@@ -1094,8 +1099,15 @@ curl -X POST -H "X-Wallet-Token: $TOK" -H 'Content-Type: application/json' \
 | **409 `in_progress`** | **Pending.** The same request is still being sent; retry later with the same id. |
 | **400, 503, or 502 without `txids`** | **Not paid.** Return the funds to the customer or retry. |
 | **502 with `txids`** | **Partly paid**: the listed transactions went out; settle the remainder as a new withdrawal with a new id. |
-| **504 `outcome_unknown`**, a timeout, or no answer | **Possibly paid.** Keep it pending and retry with the **same** `request_id` until you get one of the answers above. Never re-issue it under a new id, and never return the funds on a timeout. |
+| **504 `outcome_unknown`**, a timeout, or no answer | **Possibly paid.** Keep it pending; ask `GET /api/wallet/requests/<request_id>` (below), or retry with the **same** `request_id` until you get one of the answers above. Never re-issue it under a new id, and never return the funds on a timeout. |
 
+- **`GET /api/wallet/requests/<request_id>`** answers for the last 24 hours: `in_progress`
+  (still being sent), or `sent` with every transaction and its state — `pending` (broadcast,
+  not yet seen accepted), `landed` (accepted by a chain block: `block`, `daa_score`, `depth`), or
+  `returned_or_settled` (no longer pending: its coins came back, or the wallet's scan settled it;
+  check `history` for the txid). 404 means no record of that id. The daemon watches the chain's
+  accepted-transaction stream for every pending payment, so a lost send is handed back about
+  10 minutes after the chain passed it by, and a payment the chain accepted is never handed back.
 - **Request ids are unique per payment, forever** — your withdrawal id is ideal. The daemon
   answers a repeated id from its record only when the recipient and amount also match, so an
   id accidentally reused for a different payment is treated as a new payment rather than

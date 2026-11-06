@@ -53,7 +53,7 @@ pub use engine_host::{EngineConfig, serve_engine};
 
 use axum::{
     Json, Router,
-    extract::{Query, Request, State},
+    extract::{Path as AxumPath, Query, Request, State},
     http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header},
     middleware::{Next, from_fn, from_fn_with_state},
     response::{IntoResponse, Response},
@@ -1845,6 +1845,17 @@ const SCAN_HEADER_LEN: usize = 77;
 // this rule would rewrite a growing many-MB blob every pass; those wallets save on
 // `CHECKPOINT_INTERVAL` alone (see `sync_one_wallet`).
 const CHECKPOINT_EVERY: usize = 1000;
+/// Blocks a wallet must have gained for a time-based checkpoint to be written at all.
+const CHECKPOINT_MIN_GAIN: usize = 1000;
+/// A wallet that gained anything is still written this often, whatever the gain.
+const CHECKPOINT_MAX_STALE: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Whether the time-based checkpoint rule fires: the interval has passed AND the wallet gained
+/// at least `CHECKPOINT_MIN_GAIN` blocks, or anything at all after `CHECKPOINT_MAX_STALE`.
+/// Forced writes (parked spends, warmed witnesses) and the first catch-up bypass this.
+fn periodic_checkpoint_due(advanced: usize, since_last: std::time::Duration, interval: std::time::Duration) -> bool {
+    since_last >= interval && (advanced >= CHECKPOINT_MIN_GAIN || (advanced > 0 && since_last >= CHECKPOINT_MAX_STALE))
+}
 /// Also checkpoint whenever this much wall time has passed with ANY progress. The
 /// block-count rule alone let a slow scanner — a phone against a public node — run
 /// for many minutes before its first save, and a process kill in that window (Android
@@ -3441,7 +3452,7 @@ fn load_reasons() -> &'static std::sync::Mutex<HashMap<String, &'static str>> {
 }
 
 fn set_load_reason(token: &str, code: &'static str) {
-    let mut m = load_reasons().lock().unwrap();
+    let mut m = lock_ok(load_reasons());
     if m.len() > 100_000 {
         m.clear();
     }
@@ -3449,7 +3460,7 @@ fn set_load_reason(token: &str, code: &'static str) {
 }
 
 fn load_reason(token: &str) -> Option<&'static str> {
-    load_reasons().lock().unwrap().get(token).copied()
+    lock_ok(load_reasons()).get(token).copied()
 }
 
 /// Per-token backoff for poll-driven load retries (see `spawn_load`): when the next attempt
@@ -3462,12 +3473,12 @@ fn load_backoff() -> &'static std::sync::Mutex<HashMap<String, (std::time::Insta
 const LOAD_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(60);
 
 fn load_backoff_allows(token: &str) -> bool {
-    load_backoff().lock().unwrap().get(token).is_none_or(|(next, _)| std::time::Instant::now() >= *next)
+    lock_ok(load_backoff()).get(token).is_none_or(|(next, _)| std::time::Instant::now() >= *next)
 }
 
 /// Record a failed load; returns how long the next poll-driven attempt waits (2 s doubling to 60 s).
 fn load_backoff_failed(token: &str) -> std::time::Duration {
-    let mut b = load_backoff().lock().unwrap();
+    let mut b = lock_ok(load_backoff());
     let fails = b.get(token).map_or(0, |(_, f)| *f).saturating_add(1);
     let wait = std::time::Duration::from_secs(1u64 << fails.min(6)).min(LOAD_BACKOFF_MAX);
     b.insert(token.to_string(), (std::time::Instant::now() + wait, fails));
@@ -3475,8 +3486,8 @@ fn load_backoff_failed(token: &str) -> std::time::Duration {
 }
 
 fn load_backoff_clear(token: &str) {
-    load_backoff().lock().unwrap().remove(token);
-    load_reasons().lock().unwrap().remove(token);
+    lock_ok(load_backoff()).remove(token);
+    lock_ok(load_reasons()).remove(token);
 }
 
 /// Whether to trust a node-supplied coinbase commitment verbatim instead of
@@ -3712,6 +3723,21 @@ fn engine_kernel_from_env() -> Box<dyn kaspa_shielded_core::engine::AgreeKernel>
 /// The result is the same set `WalletDb::predecrypt_page_cached` computes: `detect` hands a
 /// superset of candidates to orchard and orchard decides each (asserted by the
 /// `engine_shadow_tests` and the core `engine::tests`).
+/// Cohort-vs-plain detection differences seen (see the sampled check in `sync_chunk`).
+pub static DETECT_MISMATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Same hits: the same actions found, with the same notes.
+fn same_hits(a: &[kaspa_shielded_core::wallet::ReceivedNote], b: &[kaspa_shielded_core::wallet::ReceivedNote]) -> bool {
+    let key = |r: &kaspa_shielded_core::wallet::ReceivedNote| (r.action_index, r.note.value().inner(), r.note.recipient().to_raw_address_bytes());
+    same_hit_keys(a.iter().map(key).collect(), b.iter().map(key).collect())
+}
+
+fn same_hit_keys(mut x: Vec<(usize, u64, [u8; 43])>, mut y: Vec<(usize, u64, [u8; 43])>) -> bool {
+    x.sort_unstable();
+    y.sort_unstable();
+    x == y
+}
+
 fn engine_cohort_memo(
     state: &Arc<AppState>,
     page: &DecodedPage,
@@ -4415,6 +4441,9 @@ struct WalletEntry {
     /// retry; at [`REORG_STRIKES`] the sync loop discards the checkpoint and
     /// reloads this wallet from scratch (the append-only tree cannot roll back).
     reorged_strikes: u32,
+    /// The shared tree refused to re-base this wallet at this size, at this time: not asked
+    /// again (nor warned about) until the stream grows or an hour passes.
+    rebase_refused: Option<(u64, std::time::Instant)>,
     /// Set by the shared-tree audit on a divergence: the next sync pass retires this entry's
     /// checkpoint and the caller rebuilds it, as for a reorg it cannot follow. A flag, not a strike
     /// count, because a successful page clears the strikes before the pass reaches the retire step.
@@ -4667,6 +4696,7 @@ impl WalletEntry {
             sink_blue,
             sink_live: false,
             reorged_strikes: 0,
+            rebase_refused: None,
             reload_from_checkpoint: false,
             last_progress_publish: std::time::Instant::now(),
             audit_retire: false,
@@ -5288,7 +5318,27 @@ impl WalletEntry {
                         // page; this wallet gets exactly the memo its own call would compute.
                         let from_engine = shared.and_then(|e| engine_cohort_memo(state, &resp, token, &self.db, &page_actions, e));
                         match from_engine {
-                            Some((found, ns)) => self.db.install_predecrypted(&page_actions, found, ns),
+                            Some((found, ns)) => {
+                                // One page in 64 is also decrypted the plain way and the two answers
+                                // compared: the cohort kernel decides every hosted wallet's deposits,
+                                // and a miss there is a deposit nobody sees. A difference is logged,
+                                // counted (`/health` detect_mismatches) and the plain answer is used.
+                                let sample = page_low.as_bytes()[0] % 64 == 0;
+                                let checked = if sample { self.db.page_decryptor().map(|d| d.decrypt(&page_actions, shared)) } else { None };
+                                match checked {
+                                    Some(own) if !same_hits(&own, &found) => {
+                                        DETECT_MISMATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        log::error!(
+                                            "wallet {token_p}: cohort detection DIFFERS from plain decryption on page {page_low} ({} vs {} hits); using the plain answer",
+                                            found.len(),
+                                            own.len(),
+                                            token_p = log_pseudonym(token)
+                                        );
+                                        self.db.install_predecrypted(&page_actions, own, ns);
+                                    }
+                                    _ => self.db.install_predecrypted(&page_actions, found, ns),
+                                }
+                            }
                             None => tokio::task::block_in_place(|| scan_pool().install(|| self.db.predecrypt_page_cached(&page_actions, shared))),
                         }
                     }
@@ -5898,7 +5948,10 @@ impl WalletEntry {
                         // stream moved" failures live). The base is a memory optimisation;
                         // it can wait the ~minutes a build takes, then resume.
                         if !self.build_in_flight
-                            && tokio::task::block_in_place(|| self.db.advance_base_capped(matured, COLD_WARM_BASE_STEP))
+                            && tokio::task::block_in_place(|| {
+                                self.db.set_base_floor_value(dust_floor_sompi());
+                                self.db.advance_base_capped(matured, COLD_WARM_BASE_STEP)
+                            })
                         {
                             continue;
                         }
@@ -5986,6 +6039,7 @@ impl WalletEntry {
                         let steady_cap = (COLD_WARM_BUDGET / budget as u64).clamp(WITNESS_MIN_STEP, WITNESS_ADVANCE_CAP);
                         tokio::task::block_in_place(|| {
                             if !self.build_in_flight {
+                                self.db.set_base_floor_value(dust_floor_sompi());
                                 self.db.advance_base_capped(matured, BASE_ADVANCE_STEP);
                             }
                             // Only a WARM wallet belongs on the incremental step: it is a
@@ -6650,6 +6704,12 @@ struct AppState {
     chain_tree_size: std::sync::atomic::AtomicU64,
     /// Transient page-fetch failures since the sync loop last looked (see its back-off).
     page_failures: std::sync::atomic::AtomicU64,
+    /// Submitted payments the virtual chain has ACCEPTED (see `acceptance_loop`): txid -> the
+    /// accepting chain block, its DAA score, and when this was learned (pruned after a day).
+    accepted_txs: std::sync::Mutex<HashMap<[u8; 32], (RpcHash, u64, std::time::Instant)>>,
+    /// For pending payments not yet seen accepted: the chain DAA score up to which the virtual
+    /// chain was inspected without finding them.
+    unseen_upto: std::sync::Mutex<HashMap<[u8; 32], u64>>,
     /// The shared tree's BASE — the oldest position it can witness. Published alongside
     /// `chain_tree_size` for the same lock-free reason.
     ///
@@ -7095,6 +7155,10 @@ struct PreparedSession {
     /// (The custodial `/send` path has always done this; the non-custodial one, which
     /// is what every shipped wallet actually uses, did not.)
     token: Option<String>,
+    /// The loaded wallet the payment was prepared against. `/submit` parks the spent notes
+    /// through it, so parking never depends on loading the wallet again at that moment (a
+    /// deferred load left the notes spendable for ~3 min after a real broadcast).
+    wallet: Option<Wallet>,
     /// Absolute leaf positions of the notes this payment spends, to park on acceptance.
     positions: Vec<u64>,
     /// `sent_requests` key of the client's request id, recorded when the broadcast succeeds.
@@ -7150,6 +7214,13 @@ fn send_in_progress_err() -> (StatusCode, Json<serde_json::Value>) {
     )
 }
 
+/// Lock a std mutex and keep going after a poison: the data is a cache or a record map, and a
+/// panic in some other task must not turn every later `/send`, `/prepare` and `/submit` into a
+/// panic until restart (`.lock().unwrap()` did exactly that).
+fn lock_ok<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 fn sent_requests() -> &'static std::sync::Mutex<HashMap<String, (std::time::Instant, SendResp)>> {
     static S: std::sync::OnceLock<std::sync::Mutex<HashMap<String, (std::time::Instant, SendResp)>>> = std::sync::OnceLock::new();
     S.get_or_init(Default::default)
@@ -7163,13 +7234,26 @@ const SENT_REQUEST_TTL: std::time::Duration = std::time::Duration::from_secs(24 
 /// alone, a reused id (a counter reset, a recycled batch id) was answered "already sent" with
 /// the earlier payment's transaction: the caller marked a withdrawal paid that never went out.
 fn sent_request_key(fvk_hex: &str, request_id: &str, what: &str) -> Option<String> {
+    Some(format!("{}#{what}", sent_request_prefix(fvk_hex, request_id)?))
+}
+
+/// The record key without its payment fingerprint: `"{wallet hash}:{id}"`. Every record of this
+/// request, whatever it paid, starts with this followed by `#` (or equals it: a legacy record).
+fn sent_request_prefix(fvk_hex: &str, request_id: &str) -> Option<String> {
     let id = request_id.trim();
     if id.is_empty() || id.len() > 128 {
         return None;
     }
     let mut h = <sha2::Sha256 as sha2::Digest>::new();
     sha2::Digest::update(&mut h, fvk_hex.trim().to_ascii_lowercase().as_bytes());
-    Some(format!("{}:{id}#{what}", hex(&sha2::Digest::finalize(h)[..16])))
+    Some(format!("{}:{id}", hex(&sha2::Digest::finalize(h)[..16])))
+}
+
+/// Every record whose key names this request (any fingerprint, or the legacy form).
+fn sent_requests_for(prefix: &str) -> Vec<(String, SendResp)> {
+    let m = lock_ok(sent_requests());
+    let with_hash = format!("{prefix}#");
+    m.iter().filter(|(k, _)| k.as_str() == prefix || k.starts_with(&with_hash)).map(|(k, (_, r))| (k.clone(), r.clone())).collect()
 }
 
 /// What a request pays, for its key: the recipient(s) and amount(s), hashed.
@@ -7212,13 +7296,13 @@ fn send_many_fingerprint(payees: &[Payee]) -> String {
 /// The record for `key`, or for the same request recorded before keys carried a fingerprint
 /// (records live 24 h, so a retry across the upgrade still finds its payment).
 fn sent_request(key: &str) -> Option<SendResp> {
-    let mut m = sent_requests().lock().unwrap();
+    let mut m = lock_ok(sent_requests());
     m.retain(|_, (at, _)| at.elapsed() < SENT_REQUEST_TTL);
     m.get(key).or_else(|| key.rsplit_once('#').and_then(|(legacy, _)| m.get(legacy))).map(|(_, r)| r.clone())
 }
 
 fn record_sent_request(key: String, resp: &SendResp) {
-    let mut m = sent_requests().lock().unwrap();
+    let mut m = lock_ok(sent_requests());
     if m.len() > 100_000 {
         m.retain(|_, (at, _)| at.elapsed() < SENT_REQUEST_TTL);
     }
@@ -7296,7 +7380,7 @@ fn load_sent_requests(wallet_dir: &str) -> usize {
     let ttl = SENT_REQUEST_TTL.as_secs();
     // The last line per key wins; a tombstone removes the key (and its earlier lines).
     let mut kept: Vec<(String, String)> = Vec::new();
-    let mut m = sent_requests().lock().unwrap();
+    let mut m = lock_ok(sent_requests());
     for line in text.lines() {
         let Ok(r) = serde_json::from_str::<SentRequestLine>(line) else { continue };
         if r.forgotten {
@@ -9056,6 +9140,98 @@ impl AppState {
 /// other than queueing. Here the only per-wallet cost is trial decryption of a handful of
 /// mempool bundles: microseconds, no RPC, no tree. So a payment appears within about a
 /// second of the sender hitting Confirm, no matter how many wallets are mid-scan.
+/// How often the virtual chain is asked which of our pending payments it accepted.
+const ACCEPTANCE_POLL: std::time::Duration = std::time::Duration::from_secs(15);
+/// A pending payment the virtual chain has passed by this much (DAA) without accepting it, and
+/// that the node's mempool no longer holds, is handed back then: not after
+/// `PENDING_SPEND_EXPIRY_DAA`. The chain is the authority on what landed; the timer only ever
+/// guessed.
+const RECLAIM_UNSEEN_DAA: u64 = 600;
+/// How far below the tip the acceptance question starts at most (older pending payments keep
+/// the expiry rule).
+const ACCEPTANCE_LOOKBACK_DAA: u64 = 7_200;
+
+/// The chain block at or just below DAA `daa` (the node's own placement).
+async fn chain_block_at_or_below_daa(client: &GrpcClient, daa: u64) -> Option<RpcHash> {
+    let req = kaspa_rpc_core::GetShieldedTreeStateRequest { block_hash: None, below_daa_score: Some(daa.checked_add(1)?) };
+    match tokio::time::timeout(SYNC_RPC_TIMEOUT, client.get_shielded_tree_state_call(None, req)).await {
+        Ok(Ok(ts)) => Some(ts.block_hash),
+        _ => None,
+    }
+}
+
+/// Watch the virtual chain for our pending payments: the same source the pool's payout engine
+/// trusts (`get_virtual_chain_from_block` with accepted transaction ids, which lists shielded
+/// transactions like any other). The sync pass then settles by the chain's answer: an accepted
+/// payment is never handed back whatever its age, and one the chain passed by without
+/// accepting is handed back after `RECLAIM_UNSEEN_DAA` (with the mempool's last word) instead of
+/// after an hour. Also what `GET /api/wallet/requests/{id}` answers "landed" from.
+async fn acceptance_loop(state: Arc<AppState>) {
+    loop {
+        tokio::time::sleep(ACCEPTANCE_POLL).await;
+        // Pending payments across the resident wallets (busy ones are read next time).
+        let mut pending: HashMap<[u8; 32], u64> = HashMap::new();
+        let wallets: Vec<Wallet> = state.wallets.lock().await.values().cloned().collect();
+        for w in wallets {
+            if let Ok(e) = w.try_lock() {
+                for p in e.db.pending_spends() {
+                    if p.txid != [0u8; 32] && p.submitted_daa != 0 {
+                        let at = pending.entry(p.txid).or_insert(p.submitted_daa);
+                        *at = (*at).min(p.submitted_daa);
+                    }
+                }
+            }
+        }
+        {
+            let mut acc = lock_ok(&state.accepted_txs);
+            acc.retain(|_, (_, _, at)| at.elapsed() < std::time::Duration::from_secs(24 * 3600));
+            pending.retain(|t, _| !acc.contains_key(t));
+        }
+        if pending.is_empty() {
+            continue;
+        }
+        let Some(client) = state.request_client().await else { continue };
+        let tip = state.node_tip.lock().await.0;
+        if tip == 0 {
+            continue;
+        }
+        let oldest = pending.values().copied().min().unwrap_or(tip);
+        let start_daa = oldest.saturating_sub(60).max(tip.saturating_sub(ACCEPTANCE_LOOKBACK_DAA));
+        let Some(start) = chain_block_at_or_below_daa(&client, start_daa).await else { continue };
+        let Ok(Ok(resp)) = tokio::time::timeout(SYNC_RPC_TIMEOUT, client.get_virtual_chain_from_block(start, true, None)).await else {
+            continue;
+        };
+        let Some(last) = resp.added_chain_block_hashes.last().copied() else { continue };
+        let Ok(Ok(last_block)) = tokio::time::timeout(SYNC_RPC_TIMEOUT, client.get_block(last, false)).await else { continue };
+        let upto = last_block.header.daa_score;
+        let mut found: Vec<([u8; 32], RpcHash)> = Vec::new();
+        for a in &resp.accepted_transaction_ids {
+            for id in &a.accepted_transaction_ids {
+                let b = id.as_bytes();
+                if pending.contains_key(&b) {
+                    found.push((b, a.accepting_block_hash));
+                }
+            }
+        }
+        for (txid, h) in &found {
+            let daa = match tokio::time::timeout(SYNC_RPC_TIMEOUT, client.get_block(*h, false)).await {
+                Ok(Ok(b)) => b.header.daa_score,
+                _ => upto,
+            };
+            lock_ok(&state.accepted_txs).insert(*txid, (*h, daa, std::time::Instant::now()));
+            lock_ok(&state.unseen_upto).remove(txid);
+            log::info!("acceptance: payment {} accepted by chain block {h} (DAA {daa})", RpcHash::from_bytes(*txid));
+        }
+        let mut unseen = lock_ok(&state.unseen_upto);
+        for (txid, since) in &pending {
+            if !found.iter().any(|(t, _)| t == txid) && upto > *since {
+                unseen.insert(*txid, upto);
+            }
+        }
+        unseen.retain(|t, _| pending.contains_key(t));
+    }
+}
+
 async fn mempool_loop(state: Arc<AppState>) {
     let mut last_seen = 0usize;
     loop {
@@ -9483,6 +9659,11 @@ fn drop_held_leaves(state: &AppState, token: &str, e: &mut WalletEntry) -> bool 
     if size < base.saturating_add(HOSTED_REBASE_MIN_LEAVES) {
         return false;
     }
+    if let Some((at_size, when)) = e.rebase_refused {
+        if size < at_size.saturating_add(HOSTED_REBASE_MIN_LEAVES) && when.elapsed() < std::time::Duration::from_secs(3600) {
+            return false;
+        }
+    }
     let positions = e.db.held_positions();
     if positions.len() <= kaspa_shielded_core::walletdb::MAX_LIVE_WITNESSES {
         let minted = state.chain_tree.try_lock().ok().and_then(|ct| {
@@ -9493,6 +9674,7 @@ fn drop_held_leaves(state: &AppState, token: &str, e: &mut WalletEntry) -> bool 
         let Some((fs, ws)) = minted else { return false };
         let n = ws.len();
         if e.db.adopt_witnesses_dropping_leaves(&fs, ws) {
+            e.rebase_refused = None;
             HOSTED_LEAF_DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             log::info!(
                 "wallet {}: {} leaves dropped; {n} note(s) carry shared-tree witnesses at {size}",
@@ -9502,6 +9684,7 @@ fn drop_held_leaves(state: &AppState, token: &str, e: &mut WalletEntry) -> bool 
             return true;
         }
         HOSTED_REBASE_REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        e.rebase_refused = Some((size, std::time::Instant::now()));
         log::warn!("wallet {}: shared-tree witnesses at {size} REFUSED; keeping its leaves", log_pseudonym(token));
         return false;
     }
@@ -9510,6 +9693,7 @@ fn drop_held_leaves(state: &AppState, token: &str, e: &mut WalletEntry) -> bool 
     }
     let Some(fs) = state.chain_tree.try_lock().ok().and_then(|ct| ct.db.frontier_state_at(target)) else { return false };
     if e.db.rebase_to(&fs) {
+        e.rebase_refused = None;
         HOSTED_LEAF_DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         log::info!(
             "wallet {}: base rolled {base} -> {target} from the shared tree's frontier ({} leaves dropped, {} notes)",
@@ -9520,6 +9704,7 @@ fn drop_held_leaves(state: &AppState, token: &str, e: &mut WalletEntry) -> bool 
         return true;
     }
     HOSTED_REBASE_REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    e.rebase_refused = Some((size, std::time::Instant::now()));
     log::warn!("wallet {}: shared frontier at {target} REFUSED (leaf differs from this wallet's stream); keeping its leaves", log_pseudonym(token));
     false
 }
@@ -9820,6 +10005,31 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
         // clock restarts. No clear answer (timeout, no connection): judged again next pass.
         // Only a definite "not found" lets the reclaim below hand the coins back. Rare (a spend
         // must have expired) and bounded, though it runs under the wallet lock.
+        // What the virtual chain said (see `acceptance_loop`) comes first: an accepted payment
+        // keeps its notes parked whatever its age (the scan settles them when it reaches the
+        // block); one the chain has passed by for `RECLAIM_UNSEEN_DAA` is made due now, so the
+        // mempool check below and the reclaim after it judge it this pass.
+        {
+            let acc = lock_ok(&state.accepted_txs);
+            let unseen = lock_ok(&state.unseen_upto);
+            let pend: Vec<([u8; 32], u64)> = e.db.pending_spends().iter().map(|p| (p.txid, p.submitted_daa)).collect();
+            for (txid, since) in pend {
+                if txid == [0u8; 32] || since == 0 {
+                    continue;
+                }
+                let age = now_daa.saturating_sub(since);
+                if acc.contains_key(&txid) {
+                    if age > PENDING_SPEND_EXPIRY_DAA.saturating_sub(120) {
+                        e.db.renew_pending_spend(&txid, now_daa);
+                    }
+                } else if age <= PENDING_SPEND_EXPIRY_DAA && unseen.get(&txid).is_some_and(|&upto| upto >= since.saturating_add(RECLAIM_UNSEEN_DAA)) {
+                    e.db.renew_pending_spend(&txid, now_daa.saturating_sub(PENDING_SPEND_EXPIRY_DAA + 1));
+                    log::info!(
+                        "wallet '{token_p}': submitted spend {} not accepted by the chain for {RECLAIM_UNSEEN_DAA}+ DAA; judging it now",
+                        RpcHash::from_bytes(txid), token_p = log_pseudonym(&token));
+                }
+            }
+        }
         let expiring = e.db.expiring_spend_txids(now_daa, PENDING_SPEND_EXPIRY_DAA);
         if !expiring.is_empty() {
             let client = state.request_client().await;
@@ -9890,7 +10100,13 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
     // 15 minutes (4.2 GB, 16 s of encode+write, measured 2 Nov) for state the node can rebuild
     // in seconds after a crash. Every 30 minutes, and at shutdown (the flush), is enough.
     let effective_interval = if token == CHAIN_TREE_TOKEN { effective_interval.max(CHAIN_TREE_CHECKPOINT_INTERVAL) } else { effective_interval };
-    let overdue = advanced > 0 && e.last_checkpoint_at.elapsed() >= effective_interval;
+    // A periodic write is worth its cost only once enough new blocks accrued: at the tip a
+    // wallet advances every second, and this rewrote the whole checkpoint (every leaf since the
+    // base, the nullifier table) every interval — hundreds of MB a minute on a phone or an
+    // exchange box holding one old note. Progress alone is cheap to redo (the next load re-reads
+    // ≤ `CHECKPOINT_MIN_GAIN` blocks from the cache or the chain files); what must land promptly
+    // sets `force_checkpoint` (parked spends, warmed witnesses). Hourly in any case.
+    let overdue = periodic_checkpoint_due(advanced, e.last_checkpoint_at.elapsed(), effective_interval);
     // A wallet far enough behind to burst (see `CATCHUP_BURST_MIN_BEHIND`) ingests
     // several thousand blocks per pass, so the block rule alone would rewrite the
     // checkpoint on EVERY pass — and a restoring wallet retains every leaf since its
@@ -10295,44 +10511,65 @@ async fn evict_idle_wallets(state: &Arc<AppState>) {
 /// retired or reloaded meanwhile is left alone. Returns whether it was removed.
 async fn evict_wallet(state: &Arc<AppState>, token: &str, why: &str) -> bool {
     let Some(w) = state.wallets.lock().await.get(token).cloned() else { return false };
-    {
+    // The bytes are taken under the wallet lock; the WRITE is not. It used to run here,
+    // synchronously, on the path of every load (`admit_load` -> `enforce_resident_budget`), so
+    // one 500 MB wallet being evicted held the admission lock, and every other load and the
+    // evicted wallet's own status polls, for the length of its fsync.
+    //
+    // Progress of under `CHECKPOINT_MIN_GAIN` blocks is not written at all unless something
+    // forced it: the next load re-reads those blocks in well under the write's time. A wallet
+    // in an error state is evicted as-is: its checkpoint already lagged and the reload path
+    // re-derives whatever it can.
+    let parts = {
         let mut e = w.lock().await;
-        // Flush a dirty victim so eviction is free of rescan cost. A wallet in an
-        // error state is evicted as-is — its checkpoint already lagged and the
-        // reload path re-derives whatever it can.
-        if e.error.is_none() && e.saved_scanned != e.scanned {
-            if save_checkpoint(
-                &state.wallet_dir,
-                token,
+        let gained = e.scanned.saturating_sub(e.saved_scanned);
+        if e.error.is_none() && !e.db.poisoned() && (e.force_checkpoint || gained >= CHECKPOINT_MIN_GAIN) {
+            let parts = checkpoint_bytes(
+                shared_leaf_upto(&state.wallet_dir, token, &e.db),
                 &e.genesis,
                 &e.low,
                 e.scanned as u64,
                 &e.db,
                 &e.boundaries,
-                &e.boundary_blocks,
                 e.sink_blue,
                 e.blind_below,
-            )
-            .is_ok()
-            {
-                e.saved_scanned = e.scanned;
-                e.last_checkpoint_at = std::time::Instant::now();
-                e.force_checkpoint = false;
-            }
+            );
+            e.saved_scanned = e.scanned;
+            e.last_checkpoint_at = std::time::Instant::now();
+            e.force_checkpoint = false;
+            Some(parts)
+        } else {
+            None
         }
-    }
-    // Remove only if the map still holds THIS instance (a retire/reload racing the
-    // sweep must not be eaten).
-    let mut map = state.wallets.lock().await;
-    if map.get(token).map(|cur| Arc::ptr_eq(cur, &w)).unwrap_or(false) {
+    };
+    {
+        let mut map = state.wallets.lock().await;
+        if !map.get(token).map(|cur| Arc::ptr_eq(cur, &w)).unwrap_or(false) {
+            return false;
+        }
         map.remove(token);
-        if let Ok(mut c) = state.engine_cohort.lock() {
-            c.remove(token);
-        }
-        log::info!("evicted {why} wallet '{token_p}' (checkpoint on disk; it reloads on its next request)", token_p = log_pseudonym(&token));
-        return true;
     }
-    false
+    if let Ok(mut c) = state.engine_cohort.lock() {
+        c.remove(token);
+    }
+    if let Some(parts) = parts {
+        // A reload of this token waits on its loading lock until the file is written, so it
+        // never reads the checkpoint these bytes replace.
+        let gate = {
+            let mut loading = state.loading.lock().await;
+            loading.entry(token.to_string()).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))).clone()
+        };
+        let held = gate.lock_owned().await;
+        let (dir, who) = (state.wallet_dir.clone(), token.to_string());
+        tokio::task::spawn_blocking(move || {
+            let _held = held;
+            if let Err(e) = write_checkpoint_bytes(&dir, &who, &parts) {
+                log::warn!("wallet {}: checkpoint write at eviction failed ({e}); its next load resumes from the previous one", log_pseudonym(&who));
+            }
+        });
+    }
+    log::info!("evicted {why} wallet '{token_p}' (checkpoint on disk; it reloads on its next request)", token_p = log_pseudonym(&token));
+    true
 }
 
 /// Memory policing must not share the sync loop. A cohort of large checkpoints can
@@ -11202,7 +11439,9 @@ async fn load_new_wallet(
 struct AddressResp {
     address: String,
     /// Diversifier index this address was derived at (0 = the wallet's default address).
-    index: u32,
+    index: u64,
+    /// The same index as a decimal string, for clients whose numbers stop at 2^53.
+    index_exact: String,
 }
 
 /// `?index=N` selects the wallet's N-th diversified address. All of them pay into the same
@@ -11213,7 +11452,8 @@ struct AddressResp {
 /// this endpoint always returned.
 #[derive(Deserialize, Default)]
 struct AddressQuery {
-    index: Option<u32>,
+    /// A diversifier index: a JSON number or a decimal string (up to 2^64-1).
+    index: Option<JsonU64>,
 }
 
 async fn wallet_address(
@@ -11224,13 +11464,16 @@ async fn wallet_address(
     let token = token_from(&headers, state.allow_default_token)?;
     let w = state.get_wallet(&token).await.ok_or_else(|| err(StatusCode::NOT_FOUND, "no wallet loaded"))?;
     let e = w.lock().await;
-    let index = query.index.unwrap_or(0);
+    let index = match query.index.as_ref() {
+        Some(i) => i.parse("index")?,
+        None => 0,
+    };
     let address = if index == 0 {
         state.address_of(&e.db)
     } else {
-        String::from(&Address::new(state.prefix, Version::ShieldedOrchard, &e.db.address_bytes_at(index)))
+        String::from(&Address::new(state.prefix, Version::ShieldedOrchard, &e.db.address_bytes_at_index(index)))
     };
-    Ok(Json(AddressResp { address, index }))
+    Ok(Json(AddressResp { address, index, index_exact: index.to_string() }))
 }
 
 #[derive(Serialize)]
@@ -11336,7 +11579,7 @@ async fn wallet_watch(
             .await
             .ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "failed to resume wallet from checkpoint"))?;
         log::info!("re-registered watch-only wallet for token {token_p}: resumed from checkpoint (birthday kept {keep_birthday})", token_p = log_pseudonym(&token));
-        return Ok(Json(AddressResp { address, index: 0 }));
+        return Ok(Json(AddressResp { address, index: 0, index_exact: "0".into() }));
     }
 
     // A new or changed key must not resume a DIFFERENT key's checkpoint stream — nor
@@ -11358,7 +11601,7 @@ async fn wallet_watch(
             state.index_fvk(&token, &key).await;
             log::info!(
                 "registered watch-only wallet for token {token_p}: adopted checkpoint from twin token {donor_p} (birthday {keep_birthday})", token_p = log_pseudonym(&token), donor_p = log_pseudonym(&donor));
-            return Ok(Json(AddressResp { address, index: 0 }));
+            return Ok(Json(AddressResp { address, index: 0, index_exact: "0".into() }));
         }
         // The clone failed to load (corrupt donor file, node hiccup) — scan honestly.
         let _ = std::fs::remove_file(scan_path(&state.wallet_dir, &token));
@@ -11376,7 +11619,7 @@ async fn wallet_watch(
     state.wallets.lock().await.insert(token.clone(), Arc::new(Mutex::new(entry)));
     state.index_fvk(&token, &WalletKey::Fvk(fvk)).await;
     log::info!("registered watch-only wallet for token {token_p} (birthday {req_birthday}, requested {})", req.birthday, token_p = log_pseudonym(&token));
-    Ok(Json(AddressResp { address, index: 0 }))
+    Ok(Json(AddressResp { address, index: 0, index_exact: "0".into() }))
 }
 
 #[derive(Serialize)]
@@ -11671,6 +11914,68 @@ async fn chain_tree_state_at_daa(client: &GrpcClient, daa: u64) -> Option<kaspa_
     }
 }
 
+/// `GET /api/wallet/requests/{id}`: what became of a payment request this wallet sent with that
+/// `request_id` — for a caller that lost the answer (a crash, a timeout) and must settle its
+/// own ledger without guessing:
+/// - `in_progress`: still being sent; retry later with the same id;
+/// - `sent`: broadcast; each transaction is `pending` (not yet seen accepted), `landed`
+///   (accepted by a chain block, with its depth) or `returned` (never landed; its coins came back);
+/// - 404: no record of that id for this wallet (never sent, or older than the records' 24 h).
+async fn wallet_request_status(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let token = token_from(&headers, state.allow_default_token)?;
+    let mut prefixes: Vec<String> = vec![format!("custodial:{token}"), format!("custodial-many:{token}")];
+    let wallet = state.cached_wallet(&token).await;
+    let mut pending: HashSet<[u8; 32]> = HashSet::new();
+    if let Some(w) = &wallet {
+        if let Ok(e) = w.try_lock() {
+            prefixes.push(hex(&e.db.fvk().to_bytes()));
+            pending.extend(e.db.pending_spends().iter().map(|p| p.txid));
+        }
+    }
+    let mut records: Vec<(String, SendResp)> = Vec::new();
+    let mut in_progress = false;
+    for p in &prefixes {
+        if let Some(prefix) = sent_request_prefix(p, &id) {
+            let found = sent_requests_for(&prefix);
+            in_progress |= found.iter().any(|(k, _)| send_in_flight(Some(k))) || send_in_flight(Some(&prefix));
+            records.extend(found);
+        }
+    }
+    if in_progress && records.is_empty() {
+        return Ok(Json(serde_json::json!({ "request_id": id, "state": "in_progress" })));
+    }
+    let Some((_, resp)) = records.into_iter().max_by_key(|(_, r)| r.tx_count) else {
+        return Err(err(StatusCode::NOT_FOUND, "no record of this request id for this wallet (never sent, or older than the records' 24 h)"));
+    };
+    let tip = state.node_tip.lock().await.0;
+    let acc = lock_ok(&state.accepted_txs).clone();
+    let txs: Vec<serde_json::Value> = resp
+        .txids
+        .iter()
+        .map(|t| {
+            let bytes: Option<[u8; 32]> = unhex(t).and_then(|b| b.try_into().ok());
+            let landed = bytes.and_then(|b| acc.get(&b).copied());
+            match (landed, bytes.map(|b| pending.contains(&b)).unwrap_or(false)) {
+                (Some((block, daa, _)), _) => serde_json::json!({ "txid": t, "state": "landed", "block": block.to_string(), "daa_score": daa, "depth": tip.saturating_sub(daa) }),
+                (None, true) => serde_json::json!({ "txid": t, "state": "pending" }),
+                (None, false) => serde_json::json!({ "txid": t, "state": if wallet.is_some() { "returned_or_settled" } else { "unknown" } }),
+            }
+        })
+        .collect();
+    Ok(Json(serde_json::json!({
+        "request_id": id,
+        "state": if in_progress { "in_progress" } else { "sent" },
+        "amount_sompi_exact": resp.amount_sompi_exact,
+        "fee_sompi_exact": resp.fee_sompi_exact,
+        "tx_count": resp.tx_count,
+        "transactions": txs,
+    })))
+}
+
 async fn wallet_history(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -11729,6 +12034,9 @@ fn history_json(prefix: Prefix, e: &WalletEntry, limit: Option<usize>, offset: O
                     // row written before this daemon version) — not zero received.
                     "credits": h.credits.iter().map(|c| serde_json::json!({
                         "recipient": String::from(&Address::new(prefix, Version::ShieldedOrchard, &c.recipient)),
+                        // The customer index this address was issued at (`/address?index=`),
+                        // recovered from the address itself: null for a sent row's payee.
+                        "index": if h.kind == HistoryKind::Sent { None } else { e.db.address_index_of(&c.recipient) },
                         "amountSompi": c.value,
                         "amountSompiExact": c.value.to_string(),
                         "amountZkas": c.value as f64 / SOMPI_PER_ZKAS as f64,
@@ -12142,7 +12450,8 @@ fn prefer_unheld<'a>(candidates: Vec<&'a OwnedNote>, held: &HashMap<u64, std::ti
 fn matured_candidates(db: &WalletDb, matured: u64) -> Result<(Vec<&OwnedNote>, u64), (StatusCode, Json<serde_json::Value>)> {
     let stranded = db.stranded_notes();
     let stranded_value = sum_note_values(stranded.iter().map(|n| n.value()))?;
-    if stranded_value > 0 {
+    // Dust below the base is by design (see `WalletDb::set_base_floor_value`), not a loss.
+    if stranded_value > dust_floor_sompi() {
         log::warn!(
             "spend selection: skipping {} stranded note(s) worth {} sompi (below base {}, no witness) — recoverable only by grafting older wallet state",
             stranded.len(),
@@ -13759,6 +14068,7 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
     // wallet to record against.
     let mut spent_positions: Vec<u64> = Vec::new();
     let mut session_token: Option<String> = None;
+    let mut session_wallet: Option<Wallet> = None;
     if let Ok(token) = token_from(&headers, state.allow_default_token) {
         if let Some(w) = state.get_wallet(&token).await {
             ensure_canonical_checkpoint(&state, &w).await?;
@@ -13852,6 +14162,7 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
                     inputs = inputs_u;
                     spent_positions = positions.clone();
                     session_token = Some(token.clone());
+                    session_wallet = Some(w.clone());
                     fast_path = true;
                     let info = uniform::anchor_info_of(&e, &choice);
                     let w_ms = zkas_wallet_engine::schedule::split_window_ms(k, info.lambda_per_s, 0);
@@ -13914,6 +14225,7 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
                     if prepare_is_doomed(preview, need, fee, have_total.unwrap_or(0), self_payment, allow_partial) {
                         selected = preview;
                         session_token = Some(token.clone());
+                        session_wallet = Some(w.clone());
                     } else {
                     // Build every selected note's witness in ONE base→matured pass
                     // (O(chain + N·depth)) instead of N independent O(chain) replays —
@@ -13947,6 +14259,7 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
                         selected += n.value();
                     }
                     session_token = Some(token.clone());
+                    session_wallet = Some(w.clone());
                     // Soft-hold them for this session (see `WalletEntry::soft_held`).
                     let now = std::time::Instant::now();
                     e.soft_held.retain(|_, until| *until > now);
@@ -14302,7 +14615,7 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
         map.retain(|_, s| now.duration_since(s.created) < PREPARED_TTL); // bound memory
         map.insert(
             session.clone(),
-            PreparedSession { payment, amount, fee, created: now, token: session_token, positions: spent_positions, request_key },
+            PreparedSession { payment, amount, fee, created: now, token: session_token, wallet: session_wallet, positions: spent_positions, request_key },
         );
     }
     if self_payment {
@@ -14382,7 +14695,7 @@ async fn wallet_submit(
         map.retain(|_, s| now.duration_since(s.created) < PREPARED_TTL);
         map.remove(&req.session)
     };
-    let PreparedSession { payment, amount, fee, token, positions, request_key, .. } =
+    let PreparedSession { payment, amount, fee, token, wallet, positions, request_key, .. } =
         session.ok_or_else(|| err(StatusCode::NOT_FOUND, "no such prepared session (expired or already submitted)"))?;
     // Held until this handler returns, i.e. until the broadcast is recorded or refused.
     let _in_flight = begin_send(request_key.as_deref())?;
@@ -14420,25 +14733,38 @@ async fn wallet_submit(
     // fact. The user-facing text is plain English; the detail goes to the log.
     let n_sigs = device_sigs.len();
     let sig_indices: Vec<usize> = device_sigs.iter().map(|(i, _)| *i).collect();
-    let bundle = finalize_payment(payment, device_sigs).map_err(|e| {
-        // Log WHICH wallet and which action indices. `InvalidExternalSignature` means
-        // the device's signature did not verify against the bundle's randomized key —
-        // that is about the signing key, the randomizer, or the sighash, never the
-        // Merkle witness. Knowing the token separates "this one wallet's device key
-        // does not match the wallet the token addresses" from a general fault: seen
-        // live 2026-08-07, one wallet failed 3/3 while another succeeded in between.
-        log::error!(
-            "submit REJECTED for session {} (wallet token {}): finalize_payment failed with {n_sigs} device \
-             signature(s) for action index/es {sig_indices:?}: {e:?}",
-            req.session,
-            token.as_deref().map(log_pseudonym).unwrap_or_else(|| "<none>".into()),
-        );
-        err(
-            StatusCode::BAD_REQUEST,
-            "This payment could not be completed: the signatures from your device did not match the \
-             prepared transaction. Nothing was sent and no coins moved. Please try the payment again.",
-        )
-    })?;
+    let bundle = match finalize_payment(payment, device_sigs) {
+        Ok(b) => b,
+        Err(e) => {
+            // Log WHICH wallet and which action indices. `InvalidExternalSignature` means
+            // the device's signature did not verify against the bundle's randomized key —
+            // that is about the signing key, the randomizer, or the sighash, never the
+            // Merkle witness. Knowing the token separates "this one wallet's device key
+            // does not match the wallet the token addresses" from a general fault: seen
+            // live 2026-08-07, one wallet failed 3/3 while another succeeded in between.
+            log::error!(
+                "submit REJECTED for session {} (wallet token {}): finalize_payment failed with {n_sigs} device \
+                 signature(s) for action index/es {sig_indices:?}: {e:?}",
+                req.session,
+                token.as_deref().map(log_pseudonym).unwrap_or_else(|| "<none>".into()),
+            );
+            // The session is gone, so its holds go too. They used to stay for the session TTL
+            // (five minutes), during which the device's corrected retry was told the wallet
+            // could not pay, or paid from other notes.
+            if let Some(w) = wallet.as_ref() {
+                let mut we = w.lock().await;
+                uniform::unreserve(&mut we, &positions);
+                for p in &positions {
+                    we.soft_held.remove(p);
+                }
+            }
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                "This payment could not be completed: the signatures from your device did not match the \
+                 prepared transaction. Nothing was sent and no coins moved. Please try the payment again.",
+            ));
+        }
+    };
     let tx: Transaction = payment_tx(bundle.to_bytes());
     let node = state
         .request_client()
@@ -14467,7 +14793,12 @@ async fn wallet_submit(
             // Skipping this is what let a second send inside that window re-select the
             // same notes and build a transaction consensus drops as a double-spend.
             if let Some(token) = token {
-                if let Some(w) = state.get_wallet(&token).await {
+                // The handle from `/prepare`; a fresh load only when the session had none.
+                let handle = match wallet.clone() {
+                    Some(w) => Some(w),
+                    None => state.get_wallet(&token).await,
+                };
+                if let Some(w) = handle {
                     let mut e = w.lock().await;
                     let now_daa = submit_clock(&e);
                     for p in &positions {
@@ -14490,6 +14821,16 @@ async fn wallet_submit(
                     e.db.note_pending_outflow(accepted.as_bytes(), amount.saturating_add(fee));
                     e.forget_stale_outflow_previews();
                     log::info!("submit: parked {} spent note(s) for tx {}", positions.len(), accepted);
+                    // Evicted since `/prepare`: this entry is no longer what the daemon serves, so
+                    // its parked notes would be lost with it. Write them now; the next load reads
+                    // this file.
+                    let detached = !state.wallets.lock().await.get(&token).is_some_and(|cur| Arc::ptr_eq(cur, &w));
+                    if detached {
+                        match save_checkpoint(&state.wallet_dir, &token, &e.genesis, &e.low, e.scanned as u64, &e.db, &e.boundaries, &e.boundary_blocks, e.sink_blue, e.blind_below) {
+                            Ok(()) => log::info!("submit: wallet {} was evicted since prepare; parked notes written to its checkpoint", log_pseudonym(&token)),
+                            Err(why) => log::error!("submit: wallet {} was evicted since prepare and its checkpoint could not be written ({why}); its notes read as spendable until the scan sees tx {accepted}", log_pseudonym(&token)),
+                        }
+                    }
                 } else {
                     log::error!(
                         "submit: tx {accepted} broadcast but wallet {} could not be loaded to park its {} note(s); they read as spendable until the scan sees it",
@@ -14510,7 +14851,11 @@ async fn wallet_submit(
             // wallet could not pay. Notes the node says are already spent are instead dropped
             // when the chain's table confirms it, or every retry would pick them again.
             if let Some(t) = token.as_deref() {
-                if let Some(w) = state.get_wallet(t).await {
+                let handle = match wallet.clone() {
+                    Some(w) => Some(w),
+                    None => state.get_wallet(t).await,
+                };
+                if let Some(w) = handle {
                     let mut we = w.lock().await;
                     uniform::unreserve(&mut we, &positions);
                     for p in &positions {
@@ -16000,6 +16345,8 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
         chain_tree: chain_tree.clone(),
         chain_tree_size: std::sync::atomic::AtomicU64::new(0),
         page_failures: std::sync::atomic::AtomicU64::new(0),
+        accepted_txs: std::sync::Mutex::new(HashMap::new()),
+        unseen_upto: std::sync::Mutex::new(HashMap::new()),
         chain_tree_base: std::sync::atomic::AtomicU64::new(0),
         chain_tree_frontier: Mutex::new(None),
         wallet_dir,
@@ -16144,6 +16491,7 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
     // Unmined payments — the instant-payment path. Separate from sync_loop on purpose
     // (see mempool_loop): it must never queue behind block scanning.
     let mempool_task = tokio::spawn(mempool_loop(state.clone()));
+    let acceptance_task = tokio::spawn(acceptance_loop(state.clone()));
     // No-op unless --auto-consolidate is set; returns immediately when it is not.
     let consolidate_task = tokio::spawn(consolidate_loop(state.clone()));
     let warm_sweep_task = tokio::spawn(warm_sweep_loop(state.clone()));
@@ -16268,6 +16616,7 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
         .route("/api/wallet/balance", get(wallet_balance))
         .route("/api/wallet/history", get(wallet_history))
         .route("/api/wallet/proof", get(wallet_proof))
+        .route("/api/wallet/requests/:id", get(wallet_request_status))
         .route("/api/proof/verify", post(proof_verify))
         .route("/api/wallet/settings", post(wallet_settings))
         .route("/api/wallet/rescan", post(wallet_rescan))
@@ -16436,6 +16785,7 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
     shared_tree_audit_task.abort();
     eviction_task.abort();
     mempool_task.abort();
+    acceptance_task.abort();
     tip_task.abort();
     connector_task.abort();
     consolidate_task.abort();
@@ -16776,11 +17126,25 @@ mod token_header_tests {
 
 #[cfg(test)]
 mod request_flush_tests {
-    use super::{request_flush_due, REQUEST_FLUSH_MIN_INTERVAL};
+    use super::{periodic_checkpoint_due, request_flush_due, CHECKPOINT_MAX_STALE, CHECKPOINT_MIN_GAIN, REQUEST_FLUSH_MIN_INTERVAL};
     use std::time::Duration;
 
     /// A request writes a checkpoint only with progress to save, and not again right after the
     /// last write however often it asks.
+    #[test]
+    /// At the tip a wallet gains a block a second; the old rule (any gain, interval passed)
+    /// rewrote the whole checkpoint every interval: hundreds of MB a minute on a phone holding
+    /// one old note.
+    #[test]
+    fn a_periodic_checkpoint_needs_a_thousand_blocks_or_an_hour() {
+        let minute = Duration::from_secs(60);
+        assert!(!periodic_checkpoint_due(0, Duration::from_secs(7_200), minute), "nothing new: never");
+        assert!(!periodic_checkpoint_due(60, minute, minute), "a minute of blocks is not worth a full rewrite");
+        assert!(!periodic_checkpoint_due(CHECKPOINT_MIN_GAIN, minute - Duration::from_millis(1), minute), "the interval still gates");
+        assert!(periodic_checkpoint_due(CHECKPOINT_MIN_GAIN, minute, minute));
+        assert!(periodic_checkpoint_due(1, CHECKPOINT_MAX_STALE, minute), "but never more than an hour behind");
+    }
+
     #[test]
     fn a_requested_checkpoint_write_needs_progress_and_a_gap() {
         assert!(!request_flush_due(false, Duration::from_secs(3_600)), "nothing to save");
@@ -18120,6 +18484,14 @@ mod sdk_api_tests {
         let legacy = ka.rsplit_once('#').unwrap().0.to_string();
         record_sent_request(legacy.replace("rid-1", "rid-legacy"), &resp);
         assert!(sent_request(&sent_request_key(&fvk_a, "rid-legacy", &pay).unwrap()).is_some());
+        // `/requests/{id}` finds every record of an id whatever it paid, and the legacy form.
+        let prefix = sent_request_prefix(&fvk_a, "rid-1").unwrap();
+        assert_eq!(legacy, prefix);
+        assert_eq!(sent_requests_for(&prefix).len(), 1);
+        record_sent_request(sent_request_key(&fvk_a, "rid-1", &other).unwrap(), &resp);
+        assert_eq!(sent_requests_for(&prefix).len(), 2, "same id, another payment: both are this id's records");
+        assert_eq!(sent_requests_for(&sent_request_prefix(&fvk_a, "rid-legacy").unwrap()).len(), 1, "a legacy key equals its prefix");
+        assert!(sent_requests_for(&sent_request_prefix(&fvk_b, "rid-1").unwrap()).is_empty(), "another wallet sees nothing");
     }
 
     /// A stranger's 1-sompi outputs must never be what a merge picks: 38 of them in one transaction
@@ -18135,6 +18507,15 @@ mod sdk_api_tests {
         // A mining reward or any ordinary deposit is far above it.
         assert!(57 * 100_000_000 > floor);
         assert!(uniform::merge_dust_floor_for_test() > 0);
+    }
+
+    #[test]
+    fn cohort_and_plain_detection_are_compared_by_what_they_found() {
+        let hit = |i: usize, v: u64| (i, v, [7u8; 43]);
+        assert!(same_hit_keys(vec![hit(0, 5), hit(3, 7)], vec![hit(3, 7), hit(0, 5)]), "order does not matter");
+        assert!(!same_hit_keys(vec![hit(0, 5), hit(3, 7)], vec![hit(0, 5)]), "a missing hit is a difference");
+        assert!(!same_hit_keys(vec![hit(0, 5), hit(3, 7)], vec![hit(0, 5), hit(4, 7)]), "a hit on another action is a difference");
+        assert!(!same_hit_keys(vec![hit(0, 5)], vec![hit(0, 6)]), "a different value is a difference");
     }
 
     #[test]

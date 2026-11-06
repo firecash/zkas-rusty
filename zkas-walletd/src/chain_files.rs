@@ -112,6 +112,23 @@ impl Boundary {
         }
     }
 
+    /// A boundary at `block` (DAA `daa`) with frontier `fs`.
+    pub fn from_frontier(block: &RpcHash, daa: u64, fs: &kaspa_shielded_core::tree::FrontierState) -> Self {
+        Self {
+            block: block.to_string(),
+            daa,
+            size: fs.size,
+            // An empty tree names the zero hash, as the node's own tree state does.
+            leaf: RpcHash::from_bytes(fs.leaf.unwrap_or([0u8; 32])).to_string(),
+            ommers: fs.ommers.iter().map(|o| RpcHash::from_bytes(*o).to_string()).collect(),
+        }
+    }
+
+    /// Whether a node's tree state names the same frontier as this signed boundary.
+    pub fn same_rpc(&self, ts: &kaspa_rpc_core::GetShieldedTreeStateResponse) -> bool {
+        self.frontier_state().is_some_and(|mine| Self::from_tree_state(ts).same_frontier(&mine))
+    }
+
     fn same_frontier(&self, fs: &kaspa_shielded_core::tree::FrontierState) -> bool {
         self.frontier_state().is_some_and(|mine| mine.size == fs.size && mine.leaf == fs.leaf && mine.ommers == fs.ommers)
     }
@@ -1205,6 +1222,18 @@ fn insert_bounded(loaded: &mut VecDeque<Arc<Loaded>>, seg: Arc<Loaded>, cap: usi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_boundary_built_from_a_frontier_reads_back_as_that_frontier() {
+        let fs = kaspa_shielded_core::tree::FrontierState { size: 5, leaf: Some([9u8; 32]), ommers: vec![[1u8; 32], [2u8; 32]] };
+        let block = RpcHash::from_bytes([4u8; 32]);
+        let b = Boundary::from_frontier(&block, 77, &fs);
+        assert_eq!(b.block, block.to_string());
+        assert_eq!(b.daa, 77);
+        assert_eq!(b.frontier_state(), Some(fs));
+        let empty = Boundary::from_frontier(&block, 0, &kaspa_shielded_core::tree::FrontierState { size: 0, leaf: None, ommers: vec![] });
+        assert_eq!(empty.frontier_state().map(|f| f.size), Some(0));
+    }
 
     /// A mirror sending more than asked for is cut off, whether it announces the size or not.
     #[tokio::test(flavor = "multi_thread")]
