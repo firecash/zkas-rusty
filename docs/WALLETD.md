@@ -568,6 +568,11 @@ symptoms until someone tries to spend; there is no cheaper moment to start than 
 - **Watch-only wallets are skipped**: the daemon holds no seed for them.
 - **It converges and stops**: each merge removes 37 notes, so once a wallet is under the
   ceiling no further merges happen.
+- **Dust is left alone**: a note worth no more than one spend's share of a full merge's fee
+  (about 0.007 ZKAS) is never merged and does not count toward the ceiling. Anyone can send a
+  wallet notes, and merging a stranger's tiny ones would cost more than they hold; before
+  6 November 2026, 38 one-sompi outputs in one transaction could stop a wallet's merges for
+  good. Payments still spend such notes when they need them.
 - **Bounded CPU**: one merge (~30 core-seconds) per 60 s cooldown, standing down completely
   while any payment is proving.
 - **No races**: a payment holds `PROVING_IN_FLIGHT` across its select → submit span, so no
