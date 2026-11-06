@@ -813,6 +813,9 @@ pub struct ChainFiles {
     /// Decoded segments held at once when any base is remote (see `LOADED_SEGMENTS`): a phone
     /// keeps the default; a daemon sizes it to its memory (`with_remote_cap`).
     remote_cap: usize,
+    /// Where downloaded segments are kept on disk, so a segment the RAM cache let go is read
+    /// back from here instead of the CDN (see `with_cache_dir`). Local bases never need it.
+    cache_dir: Option<std::path::PathBuf>,
     pub pages_served: AtomicU64,
     pub segments_loaded: AtomicU64,
     /// Bytes of segment files fetched this process, and how often each segment was fetched:
@@ -857,6 +860,15 @@ impl ChainFiles {
     /// 12 MB files on every page (measured 6 Nov: three wallets and the tree, 21 re-fetches of
     /// segments 0-1 in two minutes, ~1 GB pulled from the CDN).
     pub fn with_remote_cap(bases: &str, genesis: RpcHash, remote_cap: usize) -> Arc<Self> {
+        Self::with_cache_dir(bases, genesis, remote_cap, None)
+    }
+
+    /// `with_remote_cap`, keeping every segment downloaded from an HTTP base in `cache_dir`
+    /// (verified against the manifest on every read, as a mirror would be). A daemon whose
+    /// wallets restore at different heights reads a segment long after the RAM cache let it
+    /// go: three wallets ~150 segments apart pulled 2.8 GB from the CDN for a 1.9 GB chain
+    /// (measured 6 Nov). With the cache each segment is downloaded once.
+    pub fn with_cache_dir(bases: &str, genesis: RpcHash, remote_cap: usize, cache_dir: Option<&str>) -> Arc<Self> {
         let bases: Vec<String> =
             bases.split(',').map(|b| b.trim().trim_end_matches('/').to_string()).filter(|b| !b.is_empty()).collect();
         let http = bases
@@ -877,6 +889,7 @@ impl ChainFiles {
             epoch: std::time::Instant::now(),
             disabled: std::sync::atomic::AtomicBool::new(false),
             remote_cap: remote_cap.max(LOADED_SEGMENTS),
+            cache_dir: cache_dir.map(std::path::PathBuf::from),
             pages_served: AtomicU64::new(0),
             segments_loaded: AtomicU64::new(0),
             bytes_downloaded: AtomicU64::new(0),
@@ -960,10 +973,35 @@ impl ChainFiles {
     /// serves them, in the configured order: the CDN first, the others only when it fails.
     /// (Rotating the start by segment index sent half of every download to zkas.info.)
     async fn fetch_segment(&self, entry: &SegmentEntry) -> Result<Vec<u8>, String> {
+        if let Some(cached) = self.read_cached(entry).await {
+            return Ok(cached);
+        }
         let mut last = String::from("no mirrors configured");
         for base in &self.bases {
             match self.get_from(base, &entry.file, entry.bytes).await {
-                Ok(bytes) if bytes.len() as u64 == entry.bytes && sha256_hex(&bytes) == entry.sha256 => return Ok(bytes),
+                Ok(bytes) if bytes.len() as u64 == entry.bytes && sha256_hex(&bytes) == entry.sha256 => {
+                    if is_http(base) {
+                        // Counted here, where the bytes really crossed the network: a load served
+                        // from the disk cache is not a download, and must not be warned about as
+                        // one (the "fetched N times" warning is about the CDN).
+                        let total = self.bytes_downloaded.fetch_add(bytes.len() as u64, Ordering::Relaxed) + bytes.len() as u64;
+                        let times = {
+                            let mut f = self.fetches.lock().unwrap();
+                            let n = f.entry(entry.index).or_insert(0);
+                            *n += 1;
+                            *n
+                        };
+                        if times > 2 {
+                            log::warn!(
+                                "chain files: segment {} downloaded {times} times this session ({} MB in total) — the segment cache is evicting what a wallet still reads and the disk cache did not hold it",
+                                entry.index,
+                                total / 1_048_576
+                            );
+                        }
+                        self.write_cached(entry, &bytes).await;
+                    }
+                    return Ok(bytes);
+                }
                 Ok(bytes) => {
                     self.bytes_downloaded.fetch_add(bytes.len() as u64, Ordering::Relaxed);
                     log::warn!("chain files: {base} served segment {} that does not match the manifest; trying another mirror", entry.index);
@@ -976,6 +1014,37 @@ impl ChainFiles {
             }
         }
         Err(last)
+    }
+
+    /// The segment from the disk cache, if it is there and matches the manifest; a stale or
+    /// corrupt file is removed.
+    async fn read_cached(&self, entry: &SegmentEntry) -> Option<Vec<u8>> {
+        let path = self.cache_dir.as_ref()?.join(&entry.file);
+        let bytes = tokio::fs::read(&path).await.ok()?;
+        if bytes.len() as u64 == entry.bytes && sha256_hex(&bytes) == entry.sha256 {
+            return Some(bytes);
+        }
+        log::warn!("chain files: cached segment {} does not match the manifest; removed", entry.index);
+        let _ = tokio::fs::remove_file(&path).await;
+        None
+    }
+
+    /// Keep a downloaded segment on disk (written whole, then renamed into place). A failure
+    /// only costs a later download.
+    async fn write_cached(&self, entry: &SegmentEntry, bytes: &[u8]) {
+        let Some(dir) = self.cache_dir.as_ref() else { return };
+        let path = dir.join(&entry.file);
+        let tmp = dir.join(format!("{}.{}.tmp", entry.file, std::process::id()));
+        let written = async {
+            tokio::fs::create_dir_all(dir).await?;
+            tokio::fs::write(&tmp, bytes).await?;
+            tokio::fs::rename(&tmp, &path).await
+        }
+        .await;
+        if let Err(e) = written {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            log::debug!("chain files: could not cache segment {} ({e})", entry.index);
+        }
     }
 
     pub fn note_sink(&self, sink_blue: u64) {
@@ -1171,20 +1240,6 @@ impl ChainFiles {
 
     async fn load(&self, entry: &SegmentEntry) -> Result<usize, String> {
         let bytes = self.fetch_segment(entry).await?;
-        let total = self.bytes_downloaded.fetch_add(bytes.len() as u64, Ordering::Relaxed) + bytes.len() as u64;
-        let times = {
-            let mut f = self.fetches.lock().unwrap();
-            let n = f.entry(entry.index).or_insert(0);
-            *n += 1;
-            *n
-        };
-        if times > 2 {
-            log::warn!(
-                "chain files: segment {} fetched {times} times this session ({} MB downloaded in total) — the segment cache is evicting what a wallet still reads",
-                entry.index,
-                total / 1_048_576
-            );
-        }
         let genesis = self.genesis;
         let index = entry.index;
         let (body, idx) = tokio::task::spawn_blocking(move || {
@@ -1252,6 +1307,33 @@ fn insert_bounded(loaded: &mut VecDeque<Arc<Loaded>>, seg: Arc<Loaded>, cap: usi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_cached_segment_is_served_from_disk_and_a_stale_one_is_dropped() {
+        let dir = std::env::temp_dir().join(format!("chainfiles-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cf = ChainFiles::with_cache_dir("https://example.invalid", RpcHash::from_bytes([9; 32]), 8, Some(&dir.display().to_string()));
+        let body = b"segment bytes".to_vec();
+        let entry = SegmentEntry {
+            index: 3,
+            file: "seg-3.bin".into(),
+            sha256: sha256_hex(&body),
+            bytes: body.len() as u64,
+            blocks: 1,
+            from: Boundary { block: String::new(), daa: 0, size: 0, leaf: String::new(), ommers: vec![] },
+            to: Boundary { block: String::new(), daa: 1, size: 0, leaf: String::new(), ommers: vec![] },
+        };
+        assert!(cf.read_cached(&entry).await.is_none(), "nothing cached yet");
+        cf.write_cached(&entry, &body).await;
+        assert_eq!(cf.read_cached(&entry).await.as_deref(), Some(body.as_slice()));
+        // The mirror would then not be asked at all: the fetch returns the cached bytes.
+        assert_eq!(cf.fetch_segment(&entry).await.as_deref(), Ok(body.as_slice()));
+        // A file that no longer matches the manifest is dropped, not served.
+        std::fs::write(dir.join("seg-3.bin"), b"tampered").unwrap();
+        assert!(cf.read_cached(&entry).await.is_none());
+        assert!(!dir.join("seg-3.bin").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_daemon_holds_more_remote_segments_than_a_phone() {

@@ -6411,7 +6411,14 @@ impl WalletEntry {
                     // own CPU. Adoption is expensive to redo (a full replay each) so it is
                     // always persisted; raw sweep progress is cheap by comparison and rides
                     // the ordinary `CHECKPOINT_EVERY` cadence instead.
-                    if adopted > 0 || self.witnesses_warm {
+                    // `|| self.witnesses_warm` used to be here too. Reaching "warm" is not work:
+                    // the steady tick below resets the latch whenever its sweep advanced without
+                    // reaching the anchor, so during any catch-up every wallet with notes came
+                    // back through here on every pass and forced a full checkpoint each time —
+                    // and a wallet with NOTHING to witness (the shared chain tree, every empty
+                    // wallet) did the same for a 525 MB file (measured 6 Nov: one write per
+                    // 4-second pass). Only adoption is persisted here.
+                    if adopted > 0 {
                         self.force_checkpoint = true;
                     }
                     if self.witnesses_warm {
@@ -6465,8 +6472,14 @@ impl WalletEntry {
                             // the same wasted Sinsemilla work from the warm tick to the
                             // steady tick. Their paths come from the cache, which
                             // `append_leaf` keeps current for one hash per leaf.
+                            // Nothing to witness, nothing to sweep: an empty wallet (or the
+                            // leaves-only chain tree) hashed its whole lag tree through 17 M
+                            // leaves, 4,000 a tick, for a witness set that does not exist.
+                            let holds_notes = !self.db.notes().is_empty() || !self.db.pending_spends().is_empty();
                             if self.witnesses_warm
                                 && !self.warm_via_subtree_cache
+                                && holds_notes
+                                && !self.db.is_leaves_only()
                                 && self.db.advance_witnesses_capped(matured, steady_cap)
                             {
                                 self.witnesses_warm = false;
@@ -10628,7 +10641,11 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
                     e.stats.ckpt_writes += 1;
                     e.stats.ckpt_write_ns += t_write.elapsed().as_nanos() as u64;
                     e.stats.ckpt_bytes += bytes;
-                    log::info!("shared chain tree checkpoint streamed: {} MB in {:.1?}", bytes >> 20, t_write.elapsed());
+                    log::info!(
+                        "shared chain tree checkpoint streamed: {} MB in {:.1?} (advanced {advanced}; due: blocks={due_by_blocks} caught_up={just_caught_up} forced={force} overdue={overdue})",
+                        bytes >> 20,
+                        t_write.elapsed()
+                    );
                 }
                 Err(err) => {
                     e.force_checkpoint = true;
@@ -15772,6 +15789,7 @@ async fn admin_memory(
     let wallets: Vec<(String, Wallet)> = state.wallets.lock().await.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
     let mut chain_tree = 0usize;
     let mut chain_tree_leaves = (0u64, 0u64, 0u64);
+    let mut chain_tree_state: Option<serde_json::Value> = None;
     let mut busy = 0usize;
     let mut resident: Vec<(usize, serde_json::Value)> = Vec::new();
     for (t, w) in &wallets {
@@ -15782,6 +15800,7 @@ async fn admin_memory(
                     chain_tree = bytes;
                     let (from, to) = e.db.leaf_span();
                     chain_tree_leaves = (from, to, e.db.size());
+                    chain_tree_state = Some(serde_json::json!({ "caught_up": e.caught_up, "force_checkpoint": e.force_checkpoint, "witnesses_warm": e.witnesses_warm, "saved_scanned": e.saved_scanned, "scanned": e.scanned }));
                 } else {
                     let (from, to) = e.db.leaf_span();
                     resident.push((bytes, serde_json::json!({ "wallet": log_pseudonym(t), "mib": bytes >> 20, "notes": e.db.notes().len(), "leaves_held": to - from, "caught_up": e.caught_up })));
@@ -15802,7 +15821,7 @@ async fn admin_memory(
     Ok(Json(serde_json::json!({
         "rss_mib": rss_kb / 1024,
         "chain_tree_mib": chain_tree >> 20,
-        "chain_tree": { "base": chain_tree_leaves.0, "held_to": chain_tree_leaves.1, "size": chain_tree_leaves.2 },
+        "chain_tree": { "base": chain_tree_leaves.0, "held_to": chain_tree_leaves.1, "size": chain_tree_leaves.2, "state": chain_tree_state },
         "nullifier_table_mib": interner >> 20,
         "page_cache": { "entries": pages, "mib": page_bytes >> 20 },
         "chain_file_segments": { "loaded": segments, "mib": segment_bytes >> 20 },
@@ -16927,6 +16946,7 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
     // Must happen before the first connect below.
     kaspa_grpc_client::set_node_socks_proxy(cfg.node_socks_proxy.clone());
     let wallet_dir = cfg.wallet_dir;
+    let chain_files_cache = format!("{wallet_dir}/chainfiles-cache");
     // Read before `wallet_dir` is moved into the state below.
     // Only tokens that still name a wallet: ledgers written before `touch` checked that may
     // hold any number of made-up tokens, and this map is never pruned.
@@ -17148,7 +17168,9 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
                     // (24 per 24 MiB was tried under a 2 GB limit: 290 MB of segments on top of
                     // the chain tree and the nullifier table reached the limit, measured 6 Nov.)
                     let remote_cap = resident_budget_bytes(&resources).map(|b| (b / (64 << 20)).clamp(4, 16) as usize).unwrap_or(12);
-                    pc.files = Some(chain_files::ChainFiles::with_remote_cap(base, genesis, remote_cap));
+                    // Downloaded segments stay on disk beside the wallets, so a daemon whose wallets
+                    // restore at different heights downloads each one once.
+                    pc.files = Some(chain_files::ChainFiles::with_cache_dir(base, genesis, remote_cap, Some(&chain_files_cache)));
                 }
             }
             pc

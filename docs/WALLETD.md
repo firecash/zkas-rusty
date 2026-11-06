@@ -175,7 +175,7 @@ The daemon raises any fee you pass to this floor automatically (`chunk_fee`). Pa
 
 | Flag | Default | Notes |
 | --- | --- | --- |
-| `--chain-files URL_OR_DIR[,…]` | *(none)* | Read the history covered by published chain files from them instead of from the node: `https://` base URLs (tried in order) or a local directory with `manifest.json`. Every file is checked against the node before it is trusted (§6). |
+| `--chain-files URL_OR_DIR[,…]` | *(none)* | Read the history covered by published chain files from them instead of from the node: `https://` base URLs (tried in order) or a local directory with `manifest.json`. Every file is checked against the node before it is trusted (§6). Segments downloaded from a URL are kept in `<wallet-dir>/chainfiles-cache/` (verified against the signed manifest on every read), so each is downloaded once. |
 | `--no-shared-tree` | `false` | Do not build the daemon-wide shared chain tree; every wallet keeps its own, as the on-device engines do. |
 | `--compact-nullifiers` | `false` | Persist the shared nullifier table once (`__nullifiers__.nfs`) and store a compact bitset per wallet instead of every nullifier: much smaller and faster checkpoints. Without it checkpoints keep the full form; both forms load. |
 | `--shared-leaf-store` | `false` | Checkpoint format v11: wallets reference the shared tree's leaf stream instead of embedding a copy. **One-way**: builds that predate v11 cannot read these checkpoints. |
@@ -703,6 +703,26 @@ node's load from a restore or a long catch-up. The node remains the authority:
 A tampered or stale file can therefore cost time, never correctness: it cannot create a
 payment the chain does not contain, nor hide one indefinitely; and a faulty node cannot make
 the daemon throw away files the publisher signed.
+
+### Public (hosted, watch-only) daemon: recipe and sizing
+
+```bash
+zkas-walletd --network mainnet --rpc-server <node> --listen 127.0.0.1:8501 \
+  --wallet-dir /var/lib/zkas/wallets --wallet-secret "$ZKAS_WALLET_SECRET" \
+  --no-custodial --chain-files /var/lib/zkas/chainfiles[,https://<cdn>] \
+  --shared-leaf-store --compact-nullifiers --shared-scan-engine
+```
+
+Measured 6 Nov 2026 (build `275927e4`, three wallets restoring from genesis at once, chain
+files from the CDN, under a hard 2 GB cgroup limit): peak 1.5 GB in the cgroup (file cache
+included), ~1.2 GB RSS, restores done in 10 minutes, every endpoint answering throughout.
+What the memory is: the nullifier table (~0.5 GB at 8.4 M nullifiers), loaded chain-file
+segments (sized to the budget, ~0.3 GB), the shared tree's index (~0.06 GB; its leaves live in
+the shared leaf store), and the allocator; a resident wallet is a few MB (notes, a 1 MB
+nullifier bitset, no leaves). `GET /api/admin/memory` gives the live breakdown. **2 GB is the
+floor for this mode; give it 4 GB** for headroom under many simultaneous restores. Earlier
+builds needed far more: an empty wallet restoring held every leaf since its base (0.5 GB each,
+three of them were killed at 2 GB) and the page cache alone was ~1 GB.
 
 ### Shared chain tree
 
