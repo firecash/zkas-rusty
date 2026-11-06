@@ -13397,6 +13397,11 @@ struct SendManyReq {
     /// daemon already broadcast is answered `409 {already_sent}` with its transactions.
     #[serde(default)]
     request_id: Option<String>,
+    /// Do not absorb the wallet's small notes into this payout's change when the wallet is over
+    /// its consolidation ceiling (see `wallet_send_many`). Default false: absorbing them merges
+    /// without a separate merge transaction.
+    #[serde(default)]
+    no_fill: Option<bool>,
 }
 
 /// Which transaction paid one payee. A payout run splits across transactions, and a run
@@ -13546,7 +13551,7 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
         // per-tx fee is priced on the bundle's ACTION count — `max(spends, payees+1)` —
         // because that, not the spend count alone, is what the node charges mass for.
         let mut taken = 0usize;
-        let mut plan: Vec<(usize, usize, u64)> = Vec::with_capacity(groups.len()); // (start, n_notes, fee)
+        let mut plan: Vec<(Vec<usize>, u64)> = Vec::with_capacity(groups.len()); // (candidate indexes, fee)
         for g in &groups {
             let pay: u64 = g.iter().map(|(_, a, _)| *a).sum();
             let start = taken;
@@ -13583,22 +13588,58 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
                 // Re-price: the fee floor grows with the action count.
                 fee = base_fee.max(min_relay_fee_for_actions((taken - start).max(g.len() + 1)));
             }
-            plan.push((start, taken - start, fee));
+            plan.push(((start..taken).collect(), fee));
         }
-
+        // Merge while paying. A wallet over its consolidation ceiling used to be merged by
+        // separate 38->1 transactions, each adding 38 leaves to the chain (an action carries an
+        // output whether or not it is real); measured 6 Nov, those merges were 81% of all actions
+        // on the chain. A payout batch with free input slots absorbs the wallet's smallest notes
+        // instead: the change collects them, and no transaction exists only to merge. The extra
+        // actions raise this batch's fee as a merge's would; a `max_total_fee` the fill would
+        // break drops the fill, never the payout.
+        let fill_floor = dust_floor_sompi();
+        let over_ceiling = state.auto_consolidate.is_some_and(|c| e.db.notes().len() > c);
+        if over_ceiling && !req.no_fill.unwrap_or(false) {
+            let mut spare: Vec<usize> = (taken..candidates.len()).rev().filter(|&i| candidates[i].value() > fill_floor).collect();
+            let cap_total: Option<u64> = req.max_total_fee.as_ref().map(|c| c.parse("max_total_fee")).transpose()?;
+            let mut filled: Vec<(Vec<usize>, u64)> = Vec::with_capacity(plan.len());
+            for (gi, (idxs, _)) in plan.iter().enumerate() {
+                let mut idxs = idxs.clone();
+                let payees = groups[gi].len();
+                while idxs.len() < max_spends_per_tx() {
+                    let Some(i) = spare.pop() else { break };
+                    idxs.push(i);
+                }
+                let fee = base_fee.max(min_relay_fee_for_actions(idxs.len().max(payees + 1)));
+                filled.push((idxs, fee));
+            }
+            let fee_with_fill: u64 = filled.iter().map(|(_, f)| *f).sum();
+            let absorbed: usize = filled.iter().map(|(i, _)| i.len()).sum::<usize>() - plan.iter().map(|(i, _)| i.len()).sum::<usize>();
+            if absorbed > 0 && cap_total.is_none_or(|cap| fee_with_fill <= cap) {
+                log::info!(
+                    "send_many: wallet {} is over its {}-note ceiling; this payout absorbs {absorbed} small note(s) into its change",
+                    log_pseudonym(&token),
+                    state.auto_consolidate.unwrap_or(0)
+                );
+                plan = filled;
+            }
+        }
         // One witness pass for every note across every batch.
-        let all_positions: Vec<u64> = candidates[..taken].iter().map(|n| n.position).collect();
+        let all_idx: Vec<usize> = plan.iter().flat_map(|(i, _)| i.iter().copied()).collect();
+        let all_positions: Vec<u64> = all_idx.iter().map(|&i| candidates[i].position).collect();
         let paths = tokio::task::block_in_place(|| state.batch_witness_paths(&e.db, &all_positions, matured));
-        for (gi, (start, n_notes, fee)) in plan.into_iter().enumerate() {
-            let mut inputs = Vec::with_capacity(n_notes);
-            let mut positions = Vec::with_capacity(n_notes);
-            for k in 0..n_notes {
-                let note = &candidates[start + k];
-                let path = match paths[start + k].clone() {
+        let mut at = 0usize;
+        for (gi, (idxs, fee)) in plan.into_iter().enumerate() {
+            let mut inputs = Vec::with_capacity(idxs.len());
+            let mut positions = Vec::with_capacity(idxs.len());
+            for &i in &idxs {
+                let note = &candidates[i];
+                let path = match paths[at].clone() {
                     Some(p) => p,
                     None => tokio::task::block_in_place(|| e.db.witness_path_at(note.position, matured))
                         .ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "matured note has no witness path"))?,
                 };
+                at += 1;
                 inputs.push((note.note.clone(), path));
                 positions.push(note.position);
             }

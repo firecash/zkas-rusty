@@ -1137,6 +1137,12 @@ curl -X POST -H "X-Wallet-Token: $TOK" -H 'Content-Type: application/json' \
   handles a withdrawal every few seconds. For more volume, batch queued withdrawals with
   `send_many` (up to 37 per transaction, one proof; each payee keeps its own memo, and
   `payee_txids` reports which transaction paid whom), or run several hot wallets.
+- **Merging while paying.** When the wallet is over its consolidation ceiling
+  (`--auto-consolidate`), a `send_many` batch with free input slots also spends the wallet's
+  smallest notes; the change collects them, so the wallet shrinks without a separate merge
+  transaction (which would add 38 leaves to the chain for everyone to track). The extra inputs
+  raise that batch's fee as a merge would; a `max_total_fee` the fill would break cancels the
+  fill, never the payout. `"no_fill": true` turns it off for one request.
 - **Prefer `amount_sompi`** (an integer) to `amount_fc` (a floating-point number).
 
 #### Proof of payment for disputes
