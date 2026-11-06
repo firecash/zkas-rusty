@@ -3655,10 +3655,17 @@ impl WalletDb {
     /// wallet, Android sends `onTrimMemory` before it starts killing, and the app is the
     /// biggest thing on the device. Returns the number of decoded leaves dropped so a
     /// caller can log what it actually reclaimed.
+    /// Drop what a memory warning may take: the witness cache, rebuilt on the next witness
+    /// climb or send. Never the leaf stream, which only the chain can rebuild. Returns the
+    /// bytes given back. A cache that was tried and refused stays refused, or the next tick
+    /// would pay the O(chain) build again only to be refused again.
     pub fn release_reclaimable(&mut self) -> usize {
-        // Nothing left to give back: the decoded cache this used to drop no longer exists
-        // (the stream is held once, decoded; see `leaves`). Kept for API stability.
-        0
+        let bytes = self.subtree.approx_heap_bytes();
+        if bytes == 0 {
+            return 0;
+        }
+        self.subtree = SubtreeCache { failed: self.subtree.failed, ..Default::default() };
+        bytes
     }
 
     /// Where this wallet's scan CPU has gone so far — see [`ScanCost`].

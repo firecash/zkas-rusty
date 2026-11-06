@@ -1073,6 +1073,15 @@ impl ChainFiles {
         loaded.iter().find(|s| &s.to == block).and_then(|s| s.to_frontier.clone())
     }
 
+    /// The newest signed segment end at or below DAA `daa`, as `(block, boundary)`: from the
+    /// manifest, every entry of which is under the publisher's signature, whether or not the
+    /// segment is loaded. The arbiter when a wallet's tree and the node disagree.
+    pub async fn signed_boundary_at_or_below(&self, daa: u64) -> Option<(RpcHash, Boundary)> {
+        let m = self.manifest.lock().await.as_ref().map(|(_, m)| m.clone())?;
+        let seg = m.segments.iter().filter(|s| s.to.daa <= daa).max_by_key(|s| s.to.daa)?;
+        Some((seg.to.hash()?, seg.to.clone()))
+    }
+
     pub fn stats(&self) -> Stats {
         Stats {
             source: self.bases.join(","),

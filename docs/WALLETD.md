@@ -242,7 +242,7 @@ curl -X POST -H "X-Wallet-Token: $TOK" http://127.0.0.1:8501/api/wallet/create
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `GET` | `/health` | Liveness. No token. |
+| `GET` | `/health` | Liveness. No token. Also process counters: `detect_mismatches` (pages where the hosted detection kernel and plain decryption disagreed; must stay 0) and `shared_tree.{leaf_drops,rebase_refused}`. |
 | `GET` | `/api/status` | The wallet's sync and balance picture (fields below). |
 | `GET` | `/api/wallet/balance` | Balance and notes; `?notes=1` adds the per-note array. |
 | `POST` | `/api/checkpoint` | Write this wallet's checkpoint now. The mobile app calls it when it goes to the background. |
@@ -691,10 +691,17 @@ node's load from a restore or a long catch-up. The node remains the authority:
   node and compared before it is kept.
 - **The wallet's tree is checked against the node's** frontier as soon as the node can place
   one at the wallet's position, and periodically until it matches.
-- **A mismatch disables the files** for the daemon and rebuilds the wallet from the node.
+- **A mismatch is arbitrated by the publisher's signature.** The daemon then compares the
+  node's own tree with the newest signed segment end (at most 12 hours old). If the node
+  agrees with the files there, the wallet's own copy was wrong and that wallet alone rebuilds;
+  the files stay on for every other wallet. If the node disagrees with the signed files too, the
+  node is the suspect: the wallet and the files are kept, the wallet reports "the node disagrees
+  with the signed chain files" and checks again later. Only when that comparison cannot be made
+  at all are the files disabled for the daemon and the wallet rebuilt from the node.
 
 A tampered or stale file can therefore cost time, never correctness: it cannot create a
-payment the chain does not contain, nor hide one indefinitely.
+payment the chain does not contain, nor hide one indefinitely; and a faulty node cannot make
+the daemon throw away files the publisher signed.
 
 ### Shared chain tree
 
@@ -1050,10 +1057,10 @@ ever skipped, however long you were away, and nothing is returned twice. Events:
   rules as history apply. Key your ledger entry on `(txid, i)`.
 - `memo`: the memos of a credited transaction once the full transaction was read (`memoKnown`
   was false on the credit).
-- `rebuild`: this wallet's scan restarted from `scannedDaa`. Every credit at or after that
-  score is written again as the rescan finds it (same `(txid, i)`, so your ledger ignores the
-  repeat); a credit from that range that does not reappear within the rebuild was reorganised
-  away and must go to review.
+- `rebuild`: this wallet's scan restarted from its birthday (`scannedDaa` is where it had
+  reached). Every credit is written again as the rescan finds it (same `(txid, i)`, so your
+  ledger ignores the repeat); a credit that does not reappear by the time the wallet is synced
+  again was reorganised away and must go to review.
 
 The journal is a file beside the wallet (`<token>.deposits.jsonl`); back it up with the wallet.
 

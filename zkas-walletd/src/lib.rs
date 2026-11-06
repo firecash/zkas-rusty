@@ -1829,33 +1829,93 @@ struct DepositJournal {
     next_seq: u64,
     /// Transactions already journaled as credits (one row per transaction), so a history
     /// rotation or a second look at the same rows writes nothing twice. Cleared by a rebuild.
+    /// Bounded to the newest `JOURNAL_REMEMBERED_TXIDS`: history itself holds at most 20,000
+    /// rows, so a transaction older than that cannot be offered again.
     txids: HashSet<[u8; 32]>,
+    order: VecDeque<[u8; 32]>,
 }
+
+const JOURNAL_REMEMBERED_TXIDS: usize = 65_536;
+/// How much of the journal's tail a load reads: enough for `JOURNAL_REMEMBERED_TXIDS` credit lines.
+const JOURNAL_LOAD_TAIL: u64 = 32 << 20;
 
 fn deposit_journal_path(dir: &str, token: &str) -> String {
     format!("{dir}/{token}.deposits.jsonl")
 }
 
+/// The journal's lines from byte `from` (skipping a partial first line when `from > 0`).
+fn journal_lines_from(f: &mut std::fs::File, from: u64) -> impl Iterator<Item = serde_json::Value> + '_ {
+    use std::io::{BufRead, Seek};
+    let _ = f.seek(std::io::SeekFrom::Start(from));
+    let mut r = std::io::BufReader::new(f);
+    if from > 0 {
+        let mut skip = Vec::new();
+        let _ = r.read_until(b'\n', &mut skip);
+    }
+    r.lines().map_while(Result::ok).filter_map(|l| serde_json::from_str::<serde_json::Value>(&l).ok())
+}
+
+fn journal_seq(v: &serde_json::Value) -> u64 {
+    v.get("seq").and_then(|x| x.as_u64()).unwrap_or(0)
+}
+
+/// `(events after `after`, oldest first, at most `limit`; last seq in the file)`. Lines are in
+/// sequence order, so the first wanted line is found by bisecting byte offsets: a read costs
+/// O(log size) seeks plus the lines returned, however long the journal is.
+fn journal_read_after(path: &str, after: u64, limit: usize) -> (Vec<serde_json::Value>, u64) {
+    let Ok(mut f) = std::fs::File::open(path) else { return (Vec::new(), 0) };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    let last_seq = journal_lines_from(&mut f, len.saturating_sub(64 << 10)).map(|v| journal_seq(&v)).max().unwrap_or(0);
+    let (mut lo, mut hi) = (0u64, len);
+    while hi.saturating_sub(lo) > (64 << 10) {
+        let mid = lo + (hi - lo) / 2;
+        match journal_lines_from(&mut f, mid).next() {
+            Some(v) if journal_seq(&v) > after => hi = mid,
+            Some(_) => lo = mid,
+            None => hi = mid,
+        }
+    }
+    let out: Vec<serde_json::Value> = journal_lines_from(&mut f, lo).filter(|v| journal_seq(v) > after).take(limit).collect();
+    (out, last_seq)
+}
+
 impl DepositJournal {
     fn load(dir: &str, token: &str) -> Self {
-        let mut j = DepositJournal { next_seq: 1, txids: HashSet::new() };
-        let Ok(text) = std::fs::read_to_string(deposit_journal_path(dir, token)) else { return j };
-        for line in text.lines() {
-            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
-            if let Some(seq) = v.get("seq").and_then(|x| x.as_u64()) {
-                j.next_seq = j.next_seq.max(seq + 1);
-            }
+        let mut j = DepositJournal { next_seq: 1, txids: HashSet::new(), order: VecDeque::new() };
+        let Ok(mut f) = std::fs::File::open(deposit_journal_path(dir, token)) else { return j };
+        let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+        for v in journal_lines_from(&mut f, len.saturating_sub(JOURNAL_LOAD_TAIL)) {
+            j.next_seq = j.next_seq.max(journal_seq(&v) + 1);
             match v.get("kind").and_then(|k| k.as_str()) {
                 Some("credit") => {
                     if let Some(t) = v.get("txid").and_then(|t| t.as_str()).and_then(unhex).and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok()) {
-                        j.txids.insert(t);
+                        j.remember(t);
                     }
                 }
-                Some("rebuild") => j.txids.clear(),
+                Some("rebuild") => j.forget_all(),
                 _ => {}
             }
         }
         j
+    }
+
+    /// True when `txid` was not journaled yet (and is now remembered).
+    fn remember(&mut self, txid: [u8; 32]) -> bool {
+        if !self.txids.insert(txid) {
+            return false;
+        }
+        self.order.push_back(txid);
+        while self.order.len() > JOURNAL_REMEMBERED_TXIDS {
+            if let Some(old) = self.order.pop_front() {
+                self.txids.remove(&old);
+            }
+        }
+        true
+    }
+
+    fn forget_all(&mut self) {
+        self.txids.clear();
+        self.order.clear();
     }
 
     fn append(&mut self, dir: &str, token: &str, mut lines: Vec<serde_json::Value>) {
@@ -1924,7 +1984,7 @@ impl WalletEntry {
         // Disjoint fields: the journal's txid set and the database's rows.
         let (j, db) = (self.journal.as_mut().expect("loaded above"), &self.db);
         for h in &db.history()[from..] {
-            if h.kind != HistoryKind::Received || h.credits.is_empty() || !j.txids.insert(h.txid) {
+            if h.kind != HistoryKind::Received || h.credits.is_empty() || !j.remember(h.txid) {
                 continue;
             }
             lines.extend(credit_lines(prefix, db, h));
@@ -1947,13 +2007,16 @@ impl WalletEntry {
         self.journal(dir, token).append(dir, token, vec![line]);
     }
 
-    /// Journal that this wallet's scan restarts: credits at or after `scanned_daa` are re-found
-    /// and journaled again; a ledger reviews any that are not.
+    /// Journal that this wallet's scan restarts from its birthday: every credit is re-found and
+    /// journaled again; a ledger reviews any that is not.
     fn journal_rebuild(&mut self, dir: &str, token: &str) {
+        if token == CHAIN_TREE_TOKEN {
+            return;
+        }
         let scanned = self.scanned as u64;
         let j = self.journal(dir, token);
-        j.txids.clear();
-        j.append(dir, token, vec![serde_json::json!({ "kind": "rebuild", "scannedDaa": scanned })]);
+        j.forget_all();
+        j.append(dir, token, vec![serde_json::json!({ "kind": "rebuild", "restart": "birthday", "scannedDaa": scanned })]);
     }
 }
 
@@ -4071,6 +4134,33 @@ struct PageCache {
     files: Option<std::sync::Arc<chain_files::ChainFiles>>,
 }
 
+impl DecodedPage {
+    /// Approximate heap bytes: what dropping this page gives back.
+    fn approx_bytes(&self) -> usize {
+        let mut b = self.epks.capacity() * std::mem::size_of::<Option<kaspa_shielded_core::pasta_curves::pallas::Point>>();
+        for blk in &self.blocks {
+            b += std::mem::size_of::<DecodedBlock>()
+                + blk.coinbase.capacity() * 128
+                + blk.txids.capacity() * 32
+                + blk.compact.iter().map(|t| t.capacity() * std::mem::size_of::<CompactActionRecord>()).sum::<usize>();
+        }
+        b
+    }
+}
+
+impl PageCache {
+    /// Forget every cached page (a fetch in flight is left to finish). Returns how many and
+    /// their approximate bytes. For a memory warning: pages are re-fetched on demand.
+    fn drop_pages(&mut self) -> (usize, usize) {
+        let n = self.map.len();
+        let bytes: usize = self.map.values().map(|(_, _, p)| p.approx_bytes()).sum();
+        self.map.clear();
+        self.order.clear();
+        self.next.clear();
+        (n, bytes)
+    }
+}
+
 impl PageCache {
     fn new(resources: &ResourceLimits) -> Self {
         let pool = rayon::ThreadPoolBuilder::new()
@@ -5318,16 +5408,48 @@ impl WalletEntry {
                                     token_p = log_pseudonym(&token)
                                 );
                             } else {
-                                if let Some(f) = cache.lock().await.files.clone() {
-                                    f.disable("a wallet's tree differs from the node's");
+                                let files = cache.lock().await.files.clone();
+                                let verdict = match files.as_ref() {
+                                    Some(f) => node_agrees_with_signed_files(f, client).await,
+                                    None => None,
+                                };
+                                match verdict {
+                                    Some((false, at)) => {
+                                        // The node contradicts the signed files too: it is the odd one out.
+                                        // This wallet and the files stay; checked again on a later page.
+                                        log::error!(
+                                            "wallet {token_p}: the tree does NOT equal the node's at block {} (mine {} leaves, node {}), and the node ALSO differs from the signed chain files at block {at}; keeping this wallet and the files — the node is suspect",
+                                            self.low,
+                                            mine.size,
+                                            node.size,
+                                            token_p = log_pseudonym(&token)
+                                        );
+                                        self.error = Some("the node disagrees with the signed chain files; waiting".into());
+                                        return;
+                                    }
+                                    Some((true, at)) => {
+                                        // The node vouches for the files: this wallet's own tree is wrong.
+                                        log::error!(
+                                            "wallet {token_p}: the tree does NOT equal the node's at block {} (mine {} leaves, node {}); the files are confirmed by the node at block {at}, so this wallet rebuilds",
+                                            self.low,
+                                            mine.size,
+                                            node.size,
+                                            token_p = log_pseudonym(&token)
+                                        );
+                                    }
+                                    None => {
+                                        if let Some(f) = files.as_ref() {
+                                            f.disable("a wallet's tree differs from the node's");
+                                        }
+                                        log::error!(
+                                            "wallet {token_p}: the tree does NOT equal the node's at block {} (mine {} leaves, node {}); rebuilding from the node",
+                                            self.low,
+                                            mine.size,
+                                            node.size,
+                                            token_p = log_pseudonym(&token)
+                                        );
+                                    }
                                 }
-                                log::error!(
-                                    "wallet {token_p}: the tree does NOT equal the node's at block {} (mine {} leaves, node {}); rebuilding from the node",
-                                    self.low,
-                                    mine.size,
-                                    node.size,
-                                    token_p = log_pseudonym(&token)
-                                );
                                 self.audit_retire = true;
                                 self.journal_rebuild(&state.wallet_dir, token);
                                 self.error = Some("this wallet's tree disagreed with the node; rebuilding from the node".into());
@@ -5475,7 +5597,11 @@ impl WalletEntry {
                                 // and a miss there is a deposit nobody sees. A difference is logged,
                                 // counted (`/health` detect_mismatches) and the plain answer is used.
                                 let sample = page_low.as_bytes()[0] % 64 == 0;
-                                let checked = if sample { self.db.page_decryptor().map(|d| d.decrypt(&page_actions, shared)) } else { None };
+                                let checked = if sample {
+                                    tokio::task::block_in_place(|| scan_pool().install(|| self.db.page_decryptor().map(|d| d.decrypt(&page_actions, shared))))
+                                } else {
+                                    None
+                                };
                                 match checked {
                                     Some(own) if !same_hits(&own, &found) => {
                                         DETECT_MISMATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -5695,8 +5821,25 @@ impl WalletEntry {
                         return;
                     }
                     if confirmed != Some(true) {
-                        if let Some(f) = cache.lock().await.files.clone() {
-                            f.disable("a file page that changed a wallet differs from the node's page");
+                        let files = cache.lock().await.files.clone();
+                        let verdict = match files.as_ref() {
+                            Some(f) => node_agrees_with_signed_files(f, client).await,
+                            None => None,
+                        };
+                        if let Some((false, at)) = verdict {
+                            // The node's page differs from the file's, and the node differs from the
+                            // signed files at a segment end as well: the file stands, the node is suspect.
+                            log::error!(
+                                "wallet {token_p}: a chain-files page after block {page_low} changed this wallet and was NOT the node's page, and the node ALSO differs from the signed chain files at block {at}; keeping the page and the files — the node is suspect",
+                                token_p = log_pseudonym(&token)
+                            );
+                            self.error = Some("the node disagrees with the signed chain files; waiting".into());
+                            return;
+                        }
+                        if verdict.is_none() {
+                            if let Some(f) = files.as_ref() {
+                                f.disable("a file page that changed a wallet differs from the node's page");
+                            }
                         }
                         log::error!(
                             "wallet {token_p}: a chain-files page after block {page_low} changed this wallet and was NOT the node's page; rebuilding from the node",
@@ -9308,6 +9451,22 @@ const RECLAIM_UNSEEN_DAA: u64 = 600;
 const ACCEPTANCE_LOOKBACK_DAA: u64 = 7_200;
 
 /// The chain block at or just below DAA `daa` (the node's own placement).
+/// Whether the node's tree equals the publisher's signed chain files at the newest signed
+/// segment end (at most 12 h old, so a pruned node still places it): `Some((true, block))` it
+/// does, `Some((false, block))` it does not, `None` when that cannot be checked now (no
+/// manifest, or the node does not place that block). Used when a wallet built from the files
+/// disagrees with the node: the files carry a signature and the node does not, so a node that
+/// also contradicts the files is the suspect, and one wallet's disagreement must not switch the
+/// files off for every wallet.
+async fn node_agrees_with_signed_files(files: &Arc<chain_files::ChainFiles>, client: &GrpcClient) -> Option<(bool, RpcHash)> {
+    let (block, boundary) = files.signed_boundary_at_or_below(u64::MAX).await?;
+    let ts = tokio::time::timeout(SYNC_RPC_TIMEOUT, client.get_shielded_tree_state(Some(block))).await.ok()?.ok()?;
+    if ts.block_hash != block {
+        return None;
+    }
+    Some((boundary.same_rpc(&ts), block))
+}
+
 async fn chain_block_at_or_below_daa(client: &GrpcClient, daa: u64) -> Option<RpcHash> {
     let req = kaspa_rpc_core::GetShieldedTreeStateRequest { block_hash: None, below_daa_score: Some(daa.checked_add(1)?) };
     match tokio::time::timeout(SYNC_RPC_TIMEOUT, client.get_shielded_tree_state_call(None, req)).await {
@@ -9351,7 +9510,14 @@ async fn acceptance_loop(state: Arc<AppState>) {
         if tip == 0 {
             continue;
         }
-        let oldest = pending.values().copied().min().unwrap_or(tip);
+        // The node answers at most ~1,800 merged blocks per call, so start where the least-checked
+        // payment was last looked at (its submission, before the first look), not at the oldest
+        // submission: otherwise one payment sitting in the mempool pins the window and the ones
+        // behind it are never looked at. 60 DAA of margin covers any reorganisation seen live.
+        let oldest = {
+            let unseen = lock_ok(&state.unseen_upto);
+            pending.iter().map(|(t, since)| unseen.get(t).copied().unwrap_or(*since)).min().unwrap_or(tip)
+        };
         let start_daa = oldest.saturating_sub(60).max(tip.saturating_sub(ACCEPTANCE_LOOKBACK_DAA));
         let Some(start) = chain_block_at_or_below_daa(&client, start_daa).await else { continue };
         let Ok(Ok(resp)) = tokio::time::timeout(SYNC_RPC_TIMEOUT, client.get_virtual_chain_from_block(start, true, None)).await else {
@@ -11119,7 +11285,16 @@ fn fmt_fc(sompi: u128) -> String {
 }
 
 async fn health() -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "ok": true, "service": "zkas-walletd" }))
+    use std::sync::atomic::Ordering::Relaxed;
+    // Process-wide counters only, never wallet data: this endpoint is unauthenticated.
+    // `detect_mismatches` must stay 0: each one is a page where the cohort detection kernel
+    // and plain decryption disagreed about a hosted wallet's deposits.
+    Json(serde_json::json!({
+        "ok": true,
+        "service": "zkas-walletd",
+        "detect_mismatches": DETECT_MISMATCHES.load(Relaxed),
+        "shared_tree": { "leaf_drops": HOSTED_LEAF_DROPS.load(Relaxed), "rebase_refused": HOSTED_REBASE_REFUSED.load(Relaxed) },
+    }))
 }
 
 #[derive(Serialize)]
@@ -12154,21 +12329,7 @@ async fn wallet_deposits(
     let after = query.after.unwrap_or(0);
     let limit = query.limit.unwrap_or(500).clamp(1, 5_000);
     let path = deposit_journal_path(&state.wallet_dir, &token);
-    let (events, last_seq) = tokio::task::spawn_blocking(move || {
-        let mut out: Vec<serde_json::Value> = Vec::new();
-        let mut last = 0u64;
-        if let Ok(text) = std::fs::read_to_string(&path) {
-            for line in text.lines() {
-                let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
-                let seq = v.get("seq").and_then(|x| x.as_u64()).unwrap_or(0);
-                last = last.max(seq);
-                if seq > after && out.len() < limit {
-                    out.push(v);
-                }
-            }
-        }
-        (out, last)
-    })
+    let (events, last_seq) = tokio::task::spawn_blocking(move || journal_read_after(&path, after, limit))
     .await
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("journal read failed: {e}")))?;
     Ok(Json(serde_json::json!({ "events": events, "last_seq": last_seq, "after": after })))
@@ -13604,7 +13765,15 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
         let fill_floor = dust_floor_sompi();
         let over_ceiling = state.auto_consolidate.is_some_and(|c| e.db.notes().len() > c);
         if over_ceiling && !req.no_fill.unwrap_or(false) {
-            let mut spare: Vec<usize> = (taken..candidates.len()).rev().filter(|&i| candidates[i].value() > fill_floor).collect();
+            // Spend order puts the notes that cover the whole payout alone first (smallest of
+            // them first), then the rest largest first; so the tail of `candidates` is the
+            // wallet's smallest notes. Only those below the single-note target are worth
+            // absorbing, and only ones above the dust floor (each must pay for its own action).
+            let single_target = requested.saturating_add(chunk_fee(base_fee, 1));
+            let mut spare: Vec<usize> = (taken..candidates.len())
+                .rev()
+                .filter(|&i| candidates[i].value() > fill_floor && candidates[i].value() < single_target)
+                .collect();
             let cap_total: Option<u64> = req.max_total_fee.as_ref().map(|c| c.parse("max_total_fee")).transpose()?;
             let mut filled: Vec<(Vec<usize>, u64)> = Vec::with_capacity(plan.len());
             for (gi, (idxs, _)) in plan.iter().enumerate() {
@@ -13615,7 +13784,15 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
                     idxs.push(i);
                 }
                 let fee = base_fee.max(min_relay_fee_for_actions(idxs.len().max(payees + 1)));
-                filled.push((idxs, fee));
+                // Every absorbed note is worth more than its action costs, so the sum never
+                // drops below the payout; checked anyway, since a fill must never fail a payout.
+                let pay: u64 = groups[gi].iter().map(|(_, a, _)| *a).sum();
+                let sum = idxs.iter().try_fold(0u64, |acc, &i| acc.checked_add(candidates[i].value()));
+                if sum.is_none_or(|sum| sum < pay.saturating_add(fee)) {
+                    filled.push(plan[gi].clone());
+                } else {
+                    filled.push((idxs, fee));
+                }
             }
             let fee_with_fill: u64 = filled.iter().map(|(_, f)| *f).sum();
             let absorbed: usize = filled.iter().map(|(i, _)| i.len()).sum::<usize>() - plan.iter().map(|(i, _)| i.len()).sum::<usize>();
@@ -15065,9 +15242,33 @@ async fn wallet_submit(
                     // this file.
                     let detached = !state.wallets.lock().await.get(&token).is_some_and(|cur| Arc::ptr_eq(cur, &w));
                     if detached {
+                        // Under the token's loading gate: the eviction's own checkpoint write holds
+                        // it while it runs, so this write (the newer state) lands after it, never
+                        // under it; and a reload waits for both.
+                        let gate = {
+                            let mut loading = state.loading.lock().await;
+                            loading.entry(token.clone()).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))).clone()
+                        };
+                        let _held = gate.lock().await;
                         match save_checkpoint(&state.wallet_dir, &token, &e.genesis, &e.low, e.scanned as u64, &e.db, &e.boundaries, &e.boundary_blocks, e.sink_blue, e.blind_below) {
                             Ok(()) => log::info!("submit: wallet {} was evicted since prepare; parked notes written to its checkpoint", log_pseudonym(&token)),
                             Err(why) => log::error!("submit: wallet {} was evicted since prepare and its checkpoint could not be written ({why}); its notes read as spendable until the scan sees tx {accepted}", log_pseudonym(&token)),
+                        }
+                        drop(_held);
+                        drop(e);
+                        // A reload may already serve this token from the older file: park there too.
+                        let current = state.wallets.lock().await.get(&token).cloned();
+                        if let Some(cur) = current {
+                            let mut c = cur.lock().await;
+                            let now_daa = submit_clock(&c);
+                            for p in &positions {
+                                c.db.mark_spent(*p, accepted.as_bytes(), now_daa);
+                                c.soft_held.remove(p);
+                            }
+                            uniform::unreserve(&mut c, &positions);
+                            c.db.note_pending_outflow(accepted.as_bytes(), amount.saturating_add(fee));
+                            c.forget_stale_outflow_previews();
+                            c.force_checkpoint = true;
                         }
                     }
                 } else {
@@ -16357,8 +16558,9 @@ mod warm_sweep_tests {
 /// reference that keeps a stopped daemon alive.
 static LIVE_STATE: std::sync::Mutex<Option<std::sync::Weak<AppState>>> = std::sync::Mutex::new(None);
 
-/// Drop everything the resident wallets can rebuild, and report how many decoded leaves
-/// went. Safe to call from any thread at any time, including none-running.
+/// Drop everything the daemon can rebuild — the decoded page cache and every resident
+/// wallet's witness cache — and report the bytes given back (approximate). Safe to call from
+/// any thread at any time, including none-running.
 ///
 /// Entirely `try_lock`: a wallet mid-scan is skipped rather than waited on. This is called
 /// while the system is deciding whether to kill the process — blocking on a scan lock is
@@ -16367,15 +16569,30 @@ pub fn release_memory() -> usize {
     let Some(state) = LIVE_STATE.lock().ok().and_then(|g| g.as_ref().and_then(|w| w.upgrade())) else {
         return 0;
     };
-    let Ok(map) = state.wallets.try_lock() else { return 0 };
     let mut freed = 0usize;
-    for w in map.values() {
-        if let Ok(mut e) = w.try_lock() {
-            freed += e.db.release_reclaimable();
+    let mut pages = 0usize;
+    if let Ok(mut pc) = state.page_cache.try_lock() {
+        let (n, bytes) = pc.drop_pages();
+        pages = n;
+        freed += bytes;
+    }
+    let mut caches = 0usize;
+    if let Ok(map) = state.wallets.try_lock() {
+        for w in map.values() {
+            if let Ok(mut e) = w.try_lock() {
+                let b = e.db.release_reclaimable();
+                if b > 0 {
+                    caches += 1;
+                    freed += b;
+                }
+            }
         }
     }
     if freed > 0 {
-        log::info!("release_memory: dropped {freed} decoded leaves (~{} MiB); they rebuild on the next witness climb", freed * 32 / 1_048_576);
+        log::info!(
+            "release_memory: dropped {pages} cached page(s) and {caches} witness cache(s), ~{} MiB; they rebuild as needed",
+            freed / 1_048_576
+        );
     }
     freed
 }
@@ -18758,14 +18975,14 @@ mod sdk_api_tests {
         let dir = dir.to_string_lossy().into_owned();
         let mut j = DepositJournal::load(&dir, "tok");
         assert_eq!(j.next_seq, 1);
-        assert!(j.txids.insert([1u8; 32]));
+        assert!(j.remember([1u8; 32]));
         j.append(&dir, "tok", vec![serde_json::json!({ "kind": "credit", "txid": hex(&[1u8; 32]), "i": 0 })]);
         j.append(&dir, "tok", vec![serde_json::json!({ "kind": "memo", "txid": hex(&[1u8; 32]) })]);
         assert_eq!(j.next_seq, 3);
         // Reloaded: the sequence continues and the credited txid is remembered.
         let mut k = DepositJournal::load(&dir, "tok");
         assert_eq!(k.next_seq, 3);
-        assert!(!k.txids.insert([1u8; 32]), "already journaled");
+        assert!(!k.remember([1u8; 32]), "already journaled");
         // A rebuild marker clears the memory so re-found credits are written again.
         k.append(&dir, "tok", vec![serde_json::json!({ "kind": "rebuild", "scannedDaa": 5 })]);
         let l = DepositJournal::load(&dir, "tok");
@@ -18774,6 +18991,34 @@ mod sdk_api_tests {
         let text = std::fs::read_to_string(deposit_journal_path(&dir, "tok")).unwrap();
         let seqs: Vec<u64> = text.lines().map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap()["seq"].as_u64().unwrap()).collect();
         assert_eq!(seqs, vec![1, 2, 3]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A read bisects the file for the first wanted line; whatever `after`, it returns exactly
+    /// the lines a full scan would, and the last sequence number in the file.
+    #[test]
+    fn a_journal_read_seeks_to_the_first_wanted_line() {
+        let dir = std::env::temp_dir().join(format!("deposit-journal-seek-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.to_string_lossy().into_owned();
+        let mut j = DepositJournal::load(&dir, "tok");
+        // 20,000 lines of varying length: well past the 64 KiB bisection window.
+        for n in 0..200u32 {
+            let lines: Vec<serde_json::Value> =
+                (0..100).map(|i| serde_json::json!({ "kind": "credit", "txid": hex(&[(n % 251) as u8; 32]), "i": i, "memo": "m".repeat((i * 7) % 300) })).collect();
+            j.append(&dir, "tok", lines);
+        }
+        let path = deposit_journal_path(&dir, "tok");
+        let (_, last) = journal_read_after(&path, 0, 1);
+        assert_eq!(last, 20_000);
+        for after in [0u64, 1, 63, 999, 10_000, 17_777, 19_999, 20_000, 30_000] {
+            let (events, last) = journal_read_after(&path, after, 5_000);
+            assert_eq!(last, 20_000);
+            let want: Vec<u64> = (after + 1..=20_000).take(5_000).collect();
+            let got: Vec<u64> = events.iter().map(journal_seq).collect();
+            assert_eq!(got, want, "after={after}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
