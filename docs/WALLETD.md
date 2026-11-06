@@ -713,9 +713,12 @@ zkas-walletd --network mainnet --rpc-server <node> --listen 127.0.0.1:8501 \
   --shared-leaf-store --compact-nullifiers --shared-scan-engine
 ```
 
-Measured 6 Nov 2026 (build `275927e4`, three wallets restoring from genesis at once, chain
-files from the CDN, under a hard 2 GB cgroup limit): peak 1.5 GB in the cgroup (file cache
-included), ~1.2 GB RSS, restores done in 10 minutes, every endpoint answering throughout.
+Measured 6 Nov 2026 (build `f12f187e`, chain files from the CDN, under a hard 2 GB cgroup
+limit): three wallets restoring from genesis at once finished in 10 minutes at ~1.2 GB RSS
+(peak 1.5 GB in the cgroup, file cache included); with the shared tree at the tip, three more
+restored leaf-less in 12 minutes and a seventh, served from the disk cache, in under 30
+seconds; RSS 1.2 GB with seven wallets resident, every endpoint answering throughout, the
+tree's checkpoint written once after the restart and not again.
 What the memory is: the nullifier table (~0.5 GB at 8.4 M nullifiers), loaded chain-file
 segments (sized to the budget, ~0.3 GB), the shared tree's index (~0.06 GB; its leaves live in
 the shared leaf store), and the allocator; a resident wallet is a few MB (notes, a 1 MB
