@@ -2003,8 +2003,12 @@ fn periodic_checkpoint_due(advanced: usize, since_last: std::time::Duration, int
 /// for many minutes before its first save, and a process kill in that window (Android
 /// force-stop, no shutdown) threw all of it away.
 const CHECKPOINT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
-/// The shared chain tree's own time rule (see where it is used).
-const CHAIN_TREE_CHECKPOINT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1800);
+/// The shared chain tree's own time rule (see where it is used). Its checkpoint is the whole
+/// leaf stream in full form (17 M leaves, 546 MB, 6 Nov), serialised into a fresh buffer and
+/// written each time; every 30 minutes that was 26 GB a day of writes. Two hours: a crash costs
+/// the tree about two hours of chain to re-read (seconds from local chain files), and the exit
+/// flush still writes it on a clean stop. An append-only leaf file is the real answer.
+const CHAIN_TREE_CHECKPOINT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2 * 3600);
 
 /// Minimum block lead a twin must have over THIS wallet's own checkpoint before it is
 /// worth cloning instead of scanning the gap. Below this, the argon2 + decrypt cost of
