@@ -1815,6 +1815,148 @@ fn set_wallet_birthday(dir: &str, token: &str, birthday: u64) -> std::io::Result
 // ---------------------------------------------------------------------------
 
 /// Sidecar file holding a token's scan checkpoint (next to its `.json` seed file).
+/// The deposit journal: one append-only file per wallet (`<token>.deposits.jsonl`), one line
+/// per event, each with a sequence number. A ledger reads it with
+/// `GET /api/wallet/deposits?after=<seq>` and misses nothing: history keeps only its newest
+/// 20 000 rows and drops the oldest 10 000 at once, so a poller that fell behind lost deposits.
+///
+/// Events: `credit` (one per output that paid this wallet, written when its row is written;
+/// `memoKnown` says whether the memo was read yet), `memo` (the memos of a credited transaction
+/// once the full transaction was read), `rebuild` (this wallet's scan restarted from
+/// `scannedDaa`: every credit at or after it is written again as it is re-found; a credit that
+/// never reappears was reorganised away and must be reviewed).
+struct DepositJournal {
+    next_seq: u64,
+    /// Transactions already journaled as credits (one row per transaction), so a history
+    /// rotation or a second look at the same rows writes nothing twice. Cleared by a rebuild.
+    txids: HashSet<[u8; 32]>,
+}
+
+fn deposit_journal_path(dir: &str, token: &str) -> String {
+    format!("{dir}/{token}.deposits.jsonl")
+}
+
+impl DepositJournal {
+    fn load(dir: &str, token: &str) -> Self {
+        let mut j = DepositJournal { next_seq: 1, txids: HashSet::new() };
+        let Ok(text) = std::fs::read_to_string(deposit_journal_path(dir, token)) else { return j };
+        for line in text.lines() {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+            if let Some(seq) = v.get("seq").and_then(|x| x.as_u64()) {
+                j.next_seq = j.next_seq.max(seq + 1);
+            }
+            match v.get("kind").and_then(|k| k.as_str()) {
+                Some("credit") => {
+                    if let Some(t) = v.get("txid").and_then(|t| t.as_str()).and_then(unhex).and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok()) {
+                        j.txids.insert(t);
+                    }
+                }
+                Some("rebuild") => j.txids.clear(),
+                _ => {}
+            }
+        }
+        j
+    }
+
+    fn append(&mut self, dir: &str, token: &str, mut lines: Vec<serde_json::Value>) {
+        use std::io::Write;
+        if lines.is_empty() {
+            return;
+        }
+        let mut text = String::new();
+        for v in lines.iter_mut() {
+            v["seq"] = serde_json::json!(self.next_seq);
+            self.next_seq += 1;
+            text.push_str(&v.to_string());
+            text.push('\n');
+        }
+        let path = deposit_journal_path(dir, token);
+        let written = std::fs::OpenOptions::new().create(true).append(true).open(&path).and_then(|mut f| {
+            f.write_all(text.as_bytes())?;
+            f.sync_data()
+        });
+        if let Err(e) = written {
+            log::warn!("deposit journal for wallet {}: write failed ({e}); a ledger reading it will see a gap", log_pseudonym(token));
+        }
+    }
+}
+
+fn credit_lines(prefix: Prefix, db: &WalletDb, h: &kaspa_shielded_core::walletdb::HistoryEntry) -> Vec<serde_json::Value> {
+    h.credits
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            serde_json::json!({
+                "kind": "credit",
+                "txid": hex(&h.txid),
+                "i": i,
+                "recipient": String::from(&Address::new(prefix, Version::ShieldedOrchard, &c.recipient)),
+                "index": db.address_index_of(&c.recipient),
+                "amountSompiExact": c.value.to_string(),
+                "memo": (!c.memo.is_empty()).then(|| String::from_utf8_lossy(&c.memo).into_owned()),
+                "memoKnown": h.fee_known,
+                "daaScore": h.daa_score,
+                "timestamp": h.timestamp_ms,
+            })
+        })
+        .collect()
+}
+
+impl WalletEntry {
+    fn journal(&mut self, dir: &str, token: &str) -> &mut DepositJournal {
+        if self.journal.is_none() {
+            self.journal = Some(DepositJournal::load(dir, token));
+        }
+        self.journal.as_mut().expect("just set")
+    }
+
+    /// Journal the received rows written since `history_len_before` (all rows after a rotation:
+    /// the txid set keeps the already-journaled ones out).
+    fn journal_new_receipts(&mut self, dir: &str, token: &str, prefix: Prefix, history_len_before: usize) {
+        let from = if self.db.history().len() >= history_len_before { history_len_before } else { 0 };
+        if from >= self.db.history().len() {
+            return;
+        }
+        if self.journal.is_none() {
+            self.journal = Some(DepositJournal::load(dir, token));
+        }
+        let mut lines = Vec::new();
+        // Disjoint fields: the journal's txid set and the database's rows.
+        let (j, db) = (self.journal.as_mut().expect("loaded above"), &self.db);
+        for h in &db.history()[from..] {
+            if h.kind != HistoryKind::Received || h.credits.is_empty() || !j.txids.insert(h.txid) {
+                continue;
+            }
+            lines.extend(credit_lines(prefix, db, h));
+        }
+        if !lines.is_empty() {
+            j.append(dir, token, lines);
+        }
+    }
+
+    /// Journal the memos of a credited transaction once the full transaction was read.
+    fn journal_memos(&mut self, dir: &str, token: &str, txid: &[u8; 32]) {
+        let Some(h) = self.db.history().iter().rev().find(|h| h.kind == HistoryKind::Received && &h.txid == txid) else { return };
+        let credits: Vec<serde_json::Value> = h
+            .credits
+            .iter()
+            .enumerate()
+            .map(|(i, c)| serde_json::json!({ "i": i, "memo": (!c.memo.is_empty()).then(|| String::from_utf8_lossy(&c.memo).into_owned()) }))
+            .collect();
+        let line = serde_json::json!({ "kind": "memo", "txid": hex(txid), "credits": credits });
+        self.journal(dir, token).append(dir, token, vec![line]);
+    }
+
+    /// Journal that this wallet's scan restarts: credits at or after `scanned_daa` are re-found
+    /// and journaled again; a ledger reviews any that are not.
+    fn journal_rebuild(&mut self, dir: &str, token: &str) {
+        let scanned = self.scanned as u64;
+        let j = self.journal(dir, token);
+        j.txids.clear();
+        j.append(dir, token, vec![serde_json::json!({ "kind": "rebuild", "scannedDaa": scanned })]);
+    }
+}
+
 fn scan_path(dir: &str, token: &str) -> String {
     format!("{dir}/{token}.scan")
 }
@@ -4444,6 +4586,8 @@ struct WalletEntry {
     /// The shared tree refused to re-base this wallet at this size, at this time: not asked
     /// again (nor warned about) until the stream grows or an hour passes.
     rebase_refused: Option<(u64, std::time::Instant)>,
+    /// The deposit journal's state (see `DepositJournal`), loaded from its file on first use.
+    journal: Option<DepositJournal>,
     /// Set by the shared-tree audit on a divergence: the next sync pass retires this entry's
     /// checkpoint and the caller rebuilds it, as for a reorg it cannot follow. A flag, not a strike
     /// count, because a successful page clears the strikes before the pass reaches the retire step.
@@ -4697,6 +4841,7 @@ impl WalletEntry {
             sink_live: false,
             reorged_strikes: 0,
             rebase_refused: None,
+            journal: None,
             reload_from_checkpoint: false,
             last_progress_publish: std::time::Instant::now(),
             audit_retire: false,
@@ -4748,7 +4893,7 @@ impl WalletEntry {
     /// At most `MAX_PER_PASS` fetches per pass, oldest first; the rest follow on the next
     /// passes. A row whose transaction cannot be fetched (block body pruned, node without the
     /// locator, a timeout) is tried again after `DETAILS_RETRY_AFTER`, at most `DETAILS_MAX_TRIES` times per session.
-    async fn recover_history_details(&mut self, client: &GrpcClient, page: &[DecodedBlock]) {
+    async fn recover_history_details(&mut self, client: &GrpcClient, page: &[DecodedBlock], dir: &str, token: &str) {
         const MAX_PER_PASS: usize = 8;
         // The whole history, every pass: rows still to complete are marked in the row itself
         // (`fee_known`, persisted) and failures in `details_skipped`, so this is a filter over at
@@ -4806,6 +4951,7 @@ impl WalletEntry {
             if receipt {
                 if self.db.recover_received_from_bundle(&txid, &bundle) {
                     log::info!("history: receipt {} at daa {daa} — memo recovered from the full transaction", hex(&txid[..8]));
+                    self.journal_memos(dir, token, &txid);
                 }
             } else {
                 let recovered = self.db.recover_sent_from_bundle(&txid, &bundle);
@@ -5179,6 +5325,7 @@ impl WalletEntry {
                                     token_p = log_pseudonym(&token)
                                 );
                                 self.audit_retire = true;
+                                self.journal_rebuild(&state.wallet_dir, token);
                                 self.error = Some("this wallet's tree disagreed with the node; rebuilding from the node".into());
                                 return;
                             }
@@ -5447,6 +5594,7 @@ impl WalletEntry {
                                  retiring the checkpoint and rebuilding the wallet",
                                 b.hash, token_p = log_pseudonym(&token));
                             self.audit_retire = true;
+                            self.journal_rebuild(&state.wallet_dir, token);
                             self.error = Some("inconsistent shielded data (repeated nullifier); rebuilding the wallet".into());
                         } else {
                             log::error!(
@@ -5493,6 +5641,9 @@ impl WalletEntry {
             self.stats.ingest_ns += t_ingest.elapsed().as_nanos() as u64;
             if self.db.poisoned() {
                 return;
+            }
+            if token != CHAIN_TREE_TOKEN {
+                self.journal_new_receipts(&state.wallet_dir, token, state.prefix, before.1);
             }
             if let Some(digests) = resp.file_digests.as_ref() {
                 // Rule 2 of `chain_files`: the blocks of a file page that changed this wallet —
@@ -5548,6 +5699,7 @@ impl WalletEntry {
                             token_p = log_pseudonym(&token)
                         );
                         self.audit_retire = true;
+                        self.journal_rebuild(&state.wallet_dir, token);
                         self.error = Some("published chain data disagreed with the node; rebuilding from the node".into());
                         return;
                     }
@@ -5578,7 +5730,7 @@ impl WalletEntry {
             // per wallet (one fetch per own send), bounded, best-effort; async, so it lives
             // outside the blocking ingest section above.
             if advanced && self.recoverable_history && !self.db.is_leaves_only() {
-                self.recover_history_details(client, &resp.blocks).await;
+                self.recover_history_details(client, &resp.blocks, &state.wallet_dir, token).await;
             }
             // Publish what this pass has reached so far. Without this the only progress
             // report is the one after the pass ENDS, which for an initial scan means the
@@ -11976,6 +12128,48 @@ async fn wallet_request_status(
     })))
 }
 
+#[derive(Deserialize, Default)]
+struct DepositsQuery {
+    /// Return events with a sequence number greater than this (0 = from the start).
+    after: Option<u64>,
+    limit: Option<usize>,
+}
+
+/// `GET /api/wallet/deposits?after=<seq>&limit=<n>`: the deposit journal (see `DepositJournal`),
+/// oldest first, `limit` events (default 500, at most 5 000) after `after`. `last_seq` is the
+/// newest event's number; `after` equal to it returns nothing new.
+async fn wallet_deposits(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<DepositsQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let token = token_from(&headers, state.allow_default_token)?;
+    if !wallet_exists(&state.wallet_dir, &token) {
+        return Err(err(StatusCode::NOT_FOUND, "no such wallet"));
+    }
+    let after = query.after.unwrap_or(0);
+    let limit = query.limit.unwrap_or(500).clamp(1, 5_000);
+    let path = deposit_journal_path(&state.wallet_dir, &token);
+    let (events, last_seq) = tokio::task::spawn_blocking(move || {
+        let mut out: Vec<serde_json::Value> = Vec::new();
+        let mut last = 0u64;
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            for line in text.lines() {
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+                let seq = v.get("seq").and_then(|x| x.as_u64()).unwrap_or(0);
+                last = last.max(seq);
+                if seq > after && out.len() < limit {
+                    out.push(v);
+                }
+            }
+        }
+        (out, last)
+    })
+    .await
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("journal read failed: {e}")))?;
+    Ok(Json(serde_json::json!({ "events": events, "last_seq": last_seq, "after": after })))
+}
+
 async fn wallet_history(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -16615,6 +16809,7 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
         .route("/api/wallet/reveal", get(wallet_reveal))
         .route("/api/wallet/balance", get(wallet_balance))
         .route("/api/wallet/history", get(wallet_history))
+        .route("/api/wallet/deposits", get(wallet_deposits))
         .route("/api/wallet/proof", get(wallet_proof))
         .route("/api/wallet/requests/:id", get(wallet_request_status))
         .route("/api/proof/verify", post(proof_verify))
@@ -17129,9 +17324,6 @@ mod request_flush_tests {
     use super::{periodic_checkpoint_due, request_flush_due, CHECKPOINT_MAX_STALE, CHECKPOINT_MIN_GAIN, REQUEST_FLUSH_MIN_INTERVAL};
     use std::time::Duration;
 
-    /// A request writes a checkpoint only with progress to save, and not again right after the
-    /// last write however often it asks.
-    #[test]
     /// At the tip a wallet gains a block a second; the old rule (any gain, interval passed)
     /// rewrote the whole checkpoint every interval: hundreds of MB a minute on a phone holding
     /// one old note.
@@ -17145,6 +17337,8 @@ mod request_flush_tests {
         assert!(periodic_checkpoint_due(1, CHECKPOINT_MAX_STALE, minute), "but never more than an hour behind");
     }
 
+    /// A request writes a checkpoint only with progress to save, and not again right after the
+    /// last write however often it asks.
     #[test]
     fn a_requested_checkpoint_write_needs_progress_and_a_gap() {
         assert!(!request_flush_due(false, Duration::from_secs(3_600)), "nothing to save");
@@ -18507,6 +18701,35 @@ mod sdk_api_tests {
         // A mining reward or any ordinary deposit is far above it.
         assert!(57 * 100_000_000 > floor);
         assert!(uniform::merge_dust_floor_for_test() > 0);
+    }
+
+    /// The journal numbers every event, survives a restart, never writes a credit twice, and a
+    /// rebuild marker lets re-found credits be written again.
+    #[test]
+    fn the_deposit_journal_numbers_events_and_dedupes_credits() {
+        let dir = std::env::temp_dir().join(format!("deposit-journal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.to_string_lossy().into_owned();
+        let mut j = DepositJournal::load(&dir, "tok");
+        assert_eq!(j.next_seq, 1);
+        assert!(j.txids.insert([1u8; 32]));
+        j.append(&dir, "tok", vec![serde_json::json!({ "kind": "credit", "txid": hex(&[1u8; 32]), "i": 0 })]);
+        j.append(&dir, "tok", vec![serde_json::json!({ "kind": "memo", "txid": hex(&[1u8; 32]) })]);
+        assert_eq!(j.next_seq, 3);
+        // Reloaded: the sequence continues and the credited txid is remembered.
+        let mut k = DepositJournal::load(&dir, "tok");
+        assert_eq!(k.next_seq, 3);
+        assert!(!k.txids.insert([1u8; 32]), "already journaled");
+        // A rebuild marker clears the memory so re-found credits are written again.
+        k.append(&dir, "tok", vec![serde_json::json!({ "kind": "rebuild", "scannedDaa": 5 })]);
+        let l = DepositJournal::load(&dir, "tok");
+        assert_eq!(l.next_seq, 4);
+        assert!(l.txids.is_empty());
+        let text = std::fs::read_to_string(deposit_journal_path(&dir, "tok")).unwrap();
+        let seqs: Vec<u64> = text.lines().map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap()["seq"].as_u64().unwrap()).collect();
+        assert_eq!(seqs, vec![1, 2, 3]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

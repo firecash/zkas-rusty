@@ -1039,7 +1039,25 @@ transition instead of rejecting the block. Block or txid inclusion, an explorer,
 (`GetShieldedBlocks`), its records are the applied set, but you must apply the settlement depth
 yourself.
 
-**Polling.** History is newest first: `GET /api/wallet/history?limit=<≤5000>&offset=<n>`.
+**The deposit journal (preferred).** `GET /api/wallet/deposits?after=<seq>&limit=<≤5000>`
+returns the wallet's deposit events oldest first, each with a sequence number `seq`, and
+`last_seq`. Store the last `seq` you processed and ask with `after=` that value: nothing is
+ever skipped, however long you were away, and nothing is returned twice. Events:
+
+- `credit`: one per output that paid this wallet — `txid`, `i` (its index in the
+  transaction's credits), `recipient`, `index` (customer index), `amountSompiExact`, `memo`,
+  `memoKnown`, `daaScore`, `timestamp`. Written when the row is written, so the same settlement
+  rules as history apply. Key your ledger entry on `(txid, i)`.
+- `memo`: the memos of a credited transaction once the full transaction was read (`memoKnown`
+  was false on the credit).
+- `rebuild`: this wallet's scan restarted from `scannedDaa`. Every credit at or after that
+  score is written again as the rescan finds it (same `(txid, i)`, so your ledger ignores the
+  repeat); a credit from that range that does not reappear within the rebuild was reorganised
+  away and must go to review.
+
+The journal is a file beside the wallet (`<token>.deposits.jsonl`); back it up with the wallet.
+
+**Polling history instead.** History is newest first: `GET /api/wallet/history?limit=<≤5000>&offset=<n>`.
 Keep a watermark: the highest `daaScore` you have fully processed.
 
 1. Read pages from `offset=0` until a page's oldest row has a `daaScore` below the watermark (or
