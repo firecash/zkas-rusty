@@ -160,7 +160,7 @@ The daemon raises any fee you pass to this floor automatically (`chunk_fee`). Pa
 | `--warm-always N` | `0` | Keep the N most recently active wallets resident and fully prepared (~100–190 MiB each), so reopening one is instant. |
 | `--warm-budget PCT` | `60` | Load-average ceiling (per core, %) above which the background warm sweep starts no new cold work. |
 | `--page-decode-threads N` | `cores − 2` (1–8) | Shared block-page decoder threads. |
-| `--page-cache-entries N`, `--page-cache-ttl SECONDS` | `64`, `10` | Size and lifetime of the shared decoded-page cache. |
+| `--page-cache-entries N`, `--page-cache-ttl SECONDS` | sized to memory (one entry per 96 MiB of the resident budget, 8–256; 16 without a budget), `10` | Size and lifetime of the shared decoded-page cache (~15 MB per decoded page). |
 | `--prefetch-depth N` | `1` | Block pages fetched concurrently ahead of the ingest cursor during a deep scan. Page fetch dominates sync time, so a remote node benefits from a higher value. |
 | `--active-sync-window SECONDS` | `90` | Keep syncing a wallet this long after its last API request. |
 | `--idle-evict SECONDS` | `1800` | Remove an idle wallet's checkpoint from RAM (never from disk). |
@@ -612,7 +612,7 @@ the global pool and is unaffected. Group size is bounded by cores **and** free m
 | Wallet sync concurrency | sync scheduler | cores − 1, memory-capped | `--sync-wallets N`, `--sync-wallet-memory-mb MIB` |
 | Checkpoint load / cold warm concurrency | semaphores | cores − 2 (1–4) / 1 | `--load-wallets N`, `--warm-wallets N` |
 | Shared page decode threads | dedicated rayon pool | cores − 2 | `--page-decode-threads N` |
-| Shared block-page cache | one fetch serves every wallet on the same page | 64 entries, 10 s | `--page-cache-entries N`, `--page-cache-ttl SECS` |
+| Shared block-page cache | one fetch serves every wallet on the same page | sized to memory, 10 s | `--page-cache-entries N`, `--page-cache-ttl SECS` |
 | Resident wallets | evicts idle wallets, checkpoint flushed first | memory-derived | `--max-resident-wallets`, `--hard-max-resident-wallets`, `--resident-budget-mb`, `--idle-evict` |
 | Active-sync window | only recently used wallets are swept | 90 s | `--active-sync-window SECS` |
 | Subtree-cache memory floor | defers cache builds when memory is tight | 1 200 MiB | `--subtree-free-floor-mb MIB` |
@@ -711,6 +711,13 @@ covers, and wallets keep only their own notes and witnesses. `--no-shared-tree` 
 the embedded (phone and desktop) daemons each serve a single user and run without it.
 
 ---
+
+A hosted wallet the shared tree serves keeps **no leaves of its own**, however many notes it
+holds: once the tree covers every position it holds, its base rolls to its tip and every spend
+is witnessed by the shared tree. A wallet with more than 256 notes used to keep its whole leaf
+stream from its oldest note (0.5 GB resident each, growing with the chain); it now holds only
+its notes. Should the shared tree be busy at the moment of a payment, the payment answers 503
+"retry shortly" rather than failing.
 
 ## 7. Integration playbooks
 
@@ -1062,7 +1069,8 @@ ever skipped, however long you were away, and nothing is returned twice. Events:
   ledger ignores the repeat); a credit that does not reappear by the time the wallet is synced
   again was reorganised away and must go to review.
 
-The journal is a file beside the wallet (`<token>.deposits.jsonl`); back it up with the wallet.
+Coinbase rows (mining rewards) are not journaled: they carry no per-output breakdown. The
+journal is a file beside the wallet (`<token>.deposits.jsonl`); back it up with the wallet.
 
 **Polling history instead.** History is newest first: `GET /api/wallet/history?limit=<≤5000>&offset=<n>`.
 Keep a watermark: the highest `daaScore` you have fully processed.
@@ -1149,7 +1157,9 @@ curl -X POST -H "X-Wallet-Token: $TOK" -H 'Content-Type: application/json' \
   smallest notes; the change collects them, so the wallet shrinks without a separate merge
   transaction (which would add 38 leaves to the chain for everyone to track). The extra inputs
   raise that batch's fee as a merge would; a `max_total_fee` the fill would break cancels the
-  fill, never the payout. `"no_fill": true` turns it off for one request.
+  fill, never the payout. `"no_fill": true` turns it off for one request. `send` does the same
+  for a single withdrawal. While a wallet's payouts are merging it this way, the automatic
+  consolidation leaves it alone (15 minutes after each such payout).
 - **Prefer `amount_sompi`** (an integer) to `amount_fc` (a floating-point number).
 
 #### Proof of payment for disputes

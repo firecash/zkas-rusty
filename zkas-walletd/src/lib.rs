@@ -632,7 +632,7 @@ impl Default for ResourceLimits {
             load_wallets: cores.saturating_sub(2).clamp(1, 4),
             warm_wallets: 1,
             page_decode_threads: cores.saturating_sub(2).clamp(1, 8),
-            page_cache_entries: 64,
+            page_cache_entries: 0,
             page_cache_ttl_secs: 10,
             active_sync_secs: 90,
             idle_evict_secs: 30 * 60,
@@ -1973,7 +1973,18 @@ impl WalletEntry {
     /// Journal the received rows written since `history_len_before` (all rows after a rotation:
     /// the txid set keeps the already-journaled ones out).
     fn journal_new_receipts(&mut self, dir: &str, token: &str, prefix: Prefix, history_len_before: usize) {
-        let from = if self.db.history().len() >= history_len_before { history_len_before } else { 0 };
+        // A seed wallet's first look after a load goes over every row: rows that arrived by a
+        // path other than ingest (a grafted older snapshot, an imported receipt) are journaled
+        // then, and the journal's memory keeps the rest out. Watch-only wallets (phones, by the
+        // thousand on a hosted daemon) are not read through on every load.
+        let first_pass = self.journal.is_none() && self.key.seed().is_ok();
+        let from = if first_pass {
+            0
+        } else if self.db.history().len() >= history_len_before {
+            history_len_before
+        } else {
+            0
+        };
         if from >= self.db.history().len() {
             return;
         }
@@ -1994,23 +2005,37 @@ impl WalletEntry {
         }
     }
 
-    /// Journal the memos of a credited transaction once the full transaction was read.
-    fn journal_memos(&mut self, dir: &str, token: &str, txid: &[u8; 32]) {
-        let Some(h) = self.db.history().iter().rev().find(|h| h.kind == HistoryKind::Received && &h.txid == txid) else { return };
-        let credits: Vec<serde_json::Value> = h
-            .credits
-            .iter()
-            .enumerate()
-            .map(|(i, c)| serde_json::json!({ "i": i, "memo": (!c.memo.is_empty()).then(|| String::from_utf8_lossy(&c.memo).into_owned()) }))
-            .collect();
-        let line = serde_json::json!({ "kind": "memo", "txid": hex(txid), "credits": credits });
+    /// Journal the memos of a credited transaction once the full transaction was read. A
+    /// transaction never journaled as a credit (its row had no breakdown when it was written)
+    /// is journaled as credits now instead, with its memos.
+    fn journal_memos(&mut self, dir: &str, token: &str, prefix: Prefix, txid: &[u8; 32]) {
+        let Some(idx) = self.db.history().iter().rposition(|h| h.kind == HistoryKind::Received && &h.txid == txid) else { return };
+        let has_credits = !self.db.history()[idx].credits.is_empty();
+        if has_credits && self.journal(dir, token).remember(*txid) {
+            let lines = credit_lines(prefix, &self.db, &self.db.history()[idx]);
+            self.journal.as_mut().expect("loaded above").append(dir, token, lines);
+            return;
+        }
+        let line = {
+            let h = &self.db.history()[idx];
+            let credits: Vec<serde_json::Value> = h
+                .credits
+                .iter()
+                .enumerate()
+                .map(|(i, c)| serde_json::json!({ "i": i, "memo": (!c.memo.is_empty()).then(|| String::from_utf8_lossy(&c.memo).into_owned()) }))
+                .collect();
+            serde_json::json!({ "kind": "memo", "txid": hex(txid), "credits": credits })
+        };
         self.journal(dir, token).append(dir, token, vec![line]);
     }
 
     /// Journal that this wallet's scan restarts from its birthday: every credit is re-found and
     /// journaled again; a ledger reviews any that is not.
     fn journal_rebuild(&mut self, dir: &str, token: &str) {
-        if token == CHAIN_TREE_TOKEN {
+        // Only a wallet that journals: a seed wallet, or one with a journal already (a
+        // watch-only phone wallet must not get a file for a rebuild alone).
+        let journals = self.journal.is_some() || self.key.seed().is_ok() || std::path::Path::new(&deposit_journal_path(dir, token)).exists();
+        if token == CHAIN_TREE_TOKEN || !journals {
             return;
         }
         let scanned = self.scanned as u64;
@@ -2714,6 +2739,12 @@ fn save_checkpoint(
     if db.poisoned() {
         return Err(std::io::Error::other("refusing to checkpoint a wallet that ingested inconsistent data"));
     }
+    if db.is_leaves_only() {
+        // The shared chain tree: streamed, never buffered (see `write_checkpoint_streaming`).
+        write_checkpoint_streaming(dir, token, genesis, low, scanned, db, boundaries, sink_blue, blind_below)?;
+        save_anchor_blocks(dir, token, boundary_blocks);
+        return Ok(());
+    }
     let parts = checkpoint_bytes(shared_leaf_upto(dir, token, db), genesis, low, scanned, db, boundaries, sink_blue, blind_below);
     write_checkpoint_bytes(dir, token, &parts)?;
     save_anchor_blocks(dir, token, boundary_blocks);
@@ -2851,26 +2882,80 @@ fn place_checkpoint<T>(
 /// pause, the eviction sweep, the twin-clone flush); two writers on one shared
 /// `.tmp` would truncate each other and rename a torn blob into place.
 fn write_checkpoint_bytes(dir: &str, token: &str, parts: &CheckpointParts) -> std::io::Result<()> {
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let path = scan_path(dir, token);
-    let tmp = format!("{path}.{}.tmp", SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
-    // A unique name is never reused, so a failed write must clean up after itself or a
-    // full disk grows a fresh partial `.tmp` on every retry.
-    //
     // The three pieces go out in order rather than being concatenated first: that
     // concatenation held the wallet's entire serialised stream a second time, and on a
     // phone it is what killed the process at the end of a long sync (see
     // `CheckpointParts`). The bytes on disk are byte-for-byte what the single buffer
     // produced.
+    write_checkpoint_with(dir, token, &parts.fvk, |w| {
+        use std::io::Write;
+        w.write_all(&parts.head)?;
+        w.write_all(&parts.db_blob)?;
+        w.write_all(&parts.tail)
+    })
+}
+
+/// The shared chain tree's checkpoint, streamed: its leaf stream (17 M leaves, 546 MB on
+/// 6 Nov) is written straight from the live tree instead of being copied into a buffer first.
+/// That copy was the daemon's largest allocation, every two hours and at exit, and on a small
+/// box the one that reached the memory limit. Runs under the tree's lock (I/O of a second or
+/// two); the bytes are identical to the buffered form. Returns the bytes written.
+#[allow(clippy::too_many_arguments)]
+fn write_checkpoint_streaming(
+    dir: &str,
+    token: &str,
+    genesis: &RpcHash,
+    low: &RpcHash,
+    scanned: u64,
+    db: &WalletDb,
+    boundaries: &VecDeque<(u64, u64)>,
+    sink_blue: u64,
+    blind_below: u64,
+) -> std::io::Result<u64> {
+    let enc = db.checkpoint_parts_sharing_leaves(shared_leaf_upto(dir, token, db));
+    let mut head = Vec::with_capacity(SCAN_HEADER_LEN + 8);
+    head.extend_from_slice(SCAN_MAGIC);
+    head.push(SCAN_VERSION);
+    head.extend_from_slice(&genesis.as_bytes());
+    head.extend_from_slice(&low.as_bytes());
+    head.extend_from_slice(&scanned.to_le_bytes());
+    head.extend_from_slice(&(enc.len() as u64).to_le_bytes());
+    let mut tail = Vec::with_capacity(4 + boundaries.len() * 16 + 16);
+    tail.extend_from_slice(&(boundaries.len() as u32).to_le_bytes());
+    for (blue, leaves) in boundaries {
+        tail.extend_from_slice(&blue.to_le_bytes());
+        tail.extend_from_slice(&leaves.to_le_bytes());
+    }
+    tail.extend_from_slice(&sink_blue.to_le_bytes());
+    tail.extend_from_slice(&blind_below.to_le_bytes());
+    let total = (head.len() + enc.len() + tail.len()) as u64;
+    write_checkpoint_with(dir, token, &db.fvk().to_bytes(), |w| {
+        use std::io::Write;
+        w.write_all(&head)?;
+        enc.write_to(w)?;
+        w.write_all(&tail)
+    })?;
+    Ok(total)
+}
+
+/// Write a checkpoint file atomically: `body` writes the bytes to a buffered temporary file,
+/// which is flushed, fsynced and renamed into place (see `place_checkpoint`). A unique name is
+/// never reused, so a failed write cleans up after itself or a full disk grows a fresh partial
+/// `.tmp` on every retry.
+fn write_checkpoint_with(
+    dir: &str,
+    token: &str,
+    fvk: &[u8; FVK_LEN],
+    body: impl FnOnce(&mut std::io::BufWriter<std::fs::File>) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let path = scan_path(dir, token);
+    let tmp = format!("{path}.{}.tmp", SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
     (|| -> std::io::Result<()> {
         use std::io::Write;
         let file = std::fs::File::create(&tmp)?;
-        // One buffered writer, so the many small `tail` fields are not one syscall each
-        // while the big `db_blob` still goes straight through.
-        let mut w = std::io::BufWriter::with_capacity(64 * 1024, file);
-        w.write_all(&parts.head)?;
-        w.write_all(&parts.db_blob)?;
-        w.write_all(&parts.tail)?;
+        let mut w = std::io::BufWriter::with_capacity(256 * 1024, file);
+        body(&mut w)?;
         w.flush()?;
         // A checkpoint is the wallet's scan history; a rename over unflushed data can
         // leave a valid-looking file of zeros after a crash or power loss.
@@ -2884,7 +2969,7 @@ fn write_checkpoint_bytes(dir: &str, token: &str, parts: &CheckpointParts) -> st
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
     }
-    place_checkpoint(dir, token, &parts.fvk, |to| std::fs::rename(&tmp, to)).inspect_err(|_| {
+    place_checkpoint(dir, token, fvk, |to| std::fs::rename(&tmp, to)).inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
     })
 }
@@ -4175,7 +4260,14 @@ impl PageCache {
             next: HashMap::new(),
             pool: Arc::new(pool),
             ttl: std::time::Duration::from_secs(resources.page_cache_ttl_secs.max(1)),
-            cap: resources.page_cache_entries.max(1),
+            // 0 = sized to memory: one decoded page is ~15 MB (measured 2 Nov, 142), so one entry
+            // per 96 MiB of the resident budget, 8-256. The fixed 64 was ~1 GB of pages when full:
+            // on a 2 GB box it was most of the memory (a public-mode daemon wedged at its cap,
+            // measured 6 Nov). A phone (no budget) keeps 16.
+            cap: match resources.page_cache_entries {
+                0 => resident_budget_bytes(resources).map(|b| (b / (96 << 20)).clamp(8, 256) as usize).unwrap_or(16),
+                n => n,
+            },
             hits: 0,
             dedup_hits: 0,
             misses: 0,
@@ -4987,7 +5079,7 @@ impl WalletEntry {
     /// At most `MAX_PER_PASS` fetches per pass, oldest first; the rest follow on the next
     /// passes. A row whose transaction cannot be fetched (block body pruned, node without the
     /// locator, a timeout) is tried again after `DETAILS_RETRY_AFTER`, at most `DETAILS_MAX_TRIES` times per session.
-    async fn recover_history_details(&mut self, client: &GrpcClient, page: &[DecodedBlock], dir: &str, token: &str) {
+    async fn recover_history_details(&mut self, client: &GrpcClient, page: &[DecodedBlock], dir: &str, token: &str, prefix: Prefix) {
         const MAX_PER_PASS: usize = 8;
         // The whole history, every pass: rows still to complete are marked in the row itself
         // (`fee_known`, persisted) and failures in `details_skipped`, so this is a filter over at
@@ -5045,8 +5137,10 @@ impl WalletEntry {
             if receipt {
                 if self.db.recover_received_from_bundle(&txid, &bundle) {
                     log::info!("history: receipt {} at daa {daa} — memo recovered from the full transaction", hex(&txid[..8]));
-                    self.journal_memos(dir, token, &txid);
                 }
+                // Whether or not a memo was found: the row is now fully read, and a ledger
+                // waiting on `memoKnown` must learn that an empty memo is final.
+                self.journal_memos(dir, token, prefix, &txid);
             } else {
                 let recovered = self.db.recover_sent_from_bundle(&txid, &bundle);
                 log::info!(
@@ -5877,7 +5971,7 @@ impl WalletEntry {
             // per wallet (one fetch per own send), bounded, best-effort; async, so it lives
             // outside the blocking ingest section above.
             if advanced && self.recoverable_history && !self.db.is_leaves_only() {
-                self.recover_history_details(client, &resp.blocks, &state.wallet_dir, token).await;
+                self.recover_history_details(client, &resp.blocks, &state.wallet_dir, token, state.prefix).await;
             }
             // Publish what this pass has reached so far. Without this the only progress
             // report is the one after the pass ENDS, which for an initial scan means the
@@ -7006,6 +7100,9 @@ struct AppState {
     /// Submitted payments the virtual chain has ACCEPTED (see `acceptance_loop`): txid -> the
     /// accepting chain block, its DAA score, and when this was learned (pruned after a day).
     accepted_txs: std::sync::Mutex<HashMap<[u8; 32], (RpcHash, u64, std::time::Instant)>>,
+    /// Wallets whose last payout absorbed small notes (see `wallet_send_many`), and when: the
+    /// consolidation loop leaves such a wallet alone for a while, since its payouts are merging it.
+    recent_fill: std::sync::Mutex<HashMap<String, std::time::Instant>>,
     /// For pending payments not yet seen accepted: the chain DAA score up to which the virtual
     /// chain was inspected without finding them.
     unseen_upto: std::sync::Mutex<HashMap<[u8; 32], u64>>,
@@ -7548,11 +7645,23 @@ fn sent_request_prefix(fvk_hex: &str, request_id: &str) -> Option<String> {
     Some(format!("{}:{id}", hex(&sha2::Digest::finalize(h)[..16])))
 }
 
-/// Every record whose key names this request (any fingerprint, or the legacy form).
+/// Every record whose key names this request (any fingerprint, or the legacy form), newest
+/// first.
 fn sent_requests_for(prefix: &str) -> Vec<(String, SendResp)> {
     let m = lock_ok(sent_requests());
     let with_hash = format!("{prefix}#");
-    m.iter().filter(|(k, _)| k.as_str() == prefix || k.starts_with(&with_hash)).map(|(k, (_, r))| (k.clone(), r.clone())).collect()
+    // The SDK sends a payment too large for one transaction as parts with ids `id`, `id.1`,
+    // `id.2`, ...: those are this request's records too.
+    let part = |k: &str| {
+        k.strip_prefix(prefix).and_then(|rest| rest.strip_prefix('.')).is_some_and(|rest| {
+            let digits = rest.split('#').next().unwrap_or("");
+            !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+        })
+    };
+    let mut found: Vec<(&String, &(std::time::Instant, SendResp))> =
+        m.iter().filter(|(k, _)| k.as_str() == prefix || k.starts_with(&with_hash) || part(k)).collect();
+    found.sort_by(|a, b| b.1.0.cmp(&a.1.0));
+    found.into_iter().map(|(k, (_, r))| (k.clone(), r.clone())).collect()
 }
 
 /// What a request pays, for its key: the recipient(s) and amount(s), hashed.
@@ -9439,6 +9548,8 @@ impl AppState {
 /// other than queueing. Here the only per-wallet cost is trial decryption of a handful of
 /// mempool bundles: microseconds, no RPC, no tree. So a payment appears within about a
 /// second of the sender hitting Confirm, no matter how many wallets are mid-scan.
+/// After a payout absorbed a wallet's small notes, the consolidation loop leaves it alone this long.
+const RECENT_FILL_GRACE: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 /// How often the virtual chain is asked which of our pending payments it accepted.
 const ACCEPTANCE_POLL: std::time::Duration = std::time::Duration::from_secs(15);
 /// A pending payment the virtual chain has passed by this much (DAA) without accepting it, and
@@ -9546,7 +9657,12 @@ async fn acceptance_loop(state: Arc<AppState>) {
         }
         let mut unseen = lock_ok(&state.unseen_upto);
         for (txid, since) in &pending {
-            if !found.iter().any(|(t, _)| t == txid) && upto > *since {
+            // "Not seen up to `upto`" is only true when the window began at or below where this
+            // payment was last looked at (its submission, the first time). After a restart the
+            // lookback cap can start the window above an old submission; such a payment is not
+            // judged on a window that never covered it.
+            let from = unseen.get(txid).copied().unwrap_or(*since);
+            if !found.iter().any(|(t, _)| t == txid) && upto > *since && start_daa <= from {
                 unseen.insert(*txid, upto);
             }
         }
@@ -9663,7 +9779,7 @@ async fn consolidate_loop(state: Arc<AppState>) {
             tokio::time::sleep(CONSOLIDATE_COOLDOWN).await;
             continue;
         }
-        let wallets: Vec<Wallet> = state.wallets.lock().await.values().cloned().collect();
+        let wallets: Vec<(String, Wallet)> = state.wallets.lock().await.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         let loaded = wallets.len();
         let mut merged_any = false;
         // Why nothing happened is as important as when something does. Without this
@@ -9671,7 +9787,7 @@ async fn consolidate_loop(state: Arc<AppState>) {
         // silently never eligible", and the docs tell them to watch for merge lines
         // that would never appear.
         let (mut over_ceiling, mut skip_watch_only, mut skip_behind, mut skip_busy) = (0usize, 0usize, 0usize, 0usize);
-        for w in wallets {
+        for (token, w) in wallets {
             if proving_now() {
                 break;
             }
@@ -9691,6 +9807,12 @@ async fn consolidate_loop(state: Arc<AppState>) {
                     continue;
                 }
                 over_ceiling += 1;
+                // Its payouts are absorbing its small notes (see `wallet_send_many`): a separate
+                // merge would add 38 leaves to the chain for what the next payout does for free.
+                let filled_recently = lock_ok(&state.recent_fill).get(&token).is_some_and(|t| t.elapsed() < RECENT_FILL_GRACE);
+                if filled_recently {
+                    continue;
+                }
                 // Watch-only wallets hold no seed here and cannot be merged by the
                 // daemon at all; a wallet still catching up has no stable anchor.
                 if e.key.seed().is_err() {
@@ -9967,10 +10089,24 @@ fn drop_held_leaves(state: &AppState, token: &str, e: &mut WalletEntry) -> bool 
     if token == CHAIN_TREE_TOKEN || !state.build_shared_tree || e.build_in_flight || e.db.is_leaves_only() {
         return false;
     }
+    // What the shared tree witnesses: every position from its base on, once it exists. Told to
+    // the wallet on every pass (it is not persisted), so a note below the wallet's own base is
+    // stranded only when no shared tree can serve it.
+    let shared_size = state.chain_tree_size.load(std::sync::atomic::Ordering::Relaxed);
+    let shared_base = state.chain_tree_base.load(std::sync::atomic::Ordering::Relaxed);
+    // Never withdrawn while the tree is being rebuilt (size 0 for a while): a payment then
+    // answers "retry shortly" from the shared tree, not "insufficient funds" from a wallet
+    // whose notes read as stranded.
+    if shared_size > 0 {
+        e.db.set_shared_floor(Some(shared_base));
+    }
     let base = e.db.base_size();
     let size = e.db.size();
-    let target = e.db.earliest_held_position();
-    if target >= size {
+    // Decided on what the wallet HOLDS, not on its earliest position worth keeping: with the
+    // dust floor, a wallet holding only dust has no position worth a base, and deciding on that
+    // sent it home here with every leaf since the dust — the spam case the floor exists for.
+    let positions = e.db.held_positions();
+    if positions.is_empty() {
         if e.db.tree_is_valid() && e.db.compact_if_holding_nothing() {
             HOSTED_LEAF_DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             log::debug!("wallet {}: compacted (holds nothing) at {size} leaves", log_pseudonym(token));
@@ -9978,6 +10114,7 @@ fn drop_held_leaves(state: &AppState, token: &str, e: &mut WalletEntry) -> bool 
         }
         return false;
     }
+    let target = e.db.earliest_held_position();
     if size < base.saturating_add(HOSTED_REBASE_MIN_LEAVES) {
         return false;
     }
@@ -9986,7 +10123,6 @@ fn drop_held_leaves(state: &AppState, token: &str, e: &mut WalletEntry) -> bool 
             return false;
         }
     }
-    let positions = e.db.held_positions();
     if positions.len() <= kaspa_shielded_core::walletdb::MAX_LIVE_WITNESSES {
         let minted = state.chain_tree.try_lock().ok().and_then(|ct| {
             let fs = ct.db.frontier_state_at(size)?;
@@ -10010,24 +10146,34 @@ fn drop_held_leaves(state: &AppState, token: &str, e: &mut WalletEntry) -> bool 
         log::warn!("wallet {}: shared-tree witnesses at {size} REFUSED; keeping its leaves", log_pseudonym(token));
         return false;
     }
-    if target < base.saturating_add(HOSTED_REBASE_MIN_LEAVES) {
+    // More notes than live witnesses are kept for. When the shared tree covers every held
+    // position, the wallet needs no leaves at all: its base rolls to its tip and every spend is
+    // witnessed by the shared tree (`batch_witness_paths`). Measured 4 Nov on 142: 100 such
+    // wallets held 35 GB of leaves on disk and ~0.5 GB each in RAM, growing 0.4 GB a day, for
+    // witnesses the shared tree already minted for everyone. Otherwise the base rolls up to the
+    // oldest note, as before.
+    let covered = shared_size > 0 && positions.first().is_some_and(|&p| p >= shared_base);
+    let goal = if covered { size } else { target };
+    if goal < base.saturating_add(HOSTED_REBASE_MIN_LEAVES) {
         return false;
     }
-    let Some(fs) = state.chain_tree.try_lock().ok().and_then(|ct| ct.db.frontier_state_at(target)) else { return false };
-    if e.db.rebase_to(&fs) {
+    let Some(fs) = state.chain_tree.try_lock().ok().and_then(|ct| ct.db.frontier_state_at(goal)) else { return false };
+    let rolled = if covered { e.db.rebase_past_notes_to(&fs) } else { e.db.rebase_to(&fs) };
+    if rolled {
         e.rebase_refused = None;
         HOSTED_LEAF_DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         log::info!(
-            "wallet {}: base rolled {base} -> {target} from the shared tree's frontier ({} leaves dropped, {} notes)",
+            "wallet {}: base rolled {base} -> {goal} from the shared tree's frontier ({} leaves dropped, {} notes{})",
             log_pseudonym(token),
-            target - base,
-            positions.len()
+            goal - base,
+            positions.len(),
+            if covered { ", all witnessed by the shared tree" } else { "" }
         );
         return true;
     }
     HOSTED_REBASE_REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     e.rebase_refused = Some((size, std::time::Instant::now()));
-    log::warn!("wallet {}: shared frontier at {target} REFUSED (leaf differs from this wallet's stream); keeping its leaves", log_pseudonym(token));
+    log::warn!("wallet {}: shared frontier at {goal} REFUSED (leaf differs from this wallet's stream); keeping its leaves", log_pseudonym(token));
     false
 }
 
@@ -10448,30 +10594,47 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
         && (due_by_blocks || (just_caught_up && advanced > 0) || force || overdue)
     {
         e.force_checkpoint = false;
-        let t_encode = std::time::Instant::now();
-        let parts = checkpoint_bytes(
-            shared_leaf_upto(&state.wallet_dir, &token, &e.db),
-            &e.genesis,
-            &e.low,
-            e.scanned as u64,
-            &e.db,
-            &e.boundaries,
-            e.sink_blue,
-            e.blind_below,
-        );
-        e.stats.ckpt_encode_ns += t_encode.elapsed().as_nanos() as u64;
-        Some((
-            parts,
-            e.scanned,
-            // The anchor blocks of the boundaries just serialised, so a restarted daemon can
-            // name a spend's anchor block without waiting to re-sync the matured ring.
-            e.boundary_blocks.clone(),
-        ))
+        if token == CHAIN_TREE_TOKEN {
+            // Streamed under the lock, never buffered: its 546 MB copy was the process's largest
+            // allocation (see `write_checkpoint_streaming`). One to two seconds every two hours.
+            let t_write = std::time::Instant::now();
+            let written = tokio::task::block_in_place(|| {
+                write_checkpoint_streaming(&state.wallet_dir, &token, &e.genesis, &e.low, e.scanned as u64, &e.db, &e.boundaries, e.sink_blue, e.blind_below)
+            });
+            match written {
+                Ok(bytes) => {
+                    save_anchor_blocks(&state.wallet_dir, &token, &e.boundary_blocks);
+                    e.saved_scanned = e.scanned;
+                    e.last_checkpoint_at = std::time::Instant::now();
+                    e.stats.ckpt_writes += 1;
+                    e.stats.ckpt_write_ns += t_write.elapsed().as_nanos() as u64;
+                    e.stats.ckpt_bytes += bytes;
+                    log::info!("shared chain tree checkpoint streamed: {} MB in {:.1?}", bytes >> 20, t_write.elapsed());
+                }
+                Err(err) => {
+                    e.force_checkpoint = true;
+                    log::warn!("shared chain tree checkpoint write failed ({err}); retried on the next pass");
+                }
+            }
+            None
+        } else {
+            let t_encode = std::time::Instant::now();
+            let parts = checkpoint_bytes(
+                shared_leaf_upto(&state.wallet_dir, &token, &e.db),
+                &e.genesis,
+                &e.low,
+                e.scanned as u64,
+                &e.db,
+                &e.boundaries,
+                e.sink_blue,
+                e.blind_below,
+            );
+            e.stats.ckpt_encode_ns += t_encode.elapsed().as_nanos() as u64;
+            Some((parts, e.scanned, e.boundary_blocks.clone()))
+        }
     } else {
         None
     };
-    // Snapshot the subtree-cache build inputs while we still hold the lock; the fold
-    // itself runs without it (see `SubtreeBuildJob`).
     let build_job = if e.wants_cache_build && !e.build_in_flight {
         e.wants_cache_build = false;
         e.build_in_flight = true;
@@ -10833,6 +10996,16 @@ async fn evict_idle_wallets(state: &Arc<AppState>) {
 /// retired or reloaded meanwhile is left alone. Returns whether it was removed.
 async fn evict_wallet(state: &Arc<AppState>, token: &str, why: &str) -> bool {
     let Some(w) = state.wallets.lock().await.get(token).cloned() else { return false };
+    // The token's loading gate, taken WITHOUT waiting, before anything else. A loader takes this
+    // gate and then the admission lock, and eviction runs under the admission lock: waiting here
+    // for a gate a loader holds (one that slipped in between the map removal and this point)
+    // deadlocked the two. A gate someone holds means a load of this token is in flight: not
+    // this round, the wallet stays as it is.
+    let gate = {
+        let mut loading = state.loading.lock().await;
+        loading.entry(token.to_string()).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))).clone()
+    };
+    let Ok(held) = gate.try_lock_owned() else { return false };
     // The bytes are taken under the wallet lock; the WRITE is not. It used to run here,
     // synchronously, on the path of every load (`admit_load` -> `enforce_resident_budget`), so
     // one 500 MB wallet being evicted held the admission lock, and every other load and the
@@ -10875,13 +11048,8 @@ async fn evict_wallet(state: &Arc<AppState>, token: &str, why: &str) -> bool {
         c.remove(token);
     }
     if let Some(parts) = parts {
-        // A reload of this token waits on its loading lock until the file is written, so it
+        // The gate is held until the file is written: a reload of this token waits on it and
         // never reads the checkpoint these bytes replace.
-        let gate = {
-            let mut loading = state.loading.lock().await;
-            loading.entry(token.to_string()).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))).clone()
-        };
-        let held = gate.lock_owned().await;
         let (dir, who) = (state.wallet_dir.clone(), token.to_string());
         tokio::task::spawn_blocking(move || {
             let _held = held;
@@ -12056,6 +12224,10 @@ struct SendReq {
     /// `sent_requests`). A client whose response was lost and retried without one paid twice.
     #[serde(default)]
     request_id: Option<String>,
+    /// Do not absorb the wallet's small notes into this payment's change when the wallet is
+    /// over its consolidation ceiling (see `wallet_send_many`).
+    #[serde(default)]
+    no_fill: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -12262,10 +12434,11 @@ async fn wallet_request_status(
     let wallet = state.cached_wallet(&token).await;
     let mut pending: HashSet<[u8; 32]> = HashSet::new();
     if let Some(w) = &wallet {
-        if let Ok(e) = w.try_lock() {
-            prefixes.push(hex(&e.db.fvk().to_bytes()));
-            pending.extend(e.db.pending_spends().iter().map(|p| p.txid));
-        }
+        // Waited for, not tried: a ledger settles on this answer, and "returned" for a payment
+        // that is merely parked while the wallet scans would be a lie.
+        let e = w.lock().await;
+        prefixes.push(hex(&e.db.fvk().to_bytes()));
+        pending.extend(e.db.pending_spends().iter().map(|p| p.txid));
     }
     let mut records: Vec<(String, SendResp)> = Vec::new();
     let mut in_progress = false;
@@ -12279,7 +12452,10 @@ async fn wallet_request_status(
     if in_progress && records.is_empty() {
         return Ok(Json(serde_json::json!({ "request_id": id, "state": "in_progress" })));
     }
-    let Some((_, resp)) = records.into_iter().max_by_key(|(_, r)| r.tx_count) else {
+    // Several records (the id reused for different payments): the newest is the one answered,
+    // and the rest are listed so the caller sees the reuse.
+    let others: Vec<String> = records.iter().skip(1).map(|(_, r)| r.txid.clone()).collect();
+    let Some((_, resp)) = records.into_iter().next() else {
         return Err(err(StatusCode::NOT_FOUND, "no record of this request id for this wallet (never sent, or older than the records' 24 h)"));
     };
     let tip = state.node_tip.lock().await.0;
@@ -12304,6 +12480,7 @@ async fn wallet_request_status(
         "fee_sompi_exact": resp.fee_sompi_exact,
         "tx_count": resp.tx_count,
         "transactions": txs,
+        "other_payments_with_this_id": others,
     })))
 }
 
@@ -12727,7 +12904,15 @@ async fn wallet_rescan(
     // `error.is_none()`, so this stops a concurrent pass from re-persisting the
     // old cursor after we retire it below.
     if let Some(w) = state.cached_wallet(&token).await {
-        w.lock().await.error = Some("rescanning from birthday".into());
+        let mut e = w.lock().await;
+        e.error = Some("rescanning from birthday".into());
+        e.journal_rebuild(&state.wallet_dir, &token);
+    } else if std::path::Path::new(&deposit_journal_path(&state.wallet_dir, &token)).exists() {
+        // Not resident: the journal still gets its marker, so a ledger knows every credit is
+        // about to be written again.
+        let mut j = DepositJournal::load(&state.wallet_dir, &token);
+        j.forget_all();
+        j.append(&state.wallet_dir, &token, vec![serde_json::json!({ "kind": "rebuild", "restart": "birthday", "scannedDaa": 0 })]);
     }
     state.wallets.lock().await.remove(&token);
     let scan = scan_path(&state.wallet_dir, &token);
@@ -12831,6 +13016,17 @@ fn matured_candidates(db: &WalletDb, matured: u64) -> Result<(Vec<&OwnedNote>, u
 /// consecutive positions, the oldest-first merge reached them, their sum never cleared the fee, and
 /// every later pass was refused the same way (at debug level), so the wallet never merged again.
 /// Payments still spend such a note when it is needed: they take the largest notes first.
+/// A note the wallet could not witness itself. Below its base and inside the shared tree's
+/// range, the shared tree is its witness and did not answer in time (busy for 20 s, or behind):
+/// a retry, not a fault. Anything else is a fault.
+fn no_witness_err(db: &WalletDb, position: u64) -> (StatusCode, Json<serde_json::Value>) {
+    if position < db.base_size() && db.shared_floor().is_some_and(|f| position >= f) {
+        err(StatusCode::SERVICE_UNAVAILABLE, "the shared chain tree could not witness this note right now; retry shortly")
+    } else {
+        err(StatusCode::INTERNAL_SERVER_ERROR, "matured note has no witness path")
+    }
+}
+
 fn dust_floor_sompi() -> u64 {
     let n = max_spends_per_tx().max(3);
     chunk_fee(0, n).saturating_sub(chunk_fee(0, 2)) / (n as u64 - 2)
@@ -13242,25 +13438,74 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
                     // O(chain) rebuild each, then distribute into chunks. A note the batch
                     // declines falls back to the exact per-note rebuild — never wrong.
                     let total: usize = plan.iter().map(|(n, _, _)| *n).sum();
-                    let all_positions: Vec<u64> = candidates[..total].iter().map(|n| n.position).collect();
-                    let batch_paths = tokio::task::block_in_place(|| state.batch_witness_paths(&e.db, &all_positions, matured));
-                    let mut chunks = Vec::with_capacity(plan.len());
                     let mut idx = 0usize;
+                    let mut groups: Vec<(Vec<usize>, u64, u64)> = Vec::with_capacity(plan.len()); // (candidate indexes, pay, fee)
                     for (n_notes, pay, cfee) in plan {
-                        let mut inputs = Vec::with_capacity(n_notes);
-                        let mut positions = Vec::with_capacity(n_notes);
-                        for (j, note) in candidates[idx..idx + n_notes].iter().enumerate() {
-                            let path = match batch_paths[idx + j].clone() {
+                        groups.push(((idx..idx + n_notes).collect(), pay, cfee));
+                        idx += n_notes;
+                    }
+                    // Merge while paying, as `wallet_send_many` does: a withdrawal with free input
+                    // slots absorbs the wallet's smallest notes into its change instead of a
+                    // separate merge adding 38 leaves to the chain. Never past the caller's fee
+                    // ceiling, never short of the payment.
+                    let fill_floor = dust_floor_sompi();
+                    let over_ceiling = state.auto_consolidate.is_some_and(|c| e.db.notes().iter().filter(|n| n.value() > fill_floor).count() > c);
+                    if over_ceiling && !req.no_fill.unwrap_or(false) {
+                        let single_target = amount.saturating_add(chunk_fee(fee, 1));
+                        let mut spare: Vec<usize> = (total..candidates.len())
+                            .rev()
+                            .filter(|&i| candidates[i].value() > fill_floor && candidates[i].value() < single_target)
+                            .collect();
+                        let mut filled = groups.clone();
+                        let mut absorbed = 0usize;
+                        for (idxs, pay, cfee) in filled.iter_mut() {
+                            let mut extra = idxs.clone();
+                            while extra.len() < max_per_tx {
+                                let Some(i) = spare.pop() else { break };
+                                extra.push(i);
+                            }
+                            if extra.len() == idxs.len() {
+                                continue;
+                            }
+                            let new_fee = chunk_fee(fee, extra.len());
+                            let sum = extra.iter().try_fold(0u64, |a, &i| a.checked_add(candidates[i].value()));
+                            if sum.is_some_and(|sum| sum >= pay.saturating_add(new_fee)) {
+                                absorbed += extra.len() - idxs.len();
+                                *idxs = extra;
+                                *cfee = new_fee;
+                            }
+                        }
+                        let fee_with_fill: u64 = filled.iter().map(|(_, _, f)| *f).sum();
+                        if absorbed > 0 && req.max_total_fee.is_none_or(|cap| fee_with_fill <= cap) {
+                            log::info!(
+                                "send: wallet {} is over its {}-note ceiling; this payment absorbs {absorbed} small note(s) into its change",
+                                log_pseudonym(&token),
+                                state.auto_consolidate.unwrap_or(0)
+                            );
+                            groups = filled;
+                            lock_ok(&state.recent_fill).insert(token.clone(), std::time::Instant::now());
+                        }
+                    }
+                    let all_positions: Vec<u64> = groups.iter().flat_map(|(i, _, _)| i.iter().map(|&k| candidates[k].position)).collect();
+                    let batch_paths = tokio::task::block_in_place(|| state.batch_witness_paths(&e.db, &all_positions, matured));
+                    let mut chunks = Vec::with_capacity(groups.len());
+                    let mut at = 0usize;
+                    for (idxs, pay, cfee) in groups {
+                        let mut inputs = Vec::with_capacity(idxs.len());
+                        let mut positions = Vec::with_capacity(idxs.len());
+                        for &k in &idxs {
+                            let note = &candidates[k];
+                            let path = match batch_paths[at].clone() {
                                 Some(p) => p,
                                 // block_in_place: a cold note's on-demand rebuild is an
                                 // O(chain) Sinsemilla replay — must not pin a runtime worker.
                                 None => tokio::task::block_in_place(|| e.db.witness_path_at(note.position, matured))
-                                    .ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "matured note has no witness path"))?,
+                                    .ok_or_else(|| no_witness_err(&e.db, note.position))?,
                             };
+                            at += 1;
                             inputs.push((note.note.clone(), path));
                             positions.push(note.position);
                         }
-                        idx += n_notes;
                         chunks.push((inputs, pay, positions, cfee));
                     }
                     planned = Some((chunks, have, e.caught_up, stranded_value));
@@ -13763,7 +14008,7 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
         // actions raise this batch's fee as a merge's would; a `max_total_fee` the fill would
         // break drops the fill, never the payout.
         let fill_floor = dust_floor_sompi();
-        let over_ceiling = state.auto_consolidate.is_some_and(|c| e.db.notes().len() > c);
+        let over_ceiling = state.auto_consolidate.is_some_and(|c| e.db.notes().iter().filter(|n| n.value() > fill_floor).count() > c);
         if over_ceiling && !req.no_fill.unwrap_or(false) {
             // Spend order puts the notes that cover the whole payout alone first (smallest of
             // them first), then the rest largest first; so the tail of `candidates` is the
@@ -13803,6 +14048,7 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
                     state.auto_consolidate.unwrap_or(0)
                 );
                 plan = filled;
+                lock_ok(&state.recent_fill).insert(token.clone(), std::time::Instant::now());
             }
         }
         // One witness pass for every note across every batch.
@@ -13818,7 +14064,7 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
                 let path = match paths[at].clone() {
                     Some(p) => p,
                     None => tokio::task::block_in_place(|| e.db.witness_path_at(note.position, matured))
-                        .ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "matured note has no witness path"))?,
+                        .ok_or_else(|| no_witness_err(&e.db, note.position))?,
                 };
                 at += 1;
                 inputs.push((note.note.clone(), path));
@@ -14112,7 +14358,7 @@ async fn consolidate_once(
                 // block_in_place: an on-demand rebuild is an O(chain) Sinsemilla replay —
                 // must not pin a runtime worker (it can hold the tokio I/O driver).
                 None => tokio::task::block_in_place(|| e.db.witness_path_at(n.position, matured))
-                    .ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "matured note has no witness path"))?,
+                    .ok_or_else(|| no_witness_err(&e.db, n.position))?,
             };
             inputs.push((n.note.clone(), path));
             positions.push(n.position);
@@ -14665,7 +14911,7 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
                             None => {
                                 let t_p = std::time::Instant::now();
                                 let p = tokio::task::block_in_place(|| e.db.witness_path_at(n.position, matured))
-                                    .ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "matured note has no witness path"))?;
+                                    .ok_or_else(|| no_witness_err(&e.db, n.position))?;
                                 log::info!("prepare: fallback witness_path_at(note@{}) took {:.1?}", n.position, t_p.elapsed());
                                 p
                             }
@@ -16802,6 +17048,7 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
         chain_tree_size: std::sync::atomic::AtomicU64::new(0),
         page_failures: std::sync::atomic::AtomicU64::new(0),
         accepted_txs: std::sync::Mutex::new(HashMap::new()),
+        recent_fill: std::sync::Mutex::new(HashMap::new()),
         unseen_upto: std::sync::Mutex::new(HashMap::new()),
         chain_tree_base: std::sync::atomic::AtomicU64::new(0),
         chain_tree_frontier: Mutex::new(None),
@@ -16821,7 +17068,11 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
                     log::warn!("chain files disabled: the node connection is routed through a proxy");
                 } else {
                     log::info!("chain files: pages covered by published segments are read from them");
-                    pc.files = Some(chain_files::ChainFiles::new(base, genesis));
+                    // Remote segments held at once: one per 24 MiB of the resident budget, 4-24.
+                    // Each is ~10 MB decoded; the shared tree reads ahead and every wallet
+                    // catching up needs its own current and next, so a phone's four thrashed.
+                    let remote_cap = resident_budget_bytes(&resources).map(|b| (b / (24 << 20)).clamp(4, 24) as usize).unwrap_or(16);
+                    pc.files = Some(chain_files::ChainFiles::with_remote_cap(base, genesis, remote_cap));
                 }
             }
             pc
@@ -18948,6 +19199,11 @@ mod sdk_api_tests {
         assert_eq!(sent_requests_for(&prefix).len(), 2, "same id, another payment: both are this id's records");
         assert_eq!(sent_requests_for(&sent_request_prefix(&fvk_a, "rid-legacy").unwrap()).len(), 1, "a legacy key equals its prefix");
         assert!(sent_requests_for(&sent_request_prefix(&fvk_b, "rid-1").unwrap()).is_empty(), "another wallet sees nothing");
+        // The SDK's later parts (`rid-1.1`, `rid-1.2`) belong to the request; `rid-1x` and `rid-1.x` do not.
+        record_sent_request(sent_request_key(&fvk_a, "rid-1.1", &pay).unwrap(), &resp);
+        record_sent_request(sent_request_key(&fvk_a, "rid-1x", &pay).unwrap(), &resp);
+        record_sent_request(sent_request_key(&fvk_a, "rid-1.x", &pay).unwrap(), &resp);
+        assert_eq!(sent_requests_for(&prefix).len(), 3);
     }
 
     /// A stranger's 1-sompi outputs must never be what a merge picks: 38 of them in one transaction

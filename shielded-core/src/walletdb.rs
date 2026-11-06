@@ -850,6 +850,10 @@ pub struct WalletDb {
     leaves_only: bool,
     /// Notes worth no more than this do not hold the base back (see `set_base_floor_value`).
     base_floor_value: u64,
+    /// Positions from here on are witnessed by the daemon's shared chain tree, so a note there
+    /// is spendable without this wallet's own leaves (see `set_shared_floor`). `None`: no such
+    /// tree; a note below the base is stranded.
+    shared_floor: Option<u64>,
     /// Set when an ingested page repeated a nullifier this database already appended a leaf for.
     /// Consensus never applies a second spend of one nullifier, and the node serves only applied
     /// transactions, so a repeat proves the data source is faulty or lying. The bundle is still
@@ -912,6 +916,32 @@ pub struct WalletDb {
 /// every leaf would reintroduce the O(N·k) scan that once made a wallet op take 33
 /// minutes; the excess notes fall back to the on-demand rebuild.
 pub const MAX_LIVE_WITNESSES: usize = 256;
+
+/// A checkpoint's bytes in three parts (see `WalletDb::checkpoint_parts_sharing_leaves`).
+pub struct CheckpointEncoding<'a> {
+    pub prefix: Vec<u8>,
+    pub inline_leaves: &'a [MerkleHashOrchard],
+    pub suffix: Vec<u8>,
+}
+
+impl CheckpointEncoding<'_> {
+    pub fn len(&self) -> usize {
+        self.prefix.len() + self.inline_leaves.len() * 32 + self.suffix.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Write the three parts in order: the same bytes `WalletDb::to_checkpoint` returns.
+    pub fn write_to<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
+        w.write_all(&self.prefix)?;
+        for leaf in self.inline_leaves {
+            w.write_all(&leaf.to_bytes())?;
+        }
+        w.write_all(&self.suffix)
+    }
+}
 
 /// A subtree-cache build detached from the wallet that owns it.
 ///
@@ -1300,6 +1330,7 @@ impl WalletDb {
             predecrypted: None,
             leaves_only: false,
             base_floor_value: 0,
+            shared_floor: None,
             poisoned: false,
             borrow_tree: false,
             tree_valid: true,
@@ -2650,6 +2681,22 @@ impl WalletDb {
     /// wallet's own leaf at that position, which binds it to this stream rather than any tree
     /// of the right size. Live witnesses are kept exactly as `advance_base_capped` keeps them.
     pub fn rebase_to(&mut self, fs: &FrontierState) -> bool {
+        self.rebase_to_inner(fs, false)
+    }
+
+    /// `rebase_to` past the wallet's own notes: every leaf goes, the notes stay, and their spends
+    /// are witnessed by the shared tree (`set_shared_floor` must cover every held position; a
+    /// hosted wallet with more notes than live witnesses are kept for held its whole stream from
+    /// its oldest note otherwise — 0.5 GB resident per such wallet, measured 4 Nov).
+    pub fn rebase_past_notes_to(&mut self, fs: &FrontierState) -> bool {
+        let Some(floor) = self.shared_floor else { return false };
+        if self.held_positions().iter().any(|&p| p < floor) {
+            return false;
+        }
+        self.rebase_to_inner(fs, true)
+    }
+
+    fn rebase_to_inner(&mut self, fs: &FrontierState, past_notes: bool) -> bool {
         if self.leaves_only || fs.size <= self.base_size || fs.size > self.size {
             return false;
         }
@@ -2660,7 +2707,7 @@ impl WalletDb {
             .chain(self.pending_spends.iter().map(|p| p.note.position))
             .min()
             .unwrap_or(self.size);
-        if fs.size > earliest {
+        if fs.size > earliest && !past_notes {
             return false;
         }
         let Some(leaf) = fs.leaf else { return false };
@@ -2992,7 +3039,26 @@ impl WalletDb {
     /// Recovery requires older wallet state whose leaf stream still covers the
     /// note (see the walletd graft tooling), or an archival replay of the chain.
     pub fn stranded_notes(&self) -> Vec<&OwnedNote> {
-        self.notes.iter().filter(|n| n.position < self.base_size && !self.witnesses.iter().any(|(p, _)| *p == n.position)).collect()
+        self.notes
+            .iter()
+            .filter(|n| {
+                n.position < self.base_size
+                    && !self.witnesses.iter().any(|(p, _)| *p == n.position)
+                    && !self.shared_floor.is_some_and(|f| n.position >= f)
+            })
+            .collect()
+    }
+
+    /// The daemon's shared chain tree witnesses every position from `floor` on, so a note there
+    /// needs none of this wallet's leaves: `rebase_past_notes_to` may then roll the base past
+    /// held notes, and `stranded_notes` does not report them. `None` withdraws that (a daemon
+    /// without a shared tree, or an engine on a device).
+    pub fn set_shared_floor(&mut self, floor: Option<u64>) {
+        self.shared_floor = floor;
+    }
+
+    pub fn shared_floor(&self) -> Option<u64> {
+        self.shared_floor
     }
 
     fn live_witness_path(&self, position: u64, matured_leaves: u64) -> Option<MerklePath> {
@@ -4371,15 +4437,31 @@ impl WalletDb {
         self.encode_checkpoint(shared_upto)
     }
 
+    /// The checkpoint in three parts, the inline leaves as a borrowed slice: a writer streams
+    /// them to the file instead of copying them into a buffer first. The daemon's shared
+    /// chain tree is 17 M leaves (546 MB, 6 Nov): that copy was the largest allocation the
+    /// process made, every two hours and at exit. `to_checkpoint_sharing_leaves(n)` is exactly
+    /// `prefix ++ leaves ++ suffix`.
+    pub fn checkpoint_parts_sharing_leaves(&self, shared_upto: u64) -> CheckpointEncoding<'_> {
+        self.encode_checkpoint_parts(shared_upto)
+    }
+
+    fn encode_checkpoint(&self, shared_upto: u64) -> Vec<u8> {
+        let parts = self.encode_checkpoint_parts(shared_upto);
+        let mut out = Vec::with_capacity(parts.len());
+        parts.write_to(&mut out).expect("writing to a Vec cannot fail");
+        out
+    }
+
     /// Absolute leaf positions this wallet holds, `[base_size, base_size + leaves.len())`.
     pub fn leaf_span(&self) -> (u64, u64) {
         (self.base_size, self.base_size + self.leaves.len() as u64)
     }
 
-    fn encode_checkpoint(&self, shared_upto: u64) -> Vec<u8> {
+    fn encode_checkpoint_parts(&self, shared_upto: u64) -> CheckpointEncoding<'_> {
         let n_shared = usize::try_from(shared_upto.saturating_sub(self.base_size)).unwrap_or(usize::MAX).min(self.leaves.len());
         let inline = &self.leaves[n_shared..];
-        let mut out = Vec::with_capacity(64 + inline.len() * 32 + self.notes.len() * 123);
+        let mut out = Vec::with_capacity(64 + self.notes.len() * 123);
         // Compact nullifiers need every id this wallet holds to be on disk BEFORE the blob that
         // names them: sync first, then refuse the compact form if any bit lies past it.
         let compact = match &self.nf_shared {
@@ -4413,10 +4495,8 @@ impl WalletDb {
             // follow inline, exactly as in v10, and every later section is unchanged.
             out.extend_from_slice(&(n_shared as u64).to_le_bytes());
         }
-        for leaf in inline {
-            // Canonical bytes, exactly what was written before the stream was held decoded.
-            out.extend_from_slice(&leaf.to_bytes());
-        }
+        // The inline leaves go here (canonical bytes), streamed by the writer.
+        let prefix = std::mem::take(&mut out);
         out.extend_from_slice(&(self.notes.len() as u64).to_le_bytes());
         for n in &self.notes {
             write_note(&mut out, n);
@@ -4527,7 +4607,7 @@ impl WalletDb {
         write_subtree_section(&mut ssec, &self.subtree);
         out.extend_from_slice(&(ssec.len() as u64).to_le_bytes());
         out.extend_from_slice(&ssec);
-        out
+        CheckpointEncoding { prefix, inline_leaves: inline, suffix: out }
     }
 
     /// Rebuild a wallet from its `seed` plus a checkpoint blob previously produced by
@@ -7431,6 +7511,61 @@ mod tests {
     /// Grafting an older snapshot's leaf stream un-strands the note: the base
     /// rolls back, the witness rebuilds, and its root matches a wallet that was
     /// never compacted at all.
+    /// The streamed form is byte-for-byte the buffered checkpoint, and loads.
+    #[test]
+    fn a_checkpoint_streams_as_the_same_bytes() {
+        let mine = [53u8; 32];
+        let mut db = WalletDb::from_seed(mine).unwrap();
+        for b in 0..6u8 {
+            db.ingest_block(&[coinbase_for(address_of(mine), &[b, 1, 1, 1], 1_000)], &[]);
+            db.ingest_block(&[coinbase_for(address_of([b.wrapping_add(140); 32]), &[b, 5, 5, 5], 77)], &[]);
+        }
+        for shared in [0u64, 3, db.size()] {
+            let parts = db.checkpoint_parts_sharing_leaves(shared);
+            let mut streamed = Vec::new();
+            parts.write_to(&mut streamed).unwrap();
+            assert_eq!(streamed.len(), parts.len());
+            let buffered = if shared == 0 { db.to_checkpoint() } else { db.to_checkpoint_sharing_leaves(shared) };
+            assert_eq!(streamed, buffered, "shared_upto={shared}");
+        }
+        let back = WalletDb::from_checkpoint(mine, &db.to_checkpoint()).unwrap();
+        assert_eq!(back.size(), db.size());
+        assert_eq!(back.notes().len(), db.notes().len());
+    }
+
+    /// A hosted wallet whose notes the shared tree witnesses keeps no leaves at all: the base
+    /// rolls past its notes, which are spendable (not stranded) while the floor covers them.
+    #[test]
+    fn a_wallet_the_shared_tree_serves_keeps_no_leaves_past_its_notes() {
+        let mine = [53u8; 32];
+        let mut db = WalletDb::from_seed(mine).unwrap();
+        for b in 0..10u8 {
+            db.ingest_block(&[coinbase_for(address_of(mine), &[b, 1, 1, 1], 1_000)], &[]);
+            db.ingest_block(&[coinbase_for(address_of([b.wrapping_add(140); 32]), &[b, 5, 5, 5], 77)], &[]);
+        }
+        assert_eq!(db.notes().len(), 10);
+        let tip = db.tip_frontier_state().unwrap();
+        // Without a floor the base never passes a note.
+        assert!(!db.rebase_past_notes_to(&tip));
+        assert!(!db.rebase_to(&tip));
+        // A floor above the oldest note does not cover it either.
+        db.set_shared_floor(Some(db.notes()[0].position + 1));
+        assert!(!db.rebase_past_notes_to(&tip));
+        db.set_shared_floor(Some(0));
+        assert!(db.rebase_past_notes_to(&tip));
+        assert_eq!(db.base_size(), db.size());
+        assert!(db.stranded_notes().is_empty(), "served by the shared tree, not stranded");
+        assert!(db.witness_path_at(db.notes()[0].position, db.size()).is_none(), "no leaves of its own");
+        assert_eq!(db.next_note_needing_witness(), None, "nothing to warm");
+        // The daemon lost its shared tree: the notes are stranded until it is back.
+        db.set_shared_floor(None);
+        assert_eq!(db.stranded_notes().len(), 10);
+        // New leaves keep arriving and new notes are held normally.
+        db.ingest_block(&[coinbase_for(address_of(mine), b"new1", 5_000)], &[]);
+        assert_eq!(db.notes().len(), 11);
+        assert!(db.notes()[10].position >= db.base_size());
+    }
+
     #[test]
     fn graft_history_restores_a_stranded_note() {
         let mine = [53u8; 32];

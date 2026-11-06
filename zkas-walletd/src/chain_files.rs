@@ -810,6 +810,9 @@ pub struct ChainFiles {
     /// reads everything from the node, so a poisoned source cannot be re-adopted by the
     /// rebuild it triggers.
     disabled: std::sync::atomic::AtomicBool,
+    /// Decoded segments held at once when any base is remote (see `LOADED_SEGMENTS`): a phone
+    /// keeps the default; a daemon sizes it to its memory (`with_remote_cap`).
+    remote_cap: usize,
     pub pages_served: AtomicU64,
     pub segments_loaded: AtomicU64,
     /// Bytes of segment files fetched this process, and how often each segment was fetched:
@@ -844,6 +847,16 @@ impl ChainFiles {
     /// `bases` is one or more comma-separated mirrors: `https://…` URLs or local directories
     /// holding `manifest-v2.json` (`MANIFEST_FILE`) and the files.
     pub fn new(bases: &str, genesis: RpcHash) -> Arc<Self> {
+        Self::with_remote_cap(bases, genesis, LOADED_SEGMENTS)
+    }
+
+    /// `new`, holding up to `remote_cap` decoded segments when the files come over HTTP. Four
+    /// (the default, a phone's) is 2 x READ_AHEAD: enough for one engine. A daemon's shared
+    /// chain tree reads ahead too, and every wallet catching up at its own height needs its
+    /// current and next segment; at four they evicted each other's and re-downloaded the same
+    /// 12 MB files on every page (measured 6 Nov: three wallets and the tree, 21 re-fetches of
+    /// segments 0-1 in two minutes, ~1 GB pulled from the CDN).
+    pub fn with_remote_cap(bases: &str, genesis: RpcHash, remote_cap: usize) -> Arc<Self> {
         let bases: Vec<String> =
             bases.split(',').map(|b| b.trim().trim_end_matches('/').to_string()).filter(|b| !b.is_empty()).collect();
         let http = bases
@@ -863,6 +876,7 @@ impl ChainFiles {
             sink: AtomicU64::new(0),
             epoch: std::time::Instant::now(),
             disabled: std::sync::atomic::AtomicBool::new(false),
+            remote_cap: remote_cap.max(LOADED_SEGMENTS),
             pages_served: AtomicU64::new(0),
             segments_loaded: AtomicU64::new(0),
             bytes_downloaded: AtomicU64::new(0),
@@ -1192,7 +1206,7 @@ impl ChainFiles {
         });
         let mut loaded = self.loaded.lock().unwrap();
         loaded.retain(|s| s.index != index);
-        insert_bounded(&mut loaded, seg, if self.all_local() { LOCAL_LOADED_SEGMENTS } else { LOADED_SEGMENTS });
+        insert_bounded(&mut loaded, seg, if self.all_local() { LOCAL_LOADED_SEGMENTS } else { self.remote_cap });
         self.segments_loaded.fetch_add(1, Ordering::Relaxed);
         Ok(n)
     }
@@ -1231,6 +1245,14 @@ fn insert_bounded(loaded: &mut VecDeque<Arc<Loaded>>, seg: Arc<Loaded>, cap: usi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_daemon_holds_more_remote_segments_than_a_phone() {
+        let g = RpcHash::from_bytes([9; 32]);
+        assert_eq!(ChainFiles::new("https://example.invalid", g).remote_cap, LOADED_SEGMENTS);
+        assert_eq!(ChainFiles::with_remote_cap("https://example.invalid", g, 24).remote_cap, 24);
+        assert_eq!(ChainFiles::with_remote_cap("https://example.invalid", g, 1).remote_cap, LOADED_SEGMENTS, "never below a phone's");
+    }
 
     #[test]
     fn a_boundary_built_from_a_frontier_reads_back_as_that_frontier() {

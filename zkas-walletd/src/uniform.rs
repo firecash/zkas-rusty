@@ -219,7 +219,7 @@ fn witness_inputs(
         let path = match paths.get(k).cloned().flatten() {
             Some(path) => path,
             None => tokio::task::block_in_place(|| e.db.witness_path_at(p, leaves))
-                .ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "matured note has no witness path"))?,
+                .ok_or_else(|| no_witness_err(&e.db, p))?,
         };
         out.push((note.note.clone(), path));
     }
