@@ -108,7 +108,12 @@ async fn create_invoice(
                 metadata: body.metadata.unwrap_or_default(),
                 idempotency_key,
             })
-            .map_err(|error| api_error(StatusCode::BAD_REQUEST, error.to_string()))?;
+            .map_err(|error| match error {
+                zkas_payment_gateway::GatewayError::IdempotencyMismatch => {
+                    api_error(StatusCode::CONFLICT, "this Idempotency-Key was used for a different order or amount")
+                }
+                error => api_error(StatusCode::BAD_REQUEST, error.to_string()),
+            })?;
         persist(&state.config.state_file, &gateway.snapshot()).map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
         invoice
     };
@@ -250,6 +255,12 @@ fn row_payments(row: &Value) -> Option<Vec<([u8; 43], u64)>> {
     (sum == total).then_some(parts)
 }
 
+/// When a payment happened: its block's time (walletd reports milliseconds), never later than
+/// now. Without one, now — the old behaviour.
+fn paid_at(row: &Value) -> u64 {
+    row.get("timestamp").and_then(Value::as_u64).map(|ms| ms / 1000).filter(|t| *t > 0).unwrap_or_else(now).min(now())
+}
+
 async fn poll_wallet(state: &AppState) -> Result<(), String> {
     // Fetch the tip first: without a real reference every payment would confirm
     // instantly (the old code fabricated `daa + 10_000` / `u64::MAX` as the
@@ -297,7 +308,7 @@ async fn poll_wallet(state: &AppState) -> Result<(), String> {
                 continue;
             };
             for (raw, amount) in parts {
-                if let Ok(Some(event)) = gateway.observe_payment(raw, txid, amount, daa, daa, tip_daa, now()) {
+                if let Ok(Some(event)) = gateway.observe_payment(raw, txid, amount, daa, daa, tip_daa, paid_at(row)) {
                     events.push(event);
                 }
             }
@@ -319,19 +330,34 @@ async fn poll_wallet(state: &AppState) -> Result<(), String> {
         }
         persist(&state.config.state_file, &gateway.snapshot())?;
     }
-    for event in events {
-        deliver_webhook(state, &event).await;
+    // In order, off the poll loop: a slow or dead endpoint must not stall payment detection.
+    if !events.is_empty() {
+        let state = state.clone();
+        tokio::spawn(async move {
+            for event in events {
+                deliver_webhook(&state, &event).await;
+            }
+        });
     }
     Ok(())
 }
 
+/// Delivered until the endpoint answers 2xx, a few times over about 20 minutes. Sent once and
+/// forgotten, one failed request (a deploy, a restart) left a paid order unpaid for good.
+/// Each attempt is signed afresh: receivers bound the signature's age.
 async fn deliver_webhook(state: &AppState, event: &WebhookEvent) {
     let Some(url) = state.config.webhook_url.as_ref() else { return };
     let Ok(body) = serde_json::to_vec(event) else { return };
-    let timestamp = now();
-    let signature = sign_webhook(state.config.webhook_secret.as_bytes(), timestamp, &body);
-    let _ =
-        state.http.post(url).header("content-type", "application/json").header("zkas-signature", signature).body(body).send().await;
+    for (attempt, wait) in [0u64, 5, 30, 120, 600, 600].into_iter().enumerate() {
+        tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+        let signature = sign_webhook(state.config.webhook_secret.as_bytes(), now(), &body);
+        match state.http.post(url).header("content-type", "application/json").header("zkas-signature", signature).body(body.clone()).send().await {
+            Ok(response) if response.status().is_success() => return,
+            Ok(response) => eprintln!("gateway webhook {} attempt {}: {}", event.id, attempt + 1, response.status()),
+            Err(error) => eprintln!("gateway webhook {} attempt {}: {error}", event.id, attempt + 1),
+        }
+    }
+    eprintln!("gateway webhook {} for invoice {} NOT delivered; the merchant must read the invoice", event.id, event.invoice.id);
 }
 
 fn config() -> Result<Config, String> {
@@ -370,7 +396,9 @@ async fn main() -> Result<(), String> {
         }
         Err(error) => return Err(error.to_string()),
     };
-    let state = AppState { config: config.clone(), gateway: Arc::new(Mutex::new(gateway)), http: reqwest::Client::new() };
+    // Bounded: a hung walletd or webhook endpoint must not wedge the observer.
+    let http = reqwest::Client::builder().timeout(std::time::Duration::from_secs(12)).build().map_err(|error| error.to_string())?;
+    let state = AppState { config: config.clone(), gateway: Arc::new(Mutex::new(gateway)), http };
     tokio::spawn(observer(state.clone()));
     let app = Router::new()
         .route("/health", get(|| async { Json(json!({"ok": true})) }))

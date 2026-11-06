@@ -100,6 +100,8 @@ pub enum GatewayError {
     UnknownInvoice,
     AddressMismatch,
     AmountOverflow,
+    /// The idempotency key names an invoice for a different order or amount.
+    IdempotencyMismatch,
 }
 
 impl core::fmt::Display for GatewayError {
@@ -144,7 +146,15 @@ impl Gateway {
         }
         if let Some(key) = request.idempotency_key.as_ref() {
             if let Some(id) = self.idempotency.get(key) {
-                return Ok(self.invoices[id].clone());
+                // A retry of the same request gets the same invoice. A key reused for another order
+                // or amount does NOT: handed the earlier invoice, a shop that changed the cart
+                // between attempts (WooCommerce reuses a pending order's id) took the earlier,
+                // smaller amount as payment for the larger order.
+                let existing = &self.invoices[id];
+                if existing.order_id != request.order_id || existing.amount_sompi != request.amount_sompi {
+                    return Err(GatewayError::IdempotencyMismatch);
+                }
+                return Ok(existing.clone());
             }
         }
         let index = self.next_diversifier;
@@ -197,7 +207,11 @@ impl Gateway {
         snapshot: GatewaySnapshot,
     ) -> Result<Self, GatewayError> {
         let mut gateway = Self::new(fvk, prefix, public_url)?;
-        gateway.next_diversifier = snapshot.next_diversifier;
+        // Never below an index already handed out: restored from an older copy of the state, the
+        // counter would give a new invoice the address of an existing one, and a payment to it
+        // would be credited to whichever invoice was mapped last.
+        let issued = snapshot.invoices.iter().map(|i| i.diversifier_index.saturating_add(1)).max().unwrap_or(1);
+        gateway.next_diversifier = snapshot.next_diversifier.max(issued);
         gateway.idempotency = snapshot.idempotency;
         for invoice in snapshot.invoices {
             let address = Address::try_from(invoice.address.as_str()).map_err(|_| GatewayError::AddressMismatch)?;
@@ -213,6 +227,11 @@ impl Gateway {
 
     /// Reconcile a decrypted received note. Duplicate transaction/invoice pairs
     /// are ignored, making scanner retries safe.
+    ///
+    /// `paid_at` is when the payment happened: the time of the block that carried it, in seconds.
+    /// It decides whether the payment was on time. (It used to be when the gateway first SAW the
+    /// payment, which is minutes later — the wallet publishes a payment only once it is settled —
+    /// and hours later after a gateway outage, so honest payments were judged late.)
     pub fn observe_payment(
         &mut self,
         recipient: [u8; 43],
@@ -221,7 +240,7 @@ impl Gateway {
         blue_score: u64,
         daa_score: u64,
         sink_blue_score: u64,
-        observed_at: u64,
+        paid_at: u64,
     ) -> Result<Option<WebhookEvent>, GatewayError> {
         let id = self.by_address.get(&recipient).cloned().ok_or(GatewayError::AddressMismatch)?;
         if !self.seen_transactions.insert((transaction_id, id.clone())) {
@@ -231,10 +250,14 @@ impl Gateway {
         invoice.paid_sompi = invoice.paid_sompi.checked_add(amount_sompi).ok_or(GatewayError::AmountOverflow)?;
         invoice.payments.push(Payment { transaction_id, amount_sompi, blue_score, daa_score });
         let old = invoice.status;
-        invoice.status = if old == InvoiceStatus::Expired || observed_at >= invoice.expires_at {
-            InvoiceStatus::PaidLate
-        } else {
-            payment_status(invoice, sink_blue_score)
+        invoice.status = match old {
+            // Settled stays settled: anyone can send an invoice's address a few sompi, and that
+            // flipped a confirmed invoice back to `paid` (not terminal) until it was deep. Extra
+            // money is recorded; `advance` lifts `Confirmed` to `Overpaid` once it is deep.
+            InvoiceStatus::Confirmed | InvoiceStatus::Overpaid | InvoiceStatus::PaidLate => old,
+            InvoiceStatus::Expired => InvoiceStatus::PaidLate,
+            _ if paid_at >= invoice.expires_at => InvoiceStatus::PaidLate,
+            _ => payment_status(invoice, sink_blue_score),
         };
         Ok((old != invoice.status).then(|| event("invoice.updated", invoice.clone(), invoice.created_at)))
     }
@@ -243,10 +266,19 @@ impl Gateway {
         let mut events = Vec::new();
         for invoice in self.invoices.values_mut() {
             let old = invoice.status;
-            if invoice.paid_sompi == 0 && now >= invoice.expires_at {
-                invoice.status = InvoiceStatus::Expired;
-            } else if invoice.paid_sompi >= invoice.amount_sompi {
-                invoice.status = payment_status(invoice, sink_blue_score);
+            match old {
+                // Late stays late. It used to be recomputed here like any funded invoice, so a full
+                // payment made after expiry became `Confirmed` in the same poll: the expiry, which
+                // protects a merchant from a stale exchange rate, protected nothing.
+                InvoiceStatus::PaidLate | InvoiceStatus::Overpaid | InvoiceStatus::Expired => {}
+                InvoiceStatus::Confirmed => {
+                    if invoice.paid_sompi > invoice.amount_sompi && payment_status(invoice, sink_blue_score) == InvoiceStatus::Overpaid {
+                        invoice.status = InvoiceStatus::Overpaid;
+                    }
+                }
+                _ if invoice.paid_sompi == 0 && now >= invoice.expires_at => invoice.status = InvoiceStatus::Expired,
+                _ if invoice.paid_sompi >= invoice.amount_sompi => invoice.status = payment_status(invoice, sink_blue_score),
+                _ => {}
             }
             if invoice.status != old {
                 events.push(event("invoice.updated", invoice.clone(), now));
@@ -296,10 +328,15 @@ impl Gateway {
             // Recompute rather than subtract: the sum is authoritative and cannot underflow.
             invoice.paid_sompi = invoice.payments.iter().map(|payment| payment.amount_sompi).sum();
             let old = invoice.status;
-            invoice.status = if invoice.paid_sompi == 0 {
-                if now >= invoice.expires_at { InvoiceStatus::Expired } else { InvoiceStatus::New }
-            } else {
-                payment_status(invoice, sink_blue_score)
+            invoice.status = match old {
+                // A shallow extra on a settled invoice went away; the invoice stays settled.
+                InvoiceStatus::Confirmed | InvoiceStatus::Overpaid => old,
+                InvoiceStatus::PaidLate if invoice.paid_sompi > 0 => old,
+                InvoiceStatus::PaidLate => InvoiceStatus::Expired,
+                _ if invoice.paid_sompi == 0 => {
+                    if now >= invoice.expires_at { InvoiceStatus::Expired } else { InvoiceStatus::New }
+                }
+                _ => payment_status(invoice, sink_blue_score),
             };
             if invoice.status != old {
                 events.push(event("invoice.updated", invoice.clone(), now));
@@ -448,6 +485,65 @@ mod tests {
         gateway.retract_absent_shallow(&HashSet::new(), 120, 1_400);
         assert_eq!(gateway.invoice(&invoice.id).unwrap().paid_sompi, 100, "a deep payment is never retracted");
         assert_eq!(gateway.invoice(&invoice.id).unwrap().status, InvoiceStatus::Confirmed);
+    }
+
+    fn raw_of(invoice: &Invoice) -> [u8; 43] {
+        Address::try_from(invoice.address.as_str()).unwrap().payload.as_slice().try_into().unwrap()
+    }
+
+    /// A full payment after expiry used to become `Confirmed` in the same poll.
+    #[test]
+    fn a_late_payment_stays_late() {
+        let mut gateway = gateway();
+        let invoice = gateway.create_invoice(request(None)).unwrap();
+        gateway.advance(2_000, 100);
+        assert_eq!(gateway.invoice(&invoice.id).unwrap().status, InvoiceStatus::Expired);
+        gateway.observe_payment(raw_of(&invoice), [6; 32], 100, 100, 100, 100, 2_000).unwrap();
+        assert_eq!(gateway.invoice(&invoice.id).unwrap().status, InvoiceStatus::PaidLate);
+        gateway.advance(2_100, 1_000);
+        assert_eq!(gateway.invoice(&invoice.id).unwrap().status, InvoiceStatus::PaidLate, "deep, still late");
+        // Paid in time (block time) but first seen after expiry: on time.
+        let ontime = gateway.create_invoice(CreateInvoice { order_id: "o2".into(), ..request(None) }).unwrap();
+        gateway.observe_payment(raw_of(&ontime), [7; 32], 100, 100, 100, 100, 1_899).unwrap();
+        assert_eq!(gateway.invoice(&ontime.id).unwrap().status, InvoiceStatus::Paid);
+        gateway.advance(5_000, 200);
+        assert_eq!(gateway.invoice(&ontime.id).unwrap().status, InvoiceStatus::Confirmed);
+    }
+
+    /// A stranger's sompi to a confirmed invoice's address flipped it back to `paid`.
+    #[test]
+    fn a_settled_invoice_is_not_reopened_by_more_money() {
+        let mut gateway = gateway();
+        let invoice = gateway.create_invoice(request(None)).unwrap();
+        let raw = raw_of(&invoice);
+        gateway.observe_payment(raw, [8; 32], 100, 100, 100, 200, 1_100).unwrap();
+        assert_eq!(gateway.invoice(&invoice.id).unwrap().status, InvoiceStatus::Confirmed);
+        gateway.observe_payment(raw, [9; 32], 1, 200, 200, 200, 1_200).unwrap();
+        assert_eq!(gateway.invoice(&invoice.id).unwrap().status, InvoiceStatus::Confirmed);
+        gateway.advance(1_300, 205);
+        assert_eq!(gateway.invoice(&invoice.id).unwrap().status, InvoiceStatus::Confirmed, "the extra is shallow");
+        gateway.advance(1_400, 300);
+        assert_eq!(gateway.invoice(&invoice.id).unwrap().status, InvoiceStatus::Overpaid);
+        assert_eq!(gateway.invoice(&invoice.id).unwrap().paid_sompi, 101);
+    }
+
+    #[test]
+    fn an_idempotency_key_reused_for_another_order_or_amount_is_refused() {
+        let mut gateway = gateway();
+        gateway.create_invoice(request(Some("k"))).unwrap();
+        assert_eq!(gateway.create_invoice(CreateInvoice { amount_sompi: 500, ..request(Some("k")) }), Err(GatewayError::IdempotencyMismatch));
+        assert_eq!(gateway.create_invoice(CreateInvoice { order_id: "other".into(), ..request(Some("k")) }), Err(GatewayError::IdempotencyMismatch));
+    }
+
+    #[test]
+    fn restoring_an_older_counter_never_reissues_an_address() {
+        let fvk = fvk_bytes_from_seed([7; 32]).unwrap();
+        let mut first = Gateway::new(&fvk, Prefix::Mainnet, "https://pay.zkas.info").unwrap();
+        let a = first.create_invoice(request(None)).unwrap();
+        let mut snap = first.snapshot();
+        snap.next_diversifier = 1;
+        let mut restored = Gateway::restore(&fvk, Prefix::Mainnet, "https://pay.zkas.info", snap).unwrap();
+        assert_ne!(restored.create_invoice(request(None)).unwrap().address, a.address);
     }
 
     #[test]

@@ -52,7 +52,10 @@ add_action('plugins_loaded', function () {
                 'timeout' => 20,
                 'headers' => array(
                     'Authorization' => 'Bearer ' . $this->get_option('api_key'),
-                    'Idempotency-Key' => 'woocommerce-' . $order_id,
+                    // The amount is part of the key: WooCommerce reuses a pending order's id when the
+                    // customer changes the cart, and the gateway must never hand back an invoice
+                    // for the earlier, smaller total.
+                    'Idempotency-Key' => 'woocommerce-' . $order_id . '-' . $sompi,
                     'Content-Type' => 'application/json',
                 ),
                 'body' => wp_json_encode($body),
@@ -66,7 +69,12 @@ add_action('plugins_loaded', function () {
                 wc_add_notice('The ZKAS gateway returned an invalid invoice.', 'error');
                 return array('result' => 'failure');
             }
+            if ((string) ($invoice['amountSompi'] ?? '') !== $sompi) {
+                wc_add_notice('The ZKAS gateway returned an invoice for a different amount.', 'error');
+                return array('result' => 'failure');
+            }
             $order->update_meta_data('_zkas_invoice_id', sanitize_text_field($invoice['id']));
+            $order->update_meta_data('_zkas_expected_sompi', $sompi);
             $order->update_status('on-hold', 'Waiting for ZKAS payment.');
             $order->save();
             wc_reduce_stock_levels($order_id);
@@ -92,12 +100,34 @@ add_action('rest_api_init', function () {
             if (abs(time() - (int) $matches[1]) > 300) return new WP_REST_Response(null, 401);
             $expected = hash_hmac('sha256', $matches[1] . '.' . $body, $settings['webhook_secret'] ?? '');
             if (!hash_equals($expected, $matches[2])) return new WP_REST_Response(null, 401);
-            $event = json_decode($body, true);
+            // Amounts arrive as JSON numbers; keep them exact.
+            $event = json_decode($body, true, 512, JSON_BIGINT_AS_STRING);
             $invoice = $event['invoice'] ?? array();
             $order_id = $invoice['orderId'] ?? null;
             $order = $order_id ? wc_get_order($order_id) : null;
             if (!$order || $order->get_meta('_zkas_invoice_id') !== ($invoice['id'] ?? '')) return new WP_REST_Response(null, 202);
-            if (in_array($invoice['status'] ?? '', array('confirmed', 'overpaid'), true) && !$order->is_paid()) {
+            $status = $invoice['status'] ?? '';
+            // Settle only what this order asked for: the invoice must be for the amount recorded when
+            // it was created, and at least that much must have arrived.
+            // (Orders placed before this check have no recorded amount and settle on status alone.)
+            $expected = (string) $order->get_meta('_zkas_expected_sompi');
+            $asked = (string) ($invoice['amountSompi'] ?? '');
+            $paid = (string) ($invoice['paidSompi'] ?? '');
+            $amount_ok = $expected === '' || ($asked === $expected
+                && ctype_digit($paid)
+                && (strlen($paid) > strlen($expected) || (strlen($paid) === strlen($expected) && strcmp($paid, $expected) >= 0)));
+            // An invoice that expired unpaid releases the stock this order holds.
+            if ($status === 'expired' && $paid === '0' && $order->has_status('on-hold')) {
+                $order->update_status('cancelled', 'ZKAS invoice expired unpaid.');
+                return new WP_REST_Response(null, 200);
+            }
+            if ($status === 'paid_late' && !$order->is_paid()) {
+                $order->add_order_note('ZKAS payment arrived after the invoice expired: check the amount and refund or complete by hand. Invoice ' . sanitize_text_field($invoice['id']));
+            }
+            if (in_array($status, array('confirmed', 'overpaid'), true) && !$order->is_paid() && !$amount_ok) {
+                $order->add_order_note('ZKAS webhook for invoice ' . sanitize_text_field($invoice['id'] ?? '') . ' does not match this order\'s amount; not completed.');
+            }
+            if (in_array($status, array('confirmed', 'overpaid'), true) && !$order->is_paid() && $amount_ok) {
                 $tx = $invoice['payments'][0]['transactionId'] ?? 'ZKAS';
                 if (is_array($tx)) $tx = implode('', array_map(function ($byte) { return sprintf('%02x', $byte); }, $tx));
                 $order->payment_complete($tx);
