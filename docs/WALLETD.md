@@ -191,7 +191,7 @@ The daemon raises any fee you pass to this floor automatically (`chunk_fee`). Pa
 
 | Flag | Notes |
 | --- | --- |
-| `--uniform-v1`, `--uniform-hold immediate\|standard\|private`, `--uniform-internal-change`, `--uniform-merge` | Uniform transactions: every send, payout and merge takes one public shape (4 actions, fixed fee 0.031178 ZKAS, epoch anchor) and is released at a scheduled random time. Opt-in; changes fees and latency of the standard endpoints. The `/api/wallet/uniform/*` endpoints work without it. |
+| `--uniform-v1`, `--uniform-hold immediate\|standard\|private`, `--uniform-internal-change`, `--uniform-merge` | Uniform transactions: every send, payout and merge takes one public shape (4 actions, fixed fee 0.031178 ZKAS, epoch anchor) and is released at a scheduled random time. Opt-in; changes fees and latency of the standard endpoints, which keep their request ids, fee ceiling and answers (§4). The `/api/wallet/uniform/*` endpoints work without it. |
 | `--shared-scan-engine`, `--engine-*` | The multi-wallet scan engine (one trial-decryption pass for a cohort of wallets). Under evaluation; leave off in production. |
 
 The runtime deliberately oversubscribes worker threads (2 × cores): trial decryption and
@@ -331,7 +331,7 @@ amount and fee before signing, so a dishonest service cannot redirect funds. See
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `POST` | `/api/wallet/uniform/send`, `/uniform/send_many`, `/uniform/consolidate` | Uniform-shape payments released at a scheduled time. |
+| `POST` | `/api/wallet/uniform/send`, `/uniform/send_many`, `/uniform/consolidate` | Uniform-shape payments released at a scheduled time. They take no `request_id`, and without `"wait": true` they answer as soon as the payment is scheduled (`status: "scheduled"`, no txid). A scheduled transaction reports `released`, `outcome_unknown` (sent, answer lost: it may land) or `failed`. Exchanges use `/send` and `/send_many` instead. |
 | `GET` | `/api/wallet/uniform/scheduled`, `/api/uniform/anchor` | Scheduled releases and the wallet's current uniform anchor. |
 | `GET` / `POST` | `/api/bundle/offer`, `/api/bundle/prepare`, `/api/bundle/submit` | Multi-party atomic bundles; served only with `--enable-multiparty`. |
 
@@ -990,8 +990,8 @@ transaction; its **`credits[]`** array has one entry per output that paid this w
 
 1. **Attribute from `credits[]`, never from the row's top-level fields.** One transaction can
    pay several of your customers (a payer settling two invoices, another exchange's batched
-   payout); the row's `amountSompi` is then their **sum** and its `recipient` only the
-   **first** address.
+   payout); the row's `amountSompi` is then their **sum**, and its `recipient` is `null`
+   (daemons before 6 November 2026 named the **first** address there).
 2. **Use `amountSompiExact`** (a decimal string). The numeric `amountSompi` is a JSON number,
    which JavaScript and many JSON libraries round above 2^53 sompi.
 3. **Check the row before crediting it:** the credits must sum to the row's `amountSompiExact`.

@@ -7191,6 +7191,24 @@ fn fingerprint_amount(sompi: Option<u64>, fc: Option<f64>) -> String {
     }
 }
 
+/// What a custodial `/send` pays, for its record key (shared by the uniform route).
+fn send_fingerprint(req: &SendReq) -> String {
+    payment_fingerprint(&[req.to.trim().to_string(), fingerprint_amount(req.amount_sompi, req.amount_fc)])
+}
+
+/// What a custodial `/send_many` pays, for its record key (shared by the uniform route).
+fn send_many_fingerprint(payees: &[Payee]) -> String {
+    payment_fingerprint(
+        &payees
+            .iter()
+            .map(|p| {
+                let sompi = p.amount_sompi.as_ref().and_then(|a| a.parse("amount_sompi").ok());
+                format!("{}|{}", p.to.trim(), fingerprint_amount(sompi, p.amount_fc))
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
 /// The record for `key`, or for the same request recorded before keys carried a fingerprint
 /// (records live 24 h, so a retry across the upgrade still finds its payment).
 fn sent_request(key: &str) -> Option<SendResp> {
@@ -11661,6 +11679,12 @@ async fn wallet_history(
 }
 
 /// `/api/wallet/history` for one wallet entry (see [`balance_resp`]).
+/// The address a history row names: its own, unless its credits went to several addresses.
+fn row_recipient(h: &kaspa_shielded_core::walletdb::HistoryEntry) -> Option<[u8; 43]> {
+    let several = h.kind != HistoryKind::Sent && h.credits.iter().any(|c| c.recipient != h.credits[0].recipient);
+    if several { None } else { h.recipient }
+}
+
 fn history_json(prefix: Prefix, e: &WalletEntry, limit: Option<usize>, offset: Option<usize>) -> serde_json::Value {
     let history_page = limit.unwrap_or(500).clamp(1, 5_000);
     let offset = offset.unwrap_or(0);
@@ -11687,7 +11711,11 @@ fn history_json(prefix: Prefix, e: &WalletEntry, limit: Option<usize>, offset: O
                     "feeSompi": h.fee,
                     "feeSompiExact": h.fee.to_string(),
                     "feeKnown": h.fee_known,
-                    "recipient": h.recipient.map(|r| String::from(&Address::new(prefix, Version::ShieldedOrchard, &r))),
+                    // Null when the transaction paid more than one of this wallet's addresses: the
+                    // row's amount is then their sum, and naming the first address invited a
+                    // client to credit all of it there (another customer's deposit). `credits`
+                    // attributes each part.
+                    "recipient": row_recipient(h).map(|r| String::from(&Address::new(prefix, Version::ShieldedOrchard, &r))),
                     "memo": (!h.memo.is_empty()).then(|| String::from_utf8_lossy(&h.memo).into_owned()),
                     // Per-output breakdown. `recipient`/`amountSompi` stay exactly
                     // as they were for every existing client; a caller that must
@@ -12400,8 +12428,7 @@ async fn wallet_send(
     let _spending = gate.lock().await;
     // Under the per-wallet send gate, so a retry racing its original waits for it and then
     // finds it here. Keyed by the wallet token (custodial: the token is the wallet).
-    let what = payment_fingerprint(&[req.to.trim().to_string(), fingerprint_amount(req.amount_sompi, req.amount_fc)]);
-    let request_key = req.request_id.as_deref().and_then(|id| sent_request_key(&format!("custodial:{token}"), id, &what));
+    let request_key = req.request_id.as_deref().and_then(|id| sent_request_key(&format!("custodial:{token}"), id, &send_fingerprint(&req)));
     if let Some(done) = request_key.as_deref().and_then(sent_request) {
         log::info!("send: request already broadcast as {}; returning it instead of paying again", done.txid);
         return Err((
@@ -12907,16 +12934,8 @@ async fn wallet_send_many(
     // not select the same notes.
     let gate = state.send_gate(&token).await;
     let _spending = gate.lock().await;
-    let what = payment_fingerprint(
-        &req.payees
-            .iter()
-            .map(|p| {
-                let sompi = p.amount_sompi.as_ref().and_then(|a| a.parse("amount_sompi").ok());
-                format!("{}|{}", p.to.trim(), fingerprint_amount(sompi, p.amount_fc))
-            })
-            .collect::<Vec<_>>(),
-    );
-    let request_key = req.request_id.as_deref().and_then(|id| sent_request_key(&format!("custodial-many:{token}"), id, &what));
+    let request_key =
+        req.request_id.as_deref().and_then(|id| sent_request_key(&format!("custodial-many:{token}"), id, &send_many_fingerprint(&req.payees)));
     if let Some(done) = request_key.as_deref().and_then(sent_request) {
         log::info!("send_many: request already broadcast as {}; returning it instead of paying again", done.txid);
         return Err((
@@ -18081,6 +18100,37 @@ mod sdk_api_tests {
         let legacy = ka.rsplit_once('#').unwrap().0.to_string();
         record_sent_request(legacy.replace("rid-1", "rid-legacy"), &resp);
         assert!(sent_request(&sent_request_key(&fvk_a, "rid-legacy", &pay).unwrap()).is_some());
+    }
+
+    #[test]
+    fn a_history_row_paying_several_of_our_addresses_names_none_of_them() {
+        use kaspa_shielded_core::walletdb::{Credit, HistoryEntry};
+        let (a, b) = ([1u8; 43], [2u8; 43]);
+        let credit = |r: [u8; 43], v: u64| Credit { recipient: r, value: v, memo: Vec::new() };
+        let row = |kind, credits: Vec<Credit>| HistoryEntry {
+            kind,
+            txid: [9; 32],
+            daa_score: 1,
+            timestamp_ms: 1,
+            amount: credits.iter().map(|c| c.value).sum(),
+            fee: 0,
+            amount_is_net_outflow: false,
+            fee_known: true,
+            recipient: credits.first().map(|c| c.recipient),
+            memo: Vec::new(),
+            credits,
+        };
+        // Two customers in one transaction: the row's 5000 is their sum, so it names nobody.
+        assert_eq!(row_recipient(&row(HistoryKind::Received, vec![credit(a, 1000), credit(b, 4000)])), None);
+        // Every part to one address, or one part: the address is the row's, as before.
+        assert_eq!(row_recipient(&row(HistoryKind::Received, vec![credit(a, 1000), credit(a, 4000)])), Some(a));
+        assert_eq!(row_recipient(&row(HistoryKind::Received, vec![credit(a, 1000)])), Some(a));
+        // No breakdown (an old row, a compact-only receipt before recovery): unchanged.
+        let mut old = row(HistoryKind::Received, vec![]);
+        old.recipient = Some(a);
+        assert_eq!(row_recipient(&old), Some(a));
+        // A send's credits are its payees; that row is untouched.
+        assert_eq!(row_recipient(&row(HistoryKind::Sent, vec![credit(a, 1), credit(b, 2)])), Some(a));
     }
 
     #[test]

@@ -305,7 +305,9 @@ pub(crate) struct JobView {
     pub release_at_ms: u64,
     pub amount_sompi: u64,
     pub fee_sompi: u64,
-    /// scheduled | released | failed
+    /// scheduled | released | outcome_unknown | failed. `outcome_unknown`: the connection to the
+    /// node failed while it received the transaction (`txid` is set); its coins stay parked and
+    /// come back on their own if it never lands. Never read it as "not paid".
     pub status: &'static str,
     pub txid: Option<String>,
     pub reproved: u32,
@@ -355,8 +357,25 @@ struct Release {
     shape: SendShape,
 }
 
+/// A released transaction: accepted by the node, or broadcast with its answer lost
+/// ([`Submitted::presumed`]) — which may have paid, so it is never reported as a refusal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Released {
+    Sent(String),
+    Unknown(String),
+}
+
+impl Released {
+    fn txid(&self) -> &str {
+        match self {
+            Released::Sent(t) | Released::Unknown(t) => t,
+        }
+    }
+}
+
 /// Release one job at its time: re-prove if the anchor epoch rolled (W5), submit, park the notes.
-async fn release_one(r: &Release, id: &str, mut job: Job) -> Result<String, String> {
+/// `Err` only when nothing went out (a refusal, or a failure before the broadcast).
+async fn release_one(r: &Release, id: &str, mut job: Job) -> Result<Released, String> {
     let wait = job.release_at_ms.saturating_sub(now_ms());
     if wait > 0 {
         tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
@@ -402,12 +421,16 @@ async fn release_one(r: &Release, id: &str, mut job: Job) -> Result<String, Stri
             unreserve(&mut e, &job.positions);
             e.db.note_pending_outflow(accepted.as_bytes(), pay.saturating_add(UNIFORM_FEE_V1));
             e.forget_stale_outflow_previews();
+            // Saved promptly: a restart must not forget the parked coins.
+            e.force_checkpoint = true;
             if presumed {
                 // Its coins stay parked (returned by the reclaim if it never lands): releasing them
                 // as for a refusal would let the next payment spend coins that may already be gone.
-                return Err(format!("outcome unknown: the connection to the node failed while sending transaction {accepted}; check History"));
+                // Nor is it a failure: a caller told "failed" pays again while this one may land.
+                log::warn!("uniform: OUTCOME UNKNOWN for scheduled tx {id} ({accepted}): the connection to the node failed while sending it");
+                return Ok(Released::Unknown(accepted.to_string()));
             }
-            Ok(accepted.to_string())
+            Ok(Released::Sent(accepted.to_string()))
         }
         Err(err) => {
             let mut e = r.w.lock().await;
@@ -418,7 +441,7 @@ async fn release_one(r: &Release, id: &str, mut job: Job) -> Result<String, Stri
 }
 
 /// Run a schedule in release order; returns `(job index, txid or error)` for each.
-async fn run_schedule(r: Release, ids: Vec<String>, jobs: Vec<Job>) -> Vec<(usize, Result<String, String>)> {
+async fn run_schedule(r: Release, ids: Vec<String>, jobs: Vec<Job>) -> Vec<(usize, Result<Released, String>)> {
     let mut order: Vec<(usize, Job)> = jobs.into_iter().enumerate().collect();
     order.sort_by_key(|(_, j)| j.release_at_ms);
     let mut out = Vec::with_capacity(order.len());
@@ -427,9 +450,14 @@ async fn run_schedule(r: Release, ids: Vec<String>, jobs: Vec<Job>) -> Vec<(usiz
     for (i, job) in order {
         let res = release_one(&r, &ids[i], job).await;
         match &res {
-            Ok(txid) => update_view(&r.token, &ids[i], |v| {
+            Ok(Released::Sent(txid)) => update_view(&r.token, &ids[i], |v| {
                 v.status = "released";
                 v.txid = Some(txid.clone());
+            }),
+            Ok(Released::Unknown(txid)) => update_view(&r.token, &ids[i], |v| {
+                v.status = "outcome_unknown";
+                v.txid = Some(txid.clone());
+                v.error = Some("the connection to the node failed while sending it; it may still land".into());
             }),
             Err(e) => {
                 log::warn!("uniform: scheduled tx {} failed: {e}", ids[i]);
@@ -460,7 +488,7 @@ async fn build_and_schedule(
     choice: AnchorChoice,
     planned: Vec<Planned>,
     wait: bool,
-) -> Result<(Vec<JobView>, Option<Vec<(usize, Result<String, String>)>>), (StatusCode, Json<serde_json::Value>)> {
+) -> Result<(Vec<JobView>, Option<Vec<(usize, Result<Released, String>)>>), (StatusCode, Json<serde_json::Value>)> {
     let net: [u8; 32] = rel.state.genesis.as_bytes();
     let ctx = payment_tx_context();
     let mut jobs = Vec::with_capacity(planned.len());
@@ -614,6 +642,93 @@ fn plan_one(candidates: &[&OwnedNote], used: &HashSet<u64>, amount: u64) -> Resu
     Ok(plan.siblings.iter().map(|s| (s.notes.iter().map(|&i| order[i].position).collect(), s.amount)).collect())
 }
 
+/// What the legacy `/send` and `/send_many` bring to a uniform spend that the uniform endpoints do
+/// not: the caller's request id (as the record key, see `sent_request_key`) and its fee ceiling.
+#[derive(Default)]
+pub(crate) struct LegacyTerms {
+    pub request_key: Option<String>,
+    pub max_total_fee: Option<u64>,
+}
+
+impl LegacyTerms {
+    /// Under the wallet's send gate: a retry racing its original waits for it, then finds it here.
+    fn refuse_if_sent(&self, what: &str) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+        if let Some(done) = self.request_key.as_deref().and_then(sent_request) {
+            log::info!("uniform {what}: request already broadcast as {}; returning it instead of paying again", done.txid);
+            return Err((
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": format!("this {what} was already sent (transaction {})", done.txid), "already_sent": done })),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Refused before anything is reserved or proved, as the legacy paths refuse it.
+    fn check_fee(&self, txs: usize, what: &str) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+        let planned_fee = UNIFORM_FEE_V1.saturating_mul(txs as u64);
+        match self.max_total_fee {
+            Some(cap) if planned_fee > cap => Err(err(
+                StatusCode::CONFLICT,
+                format!(
+                    "this {what} needs {txs} uniform transactions and would pay {planned_fee} sompi in fees, over the {cap} sompi \
+                     ceiling; consolidate first or raise max_total_fee"
+                ),
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    /// Remember what went out (accepted or possibly accepted), so a retry is answered, never paid
+    /// again. Nothing is recorded when nothing went out: a retry then pays, as it must.
+    fn record(&self, txids: &[String], sent: u64) {
+        if let (Some(k), Some(first)) = (self.request_key.as_ref(), txids.first()) {
+            let fee = UNIFORM_FEE_V1.saturating_mul(txids.len() as u64);
+            record_sent_request(
+                k.clone(),
+                &SendResp {
+                    txid: first.clone(),
+                    amount_sompi: sent,
+                    fee_sompi: fee,
+                    amount_sompi_exact: sent.to_string(),
+                    fee_sompi_exact: fee.to_string(),
+                    txids: txids.to_vec(),
+                    tx_count: txids.len(),
+                },
+            );
+        }
+    }
+}
+
+/// The outcome of a waited-for schedule, in release order: every transaction that went out or may
+/// have (`txids`, with `sent` their amounts), the first whose answer was lost, the first refusal.
+struct Settled {
+    txids: Vec<String>,
+    sent: u64,
+    unknown: Option<String>,
+    refused: Option<String>,
+}
+
+fn settle(views: &[JobView], results: &[(usize, Result<Released, String>)]) -> Settled {
+    let mut out = Settled { txids: Vec::new(), sent: 0, unknown: None, refused: None };
+    for (i, res) in results {
+        match res {
+            Ok(rel) => {
+                out.txids.push(rel.txid().to_string());
+                out.sent = out.sent.saturating_add(views.get(*i).map_or(0, |v| v.amount_sompi));
+                if let (Released::Unknown(t), None) = (rel, &out.unknown) {
+                    out.unknown = Some(t.clone());
+                }
+            }
+            Err(e) => {
+                if out.refused.is_none() {
+                    out.refused = Some(e.clone());
+                }
+            }
+        }
+    }
+    out
+}
+
 pub(crate) async fn send_core(
     state: Arc<AppState>,
     headers: HeaderMap,
@@ -622,6 +737,7 @@ pub(crate) async fn send_core(
     memo: [u8; 512],
     hold: HoldMode,
     wait: bool,
+    terms: LegacyTerms,
 ) -> Result<USendResp, (StatusCode, Json<serde_json::Value>)> {
     if amount == 0 {
         return Err(err(StatusCode::BAD_REQUEST, "amount must be positive"));
@@ -631,6 +747,7 @@ pub(crate) async fn send_core(
     let (token, w, seed, recoverable) = custodial_front(&state, &headers).await?;
     let gate = state.send_gate(&token).await;
     let _spending = gate.lock().await;
+    terms.refuse_if_sent("payment")?;
     await_consolidation_clear().await;
     build_send_cache_off_lock(&state, &token, &w).await;
     let choice = pick_anchor_waiting(&w).await?;
@@ -646,6 +763,7 @@ pub(crate) async fn send_core(
             Err(UniformPlanError::NeedsConsolidation { siblings }) => return Err(needs_consolidation(&token, siblings, amount)),
             Err(e) => return Err(err(StatusCode::CONFLICT, format!("{e} (funds must be ~10 min old to spend)"))),
         };
+        terms.check_fee(siblings.len(), "payment")?;
         let times = sibling_release_times(siblings.len(), confirmed, lambda_now(), hold, &mut os_u64);
         let last = *times.last().unwrap_or(&confirmed);
         let positions: Vec<u64> = siblings.iter().flat_map(|s| s.0.clone()).collect();
@@ -670,14 +788,27 @@ pub(crate) async fn send_core(
     let (views, results) = build_and_schedule(rel, choice, planned, wait).await?;
     let txids = match results {
         Some(r) => {
-            if let Some((_, Err(e))) = r.iter().find(|x| x.1.is_err()) {
-                let sent: Vec<String> = r.iter().filter_map(|x| x.1.as_ref().ok().cloned()).collect();
+            let o = settle(&views, &r);
+            terms.record(&o.txids, o.sent);
+            // A lost answer first: whatever else happened, the caller must not pay this again.
+            if let Some(t) = &o.unknown {
+                let mut body = submit_outcome_unknown_body(t, "payment");
+                body["txids"] = serde_json::json!(o.txids);
+                body["sent_sompi"] = serde_json::json!(o.sent);
+                return Err((StatusCode::GATEWAY_TIMEOUT, Json(body)));
+            }
+            if let Some(e) = &o.refused {
                 return Err((
                     StatusCode::BAD_GATEWAY,
-                    Json(serde_json::json!({ "error": format!("payment partially sent: {}/{k} txs accepted: {e}", sent.len()), "txids": sent })),
+                    Json(serde_json::json!({
+                        "error": format!("payment partially sent: {}/{k} txs accepted: {e}", o.txids.len()),
+                        "txids": o.txids,
+                        "sent_sompi": o.sent,
+                        "sent_sompi_exact": o.sent.to_string(),
+                    })),
                 ));
             }
-            r.into_iter().filter_map(|x| x.1.ok()).collect()
+            o.txids
         }
         None => Vec::new(),
     };
@@ -701,7 +832,7 @@ pub(crate) async fn send(
     let amount = parse_amount(req.amount_sompi.as_ref(), req.amount_fc)?;
     let memo = memo_bytes(req.memo.as_deref())?;
     let hold = parse_hold(req.hold.as_deref())?;
-    send_core(state, headers, req.to, amount, memo, hold, req.wait.unwrap_or(false)).await.map(Json)
+    send_core(state, headers, req.to, amount, memo, hold, req.wait.unwrap_or(false), LegacyTerms::default()).await.map(Json)
 }
 
 /// The legacy `/api/wallet/send` under `uniform_v1`: same request, same response, Stage W inside.
@@ -714,12 +845,12 @@ pub(crate) async fn legacy_send(state: Arc<AppState>, headers: HeaderMap, req: S
         (None, None) => return Err(err(StatusCode::BAD_REQUEST, "specify amount_sompi or amount_fc")),
     };
     let memo = memo_bytes(req.memo.as_deref())?;
-    let r = send_core(state, headers, req.to, amount, memo, uniform_policy().hold, true).await?;
-    if let Some(cap) = req.max_total_fee {
-        if r.total_fee_sompi > cap {
-            log::warn!("uniform legacy send: fee {} above the caller's ceiling {cap} (already sent)", r.total_fee_sompi);
-        }
-    }
+    // The same record key as `wallet_send`, so the request id keeps its meaning whichever mode the
+    // daemon runs in (and across a switch between them).
+    let token = token_from(&headers, state.allow_default_token)?;
+    let request_key = req.request_id.as_deref().and_then(|id| sent_request_key(&format!("custodial:{token}"), id, &send_fingerprint(&req)));
+    let terms = LegacyTerms { request_key, max_total_fee: req.max_total_fee };
+    let r = send_core(state, headers, req.to, amount, memo, uniform_policy().hold, true, terms).await?;
     Ok(Json(SendResp {
         txid: r.txids.first().cloned().unwrap_or_default(),
         amount_sompi: amount,
@@ -754,7 +885,8 @@ pub(crate) async fn send_many_core(
     payees: Vec<Payee>,
     window_ms: u64,
     wait: bool,
-) -> Result<(USendManyResp, Vec<Option<String>>, Vec<String>), (StatusCode, Json<serde_json::Value>)> {
+    terms: LegacyTerms,
+) -> Result<(USendManyResp, ManyOutcome), (StatusCode, Json<serde_json::Value>)> {
     if payees.is_empty() {
         return Err(err(StatusCode::BAD_REQUEST, "payees must not be empty"));
     }
@@ -771,6 +903,7 @@ pub(crate) async fn send_many_core(
     let (token, w, seed, recoverable) = custodial_front(&state, &headers).await?;
     let gate = state.send_gate(&token).await;
     let _spending = gate.lock().await;
+    terms.refuse_if_sent("payout")?;
     await_consolidation_clear().await;
     build_send_cache_off_lock(&state, &token, &w).await;
     let choice = pick_anchor_waiting(&w).await?;
@@ -801,6 +934,7 @@ pub(crate) async fn send_many_core(
                 });
             }
         }
+        terms.check_fee(planned.len(), "payout")?;
         // i.i.d. uniform times over the window, assigned in a random order: no tick gates a send.
         let times = schedule::release_times(planned.len(), start, start.saturating_add(window_ms), &mut os_u64);
         let mut slots: Vec<(u64, usize)> = (0..planned.len()).map(|i| (os_u64(), i)).collect();
@@ -815,18 +949,21 @@ pub(crate) async fn send_many_core(
     let payee_of: Vec<usize> = planned.iter().map(|p| p.payee_index[0]).collect();
     let rel = Release { state: state.clone(), w: w.clone(), token, seed, recoverable, shape: uniform_policy().shape() };
     let (views, results) = build_and_schedule(rel, choice, planned, wait).await?;
-    // A payee is paid once EVERY transaction carrying its payment is accepted.
+    // A payee is paid once EVERY transaction carrying its payment went out. One whose answer was
+    // lost counts as out: reported unpaid, its payee would be paid again while it may still land.
     let mut paid: Vec<Option<String>> = vec![None; resolved.len()];
     let mut failed = vec![false; resolved.len()];
-    let mut all_txids = Vec::new();
+    let mut sent_to = vec![0u64; resolved.len()];
+    let mut outcome = ManyOutcome::default();
     if let Some(r) = &results {
         for (ji, res) in r {
             match res {
-                Ok(t) => {
-                    all_txids.push(t.clone());
+                Ok(rel) => {
+                    let t = rel.txid().to_string();
                     if paid[payee_of[*ji]].is_none() {
                         paid[payee_of[*ji]] = Some(t.clone());
                     }
+                    sent_to[payee_of[*ji]] = sent_to[payee_of[*ji]].saturating_add(views.get(*ji).map_or(0, |v| v.amount_sompi));
                 }
                 Err(_) => failed[payee_of[*ji]] = true,
             }
@@ -836,6 +973,9 @@ pub(crate) async fn send_many_core(
                 paid[i] = None;
             }
         }
+        let o = settle(&views, r);
+        terms.record(&o.txids, o.sent);
+        outcome = ManyOutcome { paid: paid.clone(), sent_to, txids: o.txids, unknown: o.unknown, refused: o.refused.is_some() };
     }
     let payee_txids = resolved
         .iter()
@@ -848,7 +988,22 @@ pub(crate) async fn send_many_core(
         })
         .collect();
     let total_fee = UNIFORM_FEE_V1 * views.len() as u64;
-    Ok((USendManyResp { transactions: views, payee_txids, total_fee_sompi: total_fee }, paid, all_txids))
+    Ok((USendManyResp { transactions: views, payee_txids, total_fee_sompi: total_fee }, outcome))
+}
+
+/// What a waited-for payout did, per payee and overall (see [`send_many_core`]).
+#[derive(Default)]
+pub(crate) struct ManyOutcome {
+    /// The payee's first transaction, when every one carrying its payment went out.
+    paid: Vec<Option<String>>,
+    /// What went out to each payee, including the part of one paid only in part.
+    sent_to: Vec<u64>,
+    /// Every transaction that went out or may have, in release order.
+    txids: Vec<String>,
+    /// The first transaction whose answer was lost.
+    unknown: Option<String>,
+    /// Some transaction was refused (nothing of it went out).
+    refused: bool,
 }
 
 /// `POST /api/wallet/uniform/send_many`.
@@ -860,7 +1015,7 @@ pub(crate) async fn send_many(
     // Clamped: a caller-chosen window feeds `start + window_ms` and the reservation length, and
     // release builds trap on overflow. A day is far beyond any payout schedule.
     let window = req.release_window_s.map(|s| s.min(MAX_RELEASE_WINDOW_S).saturating_mul(1_000)).unwrap_or(DESK_RELEASE_WINDOW_MS);
-    send_many_core(state, headers, req.payees, window, req.wait.unwrap_or(false)).await.map(|(r, _, _)| Json(r))
+    send_many_core(state, headers, req.payees, window, req.wait.unwrap_or(false), LegacyTerms::default()).await.map(|(r, _)| Json(r))
 }
 
 /// The legacy `/api/wallet/send_many` under `uniform_v1` (the OTC desk's call): one payee per
@@ -870,12 +1025,34 @@ pub(crate) async fn legacy_send_many(
     headers: HeaderMap,
     req: SendManyReq,
 ) -> Result<Json<SendManyResp>, (StatusCode, Json<serde_json::Value>)> {
-    let (r, paid, txids) = send_many_core(state, headers, req.payees, DESK_RELEASE_WINDOW_MS, true).await?;
+    // The same record key as `wallet_send_many` (see `legacy_send`).
+    let token = token_from(&headers, state.allow_default_token)?;
+    let request_key =
+        req.request_id.as_deref().and_then(|id| sent_request_key(&format!("custodial-many:{token}"), id, &send_many_fingerprint(&req.payees)));
+    let max_total_fee = req.max_total_fee.as_ref().map(|c| c.parse("max_total_fee")).transpose()?;
+    let (r, o) = send_many_core(state, headers, req.payees, DESK_RELEASE_WINDOW_MS, true, LegacyTerms { request_key, max_total_fee }).await?;
     let paid_sompi: u64 = r.payee_txids.iter().filter(|p| p.txid.is_some()).map(|p| p.amount_sompi).sum();
-    if paid.iter().any(|p| p.is_none()) {
+    let txids = o.txids;
+    if let Some(t) = &o.unknown {
+        let mut body = submit_outcome_unknown_body(t, "payout");
+        body["txids"] = serde_json::json!(txids);
+        body["paid_sompi"] = serde_json::json!(paid_sompi);
+        body["payee_txids"] = serde_json::json!(r.payee_txids);
+        body["payee_sent_sompi"] = serde_json::json!(o.sent_to);
+        return Err((StatusCode::GATEWAY_TIMEOUT, Json(body)));
+    }
+    if o.refused || o.paid.iter().any(|p| p.is_none()) {
         return Err((
             StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({ "error": "payout partially sent", "txids": txids, "paid_sompi": paid_sompi, "payee_txids": r.payee_txids })),
+            Json(serde_json::json!({
+                "error": "payout partially sent",
+                "txids": txids,
+                "paid_sompi": paid_sompi,
+                "payee_txids": r.payee_txids,
+                // A payee split over several transactions can be paid in part: its txid is null
+                // but this says what it did receive.
+                "payee_sent_sompi": o.sent_to,
+            })),
         ));
     }
     Ok(Json(SendManyResp {
@@ -941,7 +1118,8 @@ async fn merge_once(state: &Arc<AppState>, w: &Wallet, token: &str, urgent_amoun
     let rel = Release { state: state.clone(), w: w.clone(), token: token.to_string(), seed, recoverable, shape: uniform_policy().shape() };
     let (_, results) = build_and_schedule(rel, choice, planned, true).await?;
     let txid = match results.and_then(|mut r| r.pop()).map(|x| x.1) {
-        Some(Ok(t)) => t,
+        Some(Ok(Released::Sent(t))) => t,
+        Some(Ok(Released::Unknown(t))) => return Err((StatusCode::GATEWAY_TIMEOUT, Json(submit_outcome_unknown_body(&t, "consolidation")))),
         Some(Err(e)) => return Err(err(StatusCode::BAD_GATEWAY, e)),
         None => return Err(err(StatusCode::INTERNAL_SERVER_ERROR, "merge did not run")),
     };
@@ -1082,6 +1260,57 @@ pub(crate) async fn merge_loop(state: Arc<AppState>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn view(amount: u64) -> JobView {
+        JobView {
+            id: "j".into(),
+            kind: "payment",
+            release_at_ms: 0,
+            amount_sompi: amount,
+            fee_sompi: UNIFORM_FEE_V1,
+            status: "scheduled",
+            txid: None,
+            reproved: 0,
+            error: None,
+        }
+    }
+
+    /// A lost answer is "may have paid", never "failed": the legacy answer used to list only the
+    /// accepted siblings and call the rest a refusal, so the caller paid again.
+    #[test]
+    fn a_lost_answer_counts_as_sent_and_a_refusal_does_not() {
+        let views = vec![view(100), view(200), view(400)];
+        let r = vec![(0, Ok(Released::Sent("a".into()))), (1, Ok(Released::Unknown("b".into()))), (2, Err("refused".into()))];
+        let o = settle(&views, &r);
+        assert_eq!(o.txids, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(o.sent, 300);
+        assert_eq!(o.unknown.as_deref(), Some("b"));
+        assert_eq!(o.refused.as_deref(), Some("refused"));
+        let none = settle(&views, &[(0, Err("x".into()))]);
+        assert!(none.txids.is_empty() && none.sent == 0 && none.unknown.is_none());
+    }
+
+    /// Under `--uniform-v1` the legacy `/send` ignored `request_id`: a retry paid again.
+    #[test]
+    fn uniform_legacy_terms_remember_what_went_out_and_refuse_it_again() {
+        let key = sent_request_key(&"ef".repeat(96), "uniform-rid", "fp").unwrap();
+        let terms = LegacyTerms { request_key: Some(key.clone()), max_total_fee: Some(2 * UNIFORM_FEE_V1) };
+        assert!(terms.refuse_if_sent("payment").is_ok());
+        // Nothing went out: no record, so a retry pays (as it must).
+        terms.record(&[], 0);
+        assert!(sent_request(&key).is_none());
+        terms.record(&["t1".into(), "t2".into()], 700);
+        let done = sent_request(&key).unwrap();
+        assert_eq!((done.txid.as_str(), done.amount_sompi, done.tx_count, done.fee_sompi), ("t1", 700, 2, 2 * UNIFORM_FEE_V1));
+        let (code, body) = terms.refuse_if_sent("payment").unwrap_err();
+        assert_eq!(code, StatusCode::CONFLICT);
+        assert_eq!(body.0["already_sent"]["txid"], "t1");
+        // Without a request id nothing is remembered or refused.
+        assert!(LegacyTerms::default().refuse_if_sent("payment").is_ok());
+        // The fee ceiling is checked against the plan, before anything is reserved.
+        assert!(terms.check_fee(2, "payment").is_ok());
+        assert_eq!(terms.check_fee(3, "payment").unwrap_err().0, StatusCode::CONFLICT);
+    }
 
     #[test]
     fn policy_is_off_by_default() {
