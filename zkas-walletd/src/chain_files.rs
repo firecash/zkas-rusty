@@ -1096,6 +1096,13 @@ impl ChainFiles {
         Some((seg.to.hash()?, seg.to.clone()))
     }
 
+    /// Decoded segments held right now and their bytes (file bodies plus the per-block index).
+    pub fn loaded_bytes(&self) -> (usize, usize) {
+        let loaded = self.loaded.lock().unwrap();
+        let bytes = loaded.iter().map(|l| l.body.capacity() + l.offsets.capacity() * 8 + l.pos.capacity() * 48).sum();
+        (loaded.len(), bytes)
+    }
+
     pub fn stats(&self) -> Stats {
         Stats {
             source: self.bases.join(","),

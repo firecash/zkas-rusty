@@ -4234,6 +4234,11 @@ impl DecodedPage {
 }
 
 impl PageCache {
+    /// Cached pages and their approximate bytes.
+    fn held(&self) -> (usize, usize) {
+        (self.map.len(), self.map.values().map(|(_, _, p)| p.approx_bytes()).sum())
+    }
+
     /// Forget every cached page (a fetch in flight is left to finish). Returns how many and
     /// their approximate bytes. For a memory warning: pages are re-fetched on demand.
     fn drop_pages(&mut self) -> (usize, usize) {
@@ -4261,11 +4266,11 @@ impl PageCache {
             pool: Arc::new(pool),
             ttl: std::time::Duration::from_secs(resources.page_cache_ttl_secs.max(1)),
             // 0 = sized to memory: one decoded page is ~15 MB (measured 2 Nov, 142), so one entry
-            // per 96 MiB of the resident budget, 8-256. The fixed 64 was ~1 GB of pages when full:
-            // on a 2 GB box it was most of the memory (a public-mode daemon wedged at its cap,
-            // measured 6 Nov). A phone (no budget) keeps 16.
+            // per 128 MiB of the resident budget, 8-256. The fixed 64 was ~1 GB of pages when
+            // full: on a 2 GB box it was most of the memory (a public-mode daemon wedged at its
+            // cap, measured 6 Nov). A phone (no budget) keeps 12.
             cap: match resources.page_cache_entries {
-                0 => resident_budget_bytes(resources).map(|b| (b / (96 << 20)).clamp(8, 256) as usize).unwrap_or(16),
+                0 => resident_budget_bytes(resources).map(|b| (b / (128 << 20)).clamp(8, 256) as usize).unwrap_or(12),
                 n => n,
             },
             hits: 0,
@@ -5958,8 +5963,22 @@ impl WalletEntry {
             // base — a genesis restore on a phone reached 13 M leaves in RAM and a 568 MB checkpoint
             // rewritten every few minutes, for a wallet with nothing to witness. O(1) per page
             // (the tip frontier becomes the base); never while a cache build snapshots the stream.
-            if advanced && !self.db.tree_is_valid() && self.db.is_borrowing() && shared_tree_covers == 0 {
-                if let Some(fs) = cache.lock().await.files.clone().and_then(|f| f.frontier_at(&self.low)) {
+            //
+            // Whatever the wallet borrows from. With a shared tree it used to adopt only at the
+            // end of its pass, and only the shared tree's TIP frontier — which `adopt_tip_frontier`
+            // rightly refuses while the wallet is behind (sizes differ) — so a restoring empty
+            // wallet's tree stayed invalid, nothing compacted, and it carried every leaf since
+            // its base until caught up: 15.5 M leaves, 513 MiB each, three of them restoring
+            // took a 2 GB daemon down (measured 6 Nov). Now: the files' signed frontier at a
+            // segment end when the cursor is there, else the shared tree's frontier at exactly
+            // this wallet's size (O(depth) from its subtree cache; skipped while it is busy).
+            if advanced && !self.db.tree_is_valid() && self.db.is_borrowing() {
+                let mut fs = cache.lock().await.files.clone().and_then(|f| f.frontier_at(&self.low));
+                if fs.is_none() && shared_tree_covers >= self.db.size() && self.db.notes().is_empty() && self.db.pending_spends().is_empty() {
+                    let at = self.db.size();
+                    fs = state.chain_tree.try_lock().ok().and_then(|ct| ct.db.frontier_state_at(at));
+                }
+                if let Some(fs) = fs {
                     self.db.adopt_tip_frontier(&fs);
                 }
             }
@@ -15737,6 +15756,61 @@ fn require_local_operator(
     }
 }
 
+/// `GET /api/admin/memory` (loopback only): where the process's memory goes, approximately,
+/// for sizing a box — RSS, the shared chain tree, the nullifier table, cached pages, loaded
+/// chain-file segments, and the resident wallets (the largest first). Wallets busy under their
+/// lock are counted, not measured.
+async fn admin_memory(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    peer: Option<axum::extract::ConnectInfo<SocketAddr>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    require_local_operator(peer)?;
+    let rss_kb = std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|st| st.lines().find(|l| l.starts_with("VmRSS:")).and_then(|l| l.split_whitespace().nth(1)).and_then(|v| v.parse::<u64>().ok()))
+        .unwrap_or(0);
+    let wallets: Vec<(String, Wallet)> = state.wallets.lock().await.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    let mut chain_tree = 0usize;
+    let mut chain_tree_leaves = (0u64, 0u64, 0u64);
+    let mut busy = 0usize;
+    let mut resident: Vec<(usize, serde_json::Value)> = Vec::new();
+    for (t, w) in &wallets {
+        match w.try_lock() {
+            Ok(e) => {
+                let bytes = e.db.approx_heap_bytes();
+                if t == CHAIN_TREE_TOKEN {
+                    chain_tree = bytes;
+                    let (from, to) = e.db.leaf_span();
+                    chain_tree_leaves = (from, to, e.db.size());
+                } else {
+                    let (from, to) = e.db.leaf_span();
+                    resident.push((bytes, serde_json::json!({ "wallet": log_pseudonym(t), "mib": bytes >> 20, "notes": e.db.notes().len(), "leaves_held": to - from, "caught_up": e.caught_up })));
+                }
+            }
+            Err(_) => busy += 1,
+        }
+    }
+    resident.sort_by(|a, b| b.0.cmp(&a.0));
+    let resident_bytes: usize = resident.iter().map(|(b, _)| *b).sum();
+    let interner = WalletDb::default_nullifier_interner().map(|i| i.approx_heap_bytes()).unwrap_or(0);
+    let (pages, page_bytes, segments, segment_bytes) = {
+        let pc = state.page_cache.lock().await;
+        let (p, pb) = pc.held();
+        let (sg, sb) = pc.files.as_ref().map(|f| f.loaded_bytes()).unwrap_or((0, 0));
+        (p, pb, sg, sb)
+    };
+    Ok(Json(serde_json::json!({
+        "rss_mib": rss_kb / 1024,
+        "chain_tree_mib": chain_tree >> 20,
+        "chain_tree": { "base": chain_tree_leaves.0, "held_to": chain_tree_leaves.1, "size": chain_tree_leaves.2 },
+        "nullifier_table_mib": interner >> 20,
+        "page_cache": { "entries": pages, "mib": page_bytes >> 20 },
+        "chain_file_segments": { "loaded": segments, "mib": segment_bytes >> 20 },
+        "resident_wallets": { "count": resident.len(), "busy": busy, "mib": resident_bytes >> 20 },
+        "largest_wallets": resident.into_iter().take(20).map(|(_, v)| v).collect::<Vec<_>>(),
+    })))
+}
+
 async fn warm_chain_tree(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     peer: Option<axum::extract::ConnectInfo<SocketAddr>>,
@@ -17068,10 +17142,12 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
                     log::warn!("chain files disabled: the node connection is routed through a proxy");
                 } else {
                     log::info!("chain files: pages covered by published segments are read from them");
-                    // Remote segments held at once: one per 24 MiB of the resident budget, 4-24.
-                    // Each is ~10 MB decoded; the shared tree reads ahead and every wallet
+                    // Remote segments held at once: one per 64 MiB of the resident budget, 4-16.
+                    // Each is ~12 MB as held; the shared tree reads ahead and every wallet
                     // catching up needs its own current and next, so a phone's four thrashed.
-                    let remote_cap = resident_budget_bytes(&resources).map(|b| (b / (24 << 20)).clamp(4, 24) as usize).unwrap_or(16);
+                    // (24 per 24 MiB was tried under a 2 GB limit: 290 MB of segments on top of
+                    // the chain tree and the nullifier table reached the limit, measured 6 Nov.)
+                    let remote_cap = resident_budget_bytes(&resources).map(|b| (b / (64 << 20)).clamp(4, 16) as usize).unwrap_or(12);
                     pc.files = Some(chain_files::ChainFiles::with_remote_cap(base, genesis, remote_cap));
                 }
             }
@@ -17349,6 +17425,7 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
         // Operator tools: force the shared tree / a wallet to the tip on demand, so a
         // restart's catch-up window can be closed by hand instead of waited out.
         .route("/api/admin/warm_chain_tree", post(warm_chain_tree))
+        .route("/api/admin/memory", get(admin_memory))
         .route("/api/admin/warm_wallet", post(warm_wallet))
         // Public, token-scoped warm: the app calls it when a wallet is opened so the
         // send path is already fast by the time the user reaches it.

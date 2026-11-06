@@ -160,7 +160,7 @@ The daemon raises any fee you pass to this floor automatically (`chunk_fee`). Pa
 | `--warm-always N` | `0` | Keep the N most recently active wallets resident and fully prepared (~100–190 MiB each), so reopening one is instant. |
 | `--warm-budget PCT` | `60` | Load-average ceiling (per core, %) above which the background warm sweep starts no new cold work. |
 | `--page-decode-threads N` | `cores − 2` (1–8) | Shared block-page decoder threads. |
-| `--page-cache-entries N`, `--page-cache-ttl SECONDS` | sized to memory (one entry per 96 MiB of the resident budget, 8–256; 16 without a budget), `10` | Size and lifetime of the shared decoded-page cache (~15 MB per decoded page). |
+| `--page-cache-entries N`, `--page-cache-ttl SECONDS` | sized to memory (one entry per 128 MiB of the resident budget, 8–256; 12 without a budget), `10` | Size and lifetime of the shared decoded-page cache (~15 MB per decoded page). |
 | `--prefetch-depth N` | `1` | Block pages fetched concurrently ahead of the ingest cursor during a deep scan. Page fetch dominates sync time, so a remote node benefits from a higher value. |
 | `--active-sync-window SECONDS` | `90` | Keep syncing a wallet this long after its last API request. |
 | `--idle-evict SECONDS` | `1800` | Remove an idle wallet's checkpoint from RAM (never from disk). |
@@ -345,6 +345,7 @@ consolidates.
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `POST` | `/api/admin/warm_chain_tree` | Drive the **shared chain tree** forward (up to 90 s per call) and start its subtree-cache build. Once built, every wallet the shared tree covers witnesses in O(depth). |
+| `GET` | `/api/admin/memory` | Where the process's memory goes (approximate): RSS, the shared chain tree, the nullifier table, cached pages, loaded chain-file segments, the resident wallets largest first. For sizing a box. |
 | `POST` | `/api/admin/warm_wallet` | Build **this token's** subtree cache now and persist it, for a wallet the shared tree cannot serve (its notes predate the tree's base). |
 
 `warm_chain_tree` reports progress; the build continues in the background:
