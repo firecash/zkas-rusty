@@ -10146,6 +10146,14 @@ fn drop_held_leaves(state: &AppState, token: &str, e: &mut WalletEntry) -> bool 
         }
         return false;
     }
+    // Already leaf-less from an earlier pass or an older build, still carrying the witness
+    // index it built when it held every leaf: drop it and rewrite the checkpoint small.
+    if e.db.witness_index_is_stale() {
+        let bytes = e.db.release_reclaimable();
+        e.force_checkpoint = true;
+        log::info!("wallet {}: dropped its stale witness index ({} MB); the shared tree witnesses its notes", log_pseudonym(token), bytes >> 20);
+        return true;
+    }
     let target = e.db.earliest_held_position();
     if size < base.saturating_add(HOSTED_REBASE_MIN_LEAVES) {
         return false;

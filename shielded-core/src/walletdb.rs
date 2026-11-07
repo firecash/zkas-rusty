@@ -2693,7 +2693,23 @@ impl WalletDb {
         if self.held_positions().iter().any(|&p| p < floor) {
             return false;
         }
-        self.rebase_to_inner(fs, true)
+        if !self.rebase_to_inner(fs, true) {
+            return false;
+        }
+        // The wallet's own witness index served positions it no longer holds leaves for; the
+        // shared tree witnesses every spend now. Built over 17 M leaves it was ~50-130 MB in
+        // RAM and ~50 MB in every checkpoint of a wallet that otherwise holds a few MB.
+        self.subtree = SubtreeCache::default();
+        true
+    }
+
+    /// Whether this wallet's own witness index is pointless: every note it holds is below its
+    /// base (the shared tree witnesses them) and the index still occupies memory.
+    pub fn witness_index_is_stale(&self) -> bool {
+        self.shared_floor.is_some()
+            && self.subtree.approx_heap_bytes() > 0
+            && !self.notes.is_empty()
+            && self.held_positions().iter().all(|&p| p < self.base_size)
     }
 
     fn rebase_to_inner(&mut self, fs: &FrontierState, past_notes: bool) -> bool {
@@ -7557,6 +7573,7 @@ mod tests {
         assert!(db.stranded_notes().is_empty(), "served by the shared tree, not stranded");
         assert!(db.witness_path_at(db.notes()[0].position, db.size()).is_none(), "no leaves of its own");
         assert_eq!(db.next_note_needing_witness(), None, "nothing to warm");
+        assert!(!db.subtree_cache_ready(db.size()), "its own witness index is gone with its leaves");
         // The daemon lost its shared tree: the notes are stranded until it is back.
         db.set_shared_floor(None);
         assert_eq!(db.stranded_notes().len(), 10);
