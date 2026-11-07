@@ -5,6 +5,79 @@ CLI wallet, Stratum bridge). Downloads and checksums: <https://zkas.info/downloa
 Every tag is on Radicle (`zkas-v<version>`). **Mainnet requires zkas-v1.0.11 or newer**: the
 security fork activated at DAA 6,983,500 on 15 October 2026, and older nodes cannot follow it.
 
+## zkas-v1.0.14 — 2026-11-07
+
+Tag `zkas-v1.0.14` on Radicle. No consensus change: runs alongside v1.0.11 to v1.0.13 nodes. The node binary
+changes little; this release is the wallet daemon, the browser engine and the integration
+surface (exchanges, gateways, SDK). Recommended for every wallet-daemon operator; node operators
+gain the gRPC keepalive. Linux x86_64, Windows x86_64, macOS Apple Silicon and Intel.
+
+**Node**
+- gRPC: TCP keepalive on every client connection. A client that vanished (a phone that changed
+  networks, a frozen host) used to keep its connection slot for ever; on 3 November 82 of 94
+  connections on a public node were idle for over ten minutes, and once the 256 slots were full
+  every new wallet was refused. Dead peers are now dropped in about twelve minutes; sleeping but
+  live apps are kept.
+- `kaspad --version` prints `2.0.1 (zkas-v1.0.14)`; peers see `zkas:1.0.14`.
+- `shielded-core`: the `circuit` feature is now `circuit-core` plus multicore proving (native
+  builds unchanged; a browser builds `circuit-core` alone), and a new variable-time coinbase
+  note-commitment path exists for wallets. Consensus keeps calling the unchanged constant-time
+  functions; the new path is checked against them in tests and is not used by the node.
+- Stratum bridge and miner: no changes.
+
+**Wallet daemon (`zkas-walletd`)**
+- Memory: a daemon serving many wallets ran at 38 to 50 GB; it now runs at about 1.2 to 2.4 GB
+  (measured on the hosted service, 7 November). Wallets beside a shared chain tree hold no leaves
+  of their own (their notes carry shared-tree witnesses); the page cache, the remote-segment cap
+  and the on-disk segment cache (`<wallet-dir>/chainfiles-cache/`, with `--shared-leaf-store`)
+  are sized from `--sync-wallet-memory-mb`; the chain-tree checkpoint is streamed instead of
+  built in a 525 MB buffer. Empty wallets restoring beside a shared tree adopt the signed
+  frontier and stay small (5 MiB for a 7,701-note wallet, not 513 MiB).
+- Disk: write amplification removed. A warm wallet no longer forces a checkpoint on every pass
+  (518 writes / 1.19 GB per ten minutes became 71 / 83 MB); empty and leaves-only wallets never
+  sweep; the wallet directory of the hosted service fell from 24 GB to 9.7 GB.
+- Payments cannot be paid twice. `send`, `send_many` and `prepare` take a `request_id`; the
+  record of what was broadcast under it survives restarts for 24 hours; a reused id for the same
+  payment answers `already_sent`, for a different recipient or amount it is refused; a split
+  payment that fails part-way reports the parts that went out; a broadcast whose answer was lost
+  returns `outcome_unknown` (HTTP 504) instead of "no coins moved". `GET /api/wallet/requests/{id}`
+  reports `in_progress`, or `sent` with each transaction `landed` (with depth), `pending` or
+  `returned_or_settled`.
+- Exchanges: a deposit journal, `GET /api/wallet/deposits?after=<seq>`, numbers every credit
+  (with the diversified-address `index`, exact amount, memo, DAA score); `history` rows carry
+  `credits[].index`; received payments carry their memos; payout batches absorb small notes;
+  consolidation leaves dust alone. Launch guide: `docs/WALLETD.md` section 7b.
+- Signed chain files arbitrate over the node where they disagree (rule 3); a daemon reading only
+  local files never re-fetches from the node; segments come from the CDN first, zkas.info only
+  when it fails; a download is capped at its expected size.
+- Scanning: deep catch-up decrypts the next pages while it ingests; tip wallets decrypt only
+  newly settled blocks; scan work has its own thread pool, so `--proof-threads` no longer slows
+  decryption; a wallet more than 300 blocks behind keeps catching up within its pass;
+  `--compact-nullifiers` stores one shared nullifier table plus per-wallet bitsets.
+- Correctness: a refused payment releases its notes or drops the ones the chain spent; a
+  lost-looking send the chain has spent is dropped, never handed back as spendable; a wallet
+  whose payment awaits the device's signatures is never evicted; an open prepare soft-holds its
+  notes so a parallel prepare picks others; a new wallet starts below the reorg window; the
+  nullifier table cuts back a failed append and refuses to start on a read error; the
+  viewing-key index derives keys directly (six threads, 3 s load bound).
+- Operators: `GET /api/admin/memory` (loopback) shows the live memory breakdown; `/health`
+  carries process counters; `scan_stats` says where a wallet's time went.
+- iOS: the daemon builds for `target_os = "ios"` without an Apple SDK: HTTPS through the
+  system's Security framework, no TLS self-hosting (loopback only), sysinfo without the
+  network statistics Apple forbids. Nothing changes on other targets.
+
+**Browser engine, SDK, gateway, API**
+- Browser engine: several payees, consolidation and private sends; no zero-value change; the
+  spend index is built in slices; a browser can adopt a wallet service's scan receipt; a clock
+  that exists in a browser (the engine used to abort on `Instant::now()`).
+- Payment proofs bind their memo and verify after pruning (`verify_compact`); the explorer reads
+  the node's shielded books.
+- SDK: `deposits()`, `requestStatus()`, request ids across split payments, `SubmitOutcomeUnknownError`.
+- Payment gateway: expiry holds, settled invoices stay settled, webhooks retry, invoices are
+  credited from `credits[]`.
+- Docs: `WALLETD.md` rewritten against the code (public-daemon sizing, exchange launch guide,
+  key material as it is: a 12-word phrase with ZIP-32 accounts, or a raw seed).
+
 ## zkas-v1.0.13 — 2026-10-28
 
 Commit `7d892c81`. No consensus change: runs alongside v1.0.11 and v1.0.12 nodes. Recommended for
