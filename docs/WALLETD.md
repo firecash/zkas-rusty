@@ -927,6 +927,9 @@ ExecStart=/usr/local/bin/zkas-walletd \
   --rpc-server 127.0.0.1:16810 \
   --listen 127.0.0.1:8501 \
   --wallet-dir /var/lib/zkas/wallets \
+  --chain-files /var/lib/zkas/chainfiles,https://pub-ae5ed92258b2437e985b69ab9947ef60.r2.dev \
+  --shared-leaf-store \
+  --compact-nullifiers \
   --auto-consolidate 200 \
   --warm-always 3 \
   --active-sync-window 86400 \
@@ -947,7 +950,10 @@ WantedBy=multi-user.target
 | `--auto-consolidate 200` | Every deposit is a note; the ceiling keeps withdrawals at 1–3 spends (~2–7 s) instead of drifting into minutes (§0). |
 | `--warm-always 3` | The hot wallet (and the watch-only cold wallet) stay resident and fully prepared, so the first withdrawal after a quiet period does not wait for the wallet to reopen. ~100–190 MiB each. |
 | `--active-sync-window 86400`, `--idle-evict 86400` | A wallet is synced only while it was requested within the active-sync window (default 90 s) and stays in memory only until it has been idle for `--idle-evict` (default 30 min). With a day for both, the hot wallet keeps following the chain between polls, so a deposit is in history when you next look rather than after the poll that wakes the wallet. |
-| shared chain tree (default on) | Keep it on. Without it each wallet carries every leaf since its oldest unspent note in memory and in every checkpoint; a hot wallet holding one old note grows by ~4 MB a day and rewrites hundreds of MB per checkpoint. With it, wallets keep only their notes and witnesses, and the daemon's one copy of the chain serves them all. The tree costs one scan from genesis at first start (minutes with `--chain-files`). |
+| shared chain tree (default on) | Keep it on (never `--no-shared-tree`). Without it each wallet carries every leaf since its oldest unspent note in memory and in every checkpoint; a hot wallet holding one old note grows by ~4 MB a day and rewrites hundreds of MB per checkpoint. With it a wallet keeps only its notes, however many, and the daemon's one copy of the chain witnesses every spend. The tree costs one scan from genesis at first start (about two hours from the CDN; its checkpoint is streamed, 0.9 s for the whole chain). |
+| `--chain-files DIR,URL` | History pages come from signed chain files instead of the node: the first start and every restore take minutes, not hours, and the node is left alone. Give a local directory first if you export the files yourself, the public CDN as the fallback; downloaded segments are kept in `<wallet-dir>/chainfiles-cache/`. Every file is checked against the node (§6). |
+| `--shared-leaf-store` | Wallet checkpoints reference the shared tree's leaf stream instead of embedding a copy: a 500 MB checkpoint becomes a few MB. One-way: a build older than v11 cannot read the converted wallets, so do not roll back below `5864d0d7` (6 Nov 2026 builds or later). |
+| `--compact-nullifiers` | The chain's nullifier table is kept once (`__nullifiers__.nfs`) and each wallet stores a 1 MB bitset instead of every nullifier: checkpoints that write in milliseconds. Both forms load. |
 | `--rpc-server 127.0.0.1:16810` | Your own node, next to the daemon. |
 | `TimeoutStopSec=120` | A stop flushes every wallet's checkpoint; give it time to finish. |
 
@@ -955,8 +961,15 @@ If the node shares the machine, add `--proof-threads $(( $(nproc) - 2 ))` so pro
 starves it. Everything else stays at its default.
 
 **Never pass** on an exchange daemon: `--allow-remote`, `--allow-origin`, `--serve-public`,
-`--allow-default-token`, `--no-auto-consolidate`, `--enable-multiparty`, `--uniform-v1`,
-`--idle-timeout`, or the one-way `--shared-leaf-store`.
+`--allow-default-token`, `--no-auto-consolidate`, `--no-shared-tree`, `--enable-multiparty`,
+`--uniform-v1`, `--idle-timeout`. `--shared-scan-engine` is for a hosted daemon with thousands
+of wallets on one page and buys nothing here.
+
+This configuration was run end to end on 7 Nov 2026 (build `f12f187e`): wallet created at the
+tip, deposit addresses by index up to 2^40 (`index_exact`), journal, request status, history
+and balance answering, `send`/`send_many`/`consolidate` refusing until the first matured
+anchor, a watch-only cold wallet registered beside the hot one, a restart resuming it with
+the same addresses, no errors, 1.2 GB RSS with the shared tree at the tip.
 
 #### Launch configuration — B (split key)
 
@@ -969,6 +982,9 @@ zkas-walletd \
   --rpc-server 127.0.0.1:16810 \
   --listen 127.0.0.1:8501 \
   --wallet-dir /var/lib/zkas/wallets \
+  --chain-files /var/lib/zkas/chainfiles,https://pub-ae5ed92258b2437e985b69ab9947ef60.r2.dev \
+  --shared-leaf-store \
+  --compact-nullifiers \
   --no-custodial \
   --warm-always 3 \
   --active-sync-window 86400 \
@@ -990,9 +1006,11 @@ split payments, request ids and unknown outcomes.
    `seed_hex` offline **before** funding it — or, for **B**, register its viewing key.
 3. Register the cold wallet watch-only.
 4. Wait for `synced: true` and `spend_ready: true` in `/api/status`.
-5. Rehearse with small amounts: a deposit to a per-customer address appears in history under
-   that address; a withdrawal returns `txids`; repeating it with the same `request_id` returns
-   **409 `already_sent`** and pays nothing; its payment proof verifies.
+5. Rehearse with small amounts: a deposit to a per-customer address appears as a `credit` event
+   in `GET /api/wallet/deposits` with that customer's `index`; a withdrawal returns `txids`;
+   repeating it with the same `request_id` returns **409 `already_sent`** and pays nothing;
+   `GET /api/wallet/requests/<request_id>` reports it `landed` with a depth; its payment proof
+   verifies.
 6. Back up the wallet directory and the tokens.
 
 #### Deposit attribution
