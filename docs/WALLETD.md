@@ -751,10 +751,12 @@ balances, pays one recipient at a time, and must be consistently fast at it. Bot
 governed by §0 — cost tracks **notes spent** — and both should follow §4: **a `request_id`
 on every payment**.
 
-### Key material: a raw seed, not a mnemonic
+### Key material: a recovery phrase, or a raw seed
 
-ZKas has **no BIP-39 seed phrase** anywhere — not in `zkas-walletd`, `shielded-core`, the SDK
-or the wallet apps. The unit of key material is a **raw 32-byte seed, hex-encoded**:
+The official wallet creates a **12-word recovery phrase** (BIP-39, English word list, 128
+bits of entropy, no passphrase) and derives each account with ZIP-32 for Orchard:
+`m/32'/111111'/account'` (coin type 111111; account 0 is the default). The 32-byte result
+is the spending-key seed `zkas-walletd` works with:
 
 ```jsonc
 POST /api/wallet/create            // daemon generates 32 random bytes (OsRng)
@@ -762,10 +764,11 @@ POST /api/wallet/import            // { "seed_hex": "<64 hex chars>", "birthday"
 GET  /api/wallet/reveal            // returns seed_hex — treat it as the private key it is
 ```
 
-You **can** derive that seed from a BIP-39 mnemonic on your own side and import the result as
-`seed_hex`, which gives a human-transcribable cold backup. ZKas defines no derivation standard,
-so the mnemonic is **your own convention** and the official wallet cannot restore from it.
-Document the derivation and test the round trip before funding anything.
+The daemon never sees the phrase: derive the account's `seed_hex` with the signer
+(`account_seed_hex(phrase, account)`, in the WASM, the mobile library and the `zkas-signer`
+crate) and import that. Wallets created before phrases existed hold a raw 64-hex seed; both
+forms restore in the official wallet. A service that keeps its own convention (another
+derivation, a passphrase) must document and test the round trip before funding anything.
 
 `birthday` is the DAA score to start scanning from. Use the tip for a new wallet; `0` scans
 the whole chain for funds an imported seed may already hold.
