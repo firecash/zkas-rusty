@@ -72,6 +72,7 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(not(target_os = "ios"))]
 fn fingerprint_of_der(der: &[u8]) -> String {
     hex::encode(Sha256::digest(der))
 }
@@ -79,6 +80,13 @@ fn fingerprint_of_der(der: &[u8]) -> String {
 /// Load an existing self-signed cert from `dir`, or mint a fresh one. Stable across
 /// restarts. SANs cover `localhost` plus every entry in `sans` (the operator's public
 /// host, if known) — though a pinning client validates the fingerprint, not the name.
+/// The iOS engine serves loopback only and is built without the TLS listener.
+#[cfg(target_os = "ios")]
+pub fn ensure_cert(_dir: &Path, _sans: &[String]) -> Result<TlsIdentity, String> {
+    Err("TLS self-hosting is not built into the iOS engine; it serves 127.0.0.1 only".to_string())
+}
+
+#[cfg(not(target_os = "ios"))]
 pub fn ensure_cert(dir: &Path, sans: &[String]) -> Result<TlsIdentity, String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
     let cert_path = dir.join("cert.pem");
@@ -168,7 +176,10 @@ pub async fn run_selfhost(cfg: SelfHostConfig, shutdown: tokio::sync::oneshot::R
         None
     } else {
         // Install a process-default rustls crypto provider (ring) for axum-server's TLS.
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        #[cfg(not(target_os = "ios"))]
+        {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        }
         let sans: Vec<String> = cfg.public_host.iter().cloned().collect();
         Some(ensure_cert(&cfg.state_dir, &sans)?)
     };

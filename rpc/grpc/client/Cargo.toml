@@ -44,10 +44,14 @@ tokio-stream.workspace = true
 tonic = { workspace = true, features = ["gzip"] }
 triggered.workspace = true
 futures-util.workspace = true
-rustls.workspace = true
 
 [features]
 heap = []
 
 [lints]
 workspace = true
+
+# Not referenced by this crate's code; present so the workspace's rustls features unify.
+# The iOS engine must not pull a C-compiled TLS provider (see zkas-walletd/Cargo.toml).
+[target.'cfg(not(target_os = "ios"))'.dependencies]
+rustls.workspace = true

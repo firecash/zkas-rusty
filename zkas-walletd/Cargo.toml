@@ -40,7 +40,10 @@ kaspa-core.workspace = true
 # gRPC transport to a running kaspad (ZKas) node.
 kaspa-grpc-client.workspace = true
 # Free memory on platforms without /proc/meminfo (Windows, macOS) for the memory gates.
-sysinfo.workspace = true
+# Only `System` (memory totals) is used; the other modules are not built. The network
+# module in particular does not compile for iOS (routing-socket constants libc has no iOS
+# definition for), and Apple forbids its calls there.
+sysinfo = { version = "0.31.2", default-features = false, features = ["system"] }
 kaspa-rpc-core.workspace = true
 # The shielded engine: WalletDb (scan/witness/balance), the real Halo 2 payment
 # builder (circuit feature), coinbase-note reconstruction, and message sign/verify.
@@ -61,7 +64,6 @@ rayon.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 flate2.workspace = true
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 log.workspace = true
 clap.workspace = true
 # CSPRNG for fresh wallet seeds + message signing.
@@ -74,9 +76,6 @@ chacha20poly1305.workspace = true
 # Self-hosting mode (`--serve-public` / node-embedded): auto-generate a self-signed
 # TLS cert, serve HTTPS directly (no reverse proxy), and print a pairing QR so a
 # mobile wallet can pin the cert. Keeps the FVK off the wire in the clear.
-axum-server = { version = "0.7", features = ["tls-rustls"] }
-rustls.workspace = true
-rcgen = "0.13"
 qrcode = { version = "0.14", default-features = false }
 sha2.workspace = true
 hex.workspace = true
@@ -91,3 +90,20 @@ blake2b_simd = { workspace = true }
 # Stage W conformance (spec 02 §7.1 T1): walletd's uniform build under the pinned ChaCha20 RNG of
 # the golden vectors (SHA-256 via the regular `sha2` dependency).
 rand_chacha = "0.10"
+
+# The TLS stack, per target. Everywhere but iOS it is rustls, whose providers (ring,
+# aws-lc) compile C against the platform headers. The iOS engine is cross-built on Linux
+# without an Apple SDK, so it compiles no C against Apple headers: HTTPS (chain files)
+# goes through the system's Security.framework via native-tls, and the self-hosting TLS
+# listener (axum-server + rcgen) is not built in — a phone serves loopback only.
+[target.'cfg(not(target_os = "ios"))'.dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+rustls.workspace = true
+rcgen = "0.13"
+
+[target.'cfg(target_os = "ios")'.dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["native-tls"] }
+# The App Store feature set leaves out the routing-socket network statistics Apple forbids
+# on iOS (and whose libc constants do not exist for the iOS target).
+sysinfo = { version = "0.31.2", default-features = false, features = ["system", "apple-app-store"] }

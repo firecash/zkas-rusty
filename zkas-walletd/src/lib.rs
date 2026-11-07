@@ -17542,21 +17542,34 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
         // HTTPS directly — no reverse proxy. The client pins the cert fingerprint from the
         // pairing QR, so the self-signed cert is trusted for exactly this node.
         Some(id) => {
-            log::info!("zkas-walletd listening on https://{listen} (self-signed, fingerprint {})", id.fingerprint);
-            let tls_cfg = axum_server::tls_rustls::RustlsConfig::from_pem(id.cert_pem, id.key_pem)
-                .await
-                .map_err(|e| format!("load TLS identity: {e}"))?;
-            let handle = axum_server::Handle::new();
-            let h = handle.clone();
-            tokio::spawn(async move {
-                let _ = shutdown.await;
-                h.graceful_shutdown(Some(std::time::Duration::from_secs(2)));
-            });
-            axum_server::bind_rustls(listen, tls_cfg)
-                .handle(handle)
-                .serve(app.into_make_service_with_connect_info::<SocketAddr>())
-                .await
-                .map_err(|e| format!("server error: {e}"))
+            let served: Result<(), String>;
+            #[cfg(target_os = "ios")]
+            {
+                let _ = id;
+                served = Err("TLS self-hosting is not built into the iOS engine; it serves 127.0.0.1 only".to_string());
+            }
+            #[cfg(not(target_os = "ios"))]
+            {
+                served = async {
+                    log::info!("zkas-walletd listening on https://{listen} (self-signed, fingerprint {})", id.fingerprint);
+                    let tls_cfg = axum_server::tls_rustls::RustlsConfig::from_pem(id.cert_pem, id.key_pem)
+                        .await
+                        .map_err(|e| format!("load TLS identity: {e}"))?;
+                    let handle = axum_server::Handle::new();
+                    let h = handle.clone();
+                    tokio::spawn(async move {
+                        let _ = shutdown.await;
+                        h.graceful_shutdown(Some(std::time::Duration::from_secs(2)));
+                    });
+                    axum_server::bind_rustls(listen, tls_cfg)
+                        .handle(handle)
+                        .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+                        .await
+                        .map_err(|e| format!("server error: {e}"))
+                }
+                .await;
+            }
+            served
         }
         None => {
             log::info!("zkas-walletd listening on http://{listen}");
