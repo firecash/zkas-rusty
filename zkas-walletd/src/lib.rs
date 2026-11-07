@@ -17167,10 +17167,18 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
                     // catching up needs its own current and next, so a phone's four thrashed.
                     // (24 per 24 MiB was tried under a 2 GB limit: 290 MB of segments on top of
                     // the chain tree and the nullifier table reached the limit, measured 6 Nov.)
-                    let remote_cap = resident_budget_bytes(&resources).map(|b| (b / (64 << 20)).clamp(4, 16) as usize).unwrap_or(12);
-                    // Downloaded segments stay on disk beside the wallets, so a daemon whose wallets
-                    // restore at different heights downloads each one once.
-                    pc.files = Some(chain_files::ChainFiles::with_cache_dir(base, genesis, remote_cap, Some(&chain_files_cache)));
+                    // A multi-wallet daemon (the shared leaf store is its signature: hosted and
+                    // exchange recipes) holds more segments and keeps the downloaded ones on disk
+                    // beside the wallets, so wallets restoring at different heights download each
+                    // once. A device engine or a one-wallet self-host keeps a phone's four and no
+                    // disk cache: its one wallet reads each segment once, and 1.9 GB of files on
+                    // a phone would be a surprise.
+                    pc.files = Some(if resources.shared_leaf_store {
+                        let remote_cap = resident_budget_bytes(&resources).map(|b| (b / (64 << 20)).clamp(4, 16) as usize).unwrap_or(12);
+                        chain_files::ChainFiles::with_cache_dir(base, genesis, remote_cap, Some(&chain_files_cache))
+                    } else {
+                        chain_files::ChainFiles::new(base, genesis)
+                    });
                 }
             }
             pc

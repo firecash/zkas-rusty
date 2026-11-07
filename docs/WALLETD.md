@@ -175,7 +175,7 @@ The daemon raises any fee you pass to this floor automatically (`chunk_fee`). Pa
 
 | Flag | Default | Notes |
 | --- | --- | --- |
-| `--chain-files URL_OR_DIR[,…]` | *(none)* | Read the history covered by published chain files from them instead of from the node: `https://` base URLs (tried in order) or a local directory with `manifest.json`. Every file is checked against the node before it is trusted (§6). Segments downloaded from a URL are kept in `<wallet-dir>/chainfiles-cache/` (verified against the signed manifest on every read), so each is downloaded once. |
+| `--chain-files URL_OR_DIR[,…]` | *(none)* | Read the history covered by published chain files from them instead of from the node: `https://` base URLs (tried in order) or a local directory with `manifest.json`. Every file is checked against the node before it is trusted (§6). With `--shared-leaf-store` (a multi-wallet daemon), segments downloaded from a URL are kept in `<wallet-dir>/chainfiles-cache/` (verified against the signed manifest on every read), so each is downloaded once; a device engine keeps no such cache. |
 | `--no-shared-tree` | `false` | Do not build the daemon-wide shared chain tree; every wallet keeps its own, as the on-device engines do. |
 | `--compact-nullifiers` | `false` | Persist the shared nullifier table once (`__nullifiers__.nfs`) and store a compact bitset per wallet instead of every nullifier: much smaller and faster checkpoints. Without it checkpoints keep the full form; both forms load. |
 | `--shared-leaf-store` | `false` | Checkpoint format v11: wallets reference the shared tree's leaf stream instead of embedding a copy. **One-way**: builds that predate v11 cannot read these checkpoints. |
